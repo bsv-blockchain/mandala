@@ -31,14 +31,16 @@
  *      abortAction that releases the held inputs. Kept (attempts++) on failure
  *      so a transient error never orphans the only durable record; handed to
  *      the bulk sweep only after ABORT_RETRY_CAP failures.
- *   4. Bulk sweep — wallet-toolbox specOpNoSendActions with the 'abort' label
- *      aborts every remaining stuck nosend mandala action server-side (it
- *      chain-checks first and refuses to abort anything already broadcast).
- *      Skipped while an 'accepted' or 'retryable' entry is pending (an
- *      overlay-admitted tx must not be swept before its broadcast retry, and a
- *      retryable one is deliberately still holding its inputs) and while any
- *      pipeline's fresh 'intent' entry exists (the sweep cannot tell a live
- *      noSend action from an abandoned one — the intent journal can).
+ *   4. Bulk sweep — release the inputs of stuck nosend mandala actions that
+ *      crashed before they ever journaled. Opt-out (`{ sweep: false }`) for a
+ *      host that drains its own noSend actions. Skipped while an 'accepted' or
+ *      'retryable' entry is pending (an overlay-admitted tx must not be swept
+ *      before its broadcast retry, and a retryable one is deliberately still
+ *      holding its inputs) and while any pipeline's fresh 'intent' entry exists
+ *      (the sweep cannot tell a live noSend action from an abandoned one — the
+ *      intent journal can). Per action it then requires a reported age past
+ *      SWEEP_MIN_AGE_MS and no journal entry seen this pass, of any stage —
+ *      see `sweepStuckNoSendActions` for what the 2026-09-15 incident taught.
  *
  * Whole pass runs under a cross-tab web lock: concurrent reconciles (two tabs,
  * init + settle overlap) skip instead of double-broadcasting / double-aborting.
@@ -59,8 +61,33 @@ import { tryWithLock } from './webLocks.js'
  */
 export const SPEC_OP_NOSEND_ACTIONS = 'ac6b20a3bb320adafecd637b25c84b792ad828d3aa510d05dc841481f664277d'
 
+/**
+ * The BRC-114 label that asks a wallet-toolbox listing to report each action's
+ * creation time (as an `action time <unixMillis>` label on the action). `0`
+ * filters nothing; it only turns the reporting on. A wallet that does not know
+ * the label is listed without it — and then reports no age, so nothing is
+ * swept. See `sweepStuckNoSendActions`.
+ */
+const ACTION_TIME_FROM_ANY = 'action time from 0'
+
 /** After this many failed abort retries the bulk sweep owns the cleanup. */
 export const ABORT_RETRY_CAP = 5
+
+/**
+ * How old a noSend action must be before the bulk sweep may abort it.
+ *
+ * The 2026-09-15 incident: a transfer's tx was admitted AND broadcast by the
+ * overlay, the wallet's `sendWith` resolved without posting (its storage holds
+ * token requests for its own settlement drain), the lib cleared the 'accepted'
+ * entry on that alone — and 0.7 s later the sweep, finding a noSend action with
+ * no journal entry, aborted it. The wallet marked an on-chain transaction
+ * failed and released its inputs; the next send double-spent them.
+ *
+ * Thirty minutes is far longer than any pipeline (createAction → overlay →
+ * broadcast) can legitimately be in flight, and far shorter than a stuck action
+ * is tolerable. Anything younger is presumed live.
+ */
+export const SWEEP_MIN_AGE_MS = 30 * 60 * 1000
 
 /**
  * How many passes a 'retryable' refusal is re-submitted before reconcile gives
@@ -78,6 +105,19 @@ export const RETRY_CAP = 20
  */
 export const BROADCAST_RETRY_CAP = 10
 
+export interface ReconcileOptions {
+  /**
+   * Run the bulk sweep of stuck noSend actions (step 4). Default `true`: a
+   * plain web console has no other cleanup for a crashed pipeline.
+   *
+   * **A host that manages its own noSend actions must pass `false`.** A wallet
+   * with its own settlement drain holds token requests on purpose; to this
+   * sweep those are indistinguishable from abandoned ones, and the journal
+   * guards below — good as they are — only cover transactions the LIB created.
+   */
+  sweep?: boolean
+}
+
 export interface ReconcileResult {
   /** Overlay-accepted txids whose broadcast was successfully retried. */
   rebroadcast: string[]
@@ -93,9 +133,12 @@ export interface ReconcileResult {
   skipped?: boolean
 }
 
-export async function reconcileWallet (wallet: WalletInterface): Promise<ReconcileResult> {
+export async function reconcileWallet (
+  wallet: WalletInterface,
+  opts: ReconcileOptions = {}
+): Promise<ReconcileResult> {
   const { acquired, result } = await tryWithLock('mandala.reconcile', async () =>
-    await reconcilePass(wallet)
+    await reconcilePass(wallet, opts.sweep !== false)
   )
   if (!acquired || result == null) {
     return { rebroadcast: [], aborted: [], resubmitted: [], stranded: [], swept: 0, skipped: true }
@@ -111,22 +154,60 @@ async function releaseReference (wallet: WalletInterface, reference?: string): P
   } catch { /* already on-chain, or the wallet is offline — the sweep owns it now */ }
 }
 
-async function reconcilePass (wallet: WalletInterface): Promise<ReconcileResult> {
+async function reconcilePass (wallet: WalletInterface, sweep: boolean): Promise<ReconcileResult> {
   const rebroadcast: string[] = []
   const aborted: string[] = []
   const resubmitted: string[] = []
   const stranded: string[] = []
   const now = Date.now()
+  /**
+   * Every txid/reference this pass has seen an entry for, INCLUDING entries it
+   * has since cleared. The sweep at the bottom must not touch any of them: a
+   * successful broadcast or abort earlier in this very pass is exactly the
+   * 0.7 s window in which the 2026-09-15 sweep aborted an on-chain tx.
+   */
+  const seenTxids = new Set<string>()
+  const seenRefs = new Set<string>()
+  const remember = (entry: JournalEntry): void => {
+    seenTxids.add(entry.txid)
+    if (entry.reference != null && entry.reference !== '') seenRefs.add(entry.reference)
+  }
 
   /**
-   * Broadcast an entry the overlay has accepted, clearing it on success and
-   * parking it as 'stranded' once BROADCAST_RETRY_CAP passes have failed.
-   * Shared by the 'accepted' branch and by a 'retryable' entry that has just
-   * been accepted on re-submit — both reach the identical commit point.
+   * Keep an accepted-but-unbroadcast entry for the next pass, or park it as
+   * 'stranded' once BROADCAST_RETRY_CAP passes have got nowhere (§9.11): the
+   * overlay folded this tx in, so aborting it would desync wallet from overlay,
+   * but one permanently unbroadcastable tx must not wedge every other recovery.
+   */
+  const keepOrStrand = async (entry: JournalEntry, why: string, e?: unknown): Promise<void> => {
+    const attempts = (entry.attempts ?? 0) + 1
+    if (attempts >= BROADCAST_RETRY_CAP) {
+      await journalPut({ ...entry, stage: 'stranded', attempts })
+      stranded.push(entry.txid)
+      console.warn(
+        `[mandala] ${entry.txid} was accepted by the overlay but ${attempts} broadcast attempts failed (${why}); ` +
+        'parked as stranded (journalListStranded) — it will not be retried automatically:', e
+      )
+    } else {
+      await journalPut({ ...entry, attempts })
+    }
+  }
+
+  /**
+   * Broadcast an entry the overlay has accepted, clearing it ONLY when the
+   * wallet proves it posted the transaction (`broadcastAcceptedTx`). Shared by
+   * the 'accepted' branch and by a 'retryable' entry that has just been
+   * accepted on re-submit — both reach the identical commit point.
    */
   const broadcastAccepted = async (entry: JournalEntry): Promise<void> => {
     try {
-      await broadcastAcceptedTx(wallet, entry.txid)
+      if (!await broadcastAcceptedTx(wallet, entry.txid)) {
+        // Resolved, but nothing was posted (a wallet holding the request for
+        // its own drain). Not an error — but not a broadcast either, so the
+        // entry stays exactly as a failed attempt would leave it.
+        await keepOrStrand(entry, 'the wallet did not report it as posted')
+        return
+      }
       await journalRemove(entry.txid)
       rebroadcast.push(entry.txid)
     } catch (e) {
@@ -137,25 +218,12 @@ async function reconcilePass (wallet: WalletInterface): Promise<ReconcileResult>
         rebroadcast.push(entry.txid)
         return
       }
-      const attempts = (entry.attempts ?? 0) + 1
-      if (attempts >= BROADCAST_RETRY_CAP) {
-        // §9.11. Keep it — the overlay folded this tx in, so aborting would
-        // desync wallet from overlay — but stop retrying it and stop letting it
-        // block the sweep. It is surfaced via journalListStranded().
-        await journalPut({ ...entry, stage: 'stranded', attempts })
-        stranded.push(entry.txid)
-        console.warn(
-          `[mandala] ${entry.txid} was accepted by the overlay but ${attempts} broadcast attempts failed; ` +
-          'parked as stranded (journalListStranded) — it will not be retried automatically:', e
-        )
-      } else {
-        // Still unreachable — keep the entry for the next reconcile.
-        await journalPut({ ...entry, attempts })
-      }
+      await keepOrStrand(entry, 'broadcast failed', e)
     }
   }
 
   for (const entry of await journalList()) {
+    remember(entry)
     if (entry.stage === 'intent') {
       // A live pipeline's marker — leave fresh ones alone; expire stale ones
       // (crashed pipeline) so the sweep below can reclaim its inputs.
@@ -207,6 +275,7 @@ async function reconcilePass (wallet: WalletInterface): Promise<ReconcileResult>
   // that is the whole point of parking it (§9.11).
   let swept = 0
   const entries = await journalList()
+  for (const e of entries) remember(e)
   const blocked = entries.some(e =>
     e.stage === 'accepted' ||
     e.stage === 'retryable' ||
@@ -215,17 +284,151 @@ async function reconcilePass (wallet: WalletInterface): Promise<ReconcileResult>
     e.stage === 'handed_over' ||
     (e.stage === 'intent' && Date.now() - e.at < INTENT_TTL_MS)
   )
-  if (!blocked) {
-    try {
-      const res = await wallet.listActions({
-        labels: [SPEC_OP_NOSEND_ACTIONS, 'mandala', 'abort'],
-        limit: 100
-      } as any)
-      swept = (res as { actions?: unknown[] }).actions?.length ?? 0
-    } catch { /* wallet without spec-op support — nothing to sweep */ }
+  if (sweep && !blocked) {
+    swept = await sweepStuckNoSendActions(wallet, seenTxids, seenRefs)
   }
 
   return { rebroadcast, aborted, resubmitted, stranded, swept }
+}
+
+/** One listed noSend action, reduced to what the sweep decides on. */
+interface SweepCandidate {
+  txid?: string
+  reference?: string
+  age: number
+}
+
+/**
+ * An action's creation time as the wallet reports it — a `createdAt`/
+ * `created_at` field (number, Date or parseable string), or the BRC-114
+ * `action time <unixMillis>` label a wallet-toolbox listing adds when asked.
+ * `undefined` means "this wallet does not say", which the sweep treats as
+ * "never abort it".
+ */
+function actionCreatedAt (a: unknown): number | undefined {
+  const raw = (a as { createdAt?: unknown, created_at?: unknown })?.createdAt ??
+    (a as { created_at?: unknown })?.created_at
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+  if (raw instanceof Date) return raw.getTime()
+  if (typeof raw === 'string') {
+    const t = Date.parse(raw)
+    if (!Number.isNaN(t)) return t
+  }
+  const labels = (a as { labels?: unknown })?.labels
+  for (const label of Array.isArray(labels) ? labels : []) {
+    if (typeof label !== 'string' || !label.startsWith('action time ')) continue
+    const ms = Number(label.slice('action time '.length))
+    if (Number.isSafeInteger(ms) && ms > 0) return ms
+  }
+  return undefined
+}
+
+/**
+ * Abort the stuck noSend mandala actions that are provably abandoned — and
+ * nothing else (2026-09-15).
+ *
+ * The wallet-toolbox spec-op is a LISTING that also aborts everything it lists
+ * when handed the 'abort' label: all or nothing, no exceptions. So this lists
+ * read-only first, applies the guards per action, and only then aborts:
+ *
+ *   · an action whose txid (or reference) the tx journal has touched at any
+ *     point in this pass is never aborted — whatever its stage, and even if the
+ *     entry has since cleared. That entry is the lib saying "this transaction's
+ *     fate is mine";
+ *   · an action is only old enough when the wallet reports a creation time and
+ *     that time is more than SWEEP_MIN_AGE_MS ago. No timestamp, no abort;
+ *   · an action the wallet gives a `reference` for is aborted individually. The
+ *     indiscriminate bulk abort is the fallback for wallets that report none,
+ *     and it may only run when EVERY listed action passed the guards.
+ *
+ * Returns how many actions were actually aborted.
+ */
+async function sweepStuckNoSendActions (
+  wallet: WalletInterface,
+  seenTxids: Set<string>,
+  seenRefs: Set<string>
+): Promise<number> {
+  // Ask for creation times (BRC-114) but never depend on them being understood.
+  let labels = [SPEC_OP_NOSEND_ACTIONS, 'mandala', ACTION_TIME_FROM_ANY]
+  let actions: unknown[] | undefined
+  for (const attempt of [labels, [SPEC_OP_NOSEND_ACTIONS, 'mandala']]) {
+    try {
+      const res = await wallet.listActions({ labels: attempt, includeLabels: true, limit: 100 } as any)
+      const listed = (res as { actions?: unknown }).actions
+      labels = attempt
+      actions = Array.isArray(listed) ? listed : []
+      // An empty answer may just mean the wallet took the time label as a
+      // filter it has never seen — ask again without it before believing it.
+      if (actions.length > 0) break
+    } catch { /* try the plainer listing, then give up */ }
+  }
+  // A wallet without spec-op support — nothing listed, nothing to sweep.
+  if (actions == null || actions.length === 0) return 0
+
+  const now = Date.now()
+  const eligible: SweepCandidate[] = []
+  for (const a of actions) {
+    // A wallet that does not implement the spec op ignores the label and lists
+    // ordinary mandala actions instead — aborting one of those (completed,
+    // already broadcast) is the exact harm this sweep exists to avoid.
+    const status = (a as { status?: unknown })?.status
+    if (status != null && status !== 'nosend') continue
+    const txid = typeof (a as { txid?: unknown })?.txid === 'string' ? (a as { txid: string }).txid : undefined
+    const rawRef = (a as { reference?: unknown })?.reference
+    const reference = typeof rawRef === 'string' && rawRef !== '' ? rawRef : undefined
+    if (txid != null && seenTxids.has(txid)) continue
+    if (reference != null && seenRefs.has(reference)) continue
+    const createdAt = actionCreatedAt(a)
+    if (createdAt == null) continue
+    const age = now - createdAt
+    if (age < SWEEP_MIN_AGE_MS) continue
+    eligible.push({ txid, reference, age })
+  }
+  if (eligible.length === 0) return 0
+
+  const announce = (c: SweepCandidate): void => {
+    console.warn(
+      `[mandala] sweep aborted stuck noSend action ${c.txid ?? '(txid unreported)'} — ` +
+      `age ${Math.round(c.age / 60000)}m, no journal entry`
+    )
+  }
+
+  let swept = 0
+  const unreferenced: SweepCandidate[] = []
+  for (const c of eligible) {
+    if (c.reference == null) {
+      unreferenced.push(c)
+      continue
+    }
+    try {
+      await wallet.abortAction({ reference: c.reference })
+      announce(c)
+      swept++
+    } catch (e) {
+      // Already on chain, or the wallet is offline — either way, leave it.
+      console.warn(`[mandala] sweep could not abort ${c.txid ?? c.reference}:`, e)
+    }
+  }
+
+  if (unreferenced.length > 0) {
+    if (eligible.length === actions.length) {
+      try {
+        await wallet.listActions({ labels: [...labels, 'abort'], includeLabels: true, limit: 100 } as any)
+        for (const c of unreferenced) {
+          announce(c)
+          swept++
+        }
+      } catch (e) {
+        console.warn('[mandala] sweep could not run the bulk abort:', e)
+      }
+    } else {
+      console.warn(
+        `[mandala] sweep left ${unreferenced.length} stuck noSend action(s) alone: the wallet reports no ` +
+        'reference to abort them individually, and the bulk abort would also hit actions that are still live'
+      )
+    }
+  }
+  return swept
 }
 
 /**

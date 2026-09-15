@@ -158,6 +158,32 @@ export async function journalListStranded (): Promise<JournalEntry[]> {
 }
 
 /**
+ * Does the journal still hold ANYTHING for this txid, at any stage?
+ *
+ * The question a HOST must ask before it touches a noSend action of its own
+ * accord (its settlement drain, its own sweep): an entry — 'intent',
+ * 'accepted', 'retryable', 'handed_over', 'stranded' or 'abort' alike — means
+ * this library still owns the transaction's fate, and aborting the action under
+ * it releases inputs the overlay (or a payee) is already counting on.
+ *
+ * A read failure answers `true`. Fail-safe, exactly like `hasFreshIntent`: not
+ * knowing what is live is not a licence to abort.
+ */
+export async function journalHas (txid: string): Promise<boolean> {
+  try {
+    const store = getStorage()
+    if (await store.getItem(PREFIX + txid) != null) return true
+    // Nothing under its own key — only an unmigrated legacy blob could still
+    // be hiding it, and that check is one extra read, not a full scan.
+    if (await store.getItem(LEGACY_KEY) == null) return false
+    return (await journalList()).some(e => e.txid === txid)
+  } catch (e) {
+    console.warn(`[mandala] txJournal read failed for ${txid}; assuming it is still in flight:`, e)
+    return true
+  }
+}
+
+/**
  * Insert or replace the entry for a txid. Atomic per entry. Resolves once the
  * store has it — callers that rely on the ordering guarantee (overlay.ts's
  * 'accepted' write before the broadcast) MUST await it.

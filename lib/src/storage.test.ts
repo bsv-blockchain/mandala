@@ -18,7 +18,10 @@ import {
   memoryStorage,
   defaultStorage
 } from './storage.js'
-import { journalPut, journalList, journalClear, journalRemove, hasFreshIntent, journalIntentBegin } from './txJournal.js'
+import {
+  journalPut, journalList, journalClear, journalRemove, journalHas, hasFreshIntent, journalIntentBegin,
+  JournalEntry
+} from './txJournal.js'
 import { notifyPut, notifyList, notifyClear } from './notifyJournal.js'
 import { blindingPut, blindingGet, blindingList, blindingClear } from './blindingJournal.js'
 import { configureMandala } from './constants.js'
@@ -261,5 +264,56 @@ describe('the commit point is an awaited write (deferred adapter)', () => {
     deferred.flush()
     expect(await begun).toMatch(/^intent:/)
     expect(await hasFreshIntent()).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// journalHas — the one question a HOST has to answer before it touches a
+// noSend action: "does the lib still own this transaction?" (2026-09-15).
+// ---------------------------------------------------------------------------
+
+describe('journalHas', () => {
+  const stages: Array<JournalEntry['stage']> =
+    ['intent', 'accepted', 'abort', 'retryable', 'stranded', 'handed_over']
+
+  beforeEach(async () => {
+    configureStorage(null)
+    await journalClear()
+  })
+
+  it.each(stages)('is true for a %s entry', async stage => {
+    await journalPut({ txid: 'q', stage, at: 1 })
+    expect(await journalHas('q')).toBe(true)
+  })
+
+  it('is false for a txid the journal never held, and again after it clears', async () => {
+    expect(await journalHas('nope')).toBe(false)
+    await journalPut({ txid: 'q', stage: 'accepted', at: 1 })
+    await journalRemove('q')
+    expect(await journalHas('q')).toBe(false)
+  })
+
+  it('finds an entry still sitting in the legacy single-array key', async () => {
+    const { store, map } = spyStorage()
+    configureStorage(store)
+    map.set('mandala.txJournal', JSON.stringify([{ txid: 'legacy', stage: 'accepted', at: 1 }]))
+    expect(await journalHas('legacy')).toBe(true)
+    configureStorage(null)
+  })
+
+  it('answers true when the store cannot be read — not knowing is not a licence to abort', async () => {
+    configureStorage({
+      getItem: async () => { throw new Error('store down') },
+      setItem: async () => {},
+      removeItem: async () => {},
+      keys: async () => []
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      expect(await journalHas('q')).toBe(true)
+    } finally {
+      warn.mockRestore()
+      configureStorage(null)
+    }
   })
 })

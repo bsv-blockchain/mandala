@@ -243,15 +243,44 @@ export async function submitToOverlay (
 }
 
 /**
+ * Does a `createAction({ sendWith })` result PROVE the wallet posted the tx?
+ *
+ * A resolved promise does not (2026-09-15): a wallet whose storage deliberately
+ * holds token requests for its own settlement drain returns a hold-shaped
+ * result rather than throwing, and reading that as "broadcast" cleared the
+ * 'accepted' journal entry while nothing had been sent. The BRC-100 contract
+ * says the only evidence is a `sendWithResults` row for THIS txid whose status
+ * is 'unproven' (posted, not yet proven) or 'sending' (posted, in flight);
+ * 'failed', an unknown status, a missing row, a missing array, and any
+ * differently-shaped result all mean "not posted, keep the entry".
+ */
+export function sendWithPosted (result: unknown, txid: string): boolean {
+  const results = (result as { sendWithResults?: unknown })?.sendWithResults
+  if (!Array.isArray(results)) return false
+  const rows = results as Array<{ txid?: unknown, status?: unknown } | null>
+  const match = rows.find(r => r?.txid === txid) ??
+    // The batch was `sendWith: [txid]`, so a lone row the wallet did not label
+    // with a txid can only be that one. Two unlabelled rows prove nothing.
+    (rows.length === 1 && typeof rows[0]?.txid !== 'string' ? rows[0] : undefined)
+  return match?.status === 'unproven' || match?.status === 'sending'
+}
+
+/**
  * Broadcast a previously-created `noSend` action now that the overlay has
  * accepted it. Synchronous (`acceptDelayedBroadcast: false`) so a broadcast
  * failure surfaces here rather than in a background process.
+ *
+ * Returns whether the wallet actually POSTED it (`sendWithPosted`). `false` is
+ * not an error — the wallet may be holding the request on purpose — but it is
+ * not a broadcast either, so the caller must keep its 'accepted' journal entry
+ * and try again later.
  */
-export async function broadcastAcceptedTx (wallet: WalletInterface, txid: string): Promise<void> {
-  await wallet.createAction({
+export async function broadcastAcceptedTx (wallet: WalletInterface, txid: string): Promise<boolean> {
+  const res = await wallet.createAction({
     description: 'broadcast overlay-accepted tx',
     options: { sendWith: [txid], acceptDelayedBroadcast: false }
   })
+  return sendWithPosted(res, txid)
 }
 
 /**
@@ -357,10 +386,32 @@ export async function submitAndBroadcast (
   // extra I/O, so a client that loses the overlay's admission record still
   // holds its own copy — and `offChainHex`, so a later OFFLINE hand-over can
   // forward this tx's linkage bytes verbatim (handover.ts).
+  // `reference` rides along too: it is never used to abort an accepted tx (that
+  // is forbidden), but it lets a host — and the reconcile sweep — recognise the
+  // noSend action behind this txid as one the lib still owns.
   const linkageReceipt = offChainValues != null ? { offChainHex: Utils.toHex(offChainValues) } : {}
-  await journalPut({ txid: signed.txid, stage: 'accepted', at: Date.now(), ...linkageReceipt, ...admissionReceipt(admitted) })
+  await journalPut({
+    txid: signed.txid,
+    stage: 'accepted',
+    at: Date.now(),
+    ...(reference != null ? { reference } : {}),
+    ...linkageReceipt,
+    ...admissionReceipt(admitted)
+  })
   void broadcastAcceptedTx(wallet, signed.txid)
-    .then(async () => { await journalRemove(signed.txid) })
+    .then(async posted => {
+      // ONLY a proven post clears the entry. A wallet that resolved without
+      // posting (a storage hold) leaves the tx unbroadcast, and dropping the
+      // entry there is what let the reconcile sweep abort an on-chain tx.
+      if (posted) {
+        await journalRemove(signed.txid)
+        return
+      }
+      console.warn(
+        `[mandala] overlay accepted ${signed.txid} but the wallet did not report it as posted ` +
+        "(no sendWithResults status of 'unproven'/'sending'); keeping the 'accepted' entry for reconcile"
+      )
+    })
     .catch(async e => {
       if (isAlreadyBroadcast(e)) {
         // The network already has it — recovery complete, clear the entry.

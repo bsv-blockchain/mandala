@@ -23,7 +23,7 @@ import {
   SubmitAdminActionResult
 } from './assets.js'
 import { registerAsset, issueTokens, redeemTokens, IssuerOpResult, RegisterResult } from './issuerOps.js'
-import { reconcileWallet, ReconcileResult } from './reconcile.js'
+import { reconcileWallet, ReconcileOptions, ReconcileResult } from './reconcile.js'
 
 export interface MandalaClientOptions extends MandalaEndpoints {
   /** BRC-100 wallet; defaults to a new WalletClient (browser substrate). */
@@ -74,8 +74,12 @@ export interface MandalaClient {
   issue: (args: { asset: AdminAsset, amount: number, depositHash?: string }) => Promise<IssuerOpResult>
   redeem: (args: { asset: AdminAsset, amount: number, balance?: number }) => Promise<IssuerOpResult>
   assets: () => Promise<AdminAsset[]>
-  /** Self-heal half-finished state (stuck aborts, pending broadcasts). */
-  reconcile: () => Promise<ReconcileResult>
+  /**
+   * Self-heal half-finished state (stuck aborts, pending broadcasts). Pass
+   * `{ sweep: false }` from a host that manages its own noSend actions — the
+   * bulk sweep cannot tell those from abandoned ones.
+   */
+  reconcile: (opts?: ReconcileOptions) => Promise<ReconcileResult>
 }
 
 export function createMandalaClient (opts: MandalaClientOptions = {}): MandalaClient {
@@ -136,7 +140,7 @@ export function createMandalaClient (opts: MandalaClientOptions = {}): MandalaCl
     redeem: async ({ asset, amount, balance }) =>
       redeemTokens({ wallet: wallet as any, identityKey: await identityKey(), asset, amount, balance }),
     assets: async () => listAdminAssets(wallet),
-    reconcile: async () => reconcileWallet(wallet as any)
+    reconcile: async (opts = {}) => reconcileWallet(wallet as any, opts)
   }
 }
 

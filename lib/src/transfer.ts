@@ -110,6 +110,14 @@ export interface TransferParams {
  */
 export interface TransferResult extends AdmissionReceipt {
   txid: string
+  /**
+   * The `createAction` signableTransaction reference behind this send, on BOTH
+   * rails. A host that keeps its own noSend bookkeeping needs it to map
+   * reference → txid: without it, the only way to tell a live action from an
+   * abandoned one is to guess (2026-09-15). Absent only if the wallet returned
+   * no signable transaction at all.
+   */
+  reference?: string
   /** False when the tx committed but the recipient messagebox notify failed. */
   notified: boolean
   /** The signed AtomicBEEF bytes — identical to what was submitted to the overlay. */
@@ -438,6 +446,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
 
   return {
     txid,
+    ...(reference != null ? { reference } : {}),
     notified,
     atomicBeef: signedTx,
     offChainValues: offChainValuesOut,
@@ -498,7 +507,15 @@ async function attemptImmediateSubmit (
   // and a broadcast failure here is retried by reconcile exactly like any
   // other 'accepted' entry.
   void broadcastAcceptedTx(wallet, txid)
-    .then(async () => { await journalRemove(txid) })
+    .then(async posted => {
+      // Only a proven post clears the entry: a wallet that resolved without
+      // posting has not broadcast anything (2026-09-15).
+      if (posted) { await journalRemove(txid); return }
+      console.warn(
+        `[mandala] immediate post-hand-over submit accepted ${txid} but the wallet did not report it as ` +
+        "posted; keeping the 'accepted' entry for reconcile"
+      )
+    })
     .catch(async e => {
       if (isAlreadyBroadcast(e)) { await journalRemove(txid); return }
       console.warn(

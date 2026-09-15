@@ -18,7 +18,7 @@ import {
   hasFreshIntent,
   INTENT_TTL_MS
 } from './txJournal.js'
-import { reconcileWallet, ABORT_RETRY_CAP } from './reconcile.js'
+import { reconcileWallet, ABORT_RETRY_CAP, SWEEP_MIN_AGE_MS } from './reconcile.js'
 import {
   notifyPut,
   notifyList,
@@ -73,7 +73,9 @@ describe('txJournal intents', () => {
 
   it('a fresh intent blocks the bulk sweep; a stale one is expired and unblocks it', async () => {
     const id = await journalIntentBegin()
-    const wallet = mkWallet({ listActions: vi.fn().mockResolvedValue({ actions: [{ txid: 'x' }] }) })
+    // Old enough for the sweep's own age guard, so the intent is what decides.
+    const stuck = { txid: 'x', status: 'nosend', reference: 'ref-x', createdAt: Date.now() - SWEEP_MIN_AGE_MS - 1 }
+    const wallet = mkWallet({ listActions: vi.fn().mockResolvedValue({ actions: [stuck] }) })
     const r1 = await reconcileWallet(wallet as any)
     expect(r1.swept).toBe(0)
     expect(wallet.listActions).not.toHaveBeenCalled()

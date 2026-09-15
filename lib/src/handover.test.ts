@@ -352,3 +352,13 @@ describe('journalEvidenceSource — the lib’s own journals as the default evid
     expect(await src.linkageFor(GRAND.id('hex'))).toBeUndefined()
   })
 })
+
+describe('transferTokens({ mode: "handover" }) — the reference is durable and returned', () => {
+  it('returns the createAction reference and journals it on the handed_over entry', async () => {
+    const { result } = await handover()
+    expect(result.reference).toBe('ref-1')
+    expect(await journalList()).toMatchObject([
+      { txid: TXID, stage: 'handed_over', reference: 'ref-1' }
+    ])
+  })
+})

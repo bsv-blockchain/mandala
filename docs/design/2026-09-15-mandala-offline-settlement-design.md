@@ -1710,3 +1710,5 @@ caller that passes `basket: 'p mandala'` explicitly. The one-time migration
 (moving any already-held outputs from the old basket name to the new one)
 lives in the wallet only; the lib itself performs no migration and the web
 console needs none.
+
+**(11) 2026-09-15 — an admitted transaction is never aborted locally.** Incident: the lib's reconcile bulk sweep aborted a noSend action 0.7 s after the overlay had admitted (and broadcast) it, because the wallet's intentional token hold made the lib's post-acceptance `sendWith` look successful and its `accepted` journal entry was cleared. Rules now: the sweep is opt-out (the wallet runs reconcile with `sweep:false`), TTL-gated, and never touches a txid with any journal entry; the lib clears `accepted` only when the wallet reports the transaction as posted; the wallet refuses `abortAction` for any reference whose settlement row is held / handed_over / submitting / admitted / broadcast; and a repair pass re-attaches a transaction the wallet marked failed but the overlay admitted.

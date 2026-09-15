@@ -133,3 +133,16 @@ describe('transferTokens — atomicBeef and offChainValues', () => {
     expect(result.offChainValues).toEqual(offChainArg)
   })
 })
+
+// ---------------------------------------------------------------------------
+// The createAction reference — a host that maps reference → txid can tell a
+// live noSend action from an abandoned one without guessing (2026-09-15).
+// ---------------------------------------------------------------------------
+
+describe('transferTokens — the signableTransaction reference reaches the caller', () => {
+  it('returns it on the submit rail', async () => {
+    vi.mocked(submitAndBroadcast).mockResolvedValue({ outputsToAdmit: [0] })
+    const { result } = await send()
+    expect(result.reference).toBe('ref-1')
+  })
+})

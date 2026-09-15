@@ -1,13 +1,22 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
-  createOverlayFacilitator, OverlayRefusedError, overlayErrorFromResponse,
-  submitAndBroadcast, submitToOverlay
+  broadcastAcceptedTx, createOverlayFacilitator, OverlayRefusedError, overlayErrorFromResponse,
+  sendWithPosted, submitAndBroadcast, submitToOverlay
 } from './overlay.js'
 import { journalList, journalClear } from './txJournal.js'
 import { configureMandala } from './constants.js'
 import { configureStorage, memoryStorage } from './storage.js'
 
 const OVERLAY = 'http://test-overlay'
+
+/**
+ * A wallet that really posts a `sendWith` batch: it answers with the
+ * SendWithResult BRC-100 promises. Only that is proof of a broadcast — see
+ * "the wallet must prove it posted" below.
+ */
+const postingWallet = async (args: any): Promise<any> => ({
+  sendWithResults: ((args?.options?.sendWith ?? []) as string[]).map(txid => ({ txid, status: 'unproven' }))
+})
 
 beforeEach(async () => {
   await journalClear()
@@ -106,7 +115,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
 
   it('clears the journal after a successful accept + broadcast', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0], admissionSignature: 'ab' } }) }
-    const wallet = { createAction: vi.fn().mockResolvedValue({}), abortAction: vi.fn() }
+    const wallet = { createAction: vi.fn().mockImplementation(postingWallet), abortAction: vi.fn() }
     const res = await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any)
     expect(res.admissionSignature).toBe('ab')
     await new Promise(r => setTimeout(r, 0)) // background broadcast
@@ -120,9 +129,9 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
     })
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
     const wallet = {
-      createAction: vi.fn().mockImplementation(async () => {
+      createAction: vi.fn().mockImplementation(async (args: any) => {
         await broadcastGate
-        return {}
+        return await postingWallet(args)
       }),
       abortAction: vi.fn()
     }
@@ -388,7 +397,7 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
   })
 
   it('a later successful submit of the same txid replaces the retryable entry with accepted', async () => {
-    const wallet = { createAction: vi.fn().mockResolvedValue({}), abortAction: vi.fn() }
+    const wallet = { createAction: vi.fn().mockImplementation(postingWallet), abortAction: vi.fn() }
     await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing()))
       .rejects.toMatchObject({ retryable: true })
     expect(await journalList()).toMatchObject([{ stage: 'retryable' }])
@@ -396,5 +405,67 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
     await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', ok as any)
     await new Promise(r => setTimeout(r, 0))
     expect(await journalList()).toEqual([]) // accepted, broadcast, cleared
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The 2026-09-15 incident — `createAction({sendWith})` RESOLVED without the
+// wallet having posted anything (its storage intentionally holds token requests
+// for its own settlement drain, returning a hold result rather than throwing).
+// The lib read "resolved" as "broadcast" and dropped the 'accepted' entry; the
+// sweep then aborted an action whose transaction was already on chain.
+// ---------------------------------------------------------------------------
+
+describe('the wallet must prove it posted the tx', () => {
+  const signed = { tx: [1, 2, 3], txid: 'abc' }
+  const accepting = () => ({ send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) })
+
+  describe('sendWithPosted', () => {
+    it.each(['unproven', 'sending'])('accepts a %s status for the txid', status => {
+      expect(sendWithPosted({ sendWithResults: [{ txid: 'abc', status }] }, 'abc')).toBe(true)
+    })
+
+    it.each([
+      ['a hold-shaped result', {}],
+      ['an undefined result', undefined],
+      ['an empty batch', { sendWithResults: [] }],
+      ['a failed status', { sendWithResults: [{ txid: 'abc', status: 'failed' }] }],
+      ['a status nobody defines', { sendWithResults: [{ txid: 'abc', status: 'held' }] }],
+      ['another txid entirely', { sendWithResults: [{ txid: 'zzz', status: 'unproven' }] }],
+      ['a non-array sendWithResults', { sendWithResults: 'sent' }]
+    ])('rejects %s', (_label, result) => {
+      expect(sendWithPosted(result, 'abc')).toBe(false)
+    })
+
+    it('accepts a lone result the wallet did not label with a txid', () => {
+      // The batch was `sendWith: [txid]` — a single unlabelled result is that one.
+      expect(sendWithPosted({ sendWithResults: [{ status: 'sending' }] }, 'abc')).toBe(true)
+    })
+  })
+
+  it('broadcastAcceptedTx reports whether the wallet posted it', async () => {
+    const holding = { createAction: vi.fn().mockResolvedValue({}) }
+    expect(await broadcastAcceptedTx(holding as any, 'abc')).toBe(false)
+    const sending = { createAction: vi.fn().mockImplementation(postingWallet) }
+    expect(await broadcastAcceptedTx(sending as any, 'abc')).toBe(true)
+  })
+
+  it("keeps the 'accepted' entry when createAction resolves without posting", async () => {
+    const wallet = { createAction: vi.fn().mockResolvedValue({}), abortAction: vi.fn() }
+    await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', accepting() as any)
+    await new Promise(r => setTimeout(r, 0)) // background broadcast settles
+    expect(wallet.createAction).toHaveBeenCalled()
+    expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'accepted' }])
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+  })
+
+  it("keeps the 'accepted' entry when the wallet reports the sendWith as failed", async () => {
+    const wallet = {
+      createAction: vi.fn().mockResolvedValue({ sendWithResults: [{ txid: 'abc', status: 'failed' }] }),
+      abortAction: vi.fn()
+    }
+    await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', accepting() as any)
+    await new Promise(r => setTimeout(r, 0))
+    expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'accepted' }])
   })
 })
