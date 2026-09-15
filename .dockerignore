@@ -1,0 +1,11 @@
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+!**/.env.example
+.git
+docs
+hsm
+overlay
+testdata
+**/*.test.ts
