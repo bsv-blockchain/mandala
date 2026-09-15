@@ -265,3 +265,26 @@ Network is **main**. Overlay-first, then broadcast (Arcade).
 - lib: `cover(tip, bundle, { expectedSignerKey })` — third arg required; `payloadHash()`, `fetchAdmission(url, txid, {payloadHash})`, `'retryable'`/`'stranded'` journal stages, `journalListStranded()`.
 - Live overlay on :8080 restarted ~00:05 on the v2.1 build (payload hash verified identical across lib/TS/Go). Suites: lib 467, app 53, overlay 339, Go 294 (all green).
 - bsv-wallet: full toolbox suite 3143/3144 (the one failure is `services/capWalletArgs.test.ts`, the maintainer's separate in-flight vault work). `@bsv/mandala` consumed via `file:../demos/mandala/lib` (symlink + lockfile) until published.
+
+---
+
+## Flux deployment (testnet, 2026-09-15)
+
+Cluster `bsva-us-1`, namespace `mandala-test`, manifests in
+`bsva-infra-flux/apps/base/mandala-test` (PR bsv-blockchain/bsva-infra-flux#348).
+
+| Piece | Image | URL |
+| --- | --- | --- |
+| overlay-go | `ghcr.io/bsv-blockchain/mandala-overlay-go:0.1.0` (`overlay-go/Dockerfile`) | `https://mandala-test-overlay.bsvblockchain.tech` |
+| console | `ghcr.io/bsv-blockchain/mandala-app:0.1.0` (`app/Dockerfile`, context = repo root) | `https://mandala-test.bsvblockchain.tech` |
+| Mongo | `mongo:8` in-cluster, gp3-retain PVC | `mongodb:27017` (cluster-internal) |
+
+- `NETWORK=test`; Arcade = `https://arcade-v2-testnet-us-1.bsvblockchain.tech` (broadcast + chaintracks). `/arc-ingest` gated by `ARCADE_CALLBACK_TOKEN`.
+- Secrets: SSM us-east-2 `/apps/mandala-test/{SERVER_PRIVATE_KEY,ARCADE_CALLBACK_TOKEN,MONGO_URL,MONGO_ROOT_PASSWORD}` (profile `bsva`). `SERVER_PRIVATE_KEY` is the same key as `overlay-go/.env`, so issuer identity stays `0215643b…`.
+- Images are built by `.github/workflows/docker-publish.yml` on every `v*` tag (both images, linux/amd64, GHCR). Console `VITE_*` are baked at build time from repository variables (defaults = testnet values above). Release:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Then bump the tags in the flux manifests. `ADMIN_API_TOKEN` is deliberately unset (would have to be baked into the public bundle).

@@ -1,0 +1,69 @@
+name: Build and Push Docker Images
+
+# Publishes both deployable images to GHCR on every v* tag (and on demand):
+#   ghcr.io/<owner>/mandala-overlay-go  — overlay-go/Dockerfile
+#   ghcr.io/<owner>/mandala-app         — app/Dockerfile (repo-root context)
+# The console bakes its VITE_* config in at build time. Override the defaults
+# below with repository variables of the same name (Settings → Variables).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: mandala-overlay-go
+            context: overlay-go
+            dockerfile: overlay-go/Dockerfile
+          - image: mandala-app
+            context: .
+            dockerfile: app/Dockerfile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VITE_OVERLAY_URL=${{ vars.VITE_OVERLAY_URL || 'https://mandala-test-overlay.bsvblockchain.tech' }}
+            VITE_OVERLAY_IDENTITY_KEY=${{ vars.VITE_OVERLAY_IDENTITY_KEY || '0215643bc656ca42007faa32e94f70050f64a566ffd9e3a2ebc098389936dea57e' }}
+            VITE_MESSAGEBOX_URL=${{ vars.VITE_MESSAGEBOX_URL || 'https://gmb.bsvblockchain.tech' }}
+            VITE_ADMIN_API_TOKEN=${{ vars.VITE_ADMIN_API_TOKEN || '' }}
