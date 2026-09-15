@@ -6,6 +6,15 @@ Do **not** print `SERVER_PRIVATE_KEY` (or any other hex private key) in chat.
 
 ---
 
+## STATE RESET — 2026-09-15 (read before anything below)
+
+All overlay state was wiped on request to start fresh: Mongo `mandala_lookup_services`, the Go engine databases `overlay_local` / `overlay_validation_20260909`, and the TS engine SQLite (`/tmp/mandala-overlay.sqlite`, recreated empty by the migrations on restart). The live TS overlay on :8080 was restarted and is empty.
+
+Consequences:
+- Every "do not open a new genesis" warning below is obsolete: the registry chain (`dc810603…` / `ec5584b5…`) and both assets (`7cf8d33c…`, `e1c664af…`) no longer exist on the overlay. The next `registerAsset` and the next `registerIdentities` ARE the new geneses.
+- The issuer's MetaNet wallet still holds the old admin/registry/token outputs in its basket. The console will list them as assets the overlay does not know; relinquish them in MetaNet (or ignore them) before registering fresh assets so `listAdminAssets` does not pick a stale prior.
+- The historical txids quoted in the sections below are kept for context only.
+
 ## What we were doing
 
 Issuer console Identities page: mock-KYC admit of an arbitrary compressed pubkey onto the **overlay-wide identity registration chain** (`tm_mandala_registry`).
