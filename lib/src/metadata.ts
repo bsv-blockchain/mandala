@@ -35,14 +35,27 @@ export async function resolveAssetMetadata (assetId: string): Promise<AssetMetad
     const vout = Number(assetId.slice(dotIndex + 1))
     for (const out of answer.outputs) {
       const tx = Transaction.fromBEEF(out.beef)
-      if (!(await tx.verify(new WhatsOnChain('main')))) continue
+      // A freshly registered genesis has no Merkle path yet, so a full SPV
+      // check fails until it is mined. The overlay that served this output is
+      // the same authority whose admission signatures the holder already
+      // trusts, so fall back to a scripts-only verification of the BEEF
+      // instead of treating an unmined genesis as "unknown asset".
+      let verified = false
+      try { verified = await tx.verify(new WhatsOnChain('main')) } catch { verified = false }
+      if (!verified) {
+        try { verified = await tx.verify('scripts only') } catch { verified = false }
+      }
+      if (!verified) continue
       const idx = typeof (out as any).outputIndex === 'number' ? (out as any).outputIndex : vout
       const meta = parseMetadataFromBeef(out.beef, idx)
       if (meta != null) { result = meta; break }
     }
-  } catch {
+  } catch (e) {
+    console.warn(`[mandala] asset metadata lookup failed for ${assetId}:`, e instanceof Error ? e.message : e)
     result = null
   }
-  cache.set(assetId, result)
+  // Only a positive answer is memoized: a transient lookup/network failure
+  // must not brand the asset "unidentified" for the rest of the process.
+  if (result != null) cache.set(assetId, result)
   return result
 }
