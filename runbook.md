@@ -275,21 +275,16 @@ Cluster `bsva-us-1`, namespace `mandala-test`, manifests in
 
 | Piece | Image | URL |
 | --- | --- | --- |
-| overlay-go | `deggen88/mandala-overlay-go:v0.1.0` (`overlay-go/Dockerfile`) | `https://mandala-test-overlay.bsvblockchain.tech` |
-| console | `deggen88/mandala-app:v0.1.0` (`app/Dockerfile`, context = repo root) | `https://mandala-test.bsvblockchain.tech` |
+| overlay-go | `ghcr.io/bsv-blockchain/mandala-overlay-go:0.1.0` (`overlay-go/Dockerfile`) | `https://mandala-test-overlay.bsvblockchain.tech` |
+| console | `ghcr.io/bsv-blockchain/mandala-app:0.1.0` (`app/Dockerfile`, context = repo root) | `https://mandala-test.bsvblockchain.tech` |
 | Mongo | `mongo:8` in-cluster, gp3-retain PVC | `mongodb:27017` (cluster-internal) |
 
 - `NETWORK=test`; Arcade = `https://arcade-v2-testnet-us-1.bsvblockchain.tech` (broadcast + chaintracks). `/arc-ingest` gated by `ARCADE_CALLBACK_TOKEN`.
 - Secrets: SSM us-east-2 `/apps/mandala-test/{SERVER_PRIVATE_KEY,ARCADE_CALLBACK_TOKEN,MONGO_URL,MONGO_ROOT_PASSWORD}` (profile `bsva`). `SERVER_PRIVATE_KEY` is the same key as `overlay-go/.env`, so issuer identity stays `0215643b…`.
-- Console `VITE_*` are baked at image build time. Rebuild:
+- Images are built by `.github/workflows/docker-publish.yml` on every `v*` tag (both images, linux/amd64, GHCR). Console `VITE_*` are baked at build time from repository variables (defaults = testnet values above). Release:
 
 ```bash
-docker buildx build --platform linux/amd64 --push -t deggen88/mandala-overlay-go:<tag> overlay-go
-docker buildx build --platform linux/amd64 --push -f app/Dockerfile \
-  --build-arg VITE_OVERLAY_URL=https://mandala-test-overlay.bsvblockchain.tech \
-  --build-arg VITE_OVERLAY_IDENTITY_KEY=0215643bc656ca42007faa32e94f70050f64a566ffd9e3a2ebc098389936dea57e \
-  --build-arg VITE_MESSAGEBOX_URL=https://gmb.bsvblockchain.tech \
-  -t deggen88/mandala-app:<tag> .
+git tag v0.1.0 && git push origin v0.1.0
 ```
 
 Then bump the tags in the flux manifests. `ADMIN_API_TOKEN` is deliberately unset (would have to be baked into the public bundle).
