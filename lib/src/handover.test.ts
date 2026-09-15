@@ -13,7 +13,14 @@ import { MandalaToken } from '@bsv/templates'
 
 vi.mock('./overlay.js', async () => {
   const actual = await vi.importActual<typeof import('./overlay.js')>('./overlay.js')
-  return { ...actual, submitAndBroadcast: vi.fn(), submitToOverlay: vi.fn() }
+  return {
+    ...actual,
+    submitAndBroadcast: vi.fn(),
+    submitToOverlay: vi.fn(),
+    // Never resolves: the background broadcast-then-journalRemove chain must
+    // never race against this file's assertions on the 'accepted' entry.
+    broadcastAcceptedTx: vi.fn(async () => await new Promise<void>(() => {}))
+  }
 })
 vi.mock('./ftCandidates.js', () => ({ loadFtCandidates: vi.fn() }))
 vi.mock('./ftSelect.js', () => ({ selectFtInputs: vi.fn() }))
@@ -29,7 +36,7 @@ vi.mock('./tokens.js', () => ({
 }))
 vi.mock('./unlock.js', () => ({ walletMandalaUnlock: vi.fn() }))
 
-const { submitAndBroadcast, submitToOverlay } = await import('./overlay.js')
+const { submitAndBroadcast, submitToOverlay, broadcastAcceptedTx, OverlayRefusedError } = await import('./overlay.js')
 const { loadFtCandidates } = await import('./ftCandidates.js')
 const { selectFtInputs } = await import('./ftSelect.js')
 const { prepareBlindedPayment } = await import('./blinding.js')
@@ -194,6 +201,109 @@ describe('transferTokens({ mode: "handover" }) — sending never contacts the ov
       evidence: fullEvidence()
     })
     expect(result).toMatchObject({ handedOver: true, notified: false })
+  })
+})
+
+describe('transferTokens({ mode: "handover", submitAfterHandover: true }) — maintainer refinement: submit right after an acknowledged hand-over', () => {
+  const ADMIT = { outputsToAdmit: [0], admissionSignature: 'cafebabe', admissionIdentityKey: OVERLAY_KEY }
+
+  const send = async (box: any): Promise<any> =>
+    await transferTokens({
+      wallet: mkWallet(),
+      messageBoxClient: box,
+      identityKey: '02' + '11'.repeat(32),
+      assetId: ASSET,
+      amount: 5,
+      recipientKey: RECIPIENT,
+      mode: 'handover',
+      evidence: fullEvidence(),
+      submitAfterHandover: true
+    })
+
+  it('submits only AFTER the hand-over message is posted (order is inviolable)', async () => {
+    const order: string[] = []
+    const box = { sendMessage: vi.fn(async () => { order.push('posted'); return {} }) }
+    vi.mocked(submitToOverlay).mockImplementation(async () => { order.push('submitted'); return ADMIT })
+    await send(box)
+    expect(order).toEqual(['posted', 'submitted'])
+  })
+
+  it('never attempts the immediate submit when the hand-over message failed to post', async () => {
+    const box = { sendMessage: vi.fn().mockRejectedValue(new Error('box down')) }
+    const result = await send(box)
+    expect(result).toMatchObject({ handedOver: true, notified: false })
+    expect(result.settled).toBeUndefined()
+    expect(submitToOverlay).not.toHaveBeenCalled()
+    const entry = (await journalList()).find(e => e.txid === TXID)
+    expect(entry?.stage).toBe('handed_over')
+  })
+
+  it('on admission: promotes handed_over → accepted (with σ_I) and returns settled:true with the receipt', async () => {
+    const box = { sendMessage: vi.fn().mockResolvedValue({}) }
+    vi.mocked(submitToOverlay).mockResolvedValue(ADMIT)
+    const result = await send(box)
+    expect(result).toMatchObject({
+      handedOver: true,
+      settled: true,
+      admissionSignature: 'cafebabe',
+      admissionIdentityKey: OVERLAY_KEY,
+      outputsToAdmit: [0]
+    })
+    const entry = (await journalList()).find(e => e.txid === TXID)
+    expect(entry).toMatchObject({
+      stage: 'accepted',
+      admissionSignature: 'cafebabe',
+      admissionIdentityKey: OVERLAY_KEY,
+      outputsToAdmit: [0]
+    })
+    // Immediate — not left for a later reconcile tick.
+    expect(broadcastAcceptedTx).toHaveBeenCalledWith(expect.anything(), TXID)
+  })
+
+  it('leaves handed_over and returns settled:false on a retryable refusal (reconcile retries later)', async () => {
+    const box = { sendMessage: vi.fn().mockResolvedValue({}) }
+    vi.mocked(submitToOverlay).mockRejectedValue(new OverlayRefusedError({ code: 'ERR_UNAVAILABLE', retryable: true }))
+    const result = await send(box)
+    expect(result).toMatchObject({ handedOver: true, settled: false })
+    expect(result.refusedCode).toBeUndefined()
+    const entry = (await journalList()).find(e => e.txid === TXID)
+    expect(entry?.stage).toBe('handed_over')
+  })
+
+  it('leaves handed_over and returns settled:false on a plain network failure', async () => {
+    const box = { sendMessage: vi.fn().mockResolvedValue({}) }
+    vi.mocked(submitToOverlay).mockRejectedValue(new Error('fetch failed'))
+    const result = await send(box)
+    expect(result).toMatchObject({ handedOver: true, settled: false })
+    const entry = (await journalList()).find(e => e.txid === TXID)
+    expect(entry?.stage).toBe('handed_over')
+  })
+
+  it('on a FINAL refusal keeps handed_over (never aborts) but surfaces refusedCode', async () => {
+    const box = { sendMessage: vi.fn().mockResolvedValue({}) }
+    vi.mocked(submitToOverlay).mockRejectedValue(new OverlayRefusedError({ code: 'ERR_CONSERVATION', retryable: false }))
+    const wallet = mkWallet()
+    const result = await transferTokens({
+      wallet,
+      messageBoxClient: box,
+      identityKey: '02' + '11'.repeat(32),
+      assetId: ASSET,
+      amount: 5,
+      recipientKey: RECIPIENT,
+      mode: 'handover',
+      evidence: fullEvidence(),
+      submitAfterHandover: true
+    })
+    expect(result).toMatchObject({ handedOver: true, settled: false, refusedCode: 'ERR_CONSERVATION' })
+    const entry = (await journalList()).find(e => e.txid === TXID)
+    expect(entry?.stage).toBe('handed_over')
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+  })
+
+  it('never throws after the hand-over message was posted, even when the overlay submit fails', async () => {
+    const box = { sendMessage: vi.fn().mockResolvedValue({}) }
+    vi.mocked(submitToOverlay).mockRejectedValue(new Error('boom'))
+    await expect(send(box)).resolves.toMatchObject({ handedOver: true, settled: false })
   })
 })
 

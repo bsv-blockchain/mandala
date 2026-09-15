@@ -30,14 +30,17 @@ import { MandalaToken } from '@bsv/templates'
 import { BASKET, FT_PROTOCOL, MESSAGEBOX, TOPIC } from './constants.js'
 import { walletMandalaUnlock } from './unlock.js'
 import { revealLinkage, matchOutputIndices } from './tokens.js'
-import { AdmissionReceipt, admissionReceipt, submitAndBroadcast } from './overlay.js'
+import {
+  AdmissionReceipt, admissionReceipt, broadcastAcceptedTx, isAlreadyBroadcast, OverlayAdmitResult,
+  OverlayRefusedError, submitAndBroadcast, submitToOverlay
+} from './overlay.js'
 import { encodeLinkagePayload } from './encoding.js'
 import { changeCustomInstructions, prepareBlindedPayment, recipientCustomInstructions } from './blinding.js'
 import { blindingPut } from './blindingJournal.js'
 import { loadFtCandidates } from './ftCandidates.js'
 import { selectFtInputs } from './ftSelect.js'
 import { generateFtChange } from './ftChange.js'
-import { journalIntentBegin, journalIntentEnd, journalPut } from './txJournal.js'
+import { journalIntentBegin, journalIntentEnd, journalPut, journalRemove } from './txJournal.js'
 import {
   collectHandoverEvidence, derHex, EvidenceSource, HandoverBody, journalEvidenceSource
 } from './handover.js'
@@ -83,6 +86,20 @@ export interface TransferParams {
    * settlement store should inject its own. Ignored in `'submit'` mode.
    */
   evidence?: EvidenceSource
+  /**
+   * Maintainer refinement to the `'handover'` rail (spec §4.3 step 7 / wire
+   * contract §9.13): hand-over stays first and inviolable — nothing here ever
+   * gates or fails the MessageBox post — but once it is ACKNOWLEDGED, an
+   * online payer may submit the identical journaled bytes immediately rather
+   * than waiting for reconcile's next pass. Default `false` (unchanged
+   * behaviour: the payer submits later, via reconcile, exactly as before).
+   * Ignored in `'submit'` mode, which already submits inline.
+   *
+   * The recipient's own submit stays valid regardless — `/submit` is
+   * idempotent — so this is purely a latency improvement, never a
+   * correctness dependency.
+   */
+  submitAfterHandover?: boolean
 }
 
 /**
@@ -105,6 +122,27 @@ export interface TransferResult extends AdmissionReceipt {
    * ordinary submit path, so existing consumers are unaffected.
    */
   handedOver?: true
+  /**
+   * Present only when `submitAfterHandover` was requested on a `'handover'`
+   * send AND the message was posted successfully (the immediate submit never
+   * runs otherwise). `true` once the payer's own immediate resubmit landed —
+   * the overlay admitted these bytes and the journal entry was promoted
+   * `'handed_over'` → `'accepted'` — at which point `admissionSignature`,
+   * `admissionIdentityKey` and `outputsToAdmit` above are this submit's
+   * receipt. `false` when it did not land (a retryable refusal, a network
+   * fault, or a FINAL refusal — see `refusedCode`): the `'handed_over'` entry
+   * is left exactly as it would be without `submitAfterHandover`, for
+   * reconcile (or the recipient's own submit) to settle later.
+   */
+  settled?: boolean
+  /**
+   * Set only when the immediate post-hand-over submit hit a FINAL (verdict,
+   * non-retryable) refusal. The `'handed_over'` entry is still kept — never
+   * aborted here, since the recipient may already hold evidence over these
+   * exact bytes — and the payer's own reconcile pass is what eventually gives
+   * up, at RETRY_CAP, exactly as it would without this option.
+   */
+  refusedCode?: string
 }
 
 export async function transferTokens (p: TransferParams): Promise<TransferResult> {
@@ -208,6 +246,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
   let offChainValuesOut: number[]
   let receipt: AdmissionReceipt = {}
   let handoverExtras: Pick<HandoverBody, 'v' | 'kind' | 'linkage' | 'admissions'> | undefined
+  let reference: string | undefined
   const intent = await journalIntentBegin()
   try {
     const created = await wallet.createAction({
@@ -224,6 +263,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     })
 
     if (!created.signableTransaction) throw new Error('createAction returned no signableTransaction')
+    reference = created.signableTransaction.reference
 
     const tx = Transaction.fromBEEF(created.signableTransaction.tx as number[])
 
@@ -386,12 +426,85 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     notified = false
   }
 
+  // Maintainer refinement (spec §4.3 step 7 / wire contract §9.13): hand-over
+  // is already done and acknowledged (`notified`) — order is inviolable, so
+  // this only ever runs AFTER that, and never turns the hand-over's own
+  // success into a caller-visible failure. `notified === false` (the box was
+  // down) leaves this untouched; the payer's next reconcile pass covers it,
+  // exactly as it would without this option.
+  const settleResult = (handover && p.submitAfterHandover === true && notified)
+    ? await attemptImmediateSubmit(wallet, txid, signedTx, offChainValuesOut, reference)
+    : {}
+
   return {
     txid,
     notified,
     atomicBeef: signedTx,
     offChainValues: offChainValuesOut,
     ...(handover ? { handedOver: true as const } : {}),
-    ...receipt
+    ...receipt,
+    ...settleResult
   }
+}
+
+/**
+ * The immediate half of the maintainer's hand-over-first-submit-second
+ * refinement (spec §4.3 step 7, wire contract §9.13). Called only after the
+ * hand-over message has already been posted and acknowledged — never before,
+ * and its own outcome never throws, because by this point the payment has
+ * already been made to the recipient.
+ *
+ * Shares its commit point with `submitAndBroadcast` (write the `'accepted'`
+ * entry, carrying σ_I, before broadcasting) but its failure handling is
+ * deliberately different: the recipient may already hold evidence over these
+ * exact bytes (handover.ts), so NOTHING here may ever release the held
+ * inputs. A retryable refusal, a network fault, or even a FINAL refusal all
+ * leave the `'handed_over'` entry exactly as it was — reconcile's existing
+ * `'handed_over'` handling (identical to `'retryable'`) is what keeps
+ * re-submitting it, and its RETRY_CAP is what eventually gives up.
+ */
+async function attemptImmediateSubmit (
+  wallet: WalletInterface,
+  txid: string,
+  signedTx: number[],
+  offChainValues: number[],
+  reference: string | undefined
+): Promise<Pick<TransferResult, 'settled' | 'refusedCode'> & AdmissionReceipt> {
+  let admitted: OverlayAdmitResult
+  try {
+    admitted = await submitToOverlay(signedTx, offChainValues, undefined, [TOPIC])
+  } catch (e) {
+    if (e instanceof OverlayRefusedError && !e.retryable) {
+      // FINAL verdict — still never abort here (see class doc); surface the
+      // code and leave the 'handed_over' entry for reconcile's RETRY_CAP.
+      return { settled: false, refusedCode: e.code }
+    }
+    // Retryable refusal, or any other failure (network fault, unconfigured
+    // overlay, …) — leave 'handed_over' untouched; reconcile retries it.
+    return { settled: false }
+  }
+
+  const receipt = admissionReceipt(admitted)
+  await journalPut({
+    txid,
+    stage: 'accepted',
+    at: Date.now(),
+    ...(reference != null ? { reference } : {}),
+    offChainHex: Utils.toHex(offChainValues),
+    ...receipt
+  })
+  // Immediate, not left for a later reconcile tick — but still best-effort in
+  // the background: the 'accepted' entry is already the durable commit point,
+  // and a broadcast failure here is retried by reconcile exactly like any
+  // other 'accepted' entry.
+  void broadcastAcceptedTx(wallet, txid)
+    .then(async () => { await journalRemove(txid) })
+    .catch(async e => {
+      if (isAlreadyBroadcast(e)) { await journalRemove(txid); return }
+      console.warn(
+        `[mandala] immediate post-hand-over submit accepted ${txid} but broadcast failed; will retry via reconcile:`,
+        e
+      )
+    })
+  return { settled: true, ...receipt }
 }

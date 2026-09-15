@@ -1684,6 +1684,22 @@ Answers to §11, in order. All eight questions are resolved; none remain open.
    the tip at send time on any rail. Legacy v1 handle-rail bodies (sender
    submitted online before handing over) remain accepted, so this ships
    without a hard migration cutover.
+10. **Submit right after an acknowledged hand-over, when online (2026-09-15
+    refinement).** Hand-over-first (decision 9) stays inviolable — nothing
+    about this refinement gates or can fail the hand-over itself. But once
+    the MessageBox post is acknowledged (nearby: the positive ack), an
+    online payer no longer waits for the drain's next tick: it submits the
+    identical journaled bytes immediately, exactly as the drain would
+    (idempotent `/submit`; the overlay broadcasts on admission). Offline,
+    the drain submits on reconnect exactly as before (rule 6, unchanged);
+    the recipient's own submit (rule 3) stays valid either way — the two
+    submitters race harmlessly. This is a latency improvement only, never a
+    correctness dependency: a retryable refusal or a network fault leaves
+    the payer's `'handed_over'` entry untouched for the drain/reconcile to
+    keep retrying, and even a FINAL refusal does not abort it here (the
+    recipient may already hold evidence over these exact bytes) — reconcile's
+    existing RETRY_CAP is what eventually gives up. See UX design §4.1 step
+    7/8 and §4.3 steps 6-8, and wire contract §9.13.
 
 **One deviation from §9's edits to `design-final-ux.md`, noted here for the
 record.** The basket rename is not a hard-coded literal swap. It ships as a

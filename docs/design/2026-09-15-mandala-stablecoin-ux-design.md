@@ -371,7 +371,7 @@ Two rails (D4): **handle (MessageBox)** and **nearby**. No address rail.
 
 **6. No review screen.** `PayCta` sends directly, as every handle send in this app does (`PayScreen.tsx:1-13`, "two screens, no chooser"). The confirmation is the button: `label = t('pay_asset_cta', { amount: '25.00', ticker: 'USDX' })` → **"Send 25.00 USDX"**. A verb plus its exact object under the user's finger beats a screen repeating what is already on screen. `NearbyFlow`'s `send_confirm` phase remains the additive lever if testing demands one.
 
-**7. Handing over — no pre-submit.** Per the 2026-09-15 maintainer decision (offline-settlement spec §12.9), the handle rail is hand-over-first, identical in structure to the nearby rail (§4.3): the payer never checks anything with the issuer at send time. `PayCta busy`. Under it: `sendStartedRef` → `sendFlight.tryAcquire()` (synchronous, before any await) → `guardSendSubmit` → `sendTokenViaHandle` → `transferTokens` → `loadFtCandidates` → `selectFtInputs` → `generateFtChange` → `prepareBlindedPayment` → `createAction` → `matchOutputIndices` → `walletMandalaUnlock` → `signAction({noSend:true})` → assemble the AdmissionBundle from local evidence → `journalPut('handed_over')` → `sendMessage` posts the v2 body (§9.13 of the wire contract) to `'mandala-payments'`. No `/submit`, no broadcast, and no σ_I for the tip happen here — the recipient's own drain runs `COVER`, credits the payment, and submits (ancestors first, tip last); the payer's own drain/reconcile may submit the same bytes later, harmlessly.
+**7. Handing over — no pre-submit.** Per the 2026-09-15 maintainer decision (offline-settlement spec §12.9), the handle rail is hand-over-first, identical in structure to the nearby rail (§4.3): the payer never checks anything with the issuer at send time. `PayCta busy`. Under it: `sendStartedRef` → `sendFlight.tryAcquire()` (synchronous, before any await) → `guardSendSubmit` → `sendTokenViaHandle` → `transferTokens` → `loadFtCandidates` → `selectFtInputs` → `generateFtChange` → `prepareBlindedPayment` → `createAction` → `matchOutputIndices` → `walletMandalaUnlock` → `signAction({noSend:true})` → assemble the AdmissionBundle from local evidence → `journalPut('handed_over')` → `sendMessage` posts the v2 body (§9.13 of the wire contract) to `'mandala-payments'`. No `/submit`, no broadcast, and no σ_I for the tip happen here — the recipient's own drain runs `COVER`, credits the payment, and submits (ancestors first, tip last). **Hand-over accepted** (that post acknowledged) → **if online, the payer submits the same bytes immediately** (idempotent; the overlay broadcasts on admission), instead of waiting for the drain's next tick; **if offline, the drain submits on reconnect**, exactly as before. The recipient's own submit stays valid either way — order between the three submitters is never load-bearing (offline-settlement spec §0.1 rule 3/6, maintainer decision §12.10; wire contract §9.13). Order between hand-over and this submit IS load-bearing, and inviolable: the submit never runs before, or instead of, the acknowledged hand-over.
 
 **8. Success.**
 
@@ -381,18 +381,18 @@ Two rails (D4): **handle (MessageBox)** and **nearby**. No address rail.
               │        25.00 USDX           │  amountText
               │         to Alice            │
               │                             │
-              │   Sent · settling with      │  default, until the payer's own
-              │   Acme Bank                 │  drain sees σ_I(tip)
+              │   Sent · settling with      │  default, until an admission
+              │   {{issuer}}                │  for the tip lands (§4.3)
               │                             │
-              │        Sent · settled       │  once the payer's own drain's
-              │                             │  online submit already returned
-              │                             │  σ_I before the screen dismisses
-              │                             │
+              │   Sent · settled with       │  once the payer's own immediate
+              │   {{issuer}}                │  submit (or the drain's) already
+              │                             │  returned σ_I before the screen
+              │                             │  dismisses
               │        [   Done   ]         │  appears after ~700 ms
               └─────────────────────────────┘
 ```
 
-Settlement is never claimed at hand-over — it is an activity/settlement state (§5, and offline-settlement spec §5), not a send-time fact. The success screen defaults to **"Sent · settling with Acme Bank"** and only shows **"Sent · settled"** when confirmation already landed before the screen dismisses, matching the nearby rail's copy (§4.3). This replaces the former broadcast-pending / not-notified qualifier lines, which described a claim about network delivery this rail no longer makes at send time.
+Settlement is never claimed at hand-over — it is an activity/settlement state (§5, and offline-settlement spec §5), not a send-time fact. The success screen defaults to **"Sent · settling with {{issuer}}"** and only shows **"Sent · settled with {{issuer}}"** when the immediate submit (§4.1 step 7, or the drain's) already returned σ_I(tip) before the screen dismisses, matching the nearby rail's copy (§4.3). This replaces the former broadcast-pending / not-notified qualifier lines, which described a claim about network delivery this rail no longer makes at send time.
 
 ### 4.2 Every failure, with its exact copy
 
@@ -455,13 +455,20 @@ base units, picks "Someone nearby", `mintSession({asset})`.
    committed spec's original §4 step 6 (submit after the positive ack, on
    the DRAIN, not before hand-over) and is the point of this revision: the
    payer never blocks a face-to-face payment on connectivity.
-6. Positive ack → `holdSentPaymentOffline` (§4.4's advancing-UPDATE fix, if
-   the row is `parked`) → the drain owns everything from here (§4.3 of the
-   offline-settlement-final spec).
-7. Success screen: **"Sent. Settling with Acme Bank — you'll see it
-   confirm once you or Alice reconnect."** when offline; **"Sent · settled
-   with Acme Bank"** when the drain's own online submit already returned
-   σ_I before the screen dismisses.
+6. **Hand-over accepted** (nearby positive ack) → `holdSentPaymentOffline`
+   (§4.4's advancing-UPDATE fix, if the row is `parked`).
+7. **If online, the payer submits the same bytes immediately** (idempotent;
+   the overlay broadcasts on admission), instead of waiting for the
+   drain's next tick; **if offline, the drain submits on reconnect** — the
+   drain owns everything from here (§4.3 of the offline-settlement-final
+   spec) exactly as before. The recipient's own submit stays valid either
+   way (§0.1 rule 3/6; wire contract §9.13; maintainer decision §12.10).
+   Order between hand-over (step 6) and this submit is inviolable: the
+   submit never runs before, or instead of, the acknowledged hand-over.
+8. Success screen: **"Sent · settling with {{issuer}}"** by default — **"you'll
+   see it confirm once you or Alice reconnect"** while offline — and only
+   **"Sent · settled with {{issuer}}"** when step 7's immediate submit (or
+   the drain's) already returned σ_I before the screen dismisses.
 
 **Payee settle:** `verifyFramePayment`'s token branch runs unchanged
 (already correct under D2, per ux #29). The frame is credited — spendable
