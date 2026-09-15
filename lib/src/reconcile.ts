@@ -116,6 +116,18 @@ export interface ReconcileOptions {
    * guards below — good as they are — only cover transactions the LIB created.
    */
   sweep?: boolean
+  /**
+   * Broadcast overlay-accepted entries through `createAction({ sendWith })`
+   * (step 1, and the acceptance half of steps 2/2b). Default `true`.
+   *
+   * **A host whose own drain broadcasts token transactions must pass `false`.**
+   * Such a wallet holds every token request for its drain, so the lib's
+   * broadcast can never be proven posted there — it only burned
+   * BROADCAST_RETRY_CAP passes into a 'stranded' entry (2026-09-15). With
+   * `false`, an accepted entry is journaled and LEFT: the host clears it
+   * (`journalRemove`) the moment its drain really broadcasts the transaction.
+   */
+  broadcast?: boolean
 }
 
 export interface ReconcileResult {
@@ -138,7 +150,7 @@ export async function reconcileWallet (
   opts: ReconcileOptions = {}
 ): Promise<ReconcileResult> {
   const { acquired, result } = await tryWithLock('mandala.reconcile', async () =>
-    await reconcilePass(wallet, opts.sweep !== false)
+    await reconcilePass(wallet, opts.sweep !== false, opts.broadcast !== false)
   )
   if (!acquired || result == null) {
     return { rebroadcast: [], aborted: [], resubmitted: [], stranded: [], swept: 0, skipped: true }
@@ -154,7 +166,7 @@ async function releaseReference (wallet: WalletInterface, reference?: string): P
   } catch { /* already on-chain, or the wallet is offline — the sweep owns it now */ }
 }
 
-async function reconcilePass (wallet: WalletInterface, sweep: boolean): Promise<ReconcileResult> {
+async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast: boolean): Promise<ReconcileResult> {
   const rebroadcast: string[] = []
   const aborted: string[] = []
   const resubmitted: string[] = []
@@ -200,6 +212,11 @@ async function reconcilePass (wallet: WalletInterface, sweep: boolean): Promise<
    * accepted on re-submit — both reach the identical commit point.
    */
   const broadcastAccepted = async (entry: JournalEntry): Promise<void> => {
+    if (!broadcast) {
+      // The host's own drain broadcasts and clears this entry; the lib's job
+      // ended at acceptance. Not an attempt, not a strand — just left in place.
+      return
+    }
     try {
       if (!await broadcastAcceptedTx(wallet, entry.txid)) {
         // Resolved, but nothing was posted (a wallet holding the request for

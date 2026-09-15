@@ -612,3 +612,37 @@ describe('reconcileWallet — handed_over entries (the payer’s optional later 
     expect(await journalList()).toEqual([])
   })
 })
+
+// 2026-09-15 — a host that owns the broadcast (`broadcast: false`)
+describe('reconcileWallet — broadcast: false leaves accepted entries to the host', () => {
+  it('never calls createAction({ sendWith }) and never counts an attempt', async () => {
+    await journalPut({ txid: 'aa', stage: 'accepted', at: 1 })
+    const wallet = mkWallet()
+    for (let i = 0; i < BROADCAST_RETRY_CAP + 1; i++) {
+      const r = await reconcileWallet(wallet as any, { sweep: false, broadcast: false })
+      expect(r.stranded).toEqual([])
+      expect(r.rebroadcast).toEqual([])
+    }
+    expect(wallet.createAction).not.toHaveBeenCalled()
+    expect(await journalList()).toMatchObject([{ txid: 'aa', stage: 'accepted' }])
+    expect((await journalList())[0].attempts).toBeUndefined()
+  })
+
+  it('still re-submits a handed_over entry and journals the acceptance', async () => {
+    configureMandala({ overlayUrl: 'https://overlay.test', overlayIdentityKey: '02' + 'ab'.repeat(32), messageBoxUrl: 'https://box.test' })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true, status: 200,
+      text: async () => JSON.stringify({ tm_mandala: { outputsToAdmit: [0], admissionSignature: '30', admissionIdentityKey: '02' + 'ab'.repeat(32) } })
+    } as any)
+    try {
+      await journalPut({ txid: 'hh', stage: 'handed_over', at: 1, reference: 'ref', submit: { txHex: '00', topics: ['tm_mandala'] } })
+      const wallet = mkWallet()
+      const r = await reconcileWallet(wallet as any, { sweep: false, broadcast: false })
+      expect(r.resubmitted).toEqual(['hh'])
+      expect(wallet.createAction).not.toHaveBeenCalled()
+      expect(await journalList()).toMatchObject([{ txid: 'hh', stage: 'accepted', reference: 'ref' }])
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+})
