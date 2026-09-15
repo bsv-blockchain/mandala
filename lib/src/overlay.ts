@@ -1,5 +1,6 @@
-import { Utils, WalletInterface } from '@bsv/sdk'
-import { TOPIC, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
+import { Beef, Utils, WalletInterface } from '@bsv/sdk'
+import { TOPIC, OVERLAY_URL, OVERLAY_URL_UNSET, OVERLAY_IDENTITY_KEY } from './constants.js'
+import { verifyAdmission } from './admission.js'
 import { journalPut, journalRemove } from './txJournal.js'
 
 export interface OverlayAdmitResult {
@@ -48,6 +49,11 @@ export type OverlayErrorCode =
   | 'ERR_CONSERVATION' | 'ERR_LINKAGE' | 'ERR_SHAPE' | 'ERR_SATOSHIS' | 'ERR_INPUT_SPENT'
   | 'ERR_PAUSED' | 'ERR_FROZEN' | 'ERR_SANCTIONED' | 'ERR_ACCESS' | 'ERR_MEMBERSHIP'
   | 'ERR_EVICTED' | 'ERR_UNAVAILABLE'
+  // Client-side, never sent by a server: an "admitted" answer whose σ_I is
+  // missing (ERR_NO_ADMISSION) or does not verify under the configured overlay
+  // identity key (ERR_BAD_ADMISSION). Retryable — the operator may simply have
+  // rotated or misconfigured a key — but NEVER an admission.
+  | 'ERR_NO_ADMISSION' | 'ERR_BAD_ADMISSION'
 
 /**
  * Whether the same bytes may be re-submitted later and succeed. The table is
@@ -68,7 +74,9 @@ const RETRYABLE_BY_CODE: Record<string, boolean> = {
   ERR_SANCTIONED: true,
   ERR_ACCESS: true,
   ERR_MEMBERSHIP: true,
-  ERR_UNAVAILABLE: true
+  ERR_UNAVAILABLE: true,
+  ERR_NO_ADMISSION: true,
+  ERR_BAD_ADMISSION: true
 }
 
 /**
@@ -235,10 +243,63 @@ export async function submitToOverlay (
   const topic = topics.map(t => steak[t]).find(t => (t?.outputsToAdmit?.length ?? 0) > 0) ?? steak[topics[0]]
   const admit = topic?.outputsToAdmit ?? []
   if (admit.length === 0) throw new Error('overlay rejected the transaction')
-  return {
+  const result: OverlayAdmitResult = {
     outputsToAdmit: admit,
     admissionSignature: topic?.admissionSignature,
     admissionIdentityKey: topic?.admissionIdentityKey
+  }
+  requireVerifiedAdmission(beef, result)
+  return result
+}
+
+let warnedUnverifiable = false
+
+/**
+ * An admitted set is not an admission. Only the overlay operator's σ_I over
+ * (txid, outputsToAdmit), verifying under the CONFIGURED overlay identity key,
+ * proves the operator folded this transaction into its state — an answer
+ * without one could come from a misconfigured node, a stale deployment or a
+ * man in the middle, and a wallet that broadcast on it would put an
+ * unadmitted transaction on chain (2026-09-15 review). So an unsigned or
+ * unverifiable "admitted" answer is a retryable refusal, never a success.
+ *
+ * With no identity key configured the answer cannot be checked at all; the
+ * host is warned once, and the call behaves as before. Every production host
+ * configures the key (`configureMandala({ overlayIdentityKey })`).
+ */
+function requireVerifiedAdmission (beef: number[], r: OverlayAdmitResult): void {
+  if (OVERLAY_IDENTITY_KEY === '') {
+    if (!warnedUnverifiable) {
+      warnedUnverifiable = true
+      console.warn('[mandala] overlayIdentityKey is not configured: admission signatures cannot be verified')
+    }
+    return
+  }
+  const sig = r.admissionSignature
+  const signer = r.admissionIdentityKey
+  if (sig == null || sig === '' || signer == null || signer === '') {
+    throw new OverlayRefusedError({
+      code: 'ERR_NO_ADMISSION',
+      description: 'the overlay admitted outputs but returned no admission signature',
+      httpStatus: 200
+    })
+  }
+  let txid: string
+  try {
+    const parsed = Beef.fromBinary(beef)
+    txid = parsed.atomicTxid ?? parsed.txs[parsed.txs.length - 1].txid
+  } catch {
+    throw new OverlayRefusedError({ code: 'ERR_BAD_ADMISSION', description: 'could not read the submitted txid', httpStatus: 200 })
+  }
+  const ok =
+    signer.toLowerCase() === OVERLAY_IDENTITY_KEY.toLowerCase() &&
+    verifyAdmission({ txid, outputsToAdmit: r.outputsToAdmit, signature: sig, signerKey: signer })
+  if (!ok) {
+    throw new OverlayRefusedError({
+      code: 'ERR_BAD_ADMISSION',
+      description: 'the admission signature does not verify under the configured overlay identity key',
+      httpStatus: 200
+    })
   }
 }
 

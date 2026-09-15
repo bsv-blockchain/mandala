@@ -469,3 +469,43 @@ describe('the wallet must prove it posted the tx', () => {
     expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'accepted' }])
   })
 })
+
+
+// 2026-09-15 — an admitted set is not an admission without a verifying σ_I
+import { PrivateKey, Beef, LockingScript, Transaction, Utils as U } from '@bsv/sdk'
+import { admissionMessageV2 } from './admission.js'
+
+describe('submitToOverlay requires a verifying admission signature when a key is configured', () => {
+  const OVERLAY_PRIV = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000d4')
+  const OVERLAY_KEY = OVERLAY_PRIV.toPublicKey().toString()
+  const IMPOSTOR = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000e5')
+  const tx = new Transaction()
+  tx.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
+  const beef = new Beef(); beef.mergeTransaction(tx)
+  const bytes = beef.toBinaryAtomic(tx.id('hex'))
+  const sign = (key = OVERLAY_PRIV, outs = [0]) =>
+    U.toHex(key.sign(U.toArray(admissionMessageV2(tx.id('hex'), outs), 'utf8')).toDER() as number[])
+
+  beforeEach(() => configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: OVERLAY_KEY }))
+
+  it('accepts a σ_I by the configured key', async () => {
+    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0], admissionSignature: sign(), admissionIdentityKey: OVERLAY_KEY } }) }
+    await expect(submitToOverlay(bytes, undefined, facilitator as any)).resolves.toMatchObject({ outputsToAdmit: [0] })
+  })
+  it('an admitted set with NO signature is a retryable ERR_NO_ADMISSION, never a success', async () => {
+    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
+    await expect(submitToOverlay(bytes, undefined, facilitator as any)).rejects.toMatchObject({ code: 'ERR_NO_ADMISSION', retryable: true })
+  })
+  it('a signature by another key, or over another admitted set, is ERR_BAD_ADMISSION', async () => {
+    const wrongKey = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0], admissionSignature: sign(IMPOSTOR), admissionIdentityKey: IMPOSTOR.toPublicKey().toString() } }) }
+    await expect(submitToOverlay(bytes, undefined, wrongKey as any)).rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION', retryable: true })
+    const wrongSet = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0, 1], admissionSignature: sign(OVERLAY_PRIV, [0]), admissionIdentityKey: OVERLAY_KEY } }) }
+    await expect(submitToOverlay(bytes, undefined, wrongSet as any)).rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION' })
+  })
+  it('never broadcasts on an unsigned admission', async () => {
+    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
+    const wallet = { createAction: vi.fn().mockImplementation(postingWallet), abortAction: vi.fn().mockResolvedValue({ aborted: true }) }
+    await expect(submitAndBroadcast(wallet as any, { tx: bytes, txid: tx.id('hex') } as any, undefined, 'ref', facilitator as any)).rejects.toMatchObject({ code: 'ERR_NO_ADMISSION' })
+    expect(wallet.createAction).not.toHaveBeenCalled()
+  })
+})

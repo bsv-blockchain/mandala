@@ -629,18 +629,26 @@ describe('reconcileWallet — broadcast: false leaves accepted entries to the ho
   })
 
   it('still re-submits a handed_over entry and journals the acceptance', async () => {
-    configureMandala({ overlayUrl: 'https://overlay.test', overlayIdentityKey: '02' + 'ab'.repeat(32), messageBoxUrl: 'https://box.test' })
+    const { PrivateKey, Beef, LockingScript, Transaction, Utils } = await import('@bsv/sdk')
+    const { admissionMessageV2 } = await import('./admission.js')
+    const overlayKey = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000f6')
+    const tx = new Transaction()
+    tx.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
+    const beef = new Beef(); beef.mergeTransaction(tx)
+    const txid = tx.id('hex')
+    const sig = Utils.toHex(overlayKey.sign(Utils.toArray(admissionMessageV2(txid, [0]), 'utf8')).toDER() as number[])
+    configureMandala({ overlayUrl: 'https://overlay.test', overlayIdentityKey: overlayKey.toPublicKey().toString(), messageBoxUrl: 'https://box.test' })
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
       ok: true, status: 200,
-      text: async () => JSON.stringify({ tm_mandala: { outputsToAdmit: [0], admissionSignature: '30', admissionIdentityKey: '02' + 'ab'.repeat(32) } })
+      text: async () => JSON.stringify({ tm_mandala: { outputsToAdmit: [0], admissionSignature: sig, admissionIdentityKey: overlayKey.toPublicKey().toString() } })
     } as any)
     try {
-      await journalPut({ txid: 'hh', stage: 'handed_over', at: 1, reference: 'ref', submit: { txHex: '00', topics: ['tm_mandala'] } })
+      await journalPut({ txid, stage: 'handed_over', at: 1, reference: 'ref', submit: { txHex: Utils.toHex(beef.toBinaryAtomic(txid)), topics: ['tm_mandala'] } })
       const wallet = mkWallet()
       const r = await reconcileWallet(wallet as any, { sweep: false, broadcast: false })
-      expect(r.resubmitted).toEqual(['hh'])
+      expect(r.resubmitted).toEqual([txid])
       expect(wallet.createAction).not.toHaveBeenCalled()
-      expect(await journalList()).toMatchObject([{ txid: 'hh', stage: 'accepted', reference: 'ref' }])
+      expect(await journalList()).toMatchObject([{ txid, stage: 'accepted', reference: 'ref' }])
     } finally {
       fetchSpy.mockRestore()
     }
