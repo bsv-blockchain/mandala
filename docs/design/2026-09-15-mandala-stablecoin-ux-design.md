@@ -26,24 +26,22 @@ Locked decisions D1–D4 are assumed and designed within, never re-argued.
 
 ## 2. Information architecture
 
-No new route. No new `Stack.Screen`. One new sheet. Everything else is a prop or a slot in a screen that already exists.
+No new route. No new `Stack.Screen`. No new sheet (2026-09-15: the one sheet this design originally added, the Asset sheet, is struck — §2.2). Everything below is a prop or a slot in a screen that already exists.
 
 | Surface | Form | Exists when | Job |
 |---|---|---|---|
 | Home pinned header (`W/ui/screens/WalletHomeScreen.tsx:1173-1242`) | unchanged geometry; one conditional label swap | always | BSV balance + Pay / Get paid / Vault |
-| Home **Balances** block | `GroupedSection` + one `AssetRow` per asset, first child of `listHeader` (`:1244`) | `useTokenAssets()` non-empty **or** any `'mandala'`-labelled action in the loaded history | what you hold; tap → Asset sheet |
-| **Asset sheet** | `Sheet fitContent` (`W/ui/components/ui/Sheet.tsx`) | on tap of a row | issuer, token id, the issuer's four powers, paused/frozen state, Pay / Get paid |
-| Pay → **Paying with** | `AssetPicker` inside a `PayField`, **above** `RecipientField` | ≥1 asset held | BSV (default) or a token |
+| Pay → **Paying with** | `AssetPicker` inside a `PayField`, **below `RecipientField`, above the amount** (2026-09-15; originally above `RecipientField` — §2.3) | ≥1 asset held | BSV (default) or a token; the only place on Home→Pay a holder sees their token balances (the Home Balances block and Asset sheet this row used to route into are both removed — §2.1/§2.2) |
 | Pay → amount / rails / CTA | existing `PayAmountField`, `RecipientField`, `PayCta` | always | re-denominated; address rail refused inline (D4) |
 | Get paid → **Getting paid in** | same `AssetPicker`, above the amount | ≥1 asset held | request denomination |
 | Get paid → methods | existing `RequestHub` `PayCellRow`s | always | address row disabled with a plain reason (D4) |
 | Get paid → handle | existing `HandleReceive` | always | same QR; asset caption; `AdmissionNotice` replaces the plate when the issuer has not registered you |
-| Activity | existing single `FlatList` | always | token rows interleaved, same row component |
+| Activity | existing single `FlatList` | always | token rows interleaved, same row component; the other place a holder sees their holdings, as history |
 | Success / arrival | existing `PaymentSuccessOverlay` | on send/receive | token-denominated; first-hold disclosure line |
 
-**Hidden until relevant:** everything. `AssetRow`, `AssetPicker`, the Balances header and every token string return `null` when there is nothing held. There is no empty state, no "no tokens yet", no "add a token".
+**Hidden until relevant:** everything. `AssetPicker` and every token string return `null` when there is nothing held. There is no empty state, no "no tokens yet", no "add a token".
 
-**Chain gate.** `isMandalaAvailable(chain) = chain === 'main' && toolboxConfig.services[chain]?.mandala != null` — the exact shape of `isVaultAvailable(chain) = isVaultEnabled() && chain === 'main'` (`W/core/toolboxConfig.ts:162-164`), because `L/metadata.ts:29,35` is mainnet-pinned (`networkPreset: 'mainnet'`, `WhatsOnChain('main')`). When it is false, `useTokenAssets` returns `[]` and every surface above is absent — not broken, absent. Every read is additionally gated on `storageMatchesNetwork(storage, selectedNetwork)` (invariant 10).
+**Chain gate.** `isMandalaAvailable(chain) = chain === 'main' && toolboxConfig.services[chain]?.mandala != null` — the exact shape of `isVaultAvailable(chain) = isVaultEnabled() && chain === 'main'` (`W/core/toolboxConfig.ts:162-164`), because `L/metadata.ts:29,35` is mainnet-pinned (`networkPreset: 'mainnet'`, `WhatsOnChain('main')`). When it is false, the balance hook returns `[]`/`null` and every surface above is absent — not broken, absent. Every read is additionally gated on `storageMatchesNetwork(storage, selectedNetwork)` (invariant 10).
 
 ### 2.1 Home — holding one token
 
@@ -60,49 +58,41 @@ No new route. No new `Stack.Screen`. One new sheet. Everything else is a prop or
 │  │     Pay     │ │  Get paid   │ │  Vault   │ │ accent fill on this screen)
 │  └─────────────┘ └─────────────┘ └──────────┘ │
 │ ═══ pinned above · list scrolls below ═══      │
-│  BALANCES                                      │ ◄ NEW GroupedSection
-│ ┌────────────────────────────────────────────┐ │
-│ │ (▤)  Acme Dollar          1,240.00 USDX  › │ │  figure = typography.title3
-│ └────────────────────────────────────────────┘ │  in ListRow's `trailing`
 │                                                │
 │  Activity                        [⤓ Export CSV]│
 │  TODAY                                         │
 │ ┌──┐                                           │
-│ │◈ │ Sent USDX                  −25.00 USDX    │ ◄ token row: sigil (recipient
-│ └──┘ ● Confirmed · 4:40 PM                     │   is NOT blinded), no 2nd line
+│ │◈ │ Sent USDX                  −25.00 USDX    │ ◄ token row: sigil, keyed on
+│ └──┘ ● Confirmed · 4:40 PM                     │   the payee (§6.2)
 │ ┌──┐                                           │
-│ │↙ │ Received USDX             +40.00 USDX     │ ◄ token row: NO sigil (sender
-│ └──┘ ● Confirmed · 2:11 PM                     │   is A′ — a fresh key each time)
-│ ┌──┐                                           │
+│ │↙ │ Received USDX             +40.00 USDX     │ ◄ token row: sigil, keyed on
+│ └──┘ ● Confirmed · 2:11 PM                     │   the sender's blinded A′ — a
+│                                                │   different face every payment
+│ ┌──┐                                           │   from the same payer (D2)
 │ │◈ │ Payment to a nearby device  −6,745 sats   │ ◄ BSV row: unchanged
 │ └──┘ ● Seen · 4:38 PM             < ($0.01)    │
 └────────────────────────────────────────────────┘
 ```
 
-A wallet that has never held a token renders this screen **without** the label swap, the BALANCES block and the token rows — i.e. byte-identical to `docs/wallet_home.png` today.
+**No Balances block (2026-09-15 maintainer decision).** The per-asset row list that used to sit between the destinations and Activity — and the sheet it opened (§2.2) — are both gone. Holdings are visible in two places instead, neither of them new surfaces:
+
+- **The Pay asset picker** ("Paying with", §2.3) lists every held asset with its figure — the same information a Balances row would have shown, at the moment a holder is actually about to spend one.
+- **Activity** already interleaves every token movement into the one list this screen has always had (§6.2); those rows now draw the same generative counterparty sigil a BSV row does, instead of a plain arrow (see the token rows in the mockup above).
+
+The stuck-settlement home badge (§6) that used to open the sheet now routes to Pay with that asset selected — there is nowhere else on Home for it to send the holder.
+
+A wallet that has never held a token renders this screen **exactly** as it always has — no label swap, no token rows. The only conditional this design still adds is the hero label below.
 
 **Why the label swap.** The sharpest criticism of `pay-first` was that a holder with 1,240.00 USDX and no BSV reads "You have / 0 sats" at 44/700 with their real money in body text below. The fee-balance argument justifies keeping BSV *prominent*; it does not license letting the hero claim to be the answer to "how much money do I have". One conditional word — `t('wallet_balance_your_bsv')` in place of `t('wallet_balance_you_have')` at `WalletHomeScreen.tsx:1183` when `assets.length > 0` — removes the ambiguity entirely, adds no figure, breaks no invariant (still one `typography.display` element, `tokens.ts:52-58`), and costs nothing for the wallets that will never see it.
 
-**Row states** (all through the existing `ListRow` props — no `ListRow` change):
+### 2.2 ~~Asset sheet~~
 
-| state | `icon` | `iconColor` | `subtitle` | `trailing` |
-|---|---|---|---|---|
-| normal | `cash-outline` | — (neutral `surfaceSunken` well) | — | `<AssetAmount size="row">` |
-| first hold, sheet never opened | `cash-outline` | — | `t('token_new_tap')` | `<AssetAmount>` |
-| paused | `pause-circle-outline` | `colors.warning` | `t('token_paused_short')` | `<AssetAmount>` |
-| part frozen | `snow-outline` | `colors.warning` | `t('token_frozen_short', {amount})` | `<AssetAmount>` |
-| balance unknown (`null`) | `cash-outline` | — | — | `<ActivityIndicator/>` |
-| metadata unresolved | `help-circle-outline` | — | `t('token_unresolved_sub')` | **nothing** |
+**Removed 2026-09-15 by maintainer decision; no per-asset detail surface in v1.** There is no Balances row left to tap (§2.1), so this sheet has no entry point and is deleted outright — component, hook wiring and the home-badge navigation into it (§3.2/§3.3) — rather than kept as unreachable code. Disclosure of what follows is **not relocated anywhere**: the issuer/token-id card, the four-powers list and the paused/frozen sheet rows below existed only here. What survives elsewhere: the arrival overlay's first-hold line (§5.2, unchanged) and the pre-flight `ConsequenceNote`s inside Pay (§4.2, unchanged) — both of which say enough about an asset's regulated status at the moment it is actionable, without a permanent per-asset screen.
 
-The figure lives in `trailing`, not `value`: `ListRow.value` is typed `string` and styled as a settings value (`W/ui/components/ui/ListRow.tsx:36`), and the money figure needs `typography.title3` + `fontVariant: ['tabular-nums']`.
+<details>
+<summary>Original design, struck 2026-09-15 (kept for history only — nothing below this line is built)</summary>
 
-`label` for the unresolved case is `t('token_unresolved')` = "Unrecognised token" — **not** a truncated hex id, and **no figure at all**. `L/metadata.ts:6,44` memoises `null` for the process lifetime, so this is a steady state, not a flicker; printing `1240000000 615a06ab…` in the money column would put protocol jargon where the amount goes and a number three orders of magnitude off beside it.
-
-**Section footer.** The `GroupedSection` `footer` slot (`W/ui/components/ui/GroupedList.tsx`, `footer?: string`) carries `t('token_fee_footer')` — "Sending needs a little BSV for the network fee. Receiving doesn't." — **only when `useSpendableBalance()` is exactly `0`** (not `null`; see §4.2). One sentence, in the system's own explanatory-prose slot, present exactly when it is both true and actionable. No "fee balance" concept is invented anywhere.
-
-### 2.2 Asset sheet
-
-Raised by tapping a Balances row. Never auto-raised: `pay-first`'s automatic first-arrival sheet was unprompted modality on the most-used screen whose coverage depended on where the user happened to be standing. Disclosure instead lands in the two places the user is provably looking — the arrival overlay (§5.2) and the row's own "New — tap to see who issues it" subtitle, which clears once the sheet has been opened (persisted under `mandala_seen_assets`).
+~~Raised by tapping a Balances row. Never auto-raised: `pay-first`'s automatic first-arrival sheet was unprompted modality on the most-used screen whose coverage depended on where the user happened to be standing. Disclosure instead lands in the two places the user is provably looking — the arrival overlay (§5.2) and the row's own "New — tap to see who issues it" subtitle, which clears once the sheet has been opened (persisted under `mandala_seen_assets`).~~
 
 ```
               ┌──────────── ▄▄▄ ─────────────┐
@@ -146,13 +136,21 @@ paused variant inserts above the powers group:
               │  └────────────────────────┘  │  on the issuer's behalf
 ```
 
-Four powers, each a real gate in `overlay-go/internal/mandala/topic_manager.go`, stated as capability — not a category label, and **no "Verified" chip** (the web app hard-codes one at `SendTokens.tsx:741-744` that reflects nothing). If `resolveIdentity` returns a name and avatar, that *is* the badge and it was earned by data. No backing, peg or reserve copy anywhere: the wallet has no evidence for any of it.
+~~Four powers, each a real gate in `overlay-go/internal/mandala/topic_manager.go`, stated as capability — not a category label, and **no "Verified" chip** (the web app hard-codes one at `SendTokens.tsx:741-744` that reflects nothing). If `resolveIdentity` returns a name and avatar, that *is* the badge and it was earned by data. No backing, peg or reserve copy anywhere: the wallet has no evidence for any of it.~~
+
+</details>
 
 ### 2.3 Pay
 
 ```
  ‹                    Pay
 ────────────────────────────────────────────────
+ RECIPIENT
+┌──────────────────────────────────────────────┐
+│  Name, @handle or key                 [ ⛶ ]  │
+└──────────────────────────────────────────────┘
+   🔑 Valid identity key
+
  PAYING WITH                                      ◄ NEW — absent when no assets
 ┌──────────────────────────────────────────────┐
 │ (▤) Acme Dollar          1,240.00 USDX    ⌄  │
@@ -162,12 +160,6 @@ Four powers, each a real gate in `overlay-go/internal/mandala/topic_manager.go`,
 │ (₿) BSV                    54,195,449        │
 │ (▤) Acme Dollar             1,240.00      ✓  │  checkmark in colors.accent
 └──────────────────────────────────────────────┘
-
- RECIPIENT
-┌──────────────────────────────────────────────┐
-│  Name, @handle or key                 [ ⛶ ]  │
-└──────────────────────────────────────────────┘
-   🔑 Valid identity key
 
  AMOUNT
 ┌──────────────────────────────────────────────┐
@@ -187,9 +179,9 @@ Four powers, each a real gate in `overlay-go/internal/mandala/topic_manager.go`,
 └──────────────────────────────────────────────┘
 ```
 
-**Asset first, above the recipient**, because selecting an asset changes the unit of the amount, the available figure, and which recipient shapes are legal. Recipient-first would silently invalidate work the user already did.
+**Recipient first, then Paying with, then Amount (2026-09-15 maintainer decision, reversing the order below).** The original design put the asset picker above the recipient, reasoning that selecting an asset changes the unit of the amount, the available figure, and which recipient shapes are legal, so asking it second would silently invalidate work already done. The maintainer's ordering keeps that same rule at the state layer — the picker still has to resolve before Amount is asked, and an asset selected after a token-incompatible recipient (an address) is typed still refuses inline without erasing it (D4) — while putting "who" ahead of "what with" on screen, since the recipient is what the sender actually starts the flow already knowing.
 
-The expander is the display-currency selector pattern from `W/ui/screens/WalletConfigScreen.tsx:492-527` verbatim — a `ListRow` with `chevronDown`, expanding to an inline list of rows with a trailing `checkmark`. Not `@react-native-segmented-control` (a declared-but-unused dependency that caps out at four options).
+The expander is the display-currency selector pattern from `W/ui/screens/WalletConfigScreen.tsx:492-527` verbatim — a `ListRow` with `chevronDown`, expanding to an inline list of rows with a trailing `checkmark`. Not `@react-native-segmented-control` (a declared-but-unused dependency that caps out at four options). Unchanged component, moved slot only (§3.3 #13).
 
 ### 2.4 Get paid
 
@@ -263,19 +255,18 @@ export const TOKEN_FEE_FLOOR_SATS = 200
 | 1 | `W/ui/hooks/useTokenAssets.ts` | `() => { assets: TokenAsset[] \| null; loading: boolean; refresh: () => void }` plus `expectTokenBalance(assetId, baseUnits)` | The balance hook. Copies `useVaultBalance.ts:41-179`'s contract exactly: module-level store + `useSyncExternalStore`, keyed to `managers.permissionsManager` so a wallet switch reads `null`, invalidated on `txStatusVersion`, `SETTLE_WINDOW_MS = 30_000` with 300ms→5s backoff, `null` means unknown and is never rendered as `0`, a failed read keeps the last figure. Gated on `isMandalaAvailable(selectedNetwork)` **and** `storageMatchesNetwork`. Reads: **one** `listOutputs({ basket: 'mandala-tokens', include: 'locking scripts', includeCustomInstructions: true, limit: 1000 })` (the lib's own limit; `listOutputs` is not in either `guardVaultAccess` set — `guard.ts:490` — so the 500 cap does not apply), then `decodeBalances` (`L/tokens.ts:10`), then `resolveAssetMetadata` per asset (memoised in-lib), then `resolveAssetState` **once per foreground** per held asset. `expectTokenBalance` is the sibling of `expectVaultBalance`: without it a send's own `txStatusVersion` bump races the change output and the row flickers back to the pre-send figure. |
 | 2 | `W/ui/hooks/useTokenActivity.ts` | `(neededTxids: string[]) => Map<string, TokenActivity>` where `TokenActivity = { direction: 'sent'\|'received'\|'issued'\|'redeemed'; assetId: string; baseUnits: number }` | One `listActions({ labels:['mandala'], includeLabels, includeOutputs, includeOutputLockingScripts, limit: window })` + one `listOutputs({ basket, includeCustomInstructions, limit: 1000 })`, joined by outpoint and parsed by `parseActionsToHistory` (`L/history.ts`, exported, 19 tested classification cases). `window` starts at 100 and doubles to a 1000 cap **only** when `neededTxids` contains a txid outside the current result and the last page was full — so it terminates, and Home paginating past the window grows it instead of silently losing denomination. |
 | 3 | `W/ui/hooks/useRegistryAdmission.ts` | `() => { selfStatus: AdmissionStatus; check(key: string): AdmissionStatus }` where `AdmissionStatus = 'unknown' \| 'not-required' \| 'admitted' \| 'not-admitted' \| 'revoked'` | `fetchRegistry()` + `registryIsLive(rows)` (`L/registry.ts:367,373`), 5-minute TTL, re-fetched on focus, **fails open to `'unknown'` on any ambiguity** — the Go overlay's `membershipHolds` and the TS overlay's `registryScreening` differ, and a wrong "not admitted" is worse than a missing one. |
-| 4 | `W/ui/components/wallet/BalancesSection.tsx` | `{ assets: TokenAsset[]; showFeeFooter: boolean; onPress: (assetId: string) => void }` | `GroupedSection` header `t('token_balances_header')` + one `AssetRow` each + the conditional footer. Returns `null` when `assets.length === 0`. ~70 lines. |
-| 5 | `W/ui/components/wallet/AssetRow.tsx` | `{ asset: TokenAsset; isNew: boolean; isLast: boolean; onPress: () => void }` | The state table in §2.1, rendered entirely through existing `ListRow` props. ~60 lines. |
-| 6 | `W/ui/components/wallet/AssetAmount.tsx` | `{ baseUnits: number \| null; asset: TokenAsset; size?: 'row' \| 'sheet'; showPlus?: boolean; tone?: 'primary' \| 'incoming' }` | The token sibling of `AmountDisplay`. Renders `value` + `unit` as two `<Text>`s with `fontVariant: ['tabular-nums']`, one composed `accessibilityLabel`. Returns `<ActivityIndicator/>` for `null` and `null` for `asset.decimals === undefined`. ~50 lines. |
-| 7 | `W/ui/components/wallet/AssetSheet.tsx` | `{ visible: boolean; asset: TokenAsset \| null; onClose: () => void; onPay: (id: string) => void; onGetPaid: (id: string) => void }` | §2.2. `Sheet fitContent`. ~180 lines. |
-| 8 | `W/ui/components/pay/AssetPicker.tsx` | `{ assets: TokenAsset[]; selected: string \| null; onSelect: (id: string \| null) => void; bsvBalance: number \| null; labelKey: 'pay_asset_label' \| 'pay_asset_label_get'; needsBsv: boolean }` | The `WalletConfigScreen` expander pattern. `null` = BSV. Returns `null` when `assets.length === 0`. A token row whose `decimals` is unresolved is rendered `disabled`. ~120 lines. |
-| 9 | `W/ui/components/pay/AdmissionNotice.tsx` | `{ ticker: string; issuerName: string; onBsvInstead: () => void }` | Replaces `HandleReceive`'s QR plate when `useRegistryAdmission().selfStatus` is `not-admitted`/`revoked`. §5.4. ~90 lines. |
-| 10 | `W/core/pay/rails/token.ts` | `sendTokenViaHandle(args)`, `TokenRailWallet` (structural: the 13 `WalletInterface` methods the lib calls, §1 of the fact sheet) | The handle-rail token send. Wraps `transferTokens` with the wallet's originator and configured endpoints. |
-| 11 | `W/core/pay/creditTokenInbox.ts` | `creditTokenInboxOnce({ wallet, adminOriginator, client, storage }) => Promise<{ accepted: ReceivedTransfer[]; failed: {...}[] }>` | Mutexed pass over the `'mandala-payments'` box wrapping `receiveTokens`, with a storage-persisted `processed` set. |
-| 12 | `W/core/monitor/TaskCreditToken.ts` | sibling of `TaskCreditInbox` | Same statics, `BASE_BACKOFF_MS = 10_000` → `MAX_BACKOFF_MS = 300_000`, `onlineNow` gate, `requestNow`. Registered in `WalletContext.tsx` beside `TaskCreditInbox` with its own `credit` closure — **not** folded into `TaskCreditInbox.runTask`, which calls exactly one injected callback (`TaskCreditInbox.ts:70-76, 95-114`) and whose result shape and `onAccepted` toast belong to the BSV inbox. |
-| 13 | `W/core/pay/tokenSendErrors.ts` | `classifyTokenSendError(e, ctx) => { key: string; values: Record<string,string>; guarantee: 'nothing-sent' \| 'unknown'; action?: 'check-again' \| 'get-bsv' }` | Pure, unit-testable, on the `core/pay/creditErrors.ts` precedent. §4.5. |
-| 14 | `W/core/mandala/journalStore.ts` | `makeMandalaJournalStore(storage: StorageLike) => { load(): Promise<Record<string, unknown>>; put(k, v): Promise<void>; remove(k): Promise<void>; hydrated: Promise<void> }` | **D3.** One JSON blob per journal under `mandala_tx_journal` / `mandala_notify_journal` / `mandala_blinding_journal`, over `StorageExpoSQLite.getKeyValue/setKeyValue` (`:215-227`), with the per-storage promise-chain mutex from `W/core/peerpay/outbox.ts:96-107`. **`reconcileWallet` must await `hydrated`** — otherwise `hasFreshIntent()` reads an empty map and the bulk sweep at `L/reconcile.ts:120-133` aborts a live transaction. |
-| 15 | `W/core/mandala/config.ts` | `configureMandalaForChain(chain)`, `isMandalaAvailable(chain)` | Reads `ToolboxServiceConfig.mandala` and calls the lib's `configureMandala`. |
-| 16 | `W/core/mandala/adminWallet.ts` | `withAdminOriginator(pm, ADMIN_ORIGINATOR): WalletInterface` | ~30 lines appending the originator to the 13 methods the lib calls. Removes the spending sheet per send (`WalletPermissionsManager.js:2878`), `guardVaultAccess`'s external path, the `limit ≤ 500` denial (`guard.ts:30,195`) and the per-mutation inventory scan. **A deliberate trust decision**, stated as one: the lib runs with the same authority the wallet's own rails already hold. |
+| 4 | `W/ui/components/wallet/AssetAmount.tsx` | `{ baseUnits: number \| null; asset: TokenAsset; size?: 'row' \| 'sheet'; showPlus?: boolean; tone?: 'primary' \| 'incoming' }` | The token sibling of `AmountDisplay`. Renders `value` + `unit` as two `<Text>`s with `fontVariant: ['tabular-nums']`, one composed `accessibilityLabel`. Returns `<ActivityIndicator/>` for `null` and `null` for `asset.decimals === undefined`. ~50 lines. Kept as a shared package export even though nothing internal renders it any more (2026-09-15) — its only callers, `AssetRow` and `AssetSheet`, are both removed; see §3.3 struck entries. |
+| 5 | `W/ui/components/pay/AssetPicker.tsx` | `{ assets: TokenAsset[]; selected: string \| null; onSelect: (id: string \| null) => void; bsvBalance: number \| null; labelKey: 'pay_asset_label' \| 'pay_asset_label_get'; needsBsv: boolean }` | The `WalletConfigScreen` expander pattern. `null` = BSV. Returns `null` when `assets.length === 0`. A token row whose `decimals` is unresolved is rendered `disabled`. ~120 lines. Unchanged by the 2026-09-15 reorder (§2.3) — only its mount point in `UniversalSend` moved. |
+| 6 | `W/ui/components/pay/AdmissionNotice.tsx` | `{ ticker: string; issuerName: string; onBsvInstead: () => void }` | Replaces `HandleReceive`'s QR plate when `useRegistryAdmission().selfStatus` is `not-admitted`/`revoked`. §5.4. ~90 lines. |
+| 7 | `W/core/pay/rails/token.ts` | `sendTokenViaHandle(args)`, `TokenRailWallet` (structural: the 13 `WalletInterface` methods the lib calls, §1 of the fact sheet) | The handle-rail token send. Wraps `transferTokens` with the wallet's originator and configured endpoints. |
+| 8 | `W/core/pay/creditTokenInbox.ts` | `creditTokenInboxOnce({ wallet, adminOriginator, client, storage }) => Promise<{ accepted: ReceivedTransfer[]; failed: {...}[] }>` | Mutexed pass over the `'mandala-payments'` box wrapping `receiveTokens`, with a storage-persisted `processed` set. |
+| 9 | `W/core/monitor/TaskCreditToken.ts` | sibling of `TaskCreditInbox` | Same statics, `BASE_BACKOFF_MS = 10_000` → `MAX_BACKOFF_MS = 300_000`, `onlineNow` gate, `requestNow`. Registered in `WalletContext.tsx` beside `TaskCreditInbox` with its own `credit` closure — **not** folded into `TaskCreditInbox.runTask`, which calls exactly one injected callback (`TaskCreditInbox.ts:70-76, 95-114`) and whose result shape and `onAccepted` toast belong to the BSV inbox. |
+| 10 | `W/core/pay/tokenSendErrors.ts` | `classifyTokenSendError(e, ctx) => { key: string; values: Record<string,string>; guarantee: 'nothing-sent' \| 'unknown'; action?: 'check-again' \| 'get-bsv' }` | Pure, unit-testable, on the `core/pay/creditErrors.ts` precedent. §4.5. |
+| 11 | `W/core/mandala/journalStore.ts` | `makeMandalaJournalStore(storage: StorageLike) => { load(): Promise<Record<string, unknown>>; put(k, v): Promise<void>; remove(k): Promise<void>; hydrated: Promise<void> }` | **D3.** One JSON blob per journal under `mandala_tx_journal` / `mandala_notify_journal` / `mandala_blinding_journal`, over `StorageExpoSQLite.getKeyValue/setKeyValue` (`:215-227`), with the per-storage promise-chain mutex from `W/core/peerpay/outbox.ts:96-107`. **`reconcileWallet` must await `hydrated`** — otherwise `hasFreshIntent()` reads an empty map and the bulk sweep at `L/reconcile.ts:120-133` aborts a live transaction. |
+| 12 | `W/core/mandala/config.ts` | `configureMandalaForChain(chain)`, `isMandalaAvailable(chain)` | Reads `ToolboxServiceConfig.mandala` and calls the lib's `configureMandala`. |
+| 13 | `W/core/mandala/adminWallet.ts` | `withAdminOriginator(pm, ADMIN_ORIGINATOR): WalletInterface` | ~30 lines appending the originator to the 13 methods the lib calls. Removes the spending sheet per send (`WalletPermissionsManager.js:2878`), `guardVaultAccess`'s external path, the `limit ≤ 500` denial (`guard.ts:30,195`) and the per-mutation inventory scan. **A deliberate trust decision**, stated as one: the lib runs with the same authority the wallet's own rails already hold. |
+
+**Struck 2026-09-15 (maintainer decision — removed, not built):** ~~`W/ui/components/wallet/BalancesSection.tsx`~~ (Home's Balances `GroupedSection` + one `AssetRow` each), ~~`W/ui/components/wallet/AssetRow.tsx`~~ (the per-row state table in §2.1) and ~~`W/ui/components/wallet/AssetSheet.tsx`~~ (§2.2). All three existed only to serve the Balances block / asset-sheet surface (§2.1/§2.2); with that surface gone they have no caller and are deleted rather than kept as dead code.
 
 ### 3.3 CHANGED — precise edits
 
@@ -293,15 +284,15 @@ export const TOKEN_FEE_FLOOR_SATS = 200
 | 10 | `PayForm.tsx:88-124` | `PayCta` gains `label?: string` (raw, pre-interpolated; wins over `labelKey`) — `t(labelKey)` takes no options, so "Send 25.00 USDX" cannot come from a key alone. |
 | 11 | `W/ui/components/pay/AvailableBalance.tsx:29-32` | Gains `text?: string` and `note?: string`. When `text` is present it is rendered verbatim and `useSpendableBalance()` is not consulted — the component takes **no** balance prop today and sources its own BSV figure, so nothing else can produce a token figure. |
 | 12 | `W/ui/components/pay/RecipientField.tsx` | Gains `assetTicker?: string`. When present and the classified input is `address` / `invalid_address`: status line becomes `alert-circle-outline` + `t('pay_asset_address_status', {ticker})`, border `colors.warning`. **Non-destructive** — the typed text stays; switch the picker back to BSV and it is valid again immediately. Also gains `statusOverride?: { icon, text, tone }` for the recipient-admission line (§4.3). |
-| 13 | `W/ui/components/pay/UniversalSend.tsx:476-483, :354, :541, :572` | Mount `<AssetPicker>` in a `PayField labelKey="pay_asset_label"` above `RecipientField`; thread `asset` into `PayAmountField`; branch `handleSend` on `asset != null` → `sendTokenViaHandle`; extend `canSend`; new `ConsequenceNote` branches; `ResultBanner` fed by `classifyTokenSendError`; CTA `label`. |
+| 13 | `W/ui/components/pay/UniversalSend.tsx:476-483, :354, :541, :572` | Mount `<AssetPicker>` in a `PayField labelKey="pay_asset_label"` **below `RecipientField`, above `PayAmountField`** — reordered 2026-09-15 (§2.3; originally above `RecipientField`, moved down one slot by maintainer decision, nothing else in this row changed); thread `asset` into `PayAmountField`; branch `handleSend` on `asset != null` → `sendTokenViaHandle`; extend `canSend`; new `ConsequenceNote` branches; `ResultBanner` fed by `classifyTokenSendError`; CTA `label`. |
 | 14 | `W/ui/components/pay/RequestHub.tsx` | Gains `assets`, `selected`, `onSelect`, `asset`; mounts `AssetPicker` above `PayAmountField`; passes `asset` down; address row `disabled` with `t('pay_asset_address_status')`; remote-link subtitle → `t('pay_asset_link_no_amount')`. `requestSatsFrom` is **not** reused for a token amount (see #16). |
 | 15 | `W/ui/screens/PayScreen.tsx:136-142, :385-411` | Accept an `asset` search param; hold `selectedAsset` state; thread into `UniversalSend` / `RequestHub` / `HandleReceive` / `NearbyFlow`. |
 | 16 | `PayScreen.tsx:184, :386` | **Bug fix the winner shipped:** `const sats = requestSatsFrom(requestSats)` is passed to `HandleReceive initialSats` and `initialNearbyRequest`. When an asset is selected, `requestSats` is base units and would render as satoshis. Replace with a discriminated `request: { kind: 'bsv'; sats?: number } \| { kind: 'token'; baseUnits?: number; asset: TokenAsset }`. |
 | 17 | `W/ui/components/pay/HandleReceive.tsx:442, :689-691, :154/:582` | `requestedAmountText?: string` replaces the `<AmountDisplay>{initialSats}</AmountDisplay>` render when present; `peerPayLinkFor` is called with `sats` omitted when an asset is selected (it already omits non-positive figures — zero code change); `AdmissionNotice` replaces the plate when not admitted; the existing 5s focused tick also calls `TaskCreditToken.requestNow()`. |
 | 18 | `W/ui/screens/WalletHomeScreen.tsx:1183` | `t(assets.length > 0 ? 'wallet_balance_your_bsv' : 'wallet_balance_you_have')`. |
-| 19 | `WalletHomeScreen.tsx:1244` | `listHeader` gains `<BalancesSection/>` as its first child, above the resend banner. `pinnedHeader`, `refreshBalance`, `fetchActions`, `loadMore` and the fixed-height footer are **untouched** — the three `loadMore` guards and the footer at `:721-750, :1432-1440` exist to break an `onEndReached` loop and nothing here goes near them. |
+| 19 | ~~`WalletHomeScreen.tsx:1244` — `listHeader` gains `<BalancesSection/>` as its first child, above the resend banner.~~ | **Struck 2026-09-15**, superseded by the maintainer's removal of the Balances block (§2.1). `listHeader` gains nothing; the resend banner is once again its first child, exactly as before this spec. What the 2026-09-15 pass *does* touch on this screen: the label swap (#18, unchanged) and the stuck-settlement badge's `onPress`, which routed into the now-deleted sheet and now does `router.push('/pay?asset=' + encodeURIComponent(assetId))` instead — Pay is the only place left on Home for that tap to go. `pinnedHeader`, `refreshBalance`, `fetchActions`, `loadMore` and the fixed-height footer remain untouched, as they always were. |
 | 20 | `WalletHomeScreen.tsx:1100-1145` | The row renderer passes `token` to `ActivityRow` for any action whose `labels` include `'mandala'` (`includeLabels` is already `true` at `:633`). |
-| 21 | `W/ui/components/wallet/ActivityRow.tsx:70-74, :147-159, :170-179, :270-293` | Add `token?: { title: string; amount?: { value: string; unit: string }; incoming: boolean; suppressFace: boolean }`. When present: description ← `token.title` (the lib writes `Receive 4000 of 615a06ab….0` at `L/receive.ts:143` and `ActivityRow` renders `action.description` verbatim at `:270-272`, so the title **must** be overridden); the amount column renders `token.amount` or `t('token_row_amount_pending')` in `textTertiary` and **never** `formatAmountParts(action.satoshis, …)`; the secondary denomination line is omitted; `suppressFace` skips the sigil. Absent `token` ⇒ byte-identical. Note the local `const face` at `:172` — the new prop is named `token.suppressFace`, not `face`. |
+| 21 | `W/ui/components/wallet/ActivityRow.tsx:70-74, :147-159, :170-179, :270-293` | Add `token?: { title: string; amount?: { value: string; unit: string }; incoming: boolean; counterpartyKey?: string; statusText?: string }`. When present: description ← `token.title` (the lib writes `Receive 4000 of 615a06ab….0` at `L/receive.ts:143` and `ActivityRow` renders `action.description` verbatim at `:270-272`, so the title **must** be overridden); the amount column renders `token.amount` or `t('token_row_amount_pending')` in `textTertiary` and **never** `formatAmountParts(action.satoshis, …)`; the secondary denomination line is omitted. **Revised 2026-09-15 (maintainer decision, supersedes the `suppressFace` field originally specified below):** the row draws the same generative sigil a BSV row does, keyed on `token.counterpartyKey` directly — never on `counterpartyOf(action)`, whose inputs (the action's own labels/senderIdentityKey) describe the underlying BSV coin-selection tx, not the token counterparty. `counterpartyKey` is `TokenActivityRow`'s own field: the sender's blinded, per-payment `A′` on a received row, the payee on a sent row. No key ⇒ the plain direction arrow, same fallback a BSV row gets for a counterparty it cannot name. Absent `token` ⇒ byte-identical. ~~`suppressFace: boolean` unconditionally hid a received row's face~~ — struck: a received row now gets the *same* generative face as any other counterparty, it is simply keyed on `A′` instead of a stable identity key, so — by design, not by omission — **it is a different face on every payment from the same payer** (D2's blinding is the point; see §6.2 #3). |
 | 22 | `W/core/pay/counterparty.ts:71-85` | One branch **before** the txid fallback: `const PREFIXED = /^to-((?:02\|03)[0-9a-f]{64})$/`; a match returns `{ kind:'identityKey', value: m[1] }` — the **extracted capture**, not the whole label, so the same person's face matches on the BSV rail. Deliberately not `from-`, which under D2 is `A′`. |
 | 23 | `W/ui/components/pay/PaymentSuccessOverlay.tsx:53-75, :197-198` | Add `amountText?: string` (rendered instead of `<AmountDisplay>{amount}</AmountDisplay>`), `notified?: boolean`, `firstHoldNote?: string`. The `!broadcast` line at `:197-198` renders `pay_received_not_broadcast` ("Received offline · not yet processed") **ungated by direction** — so a sent overlay gains its own key `pay_sent_not_broadcast`. |
 | 24 | `W/ui/exportTransactions.ts:36-80` | Two columns, `assetId` and `assetAmount`, filled for `'mandala'`-labelled rows from one extra `listOutputs({basket:'mandala-tokens', includeCustomInstructions:true})` + `parseActionsToHistory` over the action set it already pages (`includeOutputs: true` is already set at `:49`). The `satoshis` column stays truthful: for a token row it is the BSV movement, i.e. the fee. |
@@ -581,7 +572,7 @@ useTokenAssets()                                   // gated on isMandalaAvailabl
 
 Invalidated on mount, `txStatusVersion` and `refresh()`. `txStatusVersion` bumps on every `createAction/signAction/internalizeAction/abortAction/relinquishOutput` (`WalletContext.tsx:1109-1124`, debounced 120ms), so a credit or a send repaints the rows for free. **This runs only for wallets on mainnet with Mandala configured** — the decode-every-locking-script pass does not land on a BSV-only user's home screen.
 
-Three figures, never conflated: **total** on the row and in the sheet; **frozen** as a footnote naming the issuer as the actor; **spendable** on the send screen's available line. Frozen is *computed* (intersect `frozenOutpoints` with the holder's own basket outputs), not claimed. Frozen stays **inside** the row's total — those coins are still yours; subtracting them from the headline would be a different lie.
+Three figures, never conflated: **total** in the Pay asset picker's row for that asset (§2.3 — the Home Balances row and the sheet this paragraph originally described are both removed, 2026-09-15, §2.1/§2.2); **frozen** as a pre-flight `ConsequenceNote` naming the issuer as the actor when it is nonzero and would affect the send; **spendable** on the send screen's available line. Frozen is *computed* (intersect `frozenOutpoints` with the holder's own basket outputs), not claimed. Frozen stays **inside** the total — those coins are still yours; subtracting them from the headline would be a different lie.
 
 **No total, anywhere. No fiat, anywhere.** `ExchangeRateContext` is a BSV↔USD↔fiat chain fetched once on mount with a `HARDCODED_USD_PER_BSV = 16` fallback explicitly marked "Not for trading". It has no price for a token. Rendering `≈ $1,240.00` beside a USD-tickered stablecoin would be the wallet vouching for the issuer's peg using a number it invented from a ticker string.
 
@@ -607,7 +598,7 @@ Reusing `parseActionsToHistory` is the whole point: it already handles sent/rece
 **Rows:**
 1. Title `t('token_row_sent'|'token_row_received', {ticker})` — the lib's `description` is a developer string containing a raw 36-byte token id and `ActivityRow` renders it verbatim (`:270-272`).
 2. Amount: `formatAmountFixed` + ticker, `colors.successAmount` for incoming (green means confirmed money and nothing else). Secondary denomination line **omitted**, not blanked.
-3. Face: a **sent** row gets a real sigil, because the recipient is not blinded and `counterpartyOf` now extracts the key from the `to-<key>` label (#22). A **received** row gets `suppressFace` and the plain direction-arrow tile: under D2 the sender is `A′ = A + rG`, fresh per payment, and — this is the part that makes it a bug rather than a nicety — `counterpartyOf` does **not** return `null` for a mandala label; it falls through to `{kind:'txid'}` (`counterparty.ts:81-82`) "so that every action still gets a stable, if anonymous, face". Without suppression the wallet would draw a different plausible face for every payment from the same person. We never draw a face for a party we cannot name.
+3. Face — **revised 2026-09-15 (maintainer decision; supersedes the original `suppressFace` design below).** Both directions get the same generative sigil a BSV row does, keyed on `token.counterpartyKey` (`TokenActivityRow.counterpartyKey`) directly — **never** on `counterpartyOf(action)`, whose inputs (the action's own labels/senderIdentityKey) describe the underlying BSV coin-selection tx, not the token counterparty, and would draw a plausible but wrong face. A **sent** row's key is the payee. A **received** row's key is the sender's blinded, per-payment `A′ = A + rG` — deliberately **a different face on every payment from the same payer** (D2), which is the blinding working as intended, not a bug to hide. No key at all (the runtime could not resolve one) falls back to the plain direction-arrow tile, the same fallback a BSV row gets for a counterparty it cannot name. ~~The original design suppressed the face entirely for every received row, reasoning that `counterpartyOf` falls through to `{kind:'txid'}` (`counterparty.ts:81-82`) rather than `null` for a mandala label and would otherwise draw one stable face per sender — true of `counterpartyOf(action)`, but moot once the face is keyed on `token.counterpartyKey` instead.~~
 4. Day grouping, status dots, chip tray, expansion: unchanged. `withDayHeaders` keys on `created_at`, which the wallet's rows carry even though `HistoryRow.when` is always `0`.
 5. Resend / Send-again chips stay absent: `resendableOutbound` requires a `peerpay`/`localpay` label (`:195-198`), and `rebuildPeerPayToken` picks the non-basketed output and reads `out.satoshis` — both invert for a token. No chip pretends a path exists.
 
@@ -627,19 +618,19 @@ No Activity row is fabricated — there is no transaction of the user's to show.
 
 ## 7. Asset trust and disclosure
 
-**Where.** Three places, each the moment the fact becomes actionable: the arrival overlay (first hold only), the Asset sheet (permanent, on demand), and the pre-flight notes inside Pay.
+**Where.** Two places, each the moment the fact becomes actionable: the arrival overlay (first hold only) and the pre-flight notes inside Pay. ~~A third, permanent, on-demand place — the Asset sheet — was struck 2026-09-15 by maintainer decision (§2.2): there is no per-asset detail surface in v1, so there is no "look it up any time you like" any more, only the two moments above.~~
 
 **What "regulated" means, stated as capability.** Four powers, each a real gate in `topic_manager.go`, plus the limit. No badge, no shield, no trust score, no colour: chroma in this app is reserved for transaction status, never decoration.
 
 **Issuer identity.** `resolveAssetState().issuerIdentityKey` (echoed from `MandalaAdmin.publicData.issuer`) through the existing `W/ui/resolveIdentity.ts:71-81` — best-effort, never rejecting, and never gating a money decision, per its own contract. Resolved → a name and avatar. Unresolved → `abbreviateKey` in monospace, which is honest.
 
-**Paused** — issuer-wide, temporary: row subtitle in warning **text** (no filled pill; a filled chip here would out-shout the Pay button), sheet status row, Pay `ConsequenceNote` + disabled CTA. **Get paid stays enabled** — refusing to receive would be the wallet deciding on the issuer's behalf, and the payer's own app also sees the pause. One line on the Get-paid screen says so: *"Acme Bank has paused USDX, so a payment may not arrive yet."*
+**Paused** — issuer-wide, temporary: Pay `ConsequenceNote` + disabled CTA. **Get paid stays enabled** — refusing to receive would be the wallet deciding on the issuer's behalf, and the payer's own app also sees the pause. One line on the Get-paid screen says so: *"Acme Bank has paused USDX, so a payment may not arrive yet."* ~~row subtitle in warning text, sheet status row~~ — both struck 2026-09-15 along with the surfaces that carried them (§2.1/§2.2).
 
-**Frozen** — your coins, indefinite: already excluded from selection; the total stays whole and a footnote names the subtotal and the actor. Where `resolveAssetState` gives exactly one `reason`, it is quoted verbatim as the sheet row's subtitle — it is the issuer's words to this user about this coin.
+**Frozen** — your coins, indefinite: already excluded from selection; the total stays whole and Pay's `ConsequenceNote` names the subtotal and the actor when it is nonzero and relevant to the send. Where `resolveAssetState` gives exactly one `reason`, it is quoted verbatim — it is the issuer's words to this user about this coin. ~~a footnote names the subtotal and the actor [on the row]; quoted verbatim as the sheet row's subtitle~~ — struck 2026-09-15; that footnote and that sheet row no longer exist.
 
 **Not registered** — you, blocking, requires action outside the wallet: §4.1 step 3 (as a sender) and §5.4 (as a payee).
 
-**Asset-state freshness.** `resolveAssetState` has a 10s memo, caches `null`, and fails open. Home fetches it **once per app foreground**, debounced, held assets only — never per render. Pay fetches on asset selection and again, cache-bypassed, at failure time. Home shows nothing rather than a stale warning.
+**Asset-state freshness.** `resolveAssetState` has a 10s memo, caches `null`, and fails open. Pay fetches on asset selection and again, cache-bypassed, at failure time. ~~Home fetches it once per app foreground, debounced, held assets only — never per render. Home shows nothing rather than a stale warning.~~ Struck 2026-09-15: with the Balances block gone (§2.1) there is no Home surface left to keep this fresh, and the batched per-foreground fetch that existed only to feed it is removed along with it (§3.3 #19).
 
 ---
 
@@ -861,3 +852,13 @@ token_messagebox_mismatch       Your wallet is set to a different message box, s
 10. **RN `fetch` with a `Uint8Array` body to `/submit`** is a supported path (`convertRequestBody.js:37-41` base64 bridge) but has not been exercised against an overlay from a device.
 11. **Which `version` does toolbox-mobile `createAction` emit by default?** Relevant to the Chronicle / low-S note; the lib never sets one.
 12. **Jest configuration is required work this design assumes but does not detail:** `@bsv/mandala` needs a `transformIgnorePatterns` allowlist entry in `WR/package.json` **and** either a `moduleNameMapper` or the `default` export condition from L2. Two new screens' worth of tests cannot run until it lands.
+
+---
+
+## 11.1 Maintainer decisions log
+
+Not open questions — decisions the maintainer has already made, recorded here (rather than only in the diff that implements them) because §2/§3 above described the original design as if these choices were still live. Each is threaded back into the sections it touches; this entry is the one place that says all three at once and why.
+
+1. **2026-09-15 — No Balances block on Home, and no Asset sheet at all in v1.** Home's per-asset row list (§2.1) and the sheet it opened (§2.2) are both removed — components, hook wiring, and the home-badge navigation into them (§3.2/§3.3) — rather than kept as unreachable code behind a flag. This is a real narrowing of what v1 discloses, not a relayout: the issuer/token-id card, the four-powers list, and the permanent "look it up any time" surface item 7 of §7 depended on all go with the sheet, and nothing replaces them. What is kept: the arrival overlay's first-hold disclosure line (§5.2) and Pay's pre-flight `ConsequenceNote`s (§4.2) — both already existed, both already say enough at the moment the fact is actionable, and the maintainer's judgment is that a permanent detail screen adds surface area without adding a decision a holder can act on. Holdings remain visible — in the Pay asset picker (still shows every held asset and its figure, §2.3) and in Activity (every token movement is already a row, §6.2) — so "where do I see what I hold" still has an answer; it is just not a dedicated Home block any more. i18n keys written only for the removed sheet (`token_sheet_*`, `token_power_*`, `token_new_tap`, `token_balances_header`, `token_fee_footer`, …) stay in the catalogue rather than being pulled and re-added later, but nothing in the app references them.
+2. **2026-09-15 — Pay's field order is Recipient → Paying with → Amount → Pay**, reversing the original design's Paying with → Recipient → Amount (§2.3). `AssetPicker` itself is unchanged — same component, same props, same behaviour (§3.2/§3.3 #5/#13) — only its slot in `UniversalSend`'s JSX moved down one field. The original ordering rationale (an asset changes the unit of the amount, the available figure, and which recipient shapes are legal, so it must resolve before Amount) still holds and is still enforced: nothing about *when the state updates* changed, only *what the sender sees first*. An address typed while a token is selected is still refused inline without being erased (D4) regardless of which field was filled in first.
+3. **2026-09-15 — Activity's token rows draw a face.** The original design (§6.2 #3, §3.3 #21) deliberately suppressed the sigil for every received token row, reasoning from `counterpartyOf(action)`'s behaviour on a mandala-labelled action. The maintainer's decision keeps the same *outcome* invariant — a received row's face still changes on every payment from the same payer, because it is still keyed on the blinded, per-payment `A′` (D2) — while restoring the *sigil itself*: token rows now key the face on `TokenActivityRow.counterpartyKey` directly (the payee on a send, the sender's `A′` on a receive) rather than on the action's own labels, and fall back to the plain arrow only when that key is genuinely absent. A plain get-paid/arrow icon on every token row read as a downgrade from the BSV rows sitting in the same list; this makes token rows visually consistent with BSV rows while keeping D2's guarantee that a blinded sender is never given a stable, re-identifiable face.
