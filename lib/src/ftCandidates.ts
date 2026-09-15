@@ -3,7 +3,7 @@
  * with confirmation status and relative age via a listActions cross-reference
  * (listOutputs exposes neither). Feeds selectFtInputs (see ftSelect.ts).
  */
-import { LockingScript, WalletInterface } from '@bsv/sdk'
+import { Beef, LockingScript, WalletInterface } from '@bsv/sdk'
 import { MandalaToken } from '@bsv/templates'
 import { BASKET } from './constants.js'
 import { FtCandidate } from './ftSelect.js'
@@ -77,11 +77,36 @@ export async function loadFtCandidates(
   })
   const txMeta = await loadTxMeta(wallet)
 
+  // Some wallets (the mobile toolbox among them) do not populate
+  // `lockingScript` for include:'locking scripts'; the BEEF listing carries
+  // every script regardless, so read from there whenever the field is absent.
+  let scriptsFromBeef: Map<string, LockingScript> | undefined
+  const scriptOf = (o: { outpoint?: unknown, lockingScript?: unknown }): LockingScript | undefined => {
+    if (typeof o.lockingScript === 'string' && o.lockingScript.length > 0) {
+      return LockingScript.fromHex(o.lockingScript)
+    }
+    if (scriptsFromBeef == null) {
+      scriptsFromBeef = new Map()
+      try {
+        const beef = Beef.fromBinary(beefRes.BEEF as number[])
+        for (const btx of beef.txs) {
+          const tx = btx.tx
+          if (tx == null) continue
+          const txid = tx.id('hex')
+          tx.outputs.forEach((out, i) => { scriptsFromBeef!.set(`${txid}.${i}`, out.lockingScript) })
+        }
+      } catch { /* unreadable BEEF — nothing decodes, caller reports zero candidates */ }
+    }
+    return scriptsFromBeef.get(String(o.outpoint))
+  }
+
   const candidates: FtCandidate[] = []
   for (const o of scriptRes.outputs) {
     let decoded
     try {
-      decoded = MandalaToken.decode(LockingScript.fromHex(o.lockingScript as string))
+      const script = scriptOf(o)
+      if (script == null) continue
+      decoded = MandalaToken.decode(script)
     } catch { continue } // not a Mandala FT output
     if (decoded.assetId !== assetId) continue
 
@@ -108,5 +133,9 @@ export async function loadFtCandidates(
     ...(state?.evictedOutpoints ?? [])
   ])
 
-  return { candidates: excludeFrozen(candidates, excluded), beef: beefRes.BEEF as number[] }
+  const usable = excludeFrozen(candidates, excluded)
+  if (usable.length === 0) {
+    console.warn(`[mandala] no spendable ${assetId} outputs: listed ${scriptRes.outputs.length} in basket '${BASKET}', ${candidates.length} decoded for this asset, ${excluded.size} frozen/evicted`)
+  }
+  return { candidates: usable, beef: beefRes.BEEF as number[] }
 }

@@ -328,3 +328,65 @@ describe('reconcileWallet — retryable entries (§9.11)', () => {
     expect(await journalList()).toEqual([])
   })
 })
+
+describe('reconcileWallet — handed_over entries (the payer’s optional later submit)', () => {
+  const mockFetch = vi.fn()
+  const OVERLAY = 'http://test-overlay'
+
+  const handedOver = (over: Record<string, unknown> = {}): any => ({
+    txid: 'ho',
+    stage: 'handed_over',
+    at: 1,
+    reference: 'ref-ho',
+    submit: { txHex: 'deadbeef', offChainHex: '0708', topics: ['tm_mandala'] },
+    ...over
+  })
+
+  beforeEach(() => {
+    mockFetch.mockReset()
+    vi.stubGlobal('fetch', mockFetch)
+    configureMandala({ overlayUrl: OVERLAY })
+  })
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('re-POSTs the stored bytes when online and commits + broadcasts on acceptance', async () => {
+    await journalPut(handedOver())
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ tm_mandala: { outputsToAdmit: [0], admissionSignature: 'de', admissionIdentityKey: '02aa' } })
+    })
+    const wallet = mkWallet()
+    const r = await reconcileWallet(wallet as any)
+    expect(mockFetch.mock.calls[0][0]).toBe(`${OVERLAY}/submit`)
+    expect(r.resubmitted).toEqual(['ho'])
+    expect(r.rebroadcast).toEqual(['ho'])
+    expect(await journalList()).toEqual([])
+  })
+
+  it('keeps the entry (and blocks the bulk sweep) while the overlay is unreachable', async () => {
+    await journalPut(handedOver())
+    mockFetch.mockRejectedValue(new Error('offline'))
+    const wallet = mkWallet()
+    const r = await reconcileWallet(wallet as any)
+    expect(await journalList()).toMatchObject([{ txid: 'ho', stage: 'handed_over', attempts: 1 }])
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+    // The noSend action behind a handed-over tx still holds its inputs on
+    // purpose — sweeping it would invalidate evidence the payee already has.
+    expect(wallet.listActions).not.toHaveBeenCalled()
+    expect(r.swept).toBe(0)
+  })
+
+  it('aborts the reference and drops the entry on a FINAL refusal', async () => {
+    await journalPut(handedOver())
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      text: async () => JSON.stringify({ status: 'error', code: 'ERR_CONSERVATION', retryable: false })
+    })
+    const wallet = mkWallet()
+    await reconcileWallet(wallet as any)
+    expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-ho' })
+    expect(await journalList()).toEqual([])
+  })
+})

@@ -101,6 +101,9 @@ export function selectFtInputs(candidates: FtCandidate[], target: number): FtSel
   allocateFrom(candidates.filter(c => c.confirmed))
   if (total < target) allocateFrom(candidates.filter(c => !c.confirmed))
 
-  if (total < target) throw new Error('insufficient token balance')
+  if (total < target) {
+    const have = candidates.reduce((sum, c) => sum + c.amount, 0)
+    throw new Error(`insufficient token balance: need ${target}, have ${have} across ${candidates.length} spendable output(s)`)
+  }
   return { selected, total }
 }
