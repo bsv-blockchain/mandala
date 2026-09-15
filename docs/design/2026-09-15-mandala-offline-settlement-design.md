@@ -1712,3 +1712,36 @@ lives in the wallet only; the lib itself performs no migration and the web
 console needs none.
 
 **(11) 2026-09-15 — an admitted transaction is never aborted locally.** Incident: the lib's reconcile bulk sweep aborted a noSend action 0.7 s after the overlay had admitted (and broadcast) it, because the wallet's intentional token hold made the lib's post-acceptance `sendWith` look successful and its `accepted` journal entry was cleared. Rules now: the sweep is opt-out (the wallet runs reconcile with `sweep:false`), TTL-gated, and never touches a txid with any journal entry; the lib clears `accepted` only when the wallet reports the transaction as posted; the wallet refuses `abortAction` for any reference whose settlement row is held / handed_over / submitting / admitted / broadcast; and a repair pass re-attaches a transaction the wallet marked failed but the overlay admitted.
+
+## Amendment 2026-09-15 (b) — the fee-parent hole and the handle rail's missing retry
+
+Incident: an 8 TOKEN handle-rail send (`8045794f`) sat at "settling". The immediate
+`settleNow` ran but no `/submit` left the device; nothing retried it; the recipient
+raw-broadcast it; the payer's lib reconcile then re-submitted and stranded.
+
+Root causes and the rules that now hold:
+
+1. **COVER and `/submit` see the wallet's full ancestry.** A noSend action's stored
+   `inputBEEF` carries only the parents the lib supplied (token parents). The fee input
+   the wallet allocates itself — routinely unmined change of an earlier BSV send — was
+   invisible, and FIX B correctly reads an invisible parent as a hole. `cover()` and
+   `submit()` now merge every missing parent from `storage.getValidBeefForTxid` before
+   walking or posting. FIX B is unchanged.
+2. **Every drain-owned `sent` row is stepped on every tick.** `sendToHandle` writes no
+   queue row, so the release drain never stepped its rows. `settlePendingSends()`
+   (runtime) takes the `settleNow` step for each `handed_over`/`submitting`/`admitted`
+   row of role `sent` on the drain tick. `built`/`parked` stay the user's (FIX F).
+3. **Guard #2 covers `TaskSendWaiting`.** An internalized inbox credit leaves its
+   request `unsent`, which the monitor posts through the module function, past the
+   storage hold. `holdTokenReqsForDrain()` + the `processUnsent` patch hold every
+   request with a `token_settlements` row.
+4. **The lib never broadcasts in this host.** `reconcileWallet(wallet, { sweep: false,
+   broadcast: false })`: the lib may re-submit its journaled bytes (idempotent) but the
+   drain's `postTokenStep` is the only broadcaster and clears the journal entry.
+5. Silent stalls (`cover` incomplete, `/submit` unavailable, a step that did not move
+   the row) are logged with their reason.
+
+Observed on device after the fix: `8045794f` → `broadcast` on the first tick (journal
+cleared); `a4a6b346` (a real double-spend) → `refused ERR_INPUT_SPENT` once its BEEF was
+complete — before that the overlay answered 503 "missing an associated source
+transaction", which is retryable by contract and never burned the row.
