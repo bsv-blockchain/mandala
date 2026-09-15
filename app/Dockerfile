@@ -28,4 +28,4 @@ RUN cd app && npm run build
 FROM nginx:1.28-alpine
 COPY app/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /src/app/dist /usr/share/nginx/html
-EXPOSE 80
+EXPOSE 8080
