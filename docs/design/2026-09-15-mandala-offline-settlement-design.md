@@ -1022,15 +1022,24 @@ Two call sites carry an unverified signature-shaped value today:
   step or write anything resembling a `settled`/`admitted` state. A value
   that fails verification is treated as **absent** — never as a negative
   ack, never as proof — so the drain still runs its own `postTokenStep`.
-- **Handle-rail body** (`L/transfer.ts:248-267`): per review, no
-  `admissionSignature`-equivalent field exists on the wire body today. If the
-  handle rail is extended to carry the tip's own admission evidence
-  (optional, since the handle rail's sender already submits online per its
-  own committed design), the same verification rule applies before the
-  receiver treats the transfer as pre-settled; absent or unverifiable
-  evidence simply means the receiver's own drain checks
-  `GET /admin/admission/:txid` on its next online tick, exactly as it would
-  for a nearby-rail credit.
+- **Handle-rail body** (`L/transfer.ts:248-267`): per the 2026-09-15
+  maintainer decision (§12.9), the handle rail is hand-over-first, identical
+  in structure to the nearby rail — no online check at send time on any
+  rail. The payer builds and signs (`noSend`), assembles the AdmissionBundle
+  from local evidence, journals a `handed_over` entry, and posts a v2 body
+  (§9.13 of the wire contract) to the recipient's `'mandala-payments'`
+  MessageBox: no `/submit`, no broadcast, and no σ_I for the tip at send
+  time. The recipient runs `COVER` (§1.2) against its own configured overlay
+  key, credits the payment, then submits via `mustSubmit` (ancestors first,
+  tip last — the overlay broadcasts what it admits); the payer's own
+  drain/reconcile may submit the same bytes later, harmlessly, since
+  `/submit` is idempotent (§3.2). Legacy v1 bodies (sender submitted online
+  before handing over) remain accepted. As with the ack path above, any
+  admission evidence riding on the v2 body is verified with the same
+  `Admitted()` predicate before the receiver treats the transfer as
+  pre-settled; absent or unverifiable evidence simply means the receiver's
+  own drain runs `postTokenStep`/checks `GET /admin/admission/:txid` on its
+  next online tick, exactly as it would for a nearby-rail credit.
 
 ### 4.6 `token_settlements` rows outlive the BSV pending queue's retry ceiling (FIX I)
 
@@ -1066,12 +1075,16 @@ of a payment that was never admitted.
 ### 4.8 Ack channels
 
 Unchanged from the existing nearby-rail machinery (`Ack`/`ConfirmDelivery`,
-`W/core/localpay/types.ts`) for the hand-over itself. The **settlement** ack
+`W/core/localpay/types.ts`) for the hand-over itself on the nearby rail. On
+the handle rail, the hand-over **is** the `'mandala-payments'` MessageBox v2
+body (§4.5; §9.13 of the wire contract) — no separate pre-settlement channel
+exists or is needed. The **settlement** ack
 (rule 5 — "acks the payment back to the sender if reachable") reuses the
 existing two channels the app already has for exactly this job: nearby while
 still connected (`NearbyFlow`'s existing confirm-channel), or the
-`'mandala-payments'` MessageBox (`L/constants.ts:11`) once the recipient's
-drain gets σ_I(tip). No new channel is introduced; the payload is `{txid,
+same `'mandala-payments'` MessageBox once the recipient's
+drain gets σ_I(tip). No new channel is introduced; the settlement-ack
+payload is `{txid,
 outputsToAdmit, admissionSignature}` so the payer's own reconciliation pass
 (§4.6, and the general "un-fail a locally-refused row that the overlay now
 reports admitted" pass in §6) can verify it with the same `Admitted()`
@@ -1662,6 +1675,15 @@ Answers to §11, in order. All eight questions are resolved; none remain open.
 8. **Certificate slot (§11.8).** Confirmed entirely out of scope. It remains
    opaque and unconsumed by this spec and is not expected to interact with
    the AdmissionBundle in v4.
+9. **Every rail is offline-first at send time (2026-09-15 addendum).** "We
+   shouldn't have to check anything with the issuer when making a payment
+   (we need to be able to do this offline)" applies to every rail, not only
+   nearby. The handle (MessageBox) rail is revised to be hand-over-first,
+   identical in structure to the nearby rail (§4.5, §4.8; wire contract
+   §9.13; UX design §4.1-§4.2): no `/submit`, no broadcast, and no σ_I for
+   the tip at send time on any rail. Legacy v1 handle-rail bodies (sender
+   submitted online before handing over) remain accepted, so this ships
+   without a hard migration cutover.
 
 **One deviation from §9's edits to `design-final-ux.md`, noted here for the
 record.** The basket rename is not a hard-coded literal swap. It ships as a

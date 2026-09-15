@@ -22,6 +22,15 @@
  *                means it needs a durable record or a crash leaks the action
  *                forever (amendment v2.1 §9.11). Recovery = re-POST `submit`;
  *                after RETRY_CAP passes reconcile aborts the reference instead.
+ *   'handed_over' — the tx was built, signed noSend and handed to the payee
+ *                OFFLINE; the overlay has never seen it and the payee is the
+ *                party responsible for submitting it (offline settlement
+ *                §0.1 rules 1-3). Its inputs stay held on purpose: the payee
+ *                holds evidence over these exact bytes, so releasing them
+ *                would invalidate a payment that has already been made.
+ *                Recovery (rule 6, the payer's OPTIONAL later submit) is
+ *                identical to 'retryable': re-POST the stored bytes when
+ *                online, RETRY_CAP applies, a final refusal aborts.
  *   'stranded' — an 'accepted' entry whose broadcast has failed
  *                BROADCAST_RETRY_CAP times. KEPT (the overlay folded this tx
  *                in; it must never be aborted) but never retried automatically
@@ -56,15 +65,24 @@ export interface JournalSubmit {
 
 export interface JournalEntry {
   txid: string
-  stage: 'intent' | 'accepted' | 'abort' | 'retryable' | 'stranded'
+  stage: 'intent' | 'accepted' | 'abort' | 'retryable' | 'stranded' | 'handed_over'
   /** createAction signableTransaction.reference — needed to retry an abort. */
   reference?: string
   /** Failed recovery attempts so far (reconcile increments; see caps there). */
   attempts?: number
   /** The overlay verdict code that produced a 'retryable' entry (diagnostics). */
   code?: string
-  /** Present on 'retryable' entries whose bytes were journaled (§9.11). */
+  /** Present on 'retryable' / 'handed_over' entries whose bytes were journaled (§9.11). */
   submit?: JournalSubmit
+  /**
+   * The off-chain linkage payload for THIS txid, hex. Written on 'accepted'
+   * and 'handed_over' entries so a later hand-over can forward the linkage
+   * bytes of an ancestor it never submitted (offline settlement §1.1: a txid
+   * with no σ_I travels as `linkage`, not as `admissions`). Duplicated on
+   * 'handed_over' inside `submit` because that copy is what reconcile
+   * re-POSTs; this one is what the evidence source reads.
+   */
+  offChainHex?: string
   /**
    * σ_I, on 'accepted' entries only (A12). The overlay's acceptance proof is
    * written at the commit point, which it already reaches before the

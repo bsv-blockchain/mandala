@@ -74,3 +74,30 @@ Binding on both engines, the lib and the wallet. Supersedes the conflicting sent
 9.10 **`cover()` trust anchor.** The verifier takes `expectedSignerKey` from its own configuration (the session's / wallet's configured overlay identity key); `bundle.overlayIdentityKey` is data and must equal it or COVER fails with `unsafe_asset`.
 9.11 **Lib journal.** A retryable overlay refusal writes a `'retryable'` journal entry (txid, reference, code, attempts) so reconcile can retry and, after `RETRY_CAP`, abort; an `'accepted'` entry whose broadcast keeps failing becomes `'stranded'` after `BROADCAST_RETRY_CAP` and is surfaced, never retried silently forever. `abortStuckRegistryActions` never aborts an action that has an `'accepted'` journal entry.
 9.12 **/arc-ingest terminal 200 body** on both engines: `{status:"success", message:"Terminal transaction status processed", data:{txid, txStatus, reason, restoredOutpoints, restoredTokenRows, alreadyEvicted}}`. Go answering 404 on an unmounted route vs TS's 503 stub is an accepted divergence (Arcade is the only caller).
+9.13 **MessageBox body v2 (2026-09-15 maintainer decision).** Every rail is hand-over-first at send time — no rail contacts the overlay before handing the payment over. The handle (MessageBox) rail's `'mandala-payments'` box body is therefore versioned:
+
+```json
+{
+  "v": 2,
+  "kind": "handover",
+  "assetId": "<hex>",
+  "amount": "<base-units>",
+  "sender": "<A' — blinded, per the wire's existing A' convention>",
+  "senderMode": "<per existing wire enum>",
+  "keyID": "<per existing wire convention>",
+  "protocolID": "<per existing wire convention>",
+  "transaction": "<AtomicBEEF>",
+  "outputIndex": 0,
+  "linkage": [{ "txid": "<hex>", "payload": "<...>" }],
+  "admissions": [
+    {
+      "txid": "<hex>",
+      "outputsToAdmit": [0],
+      "signature": "<hex>",
+      "signerKey": "<hex>"
+    }
+  ]
+}
+```
+
+No `/submit` call and no broadcast happen at send time, and the body carries no σ_I for the tip — only whatever admission evidence (`admissions[]`) the sender already holds locally for the transfer's ancestors, exactly as assembled for the AdmissionBundle (§1.1 of the offline-settlement spec). The recipient runs `COVER` against its own configured overlay key (§9.10), credits the payment, then submits via `mustSubmit` (ancestors first, tip last — the overlay broadcasts what it admits); the sender's own drain/reconcile may submit the same bytes later, harmlessly, since `/submit` is idempotent (§2). Legacy v1 bodies (sender submitted online before handing over) remain accepted by the recipient. This supersedes any earlier text in this document or the UX/settlement specs implying the handle rail submits or contacts the overlay before hand-over.

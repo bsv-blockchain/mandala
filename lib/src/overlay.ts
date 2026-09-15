@@ -355,8 +355,10 @@ export async function submitAndBroadcast (
   //
   // It also carries σ_I (A12): the acceptance proof lands durably here, at no
   // extra I/O, so a client that loses the overlay's admission record still
-  // holds its own copy.
-  await journalPut({ txid: signed.txid, stage: 'accepted', at: Date.now(), ...admissionReceipt(admitted) })
+  // holds its own copy — and `offChainHex`, so a later OFFLINE hand-over can
+  // forward this tx's linkage bytes verbatim (handover.ts).
+  const linkageReceipt = offChainValues != null ? { offChainHex: Utils.toHex(offChainValues) } : {}
+  await journalPut({ txid: signed.txid, stage: 'accepted', at: Date.now(), ...linkageReceipt, ...admissionReceipt(admitted) })
   void broadcastAcceptedTx(wallet, signed.txid)
     .then(async () => { await journalRemove(signed.txid) })
     .catch(async e => {

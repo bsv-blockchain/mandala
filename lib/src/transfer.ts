@@ -12,13 +12,22 @@
  * locking scripts (matchOutputIndices) and the recipient learns theirs from
  * the messagebox body.
  *
- * Resolves at the overlay-accept commit point. The messagebox notification to
+ * Two rails share this pipeline (`mode`). The default `'submit'` rail is the
+ * online one described above. The `'handover'` rail is OFFLINE: identical
+ * bytes are built and signed, but NOTHING is contacted — no /submit, no
+ * broadcast, no abort — and the recipient is handed the transaction plus the
+ * admission evidence for its token ancestry (handover.ts) so it can verify
+ * the payment itself and submit on its own schedule (offline settlement
+ * §0.1). The payer may submit later, from its 'handed_over' journal entry,
+ * via reconcile.
+ *
+ * Resolves at the overlay-accept commit point (submit mode only). The messagebox notification to
  * the recipient is awaited separately by the caller-visible `notified` flag —
  * a notify failure never fails the transfer (the tx is already final).
  */
-import { Transaction, Beef, WalletInterface } from '@bsv/sdk'
+import { Transaction, Beef, Utils, WalletInterface } from '@bsv/sdk'
 import { MandalaToken } from '@bsv/templates'
-import { BASKET, FT_PROTOCOL, MESSAGEBOX } from './constants.js'
+import { BASKET, FT_PROTOCOL, MESSAGEBOX, TOPIC } from './constants.js'
 import { walletMandalaUnlock } from './unlock.js'
 import { revealLinkage, matchOutputIndices } from './tokens.js'
 import { AdmissionReceipt, admissionReceipt, submitAndBroadcast } from './overlay.js'
@@ -28,7 +37,10 @@ import { blindingPut } from './blindingJournal.js'
 import { loadFtCandidates } from './ftCandidates.js'
 import { selectFtInputs } from './ftSelect.js'
 import { generateFtChange } from './ftChange.js'
-import { journalIntentBegin, journalIntentEnd } from './txJournal.js'
+import { journalIntentBegin, journalIntentEnd, journalPut } from './txJournal.js'
+import {
+  collectHandoverEvidence, derHex, EvidenceSource, HandoverBody, journalEvidenceSource
+} from './handover.js'
 import { notifyPut, notifyRemove, PendingNotification } from './notifyJournal.js'
 import { tryWithLock } from './webLocks.js'
 import { BusyError } from './singleFlight.js'
@@ -53,6 +65,24 @@ export interface TransferParams {
   assetId: string
   amount: number
   recipientKey: string
+  /**
+   * `'submit'` (default) is the online rail this package has always shipped:
+   * build noSend → submit to the overlay → broadcast on acceptance.
+   *
+   * `'handover'` is the OFFLINE rail (offline settlement §0.1): build and sign
+   * exactly the same bytes, contact NOTHING, and hand the recipient the
+   * transaction plus the admission evidence for its token ancestry. The
+   * RECIPIENT submits (rule 3); this payer may also submit later when it is
+   * next online (rule 6), which reconcile.ts does from the 'handed_over'
+   * journal entry. The default is unchanged so existing hosts are untouched.
+   */
+  mode?: 'submit' | 'handover'
+  /**
+   * Where `'handover'` mode gets its admission/linkage evidence. Defaults to
+   * the lib's own journals (`journalEvidenceSource`); a host with a durable
+   * settlement store should inject its own. Ignored in `'submit'` mode.
+   */
+  evidence?: EvidenceSource
 }
 
 /**
@@ -69,6 +99,12 @@ export interface TransferResult extends AdmissionReceipt {
   atomicBeef: number[]
   /** The exact off-chain linkage payload bytes submitted alongside `atomicBeef` for this tx. */
   offChainValues: number[]
+  /**
+   * True when this was a `'handover'` send: the overlay has NOT seen these
+   * bytes and nothing has been broadcast. Absent (never false) on the
+   * ordinary submit path, so existing consumers are unaffected.
+   */
+  handedOver?: true
 }
 
 export async function transferTokens (p: TransferParams): Promise<TransferResult> {
@@ -86,6 +122,7 @@ export async function transferTokens (p: TransferParams): Promise<TransferResult
 
 async function transferPipeline (p: TransferParams): Promise<TransferResult> {
   const { wallet, messageBoxClient, identityKey, assetId, amount, recipientKey } = p
+  const handover = p.mode === 'handover'
 
   // Token-aware coin selection: confirmed-first, fewest UTXOs (see ftSelect).
   const { candidates, beef: beefBytes } = await loadFtCandidates(wallet as any, assetId)
@@ -170,6 +207,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
   let signedTx: number[]
   let offChainValuesOut: number[]
   let receipt: AdmissionReceipt = {}
+  let handoverExtras: Pick<HandoverBody, 'v' | 'kind' | 'linkage' | 'admissions'> | undefined
   const intent = await journalIntentBegin()
   try {
     const created = await wallet.createAction({
@@ -241,8 +279,52 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
       keyID: keyIDOut,
       at: Date.now()
     })
-    const admitted = await submitAndBroadcast(wallet as any, { tx: signedTx, txid }, offChainValuesOut, created.signableTransaction.reference)
-    receipt = admissionReceipt(admitted)
+    if (handover) {
+      // OFFLINE. No submitToOverlay, no broadcast, and — critically — no abort
+      // of the held inputs: the recipient is about to hold evidence over these
+      // exact bytes, so releasing the inputs would invalidate a payment that
+      // has already been made.
+      //
+      // The tip's ancestry is read back out of the signed AtomicBEEF rather
+      // than from the pipeline's own selection, so the evidence walk sees
+      // exactly the graph the recipient will see.
+      const tipTx = Transaction.fromAtomicBEEF(signedTx)
+      const { linkage, admissions } =
+        await collectHandoverEvidence(tipTx, assetId, p.evidence ?? journalEvidenceSource())
+      // The tip is itself unadmitted, so it belongs in `linkage` (§1.1: one
+      // entry per unbroadcast token tx in the chain) — without its own
+      // off-chain payload the recipient could not build its /submit body.
+      linkage.set(txid, offChainValuesOut)
+      handoverExtras = {
+        v: 2,
+        kind: 'handover',
+        linkage: [...linkage].map(([t, payload]) => ({ txid: t, payload })),
+        admissions: [...admissions].map(([t, a]) => ({
+          txid: t,
+          outputsToAdmit: [...a.outputsToAdmit],
+          signature: derHex(a.signature),
+          signerKey: a.signerKey
+        }))
+      }
+      // Durable BEFORE the message goes out: a crash after the payee has the
+      // bytes but before this lands would leave a live noSend action nothing
+      // remembers — the bulk sweep would abort it and un-pay the payee.
+      await journalPut({
+        txid,
+        stage: 'handed_over',
+        at: Date.now(),
+        reference: created.signableTransaction.reference,
+        offChainHex: Utils.toHex(offChainValuesOut),
+        submit: {
+          txHex: Utils.toHex(signedTx),
+          offChainHex: Utils.toHex(offChainValuesOut),
+          topics: [TOPIC]
+        }
+      })
+    } else {
+      const admitted = await submitAndBroadcast(wallet as any, { tx: signedTx, txid }, offChainValuesOut, created.signableTransaction.reference)
+      receipt = admissionReceipt(admitted)
+    }
   } finally {
     // Outcome is now journaled ('accepted'/'abort') or the action settled —
     // the intent marker has done its job either way.
@@ -259,6 +341,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     recipient: recipientKey,
     messageBox: MESSAGEBOX,
     body: {
+      ...(handoverExtras ?? {}),
       assetId,
       amount,
       transaction: signedTx,
@@ -303,5 +386,12 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     notified = false
   }
 
-  return { txid, notified, atomicBeef: signedTx, offChainValues: offChainValuesOut, ...receipt }
+  return {
+    txid,
+    notified,
+    atomicBeef: signedTx,
+    offChainValues: offChainValuesOut,
+    ...(handover ? { handedOver: true as const } : {}),
+    ...receipt
+  }
 }

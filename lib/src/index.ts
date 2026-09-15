@@ -13,7 +13,8 @@ import { WalletClient, WalletInterface } from '@bsv/sdk'
 import { MessageBoxClient } from '@bsv/message-box-client'
 import { configureMandala, MandalaEndpoints, MESSAGEBOX_URL } from './constants.js'
 import { transferTokens, TransferResult } from './transfer.js'
-import { receiveTokens, ReceiveResult } from './receive.js'
+import { EvidenceSource } from './handover.js'
+import { receiveTokens, ReceiveResult, SettleFn } from './receive.js'
 import {
   AdminAsset,
   listAdminAssets,
@@ -35,11 +36,21 @@ export interface SendArgs {
   counterparty: string
   /** Base units (integer). */
   amount: number
+  /**
+   * `'handover'` builds and signs the payment but contacts NOTHING — the
+   * recipient submits (offline settlement §0.1). Defaults to `'submit'`, the
+   * online rail.
+   */
+  mode?: 'submit' | 'handover'
+  /** Evidence source for `'handover'` mode; defaults to the lib's journals. */
+  evidence?: EvidenceSource
 }
 
 export interface ReceiveArgs {
   /** Only accept transfers of this asset; others stay pending. */
   assetId?: string
+  /** Override how a credited offline hand-over is settled with the overlay. */
+  settle?: SettleFn
 }
 
 export type AdminArgs = Omit<SubmitAdminActionParams, 'wallet' | 'messageBoxClient' | 'identityKey'>
@@ -92,20 +103,23 @@ export function createMandalaClient (opts: MandalaClientOptions = {}): MandalaCl
   return {
     wallet,
     identityKey,
-    send: async ({ assetId, counterparty, amount }) =>
+    send: async ({ assetId, counterparty, amount, mode, evidence }) =>
       transferTokens({
         wallet: wallet as any,
         messageBoxClient: await messageBox(),
         identityKey: await identityKey(),
         assetId,
         amount,
-        recipientKey: counterparty
+        recipientKey: counterparty,
+        ...(mode != null ? { mode } : {}),
+        ...(evidence != null ? { evidence } : {})
       }),
     receive: async (args = {}) =>
       receiveTokens({
         wallet,
         messageBoxClient: await messageBox(),
         assetId: args.assetId,
+        ...(args.settle != null ? { settle: args.settle } : {}),
         processed
       }),
     admin: async args =>
@@ -135,6 +149,7 @@ export * from './overlay.js'
 export * from './admission.js'
 export * from './bundle.js'
 export * from './transfer.js'
+export * from './handover.js'
 export * from './receive.js'
 export * from './assets.js'
 export * from './issuerOps.js'

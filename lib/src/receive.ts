@@ -6,11 +6,14 @@
  * Per-message failure is isolated: one bad transfer never blocks the rest,
  * and a failed message is left un-acknowledged so a later run retries it.
  */
-import { AtomicBEEF, Transaction, WalletInterface } from '@bsv/sdk'
+import { AtomicBEEF, Beef, Transaction, WalletInterface } from '@bsv/sdk'
 import { MandalaToken } from '@bsv/templates'
 import { MESSAGEBOX, BASKET, OVERLAY_IDENTITY_KEY } from './constants.js'
 import { resolveAssetMetadata } from './metadata.js'
-import { verifyAdmission } from './admission.js'
+import { AdmissionEntry, verifyAdmission } from './admission.js'
+import { AdmissionBundle, cover } from './bundle.js'
+import { WireAdmission, WireLinkage } from './handover.js'
+import { OverlayRefusedError, submitToOverlay } from './overlay.js'
 
 /**
  * The message body contradicts the transaction it carries (or isn't a valid
@@ -18,9 +21,58 @@ import { verifyAdmission } from './admission.js'
  * dropped so a malicious or corrupt transfer can't wedge the receive loop.
  */
 export class InvalidTransferError extends Error {
-  constructor (message: string) {
+  /** Machine-readable reason, surfaced as `refusedCode` on the failed row. */
+  readonly code?: string
+  constructor (message: string, code?: string) {
     super(message)
     this.name = 'InvalidTransferError'
+    this.code = code
+  }
+}
+
+/**
+ * What the recipient still owes the overlay after crediting a hand-over
+ * (offline settlement §0.1 rules 3–4): the transactions COVER says are
+ * unadmitted, parents first and the tip last.
+ *
+ * `bytesFor` returns the AtomicBEEF for one of those txids together with the
+ * off-chain linkage payload the payer forwarded for it — exactly the pair
+ * `/submit` consumes. It returns `undefined` only for a txid the bundle does
+ * not contain, which COVER has already ruled out.
+ */
+export interface SettleArgs {
+  /** The tip — the transaction this credit is for. */
+  txid: string
+  mustSubmit: string[]
+  bytesFor: (txid: string) => { beef: number[], offChainValues: number[] } | undefined
+}
+
+export type SettleFn = (args: SettleArgs) => Promise<void>
+
+/**
+ * The default settlement: submit each txid in order through the overlay.
+ *
+ * The overlay broadcasts what it admits, so nothing is broadcast here.
+ * `/submit` is idempotent (§0.1 rule 6 / FIX C), so re-submitting an ancestor
+ * a third party already settled is a no-op that returns the same admission —
+ * which is what makes "whoever reconnects first settles the chain" safe.
+ *
+ * A retryable refusal propagates: the caller leaves the message un-acknowledged
+ * so the next inbox pass finishes the job. A FINAL refusal also propagates and
+ * the caller records it; nothing is reversed, because the credit was made on
+ * evidence the recipient verified for itself.
+ */
+export const defaultSettle: SettleFn = async ({ mustSubmit, bytesFor }) => {
+  for (const id of mustSubmit) {
+    const bytes = bytesFor(id)
+    if (bytes == null) {
+      throw new OverlayRefusedError({
+        code: 'ERR_UNAVAILABLE',
+        description: `hand-over bundle has no bytes for ${id}`,
+        retryable: true
+      })
+    }
+    await submitToOverlay(bytes.beef, bytes.offChainValues.length > 0 ? bytes.offChainValues : undefined)
   }
 }
 
@@ -127,6 +179,15 @@ export interface IncomingTransfer {
     /** 66-hex compressed overlay identity key. */
     signerKey: string
   }
+  /**
+   * Present only on a v2 `kind:'handover'` body — the payer was OFFLINE and
+   * never submitted. The recipient runs COVER over this evidence and, on
+   * success, is the party that submits (§0.1 rule 3).
+   */
+  handover?: {
+    linkage: WireLinkage[]
+    admissions: WireAdmission[]
+  }
 }
 
 export interface ReceivedTransfer extends IncomingTransfer {
@@ -139,6 +200,18 @@ export interface ReceivedTransfer extends IncomingTransfer {
    * not a fault (FIX H).
    */
   admissionVerified: boolean
+  /** True when this credit came from a v2 offline hand-over body. */
+  handedOver: boolean
+  /** True when COVER accepted the payer's evidence. Always false for v1. */
+  covered: boolean
+  /**
+   * True when nothing remains to be submitted for this credit: the settle hook
+   * completed for a hand-over, or — for a legacy v1 body — the payer had
+   * already submitted online before notifying.
+   */
+  settled: boolean
+  /** The overlay's FINAL verdict code when settlement was refused outright. */
+  refusedCode?: string
 }
 
 /** Minimal MessageBox surface receiveTokens needs (keeps the client mockable). */
@@ -158,18 +231,80 @@ export interface ReceiveParams {
    * double-internalize the same message. Failed ids are removed for retry.
    */
   processed?: Set<string>
+  /**
+   * How a credited hand-over is settled with the overlay. Defaults to
+   * `defaultSettle` (submit each txid in order), which is what the online web
+   * console wants. Inject one to defer settlement to a host-owned drain, or to
+   * a device that is still offline at credit time.
+   */
+  settle?: SettleFn
 }
 
 export interface ReceiveResult {
   accepted: ReceivedTransfer[]
-  failed: Array<{ messageId: string, error: unknown }>
+  failed: Array<{ messageId: string, error: unknown, refusedCode?: string }>
+}
+
+/**
+ * Rebuild the AdmissionBundle from a v2 body and run COVER over it.
+ *
+ * Nothing here trusts the payer: the BEEF is re-derived from the transaction
+ * bytes (so a txid can only map to bytes that hash to it), the admissions are
+ * verified against THIS device's configured overlay key — never one named on
+ * the wire (§9.10) — and a refusal is a refusal, not a retry.
+ */
+function coverHandover (msg: IncomingTransfer): { tip: Transaction, beef: Beef, mustSubmit: string[], linkage: Map<string, number[]> } {
+  const handover = msg.handover as { linkage: WireLinkage[], admissions: WireAdmission[] }
+  let tip: Transaction
+  try {
+    tip = Transaction.fromAtomicBEEF(msg.transaction)
+  } catch (e) {
+    throw new InvalidTransferError(`hand-over transaction does not parse: ${String(e)}`, 'shape')
+  }
+  const beef = new Beef()
+  try {
+    beef.mergeTransaction(tip)
+  } catch (e) {
+    throw new InvalidTransferError(`hand-over BEEF is incomplete: ${String(e)}`, 'shape')
+  }
+  const linkage = new Map<string, number[]>()
+  for (const l of handover.linkage ?? []) {
+    if (typeof l?.txid === 'string' && Array.isArray(l.payload)) linkage.set(l.txid, l.payload)
+  }
+  const admissions = new Map<string, AdmissionEntry>()
+  for (const a of handover.admissions ?? []) {
+    if (typeof a?.txid !== 'string') continue
+    admissions.set(a.txid, { outputsToAdmit: a.outputsToAdmit, signature: a.signature, signerKey: a.signerKey })
+  }
+  const bundle: AdmissionBundle = {
+    assetId: msg.assetId,
+    // Our own configuration is the trust anchor; the bundle field exists only
+    // so cover() can assert the two agree.
+    overlayIdentityKey: OVERLAY_IDENTITY_KEY,
+    tip,
+    beef,
+    linkage,
+    admissions
+  }
+  const result = cover(tip, bundle, { expectedSignerKey: OVERLAY_IDENTITY_KEY })
+  if (!result.ok) {
+    throw new InvalidTransferError(`hand-over evidence does not cover the payment (${result.reason})`, 'not_covered')
+  }
+  return { tip, beef, mustSubmit: result.mustSubmit, linkage }
 }
 
 async function acceptOne (
   wallet: WalletInterface,
   messageBoxClient: MessageBoxLike,
-  msg: IncomingTransfer
+  msg: IncomingTransfer,
+  settle: SettleFn
 ): Promise<ReceivedTransfer> {
+  // A hand-over is decided on evidence BEFORE anything else: an uncovered
+  // bundle is refused exactly like a body that contradicts its transaction
+  // (ack + drop) — retrying cannot make missing proof appear.
+  const handedOver = msg.handover != null
+  const covering = handedOver ? coverHandover(msg) : undefined
+
   // Trust the transaction, not the body — reject mismatches before any
   // wallet work (throws InvalidTransferError; caller acks + drops).
   const { admissionVerified } = verifyIncoming(msg)
@@ -207,8 +342,45 @@ async function acceptOne (
     // the transfer instead of the message replaying forever.
     if (!isAlreadyInternalized(e)) throw e
   }
+
+  // Settlement runs BEFORE the acknowledge, so a retryable refusal leaves the
+  // message in the box for the next inbox pass instead of stranding the
+  // obligation. Re-crediting on that pass is harmless — internalizeAction is
+  // idempotent above and /submit is idempotent by contract.
+  let settled = !handedOver
+  let refusedCode: string | undefined
+  if (covering != null) {
+    const { tip, beef, mustSubmit, linkage } = covering
+    try {
+      await settle({
+        txid: tip.id('hex'),
+        mustSubmit,
+        bytesFor: id => {
+          const tx = beef.findAtomicTransaction(id)
+          if (tx == null) return undefined
+          return { beef: tx.toAtomicBEEF(true), offChainValues: linkage.get(id) ?? [] }
+        }
+      })
+      settled = true
+    } catch (e) {
+      // A FINAL verdict will never lift: reverse nothing (the credit was made
+      // on evidence this device verified itself), report it, and let the
+      // message be acknowledged so it does not replay forever.
+      if (e instanceof OverlayRefusedError && !e.retryable) refusedCode = e.code
+      else throw e
+    }
+  }
   await messageBoxClient.acknowledgeMessage({ messageIds: [msg.id] })
-  return { ...msg, label, decimals, admissionVerified }
+  return {
+    ...msg,
+    label,
+    decimals,
+    admissionVerified,
+    handedOver,
+    covered: covering != null,
+    settled,
+    ...(refusedCode != null ? { refusedCode } : {})
+  }
 }
 
 /**
@@ -217,6 +389,7 @@ async function acceptOne (
  */
 export async function receiveTokens (p: ReceiveParams): Promise<ReceiveResult> {
   const { wallet, messageBoxClient, assetId, processed } = p
+  const settle = p.settle ?? defaultSettle
   const accepted: ReceivedTransfer[] = []
   const failed: Array<{ messageId: string, error: unknown }> = []
 
@@ -226,6 +399,9 @@ export async function receiveTokens (p: ReceiveParams): Promise<ReceiveResult> {
     if (processed?.has(raw.messageId) === true) continue
     processed?.add(raw.messageId)
     try {
+      // v2 + kind:'handover' is the whole version discriminator; a v1 body has
+      // neither and takes the legacy path byte-for-byte unchanged.
+      const isHandover = raw.body?.v === 2 && raw.body?.kind === 'handover'
       accepted.push(await acceptOne(wallet, messageBoxClient, {
         id: raw.messageId,
         assetId: raw.body.assetId,
@@ -238,8 +414,16 @@ export async function receiveTokens (p: ReceiveParams): Promise<ReceiveResult> {
         // Senders now randomize output order and say where our output
         // landed; older messages predate the field (recipient was always 0).
         outputIndex: typeof raw.body.outputIndex === 'number' ? raw.body.outputIndex : 0,
-        admission: raw.body.admission
-      }))
+        admission: raw.body.admission,
+        ...(isHandover
+          ? {
+              handover: {
+                linkage: Array.isArray(raw.body.linkage) ? raw.body.linkage : [],
+                admissions: Array.isArray(raw.body.admissions) ? raw.body.admissions : []
+              }
+            }
+          : {})
+      }, settle))
     } catch (error) {
       if (error instanceof InvalidTransferError) {
         // Poisoned message (body contradicts its transaction): acknowledge so
@@ -249,7 +433,11 @@ export async function receiveTokens (p: ReceiveParams): Promise<ReceiveResult> {
         } catch {
           processed?.delete(raw.messageId) // ack failed — let a later run drop it
         }
-        failed.push({ messageId: raw.messageId, error })
+        failed.push({
+          messageId: raw.messageId,
+          error,
+          ...(error.code != null ? { refusedCode: error.code } : {})
+        })
         continue
       }
       // Transient (network/wallet) — one bad transfer shouldn't block the

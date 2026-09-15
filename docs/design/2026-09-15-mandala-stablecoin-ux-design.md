@@ -371,11 +371,9 @@ Two rails (D4): **handle (MessageBox)** and **nearby**. No address rail.
 
 **6. No review screen.** `PayCta` sends directly, as every handle send in this app does (`PayScreen.tsx:1-13`, "two screens, no chooser"). The confirmation is the button: `label = t('pay_asset_cta', { amount: '25.00', ticker: 'USDX' })` → **"Send 25.00 USDX"**. A verb plus its exact object under the user's finger beats a screen repeating what is already on screen. `NearbyFlow`'s `send_confirm` phase remains the additive lever if testing demands one.
 
-**7. Submitting.** `PayCta busy`. Under it: `sendStartedRef` → `sendFlight.tryAcquire()` (synchronous, before any await) → `guardSendSubmit` → `sendTokenViaHandle` → `transferTokens` → `loadFtCandidates` → `selectFtInputs` → `generateFtChange` → `prepareBlindedPayment` → `createAction` → `matchOutputIndices` → `walletMandalaUnlock` → `signAction({noSend:true})` → `journalPut('intent')` → `submitToOverlay`.
+**7. Handing over — no pre-submit.** Per the 2026-09-15 maintainer decision (offline-settlement spec §12.9), the handle rail is hand-over-first, identical in structure to the nearby rail (§4.3): the payer never checks anything with the issuer at send time. `PayCta busy`. Under it: `sendStartedRef` → `sendFlight.tryAcquire()` (synchronous, before any await) → `guardSendSubmit` → `sendTokenViaHandle` → `transferTokens` → `loadFtCandidates` → `selectFtInputs` → `generateFtChange` → `prepareBlindedPayment` → `createAction` → `matchOutputIndices` → `walletMandalaUnlock` → `signAction({noSend:true})` → assemble the AdmissionBundle from local evidence → `journalPut('handed_over')` → `sendMessage` posts the v2 body (§9.13 of the wire contract) to `'mandala-payments'`. No `/submit`, no broadcast, and no σ_I for the tip happen here — the recipient's own drain runs `COVER`, credits the payment, and submits (ancestors first, tip last); the payer's own drain/reconcile may submit the same bytes later, harmlessly.
 
-**8. Delivering / broadcast.** On admit: `journalPut('accepted')` → **awaited** `broadcastAcceptedTx` with `sendWithResults` checked (L7) → `notifyPut` → `sendMessage` to `'mandala-payments'` → `notifyRemove`.
-
-**9. Success.**
+**8. Success.**
 
 ```
               ┌─────────────────────────────┐
@@ -383,20 +381,18 @@ Two rails (D4): **handle (MessageBox)** and **nearby**. No address rail.
               │        25.00 USDX           │  amountText
               │         to Alice            │
               │                             │
-              │  Sent. It hasn't reached    │  only when broadcast === 'pending'
-              │  the network yet — we'll    │
-              │  keep trying.               │
+              │   Sent · settling with      │  default, until the payer's own
+              │   Acme Bank                 │  drain sees σ_I(tip)
               │                             │
-              │  Sent. We couldn't tell     │  only when notified === false
-              │  them yet — they'll see it  │
-              │  when their wallet next     │
-              │  checks.                    │
+              │        Sent · settled       │  once the payer's own drain's
+              │                             │  online submit already returned
+              │                             │  σ_I before the screen dismisses
               │                             │
               │        [   Done   ]         │  appears after ~700 ms
               └─────────────────────────────┘
 ```
 
-The overlay must not claim settlement it does not have. `submitAndBroadcast` resolves at overlay-accept and hands the broadcast to a detached promise that never inspects `sendWithResults` (`L/overlay.ts:39-43, :99-114`) — so without L7 a green check and a success haptic fire over a payment that never reached the network. With L7 the wallet knows, and says so in the slot `PaymentSuccessOverlay` already has for exactly this (`broadcast?: boolean`, `:57-64`), using its own key because `:197-198` renders the received-side string ungated by direction.
+Settlement is never claimed at hand-over — it is an activity/settlement state (§5, and offline-settlement spec §5), not a send-time fact. The success screen defaults to **"Sent · settling with Acme Bank"** and only shows **"Sent · settled"** when confirmation already landed before the screen dismisses, matching the nearby rail's copy (§4.3). This replaces the former broadcast-pending / not-notified qualifier lines, which described a claim about network delivery this rail no longer makes at send time.
 
 ### 4.2 Every failure, with its exact copy
 
@@ -414,28 +410,22 @@ Pre-flight (nothing has happened; CTA disabled unless noted):
 | no BSV (CTA stays enabled) | **Sending USDX needs a little BSV for the network fee. Receiving doesn't.** [ Get BSV › ] |
 | part frozen (advisory) | **120.00 USDX of your balance is frozen and can't be sent.** |
 
-Post-submit (`ResultBanner`, tone `error`), driven by `classifyTokenSendError`:
+Post-submit — local, before hand-over (`ResultBanner`, tone `error`), driven by `classifyTokenSendError`. Since the handle rail no longer contacts the overlay at send time (§4.1 step 7), every row here is a **local** failure — nothing that requires an overlay round-trip appears in this table any more:
 
 | Thrown | Narrowing | Copy |
 |---|---|---|
-| `'overlay rejected the transaction'` + fresh `isPaused` | cache-bypassed `/admin/asset-state` refetch | **Acme Bank has paused USDX. Nothing was sent and your balance is unchanged.** |
-| same + recipient now blocked / unallowed / unregistered | refetch + `fetchRegistry` | **Acme Bank does not allow payments to this person. Nothing was sent and your balance is unchanged.** |
-| same + a selected outpoint now frozen/evicted | refetch | **Some of the USDX you were sending has just been frozen. Nothing was sent; your balance has been updated.** (fires `reconcileBans` + `refresh()`) |
-| same, nothing narrows | — | **Acme Bank refused this transfer. Nothing was sent and your USDX is unchanged.** [ Copy details ] |
-| any other throw at submit | — | **We couldn't reach Acme Bank to confirm this transfer. Check your USDX balance before trying again.** [ Check again ] |
 | `'insufficient token balance'` | `selectFtInputs` | **Your USDX balance changed while this was being prepared. Check the amount and try again.** |
 | toolbox funding throw at `createAction` | — | the same **needs-BSV** sentence, with [ Get BSV › ] |
 | `BusyError` | `sendFlight` / web lock | **A USDX payment is already going out.** |
-| notify failed | `TransferResult.notified === false` | **not a failure** — success overlay + qualifier line |
-| broadcast pending | `TransferResult.broadcast === 'pending'` | **not a failure** — success overlay + qualifier line |
 
-Three rules make this copy safe:
+**Overlay outcomes are not send-time failures on any rail.** Paused-asset, blocked/unallowed/unregistered-recipient, frozen/evicted-outpoint, and outright refusal are all outcomes the overlay can only render *after* hand-over, once the recipient's (or the payer's own) drain submits — so they no longer have a row in this table. They surface as activity/settlement states instead (§5; and offline-settlement spec §5's `settling` / `settled` / `refused` / `reversed` / `stuck` states), on the same activity entry the success screen (§4.1 step 8) already points at. The copy that used to read "We couldn't reach Acme Bank to confirm this transfer" is retired outright — there is no send-time issuer check left to fail.
 
-1. **The guarantee is separate from the guess.** "Nothing was sent" is attached only to the explicit-refusal path, where it is provable: `submitToOverlay` throws that exact string **only** when the facilitator returned with zero admitted outputs (`L/overlay.ts:24-26`), and `submitAndBroadcast` then calls `abortAction({reference})`, journalling `stage:'abort'` if the abort itself fails (`:85-95`). A wrong narrowing is therefore never a wrong promise.
-2. **A network throw is not a refusal.** A fetch/DNS/timeout failure comes out of `facilitator.send` with a different message entirely. In that case the overlay may have admitted the transaction and lost the response — the client aborts locally while the overlay considers the inputs spent, so an invited retry builds a second spend of the same coins and is refused for conservation forever. The copy therefore claims nothing and does not invite a retry; it says *check your balance first*, and [ Check again ] refreshes the balance and runs `reconcileWallet`.
-3. **Pre-flight is advisory and may only ever say "no".** `resolveAssetState` has a 10s TTL and fails open on `null` (`L/adminState.ts:15-27`), and `useRegistryAdmission` fails open on any ambiguity. No pre-flight string ever says "this will work".
+Two rules make this copy safe:
 
-The `issuer` in this copy is `resolveAssetState().issuerIdentityKey` resolved through `resolveIdentity`, falling back to `abbreviateKey`. When the issuer cannot be named, every `{{issuer}}` string has a sibling that says "the issuer" — the overlay-unreachable case in particular must not attribute an outage to a party that may not be the one that was unreachable (the two coincide only in the demo, where `isIssuer = identityKey === OVERLAY_IDENTITY_KEY`).
+1. **Pre-flight is advisory and may only ever say "no".** `resolveAssetState` has a 10s TTL and fails open on `null` (`L/adminState.ts:15-27`), and `useRegistryAdmission` fails open on any ambiguity. No pre-flight string ever says "this will work" — a clean pre-flight is not a settlement guarantee, only the activity/settlement state is.
+2. **A local throw at hand-over never implies overlay contact.** Every row above fires before the AdmissionBundle is even assembled or the MessageBox body is posted, so "nothing was sent" is always true for them without narrowing against overlay state.
+
+The `issuer` in this copy is `resolveAssetState().issuerIdentityKey` resolved through `resolveIdentity`, falling back to `abbreviateKey`. When the issuer cannot be named, every `{{issuer}}` string, including the settling/settled activity states (§5), has a sibling that says "the issuer" — an activity state in particular must not attribute a refusal or a stuck settlement to a party that may not be the one responsible (the two coincide only in the demo, where `isIssuer = identityKey === OVERLAY_IDENTITY_KEY`).
 
 **No dev-mode pause bypass.** The web app ships `?dev=1` persisted to `localStorage` that deliberately bypasses the client pause guard. That is a production escape hatch around a compliance control and it does not ship on a phone.
 
