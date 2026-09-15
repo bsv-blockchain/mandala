@@ -1,13 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { configureMandala } from './constants.js'
+import { fetchOverlayActivity, flattenActivityPages, describeActivity, ActivityEntry } from './overlayActivity.js'
 
 const mockFetch = vi.fn()
 vi.stubGlobal('fetch', mockFetch)
-
-vi.mock('./constants', () => ({
-  OVERLAY_URL: 'http://test-overlay'
-}))
-
-import { fetchOverlayActivity, flattenActivityPages, describeActivity, ActivityEntry } from './overlayActivity.js'
 
 const entry = (over: Partial<ActivityEntry>): ActivityEntry => ({
   txid: 't1',
@@ -21,21 +17,43 @@ const entry = (over: Partial<ActivityEntry>): ActivityEntry => ({
   ...over
 })
 
+const emptyPage = () => ({ ok: true, json: async () => ({ entries: [], nextCursor: null }) })
+
 describe('fetchOverlayActivity', () => {
-  beforeEach(() => { mockFetch.mockReset() })
+  beforeEach(() => {
+    mockFetch.mockReset()
+    configureMandala({ overlayUrl: 'http://test-overlay', adminApiToken: '' })
+  })
 
   it('requests a bounded page and no assetId filter when none given', async () => {
-    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ entries: [], nextCursor: null }) })
+    mockFetch.mockResolvedValueOnce(emptyPage())
     await fetchOverlayActivity()
-    expect(mockFetch).toHaveBeenCalledWith('http://test-overlay/admin/activity?limit=100')
+    expect(mockFetch).toHaveBeenCalledWith('http://test-overlay/admin/activity?limit=100', { headers: {} })
   })
 
   it('encodes assetId, limit, and the cursor into the query string', async () => {
-    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ entries: [], nextCursor: null }) })
+    mockFetch.mockResolvedValueOnce(emptyPage())
     await fetchOverlayActivity('tx id.0', { limit: 50, before: '2026-07-07T00:00:00.000Z' })
     expect(mockFetch).toHaveBeenCalledWith(
-      'http://test-overlay/admin/activity?assetId=tx+id.0&limit=50&before=2026-07-07T00%3A00%3A00.000Z'
+      'http://test-overlay/admin/activity?assetId=tx+id.0&limit=50&before=2026-07-07T00%3A00%3A00.000Z',
+      { headers: {} }
     )
+  })
+
+  it('sends the admin bearer token once configured (identity-bearing route)', async () => {
+    configureMandala({ adminApiToken: 'tok' })
+    mockFetch.mockResolvedValueOnce(emptyPage())
+    await fetchOverlayActivity('a.0')
+    expect(mockFetch).toHaveBeenCalledWith(
+      'http://test-overlay/admin/activity?assetId=a.0&limit=100',
+      { headers: { Authorization: 'Bearer tok' } }
+    )
+  })
+
+  it('throws before fetching when configureMandala has not set the overlay URL', async () => {
+    configureMandala({ overlayUrl: '' })
+    await expect(fetchOverlayActivity('a.0')).rejects.toThrow(/configureMandala/)
+    expect(mockFetch).not.toHaveBeenCalled()
   })
 
   it('returns parsed page with cursor', async () => {

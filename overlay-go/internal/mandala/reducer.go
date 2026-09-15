@@ -5,6 +5,10 @@ type FrozenRef struct {
 	Amount   int64  `json:"amount" bson:"amount"`
 	Owner    string `json:"owner" bson:"owner"`
 	Reason   string `json:"reason" bson:"reason"`
+	// HasFrozenRow is computed per request by AnnotateFrozenRows (A16), never
+	// persisted: whether the frozen coin still has a token row, i.e. whether a
+	// reissue of it can succeed.
+	HasFrozenRow bool `json:"hasFrozenRow" bson:"-"`
 }
 
 type AssetAdminState struct {

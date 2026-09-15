@@ -21,8 +21,10 @@ import { MandalaToken } from '@bsv/templates'
 import { BASKET, FT_PROTOCOL, MESSAGEBOX } from './constants.js'
 import { walletMandalaUnlock } from './unlock.js'
 import { revealLinkage, matchOutputIndices } from './tokens.js'
-import { submitAndBroadcast } from './overlay.js'
+import { AdmissionReceipt, admissionReceipt, submitAndBroadcast } from './overlay.js'
 import { encodeLinkagePayload } from './encoding.js'
+import { changeCustomInstructions, prepareBlindedPayment, recipientCustomInstructions } from './blinding.js'
+import { blindingPut } from './blindingJournal.js'
 import { loadFtCandidates } from './ftCandidates.js'
 import { selectFtInputs } from './ftSelect.js'
 import { generateFtChange } from './ftChange.js'
@@ -53,10 +55,20 @@ export interface TransferParams {
   recipientKey: string
 }
 
-export interface TransferResult {
+/**
+ * Extends AdmissionReceipt: the overlay's σ_I over
+ * `admissionDigestV2(txid, outputsToAdmit)`, the key that signed it and the
+ * admitted set it commits to. All three are needed to verify it — see
+ * admission.ts — so they always travel together.
+ */
+export interface TransferResult extends AdmissionReceipt {
   txid: string
   /** False when the tx committed but the recipient messagebox notify failed. */
   notified: boolean
+  /** The signed AtomicBEEF bytes — identical to what was submitted to the overlay. */
+  atomicBeef: number[]
+  /** The exact off-chain linkage payload bytes submitted alongside `atomicBeef` for this tx. */
+  offChainValues: number[]
 }
 
 export async function transferTokens (p: TransferParams): Promise<TransferResult> {
@@ -94,7 +106,14 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
 
   const stamp = Date.now()
   const keyIDOut = 'xfer-' + stamp
-  const ftOut = await new MandalaToken(wallet as any).lockBRC29(assetId, amount, FT_PROTOCOL, keyIDOut, recipientKey)
+  // Blind the sender identity toward the recipient (A′ = A + rG). r stays
+  // sender-local — never on the recipient output, never in the remittance.
+  const blinded = await prepareBlindedPayment(wallet as any, {
+    identityKey,
+    recipientKey,
+    keyID: keyIDOut
+  })
+  const ftOut = new MandalaToken(wallet as any).lock(assetId, amount, blinded.pubKeyHash)
   const recipientScript = ftOut.toHex()
 
   // One keyID per change output (the loop index keeps same-millisecond keyIDs
@@ -113,7 +132,11 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     satoshis: 1,
     lockingScript: recipientScript,
     outputDescription: 'FT to recipient',
-    customInstructions: JSON.stringify({ protocolID: FT_PROTOCOL, keyID: keyIDOut, counterparty: recipientKey, direction: 'sent', recipient: recipientKey }),
+    customInstructions: recipientCustomInstructions({
+      keyID: keyIDOut,
+      recipientKey,
+      senderBlinded: blinded.senderBlinded
+    }),
     tags: ['mandala', 'sent', assetId]
   }]
   for (const plan of changePlans) {
@@ -127,7 +150,14 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
       // of listActions — change outputs are the ones the wallet always keeps.
       // Every change output carries the FULL sentAmount (history reads the
       // first one it finds; per-output values would under-report).
-      customInstructions: JSON.stringify({ protocolID: FT_PROTOCOL, keyID: plan.keyID, counterparty: identityKey, direction: 'change', recipient: recipientKey, sentAmount: amount })
+      customInstructions: changeCustomInstructions({
+        keyID: plan.keyID,
+        identityKey,
+        recipientKey,
+        sentAmount: amount,
+        r: blinded.r,
+        senderBlinded: blinded.senderBlinded
+      })
     })
   }
 
@@ -138,7 +168,9 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
   let txid: string
   let recipientIndex: number
   let signedTx: number[]
-  const intent = journalIntentBegin()
+  let offChainValuesOut: number[]
+  let receipt: AdmissionReceipt = {}
+  const intent = await journalIntentBegin()
   try {
     const created = await wallet.createAction({
       description: `Send ${amount} of ${assetId}`,
@@ -186,7 +218,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     // inputs are revealed so the overlay can screen senders under access mode
     // (A6 gate 3). The reveals are independent wallet calls — run them together.
     const [linkOut, ...restLinks] = await Promise.all([
-      revealLinkage(wallet as any, keyIDOut, recipientKey),
+      Promise.resolve(blinded.linkage),
       ...changePlans.map(async c => await revealLinkage(wallet as any, c.keyID, identityKey)),
       ...spendInfo.map(async s => await revealLinkage(wallet as any, s.keyID, s.counterparty))
     ])
@@ -197,15 +229,24 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
       ...changeLinks.map((linkage, i) => ({ index: changeIndices[i], linkage }))
     ]
     const inLinks = inputLinks.map((linkage, i) => ({ index: i, linkage }))
-    const offChainValues = encodeLinkagePayload({ inputs: inLinks, outputs: outLinks })
+    offChainValuesOut = encodeLinkagePayload({ inputs: inLinks, outputs: outLinks })
     // Overlay gates: submit first; broadcast only on acceptance, else abort + throw.
     signedTx = signed.tx as number[]
     txid = signed.txid ?? Transaction.fromBEEF(signedTx).id('hex')
-    await submitAndBroadcast(wallet as any, { tx: signedTx, txid }, offChainValues, created.signableTransaction.reference)
+    await blindingPut({
+      txid,
+      r: blinded.r,
+      senderBlinded: blinded.senderBlinded,
+      recipient: recipientKey,
+      keyID: keyIDOut,
+      at: Date.now()
+    })
+    const admitted = await submitAndBroadcast(wallet as any, { tx: signedTx, txid }, offChainValuesOut, created.signableTransaction.reference)
+    receipt = admissionReceipt(admitted)
   } finally {
     // Outcome is now journaled ('accepted'/'abort') or the action settled —
     // the intent marker has done its job either way.
-    journalIntentEnd(intent)
+    await journalIntentEnd(intent)
   }
 
   // The tx is committed (overlay accepted); a notify failure must not undo it.
@@ -226,11 +267,29 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
       // their output sits at index 0 — tell them where it landed.
       outputIndex: recipientIndex,
       protocolID: FT_PROTOCOL,
-      sender: identityKey
+      // Remittance shows A′, not A — Bob derives against this and cannot
+      // join later payments. r is not included.
+      sender: blinded.senderBlinded,
+      senderMode: 'blinded',
+      // FIX H / §4.5: the handle rail's sender submits online, so it already
+      // holds the tip's own acceptance proof — forward it so the recipient can
+      // credit without waiting for its own overlay round-trip. Optional by
+      // design: a recipient that cannot verify it treats it as ABSENT (never
+      // as a decline), and legacy bodies simply do not carry it.
+      ...(receipt.admissionSignature != null && receipt.admissionIdentityKey != null
+        ? {
+            admission: {
+              txid,
+              outputsToAdmit: receipt.outputsToAdmit ?? [],
+              signature: receipt.admissionSignature,
+              signerKey: receipt.admissionIdentityKey
+            }
+          }
+        : {})
     },
     at: Date.now()
   }
-  notifyPut(notification)
+  await notifyPut(notification)
   let notified = true
   try {
     await messageBoxClient.sendMessage({
@@ -238,11 +297,11 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
       messageBox: notification.messageBox,
       body: notification.body
     })
-    notifyRemove(txid)
+    await notifyRemove(txid)
   } catch (e) {
     console.warn('[mandala] transfer committed but recipient notify failed; will retry via reconcileNotifications:', e)
     notified = false
   }
 
-  return { txid, notified }
+  return { txid, notified, atomicBeef: signedTx, offChainValues: offChainValuesOut, ...receipt }
 }

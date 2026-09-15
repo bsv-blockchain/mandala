@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   withAdminAuthGate,
+  withAdminAuthGates,
   beginAdminAuth,
   endAdminAuth,
   clearAdminAuthGates,
@@ -117,5 +118,73 @@ describe('double-submit race simulation (shipped gate)', () => {
     expect(rejected).toHaveLength(1)
     expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(BusyError)
     expect(createAction).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('withAdminAuthGates (composed multi-asset gate — A15)', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('acquires every asset in sorted assetId order regardless of input order, then releases all', async () => {
+    // Observe acquisition order through the web-lock layer each per-asset gate goes through.
+    const order: string[] = []
+    vi.stubGlobal('navigator', {
+      locks: {
+        request: async (name: string, _o: unknown, cb: (lock: unknown) => Promise<unknown>) => {
+          order.push(name)
+          return await cb({})
+        }
+      }
+    })
+    const claims = [
+      { assetId: 'c.0', priorOutpoint: 'pc.0' },
+      { assetId: 'a.0', priorOutpoint: 'pa.0' },
+      { assetId: 'b.0', priorOutpoint: 'pb.0' }
+    ]
+    const r = await withAdminAuthGates(claims, async () => {
+      expect(['a.0', 'b.0', 'c.0'].every(isAdminAuthInFlight)).toBe(true)
+      expect(adminAuthInFlightPrior('b.0')).toBe('pb.0')
+      return 'ok'
+    })
+    expect(r).toBe('ok')
+    expect(order).toEqual(['mandala.admin.a.0', 'mandala.admin.b.0', 'mandala.admin.c.0'])
+    // Input list is not mutated by the sort.
+    expect(claims.map(c => c.assetId)).toEqual(['c.0', 'a.0', 'b.0'])
+    for (const c of claims) expect(isAdminAuthInFlight(c.assetId)).toBe(false)
+  })
+
+  it('releases every acquired gate when fn throws', async () => {
+    const claims = [{ assetId: 'x.0', priorOutpoint: 'px' }, { assetId: 'y.0', priorOutpoint: 'py' }]
+    await expect(withAdminAuthGates(claims, async () => { throw new Error('overlay rejected') }))
+      .rejects.toThrow('overlay rejected')
+    expect(isAdminAuthInFlight('x.0')).toBe(false)
+    expect(isAdminAuthInFlight('y.0')).toBe(false)
+    await expect(withAdminAuthGates(claims, async () => 'again')).resolves.toBe('again')
+  })
+
+  it('a busy asset mid-list releases the gates acquired before it and never touches later ones', async () => {
+    beginAdminAuth('b.0', 'held-elsewhere')
+    const fn = vi.fn()
+    await expect(withAdminAuthGates([
+      { assetId: 'c.0', priorOutpoint: 'pc' },
+      { assetId: 'a.0', priorOutpoint: 'pa' },
+      { assetId: 'b.0', priorOutpoint: 'pb' }
+    ], fn)).rejects.toBeInstanceOf(BusyError)
+    expect(fn).not.toHaveBeenCalled()
+    expect(isAdminAuthInFlight('a.0')).toBe(false)
+    expect(isAdminAuthInFlight('c.0')).toBe(false)
+    // The external holder keeps its claim.
+    expect(adminAuthInFlightPrior('b.0')).toBe('held-elsewhere')
+  })
+
+  it('refuses duplicate assetIds — one prior cannot be spent twice in one tx', async () => {
+    await expect(withAdminAuthGates([
+      { assetId: 'a.0', priorOutpoint: 'p1' },
+      { assetId: 'a.0', priorOutpoint: 'p2' }
+    ], async () => 'never')).rejects.toThrow(/duplicate/i)
+    expect(isAdminAuthInFlight('a.0')).toBe(false)
+  })
+
+  it('an empty claim list just runs fn', async () => {
+    await expect(withAdminAuthGates([], async () => 'bare')).resolves.toBe('bare')
   })
 })

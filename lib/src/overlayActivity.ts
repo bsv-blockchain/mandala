@@ -5,7 +5,7 @@
  * records (identities proven via revealSpecificKeyLinkage at submission) and
  * the engine's raw-tx store. See overlay/src/activity.ts.
  */
-import { OVERLAY_URL } from './constants.js'
+import { adminAuthHeaders, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 
 export type ActivityKind = 'issue' | 'transfer' | 'self' | 'redeem'
 
@@ -40,11 +40,13 @@ export async function fetchOverlayActivity (
   assetId?: string,
   opts: { limit?: number, before?: string } = {}
 ): Promise<ActivityPage> {
+  if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
   const params = new URLSearchParams()
   if (assetId != null && assetId !== '') params.set('assetId', assetId)
   params.set('limit', String(opts.limit ?? ACTIVITY_PAGE_SIZE))
   if (opts.before != null) params.set('before', opts.before)
-  const res = await fetch(`${OVERLAY_URL}/admin/activity?${params.toString()}`)
+  // Identity-bearing route (A13): carries the admin bearer token when configured.
+  const res = await fetch(`${OVERLAY_URL}/admin/activity?${params.toString()}`, { headers: adminAuthHeaders() })
   if (!res.ok) throw new Error(`activity fetch failed: ${res.status}`)
   const data = await res.json()
   if (data == null || !Array.isArray(data.entries)) return { entries: [], nextCursor: null }

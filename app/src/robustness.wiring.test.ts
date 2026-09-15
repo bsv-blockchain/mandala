@@ -85,6 +85,26 @@ describe('robustness wiring (shipped source)', () => {
     expect(s).toMatch(/if \(busyRef\.current\) return/)
   })
 
+  it('IdentityRegistry mock-KYC uses registryFlight and compressed-key guard', () => {
+    const ui = src('components/issuer/IdentityRegistry.tsx')
+    const mut = src('hooks/useRegistryMutations.ts')
+    const libReg = lib('registry.ts')
+    expect(ui).toContain('registryFlight')
+    expect(ui).toContain('guardIdentityKey')
+    expect(ui).toContain('startedRef')
+    expect(ui).toContain('Re-attach identity chain')
+    expect(ui).toContain('handleOpen')
+    expect(mut).toContain('mockKycOpen')
+    expect(libReg).toContain('recoverRegistryAuth')
+    expect(mut).toContain('mockKycAdmit')
+    expect(mut).toContain('mockKycRevoke')
+    expect(libReg).toContain('registryFlight.run')
+    expect(libReg).toContain('nextRegistryPlan')
+    expect(libReg).toContain('buildRegistrySpendArgs')
+    expect(libReg).toContain('priorOutpoint: live.authOutpoint')
+    expect(libReg).toMatch(/inputs:\s*\[\{\s*outpoint: p\.priorOutpoint/)
+  })
+
   it('useIssuerMutations wraps register in registerFlight and pre-gates amounts', () => {
     const s = src('hooks/useIssuerMutations.ts')
     expect(s).toContain('registerFlight.run')
@@ -127,11 +147,21 @@ describe('robustness wiring (shipped source)', () => {
     expect(s).toContain("tryWithLock('mandala.reconcile'")
     // Failed aborts are retained (attempts++), not dropped on first failure.
     expect(s).toContain('ABORT_RETRY_CAP')
+    // §9.11: a retryable refusal is re-submitted then released; an accepted tx
+    // whose broadcast keeps failing is parked, not retried forever.
+    expect(s).toContain('RETRY_CAP')
+    expect(s).toContain('BROADCAST_RETRY_CAP')
+    expect(s).toContain("stage: 'stranded'")
+    expect(s).toMatch(/e\.stage === 'retryable'/)
   })
 
-  it('txJournal stages are intent | accepted | abort with per-entry atomic keys', () => {
+  it('txJournal stages cover the four recovery states plus intent, with per-entry atomic keys', () => {
     const s = lib('txJournal.ts')
-    expect(s).toContain("stage: 'intent' | 'accepted' | 'abort'")
+    // 'retryable' and 'stranded' are amendment v2.1 §9.11: a liftable refusal
+    // leaves a live action that needs a durable record, and an accepted tx whose
+    // broadcast never lands must stop wedging reconcile.
+    expect(s).toContain("stage: 'intent' | 'accepted' | 'abort' | 'retryable' | 'stranded'")
+    expect(s).toContain('journalListStranded')
     expect(s).toContain("'mandala.txJournal.'") // per-entry key prefix
     expect(s).not.toMatch(/stage:.*pending/)
   })
@@ -162,5 +192,90 @@ describe('robustness wiring (shipped source)', () => {
     const sendIdx = transfer.indexOf('messageBoxClient.sendMessage', putIdx)
     expect(putIdx).toBeGreaterThan(-1)
     expect(sendIdx).toBeGreaterThan(putIdx)
+  })
+
+  it('A08: submitAdminAction journals the reissue notification before sending; the console surfaces a pending notify', () => {
+    const assets = lib('assets.ts')
+    const putIdx = assets.indexOf('notifyPut(')
+    const sendIdx = assets.indexOf('messageBoxClient.sendMessage', putIdx)
+    expect(putIdx).toBeGreaterThan(-1)
+    expect(sendIdx).toBeGreaterThan(putIdx)
+    expect(assets).toContain('notifyRemove(')
+    expect(assets).toContain("senderMode: 'unblinded'")
+    expect(assets).toContain('outputIndex: 0')
+    const rc = src('components/issuer/RegulatoryControls.tsx')
+    expect(rc).toContain('notified')
+    expect(rc).toMatch(/recipient notification pending/i)
+  })
+
+  it('A15: registerAsset runs under intent + the mandala.register lock; global admin action under the composed gate', () => {
+    const issuer = lib('issuerOps.ts')
+    const assets = lib('assets.ts')
+    expect(issuer).toContain("tryWithLock('mandala.register'")
+    expect(issuer.match(/withIntent\(/g)?.length ?? 0).toBeGreaterThanOrEqual(3)
+    const globalFn = assets.slice(assets.indexOf('export async function submitGlobalAdminAction'))
+    expect(globalFn).toContain('withAdminAuthGates(')
+    expect(globalFn).toContain('withIntent(')
+    expect(globalFn).toContain('assertSpendablePrior(')
+  })
+
+  it('D3c: the three journals persist only through the injected storage adapter', () => {
+    for (const file of ['txJournal.ts', 'notifyJournal.ts', 'blindingJournal.ts']) {
+      const s = lib(file)
+      // The adapter owns the platform guard; a journal reaching for
+      // localStorage directly is exactly the RN-unsafe path D3c removed.
+      expect(s).not.toContain('localStorage !==')
+      expect(s).toContain("from './storage.js'")
+      expect(s).toContain('getStorage()')
+      // No memory mirror in front of the store — a second reader must never
+      // be served an entry the store no longer has.
+      expect(s).not.toMatch(/new Map<string, (JournalEntry|PendingNotification|BlindingRecord)>\(memory\)/)
+    }
+    const storage = lib('storage.ts')
+    expect(storage).toContain('export interface MandalaStorage')
+    expect(storage).toContain('export function configureStorage')
+    expect(storage).toContain('export function getStorage')
+    expect(storage).toContain('typeof localStorage !==')
+    // configureMandala stays the single entry point (D3a) and now carries it.
+    expect(lib('constants.ts')).toContain('configureStorage(endpoints.storage)')
+  })
+
+  it("D3c: the 'accepted' commit-point write is awaited before the background broadcast", () => {
+    const s = lib('overlay.ts')
+    const put = s.indexOf("await journalPut({ txid: signed.txid, stage: 'accepted'")
+    const broadcast = s.indexOf('broadcastAcceptedTx(wallet, signed.txid)')
+    expect(put).toBeGreaterThan(-1)
+    expect(broadcast).toBeGreaterThan(put)
+    // Every journal call site awaits: an un-awaited one reopens the crash window.
+    const calls = ['journalPut(', 'journalRemove(', 'journalIntentBegin(', 'journalIntentEnd(', 'notifyPut(', 'notifyRemove(', 'blindingPut(']
+    const unawaited: string[] = []
+    let sites = 0
+    for (const file of ['overlay.ts', 'transfer.ts', 'assets.ts', 'reconcile.ts', 'notifyJournal.ts']) {
+      for (const line of lib(file).split('\n')) {
+        const trimmed = line.trim()
+        // Imports name the symbols without calling them; so does the export.
+        if (trimmed.startsWith('import') || trimmed.startsWith('export ') || trimmed.startsWith('*') || trimmed.startsWith('//')) continue
+        if (!calls.some(c => trimmed.includes(c))) continue
+        sites++
+        if (!trimmed.includes('await ')) unawaited.push(`${file}: ${trimmed}`)
+      }
+    }
+    expect(sites).toBeGreaterThanOrEqual(18) // the enumerated D3c call sites
+    expect(unawaited).toEqual([])
+  })
+
+  it('A18: the post-mutation asset-state refresh bypasses the lib memo', () => {
+    const s = src('hooks/useAssetState.ts')
+    expect(s).toMatch(/resolveAssetState\([^)]*\{\s*force:\s*true\s*\}/)
+  })
+
+  it('A14: IssuerPanel hashes the deposit ref client-side and the issue mutation passes depositHash through the guard + issueTokens', () => {
+    const panel = src('components/IssuerPanel.tsx')
+    const mut = src('hooks/useIssuerMutations.ts')
+    expect(panel).toContain('sha256')
+    expect(panel).toContain('depositHash')
+    expect(panel).not.toMatch(/issueRef[^\n]*UI-only/)
+    expect(mut).toMatch(/guardIssueSubmit\(\{[\s\S]*bankRef/)
+    expect(mut).toMatch(/issueTokens\(\{[\s\S]*depositHash/)
   })
 })

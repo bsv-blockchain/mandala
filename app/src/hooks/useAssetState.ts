@@ -15,5 +15,14 @@ export function useAssetState(assetId: string) {
 /** Invalidate one asset's admin state from anywhere (post-admin-action). */
 export function useInvalidateAssetState() {
   const qc = useQueryClient()
-  return (assetId: string) => qc.invalidateQueries({ queryKey: assetStateKey(assetId) })
+  return async (assetId: string) => {
+    // Post-mutation path: the lib memoises resolveAssetState for 10 s, so a
+    // plain refetch could hand back pre-action state and the operator would
+    // see their freeze "not applied". Force one fresh fetch (which re-primes
+    // the memo), then let react-query refetch from it — one network call.
+    // Any remaining one-submit lag is the overlay folding the admission
+    // asynchronously: a server-side item, not addressed here.
+    await resolveAssetState(assetId, { force: true })
+    await qc.invalidateQueries({ queryKey: assetStateKey(assetId) })
+  }
 }

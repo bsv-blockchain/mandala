@@ -150,7 +150,7 @@ func lsAtomicBEEF(t *testing.T, tx *transaction.Transaction) []byte {
 
 func TestOutputAdmittedByTopicFTWithLinkage(t *testing.T) {
 	ctx := context.Background()
-	store := NewStore(testDB(t))
+	store := mustStore(t, testDB(t))
 	f := newLSFTFixture(t)
 	ls := NewLookupService(f.verifier, store)
 
@@ -219,7 +219,7 @@ func TestOutputAdmittedByTopicFTWithLinkage(t *testing.T) {
 
 func TestOutputAdmittedByTopicFTWithoutOffChainValues(t *testing.T) {
 	ctx := context.Background()
-	store := NewStore(testDB(t))
+	store := mustStore(t, testDB(t))
 	f := newLSFTFixture(t)
 	ls := NewLookupService(f.verifier, store)
 
@@ -282,7 +282,7 @@ func TestOutputAdmittedByTopicFTWithoutOffChainValues(t *testing.T) {
 
 func TestOutputAdmittedByTopicFTIndexMatchNilLinkagePropagatesError(t *testing.T) {
 	ctx := context.Background()
-	store := NewStore(testDB(t))
+	store := mustStore(t, testDB(t))
 	f := newLSFTFixture(t)
 	ls := NewLookupService(f.verifier, store)
 
@@ -335,7 +335,7 @@ func TestOutputAdmittedByTopicAtomicTxidNotInBundleReturnsError(t *testing.T) {
 	}()
 
 	ctx := context.Background()
-	store := NewStore(testDB(t))
+	store := mustStore(t, testDB(t))
 	f := newLSFTFixture(t)
 	ls := NewLookupService(f.verifier, store)
 
@@ -377,7 +377,7 @@ func TestOutputAdmittedByTopicAtomicTxidNotInBundleReturnsError(t *testing.T) {
 
 func TestOutputAdmittedByTopicRegisterAdmin(t *testing.T) {
 	ctx := context.Background()
-	store := NewStore(testDB(t))
+	store := mustStore(t, testDB(t))
 	verifier, err := NewVerifier(lsVerifierKeyHex)
 	if err != nil {
 		t.Fatal(err)
@@ -452,7 +452,7 @@ func TestOutputAdmittedByTopicRegisterAdmin(t *testing.T) {
 
 func TestOutputSpentDecrementsAndDeletes(t *testing.T) {
 	ctx := context.Background()
-	store := NewStore(testDB(t))
+	store := mustStore(t, testDB(t))
 	verifier, err := NewVerifier(lsVerifierKeyHex)
 	if err != nil {
 		t.Fatal(err)
@@ -501,7 +501,7 @@ func TestOutputSpentDecrementsAndDeletes(t *testing.T) {
 
 func TestLookupAssetIDExcludesEvicted(t *testing.T) {
 	ctx := context.Background()
-	store := NewStore(testDB(t))
+	store := mustStore(t, testDB(t))
 	verifier, err := NewVerifier(lsVerifierKeyHex)
 	if err != nil {
 		t.Fatal(err)
@@ -552,7 +552,7 @@ func TestLookupAssetIDExcludesEvicted(t *testing.T) {
 
 func TestLookupUnsupportedQuery(t *testing.T) {
 	ctx := context.Background()
-	store := NewStore(testDB(t))
+	store := mustStore(t, testDB(t))
 	verifier, err := NewVerifier(lsVerifierKeyHex)
 	if err != nil {
 		t.Fatal(err)

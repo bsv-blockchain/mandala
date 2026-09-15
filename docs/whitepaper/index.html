@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mandala — how the stablecoin actually works</title>
+<meta name="description" content="First-principles explanation of Mandala: issuance, overlay admission, BRC-42 child keys, linkage, sender blinding, and offline settlement on Bitcoin SV." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=Source+Serif+4:opsz,ital,wght@8..60,0,400;8..60,0,600;8..60,1,400;8..60,1,600&display=swap" rel="stylesheet" />
+<style>
+:root {
+  --paper: #f3ead8;
+  --paper-2: #ebe1cc;
+  --ink: #1c140c;
+  --ink-soft: #3d3226;
+  --muted: #6a5b48;
+  --gold: #8a6a2a;
+  --gold-line: #c4a35a;
+  --gold-dim: rgba(138, 106, 42, 0.18);
+  --admit: #2a5a3c;
+  --refuse: #8b2e2e;
+  --rule: rgba(28, 20, 12, 0.12);
+  --shadow: 0 1px 0 rgba(28,20,12,0.06);
+  --mono: "IBM Plex Mono", ui-monospace, monospace;
+  --serif: "Source Serif 4", Palatino, Georgia, serif;
+  --display: "Fraunces", Palatino, serif;
+  --max: 72rem;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; overflow-x: hidden; max-width: 100%; }
+body {
+  margin: 0;
+  overflow-x: hidden;
+  max-width: 100%;
+  background:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(196,163,90,0.18), transparent 50%),
+    var(--paper);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.0625rem;
+  line-height: 1.6;
+  font-optical-sizing: auto;
+  -webkit-font-smoothing: antialiased;
+}
+body::before {
+  content: "";
+  position: fixed; inset: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='800' height='800'><circle cx='400' cy='400' r='380' fill='none' stroke='%238a6a2a' stroke-opacity='0.05' stroke-width='1'/><circle cx='400' cy='400' r='280' fill='none' stroke='%238a6a2a' stroke-opacity='0.05'/><circle cx='400' cy='400' r='180' fill='none' stroke='%238a6a2a' stroke-opacity='0.05'/><circle cx='400' cy='400' r='80' fill='none' stroke='%238a6a2a' stroke-opacity='0.07'/></svg>");
+  background-repeat: no-repeat;
+  background-position: 110% -20%;
+  background-size: 70vmin;
+  z-index: 0;
+}
+a { color: var(--gold); text-underline-offset: 0.18em; }
+a:hover { color: var(--ink); }
+code, .math, kbd {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  font-weight: 500;
+}
+.wrap { max-width: var(--max); width: 100%; margin: 0 auto; padding: 0 1.5rem 6rem; position: relative; z-index: 1; overflow-x: hidden; }
+
+/* nav */
+nav.toc {
+  position: sticky; top: 0; z-index: 20;
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--rule);
+  display: flex; gap: 0.25rem; overflow-x: auto;
+  width: 100%;
+  max-width: 100vw;
+  padding: 0.55rem 1.5rem;
+  font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--muted);
+  -webkit-overflow-scrolling: touch;
+}
+nav.toc a { color: inherit; text-decoration: none; padding: 0.35rem 0.7rem; white-space: nowrap; border-radius: 999px; }
+nav.toc a:hover, nav.toc a.active { color: var(--ink); background: var(--gold-dim); }
+
+/* hero */
+header.hero { padding: 4.5rem 0 3rem; text-align: center; }
+.mark { width: 96px; height: 96px; margin: 0 auto 1.4rem; }
+.kicker {
+  font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.28em;
+  text-transform: uppercase; color: var(--gold); margin: 0 0 0.8rem;
+}
+h1 {
+  font-family: var(--display); font-weight: 500; font-size: clamp(1.85rem, 5vw, 3.4rem);
+  letter-spacing: -0.02em; line-height: 1.12; margin: 0 0 1rem;
+  text-wrap: balance; padding: 0 0.25rem;
+}
+.lede {
+  max-width: 40rem; margin: 0 auto 1.6rem; color: var(--ink-soft);
+  font-size: 1.15rem; font-style: italic; padding: 0 0.25rem;
+}
+@media (max-width: 540px) {
+  .lede { font-size: 1rem; }
+  .wrap { padding: 0 1.1rem 5rem; }
+  nav.toc { padding-left: 0.7rem; padding-right: 0.7rem; }
+}
+.meta { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); letter-spacing: 0.04em; }
+
+/* sections */
+section { padding: 2.75rem 0 1rem; border-top: 1px solid var(--rule); }
+section > h2 {
+  font-family: var(--display); font-weight: 550; font-size: 1.85rem;
+  letter-spacing: -0.015em; margin: 0 0 0.35rem; text-wrap: balance;
+}
+.num {
+  font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.18em;
+  text-transform: uppercase; color: var(--gold); display: block; margin-bottom: 0.45rem;
+}
+p { margin: 0.85rem 0; max-width: 42rem; overflow-wrap: break-word; }
+.wide p { max-width: none; }
+.note {
+  max-width: 42rem;
+  border-left: 3px solid var(--gold-line);
+  padding: 0.15rem 0 0.15rem 1rem;
+  color: var(--ink-soft); font-style: italic;
+}
+
+/* layout helpers */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin: 1.4rem 0; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin: 1.4rem 0; }
+.grid-2 > *, .grid-3 > *, .card, .panel { min-width: 0; }
+.mandala-wrap svg { width: 100%; height: auto; max-width: 26rem; }
+@media (max-width: 860px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+
+.card {
+  background: color-mix(in srgb, white 55%, var(--paper));
+  border: 1px solid var(--rule);
+  border-radius: 0.7rem;
+  padding: 1.1rem 1.2rem 1.15rem;
+  box-shadow: var(--shadow);
+}
+.card h3 {
+  font-family: var(--display); font-size: 1.05rem; font-weight: 600;
+  margin: 0 0 0.45rem;
+}
+.card ul { margin: 0.3rem 0 0; padding: 0 0 0 1.1rem; color: var(--ink-soft); }
+.card.gold { border-color: var(--gold-line); background: color-mix(in srgb, var(--gold-dim) 50%, white); }
+
+/* equation */
+.eq {
+  font-family: var(--mono); font-size: 0.95rem;
+  background: var(--paper-2);
+  border-top: 1px solid var(--gold-line);
+  border-bottom: 1px solid var(--gold-line);
+  padding: 0.85rem 1rem;
+  margin: 1.1rem 0;
+  text-align: center;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.eq .sub { font-size: 0.72em; }
+
+/* tables */
+.table-wrap { overflow-x: auto; margin: 1.1rem 0 1.4rem; max-width: 100%; }
+table {
+  width: 100%; border-collapse: collapse; font-size: 0.92rem;
+}
+@media (min-width: 720px) {
+  table { min-width: 36rem; }
+}
+th, td { text-align: left; padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--gold); font-weight: 500; }
+td.yes { color: var(--admit); font-weight: 600; }
+td.no { color: var(--muted); }
+.script {
+  font-family: var(--mono); font-size: 0.82rem; line-height: 1.55;
+  background: #1c140c; color: #f3ead8;
+  padding: 1rem 1.1rem; border-radius: 0.55rem; overflow-x: auto;
+  max-width: 100%;
+}
+.script .drop { color: #c4a35a; }
+.script .op { color: #e8d5a3; }
+
+/* interactive */
+.panel {
+  background: color-mix(in srgb, white 60%, var(--paper));
+  border: 1px solid var(--rule);
+  border-radius: 0.85rem;
+  padding: 1.2rem 1.3rem 1.3rem;
+  margin: 1.3rem 0 1.6rem;
+}
+.panel h3 { font-family: var(--display); margin: 0 0 0.6rem; font-size: 1.15rem; }
+.row { display: flex; flex-wrap: wrap; gap: 0.8rem 1.2rem; align-items: end; margin: 0.6rem 0; }
+label.field { display: flex; flex-direction: column; gap: 0.25rem; font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+input[type="number"], input[type="text"], select {
+  font-family: var(--mono); font-size: 0.95rem; color: var(--ink);
+  background: var(--paper); border: 1px solid var(--rule); border-radius: 0.4rem;
+  padding: 0.4rem 0.55rem; min-width: 6.5rem;
+}
+input:focus, select:focus, button:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+button {
+  font-family: var(--mono); font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase;
+  background: var(--ink); color: var(--paper); border: 0; border-radius: 0.4rem;
+  padding: 0.55rem 0.9rem; cursor: pointer;
+}
+button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--rule); }
+.verdict { font-family: var(--mono); font-size: 0.95rem; padding: 0.7rem 0.85rem; border-radius: 0.45rem; margin-top: 0.7rem; }
+.verdict.ok { background: color-mix(in srgb, var(--admit) 16%, white); color: var(--admit); }
+.verdict.bad { background: color-mix(in srgb, var(--refuse) 16%, white); color: var(--refuse); }
+
+.steps { counter-reset: step; list-style: none; padding: 0; margin: 1rem 0; max-width: 44rem; }
+.steps li {
+  counter-increment: step;
+  position: relative;
+  padding: 0.7rem 0 0.7rem 3rem;
+  border-bottom: 1px solid var(--rule);
+}
+.steps li::before {
+  content: counter(step, decimal-leading-zero);
+  position: absolute; left: 0; top: 0.75rem;
+  font-family: var(--mono); font-size: 0.72rem; color: var(--gold); letter-spacing: 0.08em;
+}
+
+/* mandala svg */
+.mandala-wrap { display: grid; grid-template-columns: 1.1fr 1fr; gap: 1.5rem; align-items: center; margin: 1.2rem 0 0.5rem; }
+@media (max-width: 860px) { .mandala-wrap { grid-template-columns: 1fr; } }
+.ring-legend button {
+  display: block; width: 100%; text-align: left; background: transparent; color: var(--ink);
+  border: 1px solid transparent; border-radius: 0.5rem; padding: 0.55rem 0.7rem; margin: 0.2rem 0;
+  text-transform: none; letter-spacing: 0; font-family: var(--serif); font-size: 0.95rem;
+}
+.ring-legend button:hover, .ring-legend button.on { background: var(--gold-dim); border-color: var(--gold-line); }
+.ring-legend strong { font-family: var(--display); font-weight: 600; display: block; }
+.ring-legend span { color: var(--muted); font-size: 0.88rem; }
+
+/* who-sees */
+.who td.hl { background: var(--gold-dim); }
+
+footer.site {
+  margin-top: 3rem; padding-top: 1.4rem; border-top: 1px solid var(--gold-line);
+  font-family: var(--mono); font-size: 0.75rem; color: var(--muted);
+}
+.refs { font-size: 0.92rem; }
+.refs li { margin: 0.35rem 0; }
+</style>
+</head>
+<body>
+<nav class="toc" aria-label="Sections">
+  <a href="#idea">Idea</a>
+  <a href="#layers">Layers</a>
+  <a href="#curve">Curve</a>
+  <a href="#ecdh">ECDH</a>
+  <a href="#child">Child keys</a>
+  <a href="#token">Token</a>
+  <a href="#chains">Chains</a>
+  <a href="#conserve">Conservation</a>
+  <a href="#link">Linkage</a>
+  <a href="#blind">Blinding</a>
+  <a href="#overlay">Overlay</a>
+  <a href="#offline">Offline</a>
+  <a href="#security">Security</a>
+  <a href="#refs">Refs</a>
+</nav>
+<div class="wrap">
+<header class="hero">
+  <svg class="mark" viewBox="0 0 100 100" aria-hidden="true">
+    <g fill="none" stroke="#8a6a2a" stroke-width="1.2">
+      <circle cx="50" cy="50" r="46"/>
+      <circle cx="50" cy="50" r="34"/>
+      <circle cx="50" cy="50" r="22"/>
+      <circle cx="50" cy="50" r="10"/>
+      <path d="M50 4 L50 96 M4 50 L96 50 M15.2 15.2 L84.8 84.8 M84.8 15.2 L15.2 84.8"/>
+    </g>
+    <circle cx="50" cy="50" r="3" fill="#8a6a2a"/>
+  </svg>
+  <p class="kicker">Mandala · Bitcoin SV</p>
+  <h1>How a fiat-backed token actually moves</h1>
+  <p class="lede">A first-principles walk through issuance, overlay admission, child keys, linkage, sender blinding, and offline settlement — for engineers who know computer science and BSV, and who are willing to learn the cryptography from the group law up.</p>
+  <p class="meta">Companion to the September 2026 whitepaper · github.com/bsv-blockchain/mandala</p>
+</header>
+
+<section id="idea">
+  <span class="num">00 — The one idea</span>
+  <h2>The chain is a notary. The overlay is a court.</h2>
+  <p>Bitcoin SV will mine any transaction whose unlocking scripts evaluate true and whose satoshis have not already been spent. That is all it does. It does not know what a dollar is. It will happily confirm a transaction that mints a million unbacked tokens, pays a sanctioned identity, or spends a frozen coin — as long as the P2PKH unlocks.</p>
+  <p>Mandala therefore splits labour. Consensus is the notary: it timestamps scripts and prevents satoshi double-spends. The overlay is the court: it decides whether a transaction is a <em>token movement</em>. A transaction may be mined and still be rejected by the overlay. A transaction the overlay accepts is a valid token movement. That is the whole architecture. Everything else is how the court is constrained so that it cannot mint without a public issuance spend, and so that anyone can rerun the same rules.</p>
+  <div class="grid-2">
+    <div class="card">
+      <h3>What miners decide</h3>
+      <ul>
+        <li>Unlocking scripts evaluate true.</li>
+        <li>Each satoshi is spent at most once.</li>
+        <li>The transaction is in a block (Merkle inclusion).</li>
+      </ul>
+    </div>
+    <div class="card gold">
+      <h3>What the overlay decides</h3>
+      <ul>
+        <li>Token amounts conserve, except for an authorized Δ<sub>auth</sub>.</li>
+        <li>Every fungible output is bound to an admitted identity.</li>
+        <li>Issuance, freeze, reissue, pause, admit, revoke are threshold-signed.</li>
+      </ul>
+    </div>
+  </div>
+  <p class="note">A licensed issuer is the trust anchor for administrative spends and for the identity graph. Listen-only replicas at exchanges recompute the same predicates and do not mint. Trust is concentrated where a fiat reserve already requires it, and split across keys so that no single officer can mint.</p>
+</section>
+
+<section id="layers">
+  <span class="num">01 — Concentric layers</span>
+  <h2>Four rings, one transaction.</h2>
+  <div class="mandala-wrap">
+    <svg id="rings" viewBox="0 0 420 420" role="img" aria-label="Four concentric layers of Mandala">
+      <g fill="none" stroke-linejoin="round">
+        <circle class="r" data-ring="0" cx="210" cy="210" r="190" stroke="#c4a35a" stroke-width="18" fill="rgba(196,163,90,0.08)" />
+        <circle class="r" data-ring="1" cx="210" cy="210" r="140" stroke="#8a6a2a" stroke-width="18" fill="rgba(138,106,42,0.10)" />
+        <circle class="r" data-ring="2" cx="210" cy="210" r="90" stroke="#3d3226" stroke-width="18" fill="rgba(28,20,12,0.08)" />
+        <circle class="r" data-ring="3" cx="210" cy="210" r="42" stroke="#1c140c" stroke-width="18" fill="#1c140c" />
+      </g>
+      <text x="210" y="216" text-anchor="middle" fill="#f3ead8" font-family="IBM Plex Mono" font-size="11">BSV</text>
+    </svg>
+    <div class="ring-legend" id="ringLegend"></div>
+  </div>
+  <p>A payment crosses every ring. The holder’s wallet builds a transaction. The overlay checks conservation, linkage, and membership, then signs the txid. Miners confirm the satoshis. The recipient, online or briefly offline, verifies Merkle inclusion and the overlay’s signature. No ring is optional. Skipping the overlay and broadcasting directly produces a mined transaction that is not a token.</p>
+</section>
+
+<section id="curve">
+  <span class="num">02 — The group, from first principles</span>
+  <h2>A private key is a number. A public key is that number of additions of G.</h2>
+  <p>secp256k1 is the elliptic curve Bitcoin uses. The equation is <span class="math">y<sup>2</sup> = x<sup>3</sup> + 7</span> over a 256-bit prime field. The points on that curve, plus a point at infinity, form an abelian group under a geometrically defined addition law: the line through two points hits the curve at a third, and you reflect that third point to get the sum. You do not need the geometry to use the protocol. You need three facts.</p>
+  <ol class="steps">
+    <li><strong>There is a generator <span class="math">G</span>.</strong> Repeated addition of <span class="math">G</span> produces every point in a huge cyclic subgroup. The number of such points is a prime <span class="math">n ≈ 2<sup>256</sup></span>.</li>
+    <li><strong>A private key is a scalar <span class="math">a</span> chosen uniformly from <span class="math">1 … n−1</span>.</strong> The public key is the point <span class="math">A = aG</span>, meaning <span class="math">G</span> added to itself <span class="math">a</span> times. Computing this is cheap (double-and-add). Computing <span class="math">a</span> from <span class="math">A</span> is the elliptic-curve discrete logarithm, assumed infeasible.</li>
+    <li><strong>Scalar multiplication distributes over addition.</strong> <span class="math">(a+b)G = aG + bG</span>, and <span class="math">a(bG) = (ab)G = b(aG)</span>. That last identity is elliptic-curve Diffie–Hellman. It is why two people can agree on a secret point without sending private keys.</li>
+  </ol>
+  <p>HASH160, used everywhere Bitcoin puts a key in a locking script, is <span class="math">RIPEMD-160(SHA-256(·))</span>. It is a one-way fingerprint of a compressed public key. Seeing HASH160(<span class="math">P</span>) does not reveal <span class="math">P</span>, let alone the private key.</p>
+</section>
+
+<section id="ecdh">
+  <span class="num">03 — Shared secrets</span>
+  <h2>Alice and Bob compute the same point. Nobody else can.</h2>
+  <p>Alice holds <span class="math">(a, A = aG)</span>. Bob holds <span class="math">(b, B = bG)</span>. Alice multiplies her private key by Bob’s public key. Bob multiplies his private key by Alice’s public key.</p>
+  <div class="eq">S = a · B = a · (bG) = (ab)G = b · (aG) = b · A</div>
+  <p>The point <span class="math">S</span> is a shared secret. An eavesdropper who sees only <span class="math">A</span> and <span class="math">B</span> cannot compute it (computational Diffie–Hellman, which follows from discrete log on this curve). <span class="math">S</span> is the root of every child key Mandala will derive between these two identities. Treat it the way you would treat a master password for the pair <em>(Alice, Bob)</em>: never put it on a wire, never give it to the overlay, never write it next to a payment.</p>
+  <p class="note">In implementations, <span class="math">S</span> is the compressed 33-byte encoding of the point, and that encoding is the HMAC key. The whitepaper writes <span class="math">HMAC(S, ι)</span> for this.</p>
+</section>
+
+<section id="child">
+  <span class="num">04 — Child keys (BRC-42)</span>
+  <h2>One shared secret, infinitely many one-time keys, selected by an invoice.</h2>
+  <p>BIP32 gives you a tree of keys from one master. BRC-42 gives you a <em>fresh universe of keys per counterparty</em>, because the HMAC key is the ECDH secret with that counterparty. The selector is an invoice number <span class="math">ι</span>.</p>
+  <div class="eq">ι = ℓ-protocolID-keyID</div>
+  <p>That three-part form is BRC-43. <span class="math">ℓ</span> is a security level (0, 1, or 2) that tells a wallet how loudly to prompt. <span class="math">protocolID</span> namespaces the application (“mandala token”, “mandala admin”). <span class="math">keyID</span> is free-form and, in Mandala, is often the hash of a structured object — so the derived key is a <em>commitment</em> to that object.</p>
+  <div class="eq">
+    k = int( HMAC-SHA256( compress(S), UTF-8(ι) ) ) mod n<br/>
+    H = kG<br/>
+    P<sub>out</sub> = B + H = (b + k)G &nbsp;&nbsp;&nbsp; b<sub>out</sub> = (b + k) mod n
+  </div>
+  <p>Read the last line slowly. Adding the point <span class="math">H</span> to Bob’s public key is the same as adding the scalar <span class="math">k</span> to Bob’s private key. Alice can compute <span class="math">P<sub>out</sub></span> because she has <span class="math">a</span> and <span class="math">B</span>. Bob can compute <span class="math">b<sub>out</sub></span> because he has <span class="math">b</span> and <span class="math">A</span>. A miner sees only HASH160(<span class="math">P<sub>out</sub></span>). That is a one-time address. Reuse of <span class="math">ι</span> with the same pair would reuse the address; Mandala never does.</p>
+  <div class="grid-3">
+    <div class="card"><h3>Anyone can compute P<sub>out</sub></h3><p style="margin:0;font-size:0.92rem;color:var(--ink-soft)">from (a, B, ι) or (b, A, ι). This is how Alice locks a coin to Bob without asking him for a fresh address.</p></div>
+    <div class="card"><h3>Only Bob can compute b<sub>out</sub></h3><p style="margin:0;font-size:0.92rem;color:var(--ink-soft)">He needs b. That is why the output is his, even though Alice chose the invoice.</p></div>
+    <div class="card"><h3>The chain sees a fingerprint</h3><p style="margin:0;font-size:0.92rem;color:var(--ink-soft)">HASH160(P<sub>out</sub>). Not A, not B, not S, not k, not ι.</p></div>
+  </div>
+</section>
+
+<section id="token">
+  <span class="num">05 — The token output</span>
+  <h2>One satoshi, a dropped payload, a standard P2PKH tail.</h2>
+  <p>A Mandala fungible output is deliberately boring. Push the asset identifier and the amount, drop them, then pay a public-key hash. Classification is off-chain: if the script has this exact 8-chunk shape, it is a token. There is no <code>!</code> prefix. Consensus would ignore it, and the overlay already knows the rule set.</p>
+  <pre class="script"><span class="drop">&lt;assetId&gt;  &lt;amount&gt;  OP_2DROP</span>
+<span class="op">OP_DUP  OP_HASH160  &lt;h&gt;  OP_EQUALVERIFY  OP_CHECKSIG</span></pre>
+  <p><code>assetId</code> is 36 bytes: the genesis outpoint in internal byte order (txid as <code>tx.hash()</code>, then 4-byte little-endian vout). A contract comparing the embedded identifier to an outpoint in the same transaction does not have to reverse anything. The string form remains <code>&lt;txid&gt;.&lt;vout&gt;</code>. Amounts are Bitcoin script numbers in <em>base units</em>. Decimals are metadata, never on-chain. Each output carries one satoshi so the token cannot hide a satoshi balance underneath.</p>
+  <p>The administrative output is a pay-to-multi-key-hash (minimum two-of-two), optionally prefixed with a JSON blob that is pushed and dropped. The locking keys are themselves BRC-42 children whose <code>keyID</code> is <code>SHA-256(canonical action JSON)</code>. Spending the live admin outpoint to produce the next one is the only way to extend the issuance chain. That is the public function of supply.</p>
+</section>
+
+<section id="chains">
+  <span class="num">06 — Two administrative chains</span>
+  <h2>Supply is one spine. Membership is another.</h2>
+  <p>Both chains are hash-linked sequences of threshold spends. Each spend consumes authorized outpoint <span class="math">n</span> and produces <span class="math">n+1</span>. Forging a step requires a live signing threshold. Rewriting history after broadcast requires a deep reorg. Keys rotate by a dedicated spend that publishes the new set, the threshold, and the height <span class="math">h</span> at which it becomes authoritative for fresh attestation signatures.</p>
+  <div class="grid-2">
+    <div class="card gold">
+      <h3>Issuance — per asset</h3>
+      <ul>
+        <li>Genesis outpoint <em>is</em> the assetId.</li>
+        <li>A bank deposit is followed by an issue that commits a hash of the deposit record and mints matching face value.</li>
+        <li>Redeem, freeze, reissue are the same chain with a different Δ<sub>auth</sub>.</li>
+        <li>P2MKH, two-of-two minimum; an off-site recovery key is in the set but does not sign day to day.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Registration — per issuer</h3>
+      <ul>
+        <li>One admission covers every stablecoin that issuer operates.</li>
+        <li>Identity keys are not pushed on-chain.</li>
+        <li>Each spend is admit or revoke. keyID = HASH(event object).</li>
+        <li>A regulator given the event object recomputes ι and the bound key and opens the event.</li>
+        <li>The database is a cache of the replay. It is not the source of truth.</li>
+      </ul>
+    </div>
+  </div>
+  <p>Freeze does not spend the holder’s coin. It marks the outpoint unspendable in overlay state (Δ<sub>auth</sub> = 0). Reissue targets an already-frozen outpoint, evicts it from the overlay’s balance view, and mints replacement units to a named recipient with Δ<sub>auth</sub> = +amount and <em>zero</em> fungible inputs of that asset. Net supply is unchanged in the overlay’s derived view. That conservation is an overlay invariant, not a consensus invariant — by design. A different overlay that admitted the evicted spend would double-count. Do not “fix” this by letting the frozen coin be spent.</p>
+</section>
+
+<section id="conserve">
+  <span class="num">07 — Conservation</span>
+  <h2>Outputs equal inputs, plus whatever the issuer just authorized.</h2>
+  <div class="eq">Σ a<sub>out</sub> = Σ a<sub>in</sub> + Δ<sub>auth</sub></div>
+  <p>This is the entire inflation check. A peer transfer has Δ<sub>auth</sub> = 0. An issue has Δ<sub>auth</sub> = +amount, and only because a verified administrative output for that asset is in the same transaction. A redeem has Δ<sub>auth</sub> = −amount, so a partial burn still balances. Try it.</p>
+  <div class="panel">
+    <h3>Does the overlay admit this?</h3>
+    <div class="row">
+      <label class="field">Inputs (base units)<input id="cin" type="number" value="100" min="0" /></label>
+      <label class="field">Outputs<input id="cout" type="number" value="100" min="0" /></label>
+      <label class="field">Kind
+        <select id="ckind">
+          <option value="0">peer transfer (Δ = 0)</option>
+          <option value="40">issue +40</option>
+          <option value="-25">redeem −25</option>
+          <option value="100">reissue +100, in must be 0</option>
+        </select>
+      </label>
+      <button type="button" id="crun">Check</button>
+    </div>
+    <div id="cverdict" class="verdict ok">100 = 100 + 0. Admitted as a peer transfer.</div>
+  </div>
+</section>
+
+<section id="link">
+  <span class="num">08 — Linkage: reveal k, never S</span>
+  <h2>The overlay must know who owns an output. It must not learn the master secret.</h2>
+  <p>The association the overlay needs is <span class="math">P<sub>out</sub> = B + kG</span>. Two revelations are possible under BRC-69.</p>
+  <div class="grid-2">
+    <div class="card">
+      <h3>Counterparty revelation — S</h3>
+      <p style="margin:0;font-size:0.92rem;color:var(--ink-soft)">Anyone with S can recompute HMAC(S, ι′) for every past and future invoice between the two parties. That links their entire history. Mandala never does this for payments.</p>
+    </div>
+    <div class="card gold">
+      <h3>Specific revelation — k</h3>
+      <p style="margin:0;font-size:0.92rem;color:var(--ink-soft)">k is the HMAC output for one invoice. It links one output. Encrypted to the overlay under BRC-72 (BRC-2 encryption to the overlay’s identity key). The overlay checks HASH160(compress(B + kG)) = h and refuses on mismatch.</p>
+    </div>
+  </div>
+  <p>The same specific revelation is attached to every fungible <em>input</em>. A spend can therefore be named from the identity bound when that coin was first accepted. That is how the overlay knows Alice is spending, even when Bob is shown a blinded key.</p>
+  <p class="note">Compromise of the overlay’s decryption key discloses the identity graph (who owned which output). It does not disclose S, so it does not let the attacker derive future child keys or decrypt BRC-2 payloads between users. Those use the child-key ECDH, which the overlay never sees.</p>
+</section>
+
+<section id="blind">
+  <span class="num">09 — Sender blinding</span>
+  <h2>Bob must be able to unlock. He must not be able to join Alice’s later payments.</h2>
+  <p>If the remittance carried Alice’s long-term identity <span class="math">A</span>, Bob could derive every future child against <span class="math">A</span> and recognize her. Authenticated BRC-29 payments do exactly that, on purpose, when the payee should know the payer. For a stablecoin moving through the world, Mandala blinds.</p>
+  <div class="eq">r ← {1…n−1} &nbsp;&nbsp; A′ = A + rG = (a + r)G</div>
+  <p>Alice presents <span class="math">A′</span>, not <span class="math">A</span>. Bob derives against <span class="math">A′</span>. Consecutive payments sample a fresh <span class="math">r</span> and do not join. This is the same remittance <em>shape</em> as BRC-29 and the same privacy <em>goal</em> as unlinkable payments (BRC-228), with one difference that matters for later proof: <span class="math">A′</span> is an additive blinding of the long-term identity, not an independent ephemeral. Alice can later open it.</p>
+  <div class="grid-2">
+    <div class="card">
+      <h3>Open</h3>
+      <p style="margin:0;font-size:0.92rem;color:var(--ink-soft)">Reveal r. Anyone checks A′ − rG = A. Cheap, and it discloses r, so that particular A′ is now joinable to A. Fine after the fact, when a recipient asks “was this you?”</p>
+    </div>
+    <div class="card">
+      <h3>Schnorr proof of r</h3>
+      <p style="margin:0;font-size:0.92rem;color:var(--ink-soft)">Prove knowledge of r such that A′ − A = rG, without revealing r (BRC-94 / RFC 8235). The statement is a discrete log. The overlay never needs this; it already bound Alice from the inputs.</p>
+    </div>
+  </div>
+  <p>Change outputs locked back to Alice still use <span class="math">A</span> as counterparty. They never leave her wallet, so blinding them would be theatre.</p>
+
+  <div class="panel">
+    <h3>Who learns the sender?</h3>
+    <p style="margin-top:0;color:var(--muted);font-size:0.92rem;">A transfer of coins Alice already owns, paid to Bob, with remittance A′.</p>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Chain</th><th>Overlay</th><th>Bob</th><th>Alice</th></tr></thead>
+      <tbody>
+        <tr><td>A (Alice’s identity)</td><td class="no">no</td><td class="yes">input linkage</td><td class="no">no, sees A′</td><td class="yes">yes</td></tr>
+        <tr><td>B (Bob’s identity)</td><td class="no">no</td><td class="yes">output linkage</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+        <tr><td>k (this output)</td><td class="no">no</td><td class="yes">encrypted</td><td class="yes">computes it</td><td class="yes">yes</td></tr>
+        <tr><td>S = aB (root secret)</td><td class="no">no</td><td class="no">no</td><td class="no">no (uses A′)</td><td class="yes">yes, with r</td></tr>
+        <tr><td>σ<sub>I</sub> (admit signature)</td><td class="no">no</td><td class="yes">produces it</td><td class="yes">carries it offline</td><td class="yes">receives it</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</section>
+
+<section id="overlay">
+  <span class="num">10 — Overlay admission</span>
+  <h2>Sign, withhold broadcast, attach linkage, submit. Broadcast only on admit.</h2>
+  <p>The overlay’s topic manager, <code>tm_mandala</code>, is a pure function of the transaction, the off-chain linkage payload, and derived administrative state. If any gate fails, the transaction is not a token movement. Gates, in order:</p>
+  <ol class="steps">
+    <li><strong>Admin-output verification.</strong> Re-derive the expected P2MKH (or bound P2PKH) from the canonical action object. Check that the prior authorization outpoint was actually spent. Only the live threshold can extend the chain. <code>register</code> is the first link and has no prior.</li>
+    <li><strong>Authorized issuance.</strong> <code>issue</code> / <code>reissue</code> credit +amount to Δ<sub>auth</sub>. <code>redeem</code> credits −amount. Other kinds credit 0.</li>
+    <li><strong>Specific linkage.</strong> Every fungible output must carry a k that satisfies HASH160(B + kG) = h. Missing linkage is not admitted; conservation then fails; the whole transaction is refused.</li>
+    <li><strong>Conservation.</strong> Per asset, Σ a<sub>out</sub> = Σ a<sub>in</sub> + Δ<sub>auth</sub>. This is what stops anyone from fabricating units.</li>
+    <li><strong>Sanctions.</strong> Every identity touching the transaction is screened. A hit refuses the whole transaction, including issuer actions. You cannot reissue to a sanctioned key.</li>
+    <li><strong>Frozen / evicted inputs.</strong> Universal, no admin exemption. The only resolutions are unfreeze or reissue.</li>
+    <li><strong>Pause.</strong> Peer transfers of a paused asset are refused. Verified admin actions still go through, so the issuer can unpause.</li>
+    <li><strong>Access mode.</strong> Denylist or allowlist on the reconstructed registration view, peer transfers only. The issuer’s identity is always authorized.</li>
+  </ol>
+  <p>On admission of <span class="math">T</span> the overlay returns <span class="math">σ<sub>I</sub></span> under the live issuer key on <span class="math">m<sub>acc</sub> = txid(T)</span>. It does not enumerate output indices. If any output in <span class="math">T</span> were not a genuine token, <span class="math">T</span> would not have been signed. Acceptance of the identifier is acceptance of every spendable token output in that transaction. The signature attests to validity <em>at acceptance time</em>, not to the absence of a later spend.</p>
+  <p>The lookup service <code>ls_mandala</code> is the single writer of derived administrative state. It folds admitted admin actions in chain order (height, offset, a monotonic admit sequence). The topic manager only reads. The database is a cache of that replay.</p>
+</section>
+
+<section id="offline">
+  <span class="num">11 — Offline settlement</span>
+  <h2>The same double-spend window Bitcoin has always had, plus a name the issuer already knows.</h2>
+  <p>Offline mode is a convenience path for short disconnects. Sender blinding still applies. A receiver with cached headers verifies that an offered native input is a mined output by checking a Merkle path. What cannot be known offline is whether that output has already been spent. On reconnect, Arcade — a relay, not an oracle of truth — reports whether the inputs are unspent. The fraud window is the offline interval. The signature already held is evidence.</p>
+  <p>Token transfers need one extra object: <span class="math">σ<sub>I</sub></span> on each unique input txid, verified against the issuer key that was live at the height of the corresponding Merkle path, or the current key for unconfirmed inputs. The recipient then has the same existence proof a native transfer has, plus assurance that the issuer accepted those inputs as tokens and already knows who they belong to.</p>
+  <p>If a fraudulent offline double-spend is alleged, an appropriate authority asks the issuer to open the identity already bound to those inputs. Two offline receivers can both accept spends of the same input; exactly one spend survives contact with the network. That is not a Mandala defect. It is Bitcoin’s offline model, with an identity the overlay already recorded.</p>
+</section>
+
+<section id="security">
+  <span class="num">12 — What a lying party can and cannot do</span>
+  <h2>State the claims so they can be attacked.</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Adversary</th><th>Can</th><th>Cannot</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>A single issuance officer</td>
+        <td>Refuse to sign; stall minting.</td>
+        <td>Mint. The script is at least two-of-two.</td>
+      </tr>
+      <tr>
+        <td>A lying overlay</td>
+        <td>Refuse valid transfers (liveness).</td>
+        <td>Create tokens without an issuance-chain spend. Holders mitigate by running a replica and demanding σ<sub>I</sub> at receipt.</td>
+      </tr>
+      <tr>
+        <td>Overlay key compromise</td>
+        <td>Decrypt the identity graph.</td>
+        <td>Learn S, so cannot derive future child keys or decrypt user-to-user BRC-2 payloads.</td>
+      </tr>
+      <tr>
+        <td>Bob, given only remittances</td>
+        <td>Unlock coins paid to him; see A′.</td>
+        <td>Join Alice’s later payments, or recover A, while r is unopened.</td>
+      </tr>
+      <tr>
+        <td>An offline double-spender</td>
+        <td>Hand the same input to two receivers during the disconnect.</td>
+        <td>Have both spends survive reconnect. The issuer can name them to an authority.</td>
+      </tr>
+      <tr>
+        <td>A deep reorg</td>
+        <td>The same thing it can do to native satoshis.</td>
+        <td>Forge an administrative step without the live threshold — unless the reorg also erases that spend, which is the same bar as erasing Bitcoin history.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="note">Addresses are single-use. The object that is KYC’d is a long-lived identity key. Compliance is a predicate on that key, not on an address. Legal structure, licensing, and reserve composition are out of scope of the protocol — they are why a licensed issuer exists, not something the script evaluates.</p>
+</section>
+
+<section id="refs">
+  <span class="num">References</span>
+  <h2>Where every claim lives.</h2>
+  <ol class="refs">
+    <li>C. P. Schnorr, “Efficient identification and signatures for smart cards,” CRYPTO ’89. Also <a href="https://grokipedia.com/page/Schnorr_signature">Grokipedia: Schnorr signature</a>.</li>
+    <li>Deggen, “Mandala Token Protocol,” <a href="https://bsv.brc.dev/tokens/0092">BRC-92</a>.</li>
+    <li>T. Everett, “BSV Key Derivation Scheme (BKDS),” <a href="https://bsv.brc.dev/key-derivation/0042">BRC-42</a>.</li>
+    <li>T. Everett, “Simple Authenticated BSV P2PKH Payment Protocol,” <a href="https://bsv.brc.dev/payments/0029">BRC-29</a>.</li>
+    <li>T. Everett, “Revealing Key Linkages,” <a href="https://bsv.brc.dev/key-derivation/0069">BRC-69</a>.</li>
+    <li>T. Everett, “Protecting BRC-69 Key Linkage Information in Transit,” <a href="https://bsv.brc.dev/key-derivation/0072">BRC-72</a>.</li>
+    <li>T. Everett, “Verifiable Revelation of Shared Secrets Using Schnorr Protocol,” <a href="https://bsv.brc.dev/key-derivation/0094">BRC-94</a>.</li>
+    <li>F. Hao, “Schnorr Non-interactive Zero-Knowledge Proof,” <a href="https://datatracker.ietf.org/doc/rfc8235/">RFC 8235</a>.</li>
+    <li>Krawczyk, Bellare, Canetti, “HMAC,” <a href="https://datatracker.ietf.org/doc/rfc2104/">RFC 2104</a>.</li>
+    <li>S. Nakamoto, “Bitcoin: A Peer-to-Peer Electronic Cash System,” 2008.</li>
+    <li>BSV Association, <a href="https://github.com/bsv-blockchain/arcade">Arcade</a>.</li>
+    <li>T. Everett, “Thoughts on the Mandala Network,” <a href="https://bsv.brc.dev/opinions/0090">BRC-90</a>.</li>
+    <li>Certicom, “SEC 2,” secp256k1. <a href="https://www.secg.org/sec2-v2.pdf">sec2-v2.pdf</a>.</li>
+    <li>Bitcoin SV BRCs, SPV and unified Merkle paths, <a href="https://bsv.brc.dev/transactions/0067">BRC-67</a> / <a href="https://bsv.brc.dev/transactions/0074">BRC-74</a>.</li>
+    <li>T. Everett, “Identity Certificates,” <a href="https://bsv.brc.dev/peer-to-peer/0052">BRC-52</a>.</li>
+    <li>BSV Association, <a href="https://github.com/bsv-blockchain/mandala">Mandala</a>.</li>
+    <li>“Unlinkable Payments under the Identity Paradigm,” <a href="https://bsv.brc.dev/payments/0228">BRC-228</a>.</li>
+    <li>BSV Association, <a href="https://github.com/bsv-blockchain/ts-templates">ts-templates</a>, including P2MKH.</li>
+    <li>T. Everett, “Security Levels, Protocol IDs, Key IDs and Counterparties,” <a href="https://bsv.brc.dev/key-derivation/0043">BRC-43</a>.</li>
+  </ol>
+</section>
+
+<footer class="site">
+  Companion explainer to <em>Mandala: Auditable Fiat-Backed Tokens on Bitcoin SV</em>, September 2026.
+  The whitepaper is the protocol. This page is the pedagogy.
+</footer>
+</div>
+
+<script>
+const rings = [
+  { name: "Wallets at the edge", blurb: "One-time child keys, blinded remittance, MessageBox handoff." },
+  { name: "Two admin chains", blurb: "Issuance (supply) and registration (membership), threshold-locked." },
+  { name: "Overlay court", blurb: "Conservation, linkage, membership, σ_I on txid(T)." },
+  { name: "Bitcoin SV consensus", blurb: "Scripts and satoshi double-spend prevention. Does not read assetId." },
+];
+const legend = document.getElementById("ringLegend");
+legend.innerHTML = rings.map((r, i) =>
+  `<button type="button" data-i="${i}"><strong>${r.name}</strong><span>${r.blurb}</span></button>`
+).join("");
+function setRing(i) {
+  document.querySelectorAll("#ringLegend button").forEach((b, j) => b.classList.toggle("on", j === i));
+  document.querySelectorAll("#rings .r").forEach((c, j) => {
+    c.setAttribute("stroke-width", j === i ? "22" : "16");
+    c.style.opacity = String(j === i ? 1 : 0.55);
+  });
+}
+legend.addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  setRing(Number(b.dataset.i));
+});
+setRing(2);
+
+function checkConserve() {
+  const inn = Number(document.getElementById("cin").value);
+  const out = Number(document.getElementById("cout").value);
+  const sel = document.getElementById("ckind");
+  const d = Number(sel.value);
+  const kind = sel.selectedOptions[0].text;
+  const v = document.getElementById("cverdict");
+  const reissue = kind.startsWith("reissue");
+  if (reissue && inn !== 0) {
+    v.className = "verdict bad";
+    v.textContent = "Refused: reissue must carry zero fungible inputs of this asset.";
+    return;
+  }
+  if (out === inn + d) {
+    v.className = "verdict ok";
+    v.textContent = `${out} = ${inn} + (${d}). Admitted as ${kind}.`;
+  } else {
+    v.className = "verdict bad";
+    v.textContent = `Refused: ${out} ≠ ${inn} + (${d}). Conservation violated.`;
+  }
+}
+document.getElementById("crun").addEventListener("click", checkConserve);
+["cin", "cout", "ckind"].forEach(id => document.getElementById(id).addEventListener("input", checkConserve));
+document.getElementById("ckind").addEventListener("change", () => {
+  const d = Number(document.getElementById("ckind").value);
+  if (d === 100) document.getElementById("cin").value = 0;
+  if (d === 40) { document.getElementById("cin").value = 0; document.getElementById("cout").value = 40; }
+  if (d === -25) { document.getElementById("cin").value = 100; document.getElementById("cout").value = 75; }
+  if (d === 0) { document.getElementById("cin").value = 100; document.getElementById("cout").value = 100; }
+  checkConserve();
+});
+
+const tocLinks = [...document.querySelectorAll("nav.toc a")];
+const sections = tocLinks.map(a => document.querySelector(a.getAttribute("href"))).filter(Boolean);
+const io = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    tocLinks.forEach(a => a.classList.toggle("active", a.getAttribute("href") === "#" + e.target.id));
+  }
+}, { rootMargin: "-20% 0px -70% 0px" });
+sections.forEach(s => io.observe(s));
+</script>
+</body>
+</html>

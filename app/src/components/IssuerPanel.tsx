@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
+import { Hash, Utils } from '@bsv/sdk'
 import { parseAmount } from '@bsv/mandala/amount'
 import { useAdminAssets } from '../hooks/useAdminAssets'
 import { useIssuerMutations } from '../hooks/useIssuerMutations'
@@ -23,8 +24,11 @@ export default function IssuerPanel({ assetId: controlledAssetId }: IssuerPanelP
   const [redeemAsset, setRedeemAsset] = useState('')
   const [redeemAmount, setRedeemAmount] = useState('')
 
-  // UI-only state (not passed to any core function)
+  // Deposit reference backing an issuance. Hashed client-side (sha256) before
+  // it leaves the panel, so the bank record stays off-chain while the issue
+  // commits to it as `bankRef` (R12 "commits a hash of the deposit record").
   const [issueRef, setIssueRef] = useState('')
+  // Settlement note is display-only (not passed to any core function).
   const [redeemNote, setRedeemNote] = useState('')
 
   // Shared cached admin-asset list; mutations invalidate it on settle.
@@ -59,9 +63,12 @@ export default function IssuerPanel({ assetId: controlledAssetId }: IssuerPanelP
       return
     }
     const amount = parseAmount(issueAmount, Number(asset.metadata?.decimals) || 0)
+    const ref = issueRef.trim()
+    const depositHash = ref === '' ? undefined : Utils.toHex(Hash.sha256(Utils.toArray(ref, 'utf8')))
     const gate = guardIssueSubmit({
       assetId: asset.assetId,
       amount,
+      bankRef: depositHash,
       walletReady: true
     })
     if (!gate.ok) {
@@ -70,9 +77,9 @@ export default function IssuerPanel({ assetId: controlledAssetId }: IssuerPanelP
     }
     issueStartedRef.current = true
     issue.mutate(
-      { asset, amount },
+      { asset, amount, depositHash },
       {
-        onSuccess: () => setIssueAmount(''),
+        onSuccess: () => { setIssueAmount(''); setIssueRef('') },
         onSettled: () => { issueStartedRef.current = false }
       }
     )

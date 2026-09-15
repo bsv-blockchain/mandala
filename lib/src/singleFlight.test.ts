@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { createSingleFlight, BusyError, sendFlight, registerFlight } from './singleFlight.js'
+import { createSingleFlight, BusyError, sendFlight, registerFlight, registryFlight } from './singleFlight.js'
 
 describe('createSingleFlight', () => {
   it('allows only one acquire at a time', () => {
@@ -61,6 +61,7 @@ describe('process-wide flights', () => {
     // Ensure a prior failed test cannot leave the latch held.
     while (sendFlight.isHeld()) sendFlight.release()
     while (registerFlight.isHeld()) registerFlight.release()
+    while (registryFlight.isHeld()) registryFlight.release()
   })
 
   it('sendFlight and registerFlight are independent', () => {
@@ -68,5 +69,12 @@ describe('process-wide flights', () => {
     expect(registerFlight.tryAcquire()).toBe(true)
     sendFlight.release()
     registerFlight.release()
+  })
+
+  it('registryFlight is independent of registerFlight', () => {
+    expect(registerFlight.tryAcquire()).toBe(true)
+    expect(registryFlight.tryAcquire()).toBe(true)
+    registerFlight.release()
+    registryFlight.release()
   })
 })

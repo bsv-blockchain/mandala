@@ -43,18 +43,19 @@ func newArcIngestAppEvict(h MerkleProofHandler, callbackToken string, evict Evic
 	return f
 }
 
-// stubEvictTx records EvictTx calls and returns a canned error.
+// stubEvictTx records EvictTx calls and returns a canned outcome/error.
 type stubEvictTx struct {
-	err error
+	err     error
+	outcome EvictionOutcome
 
 	calls    int
 	gotTxids []string
 }
 
-func (s *stubEvictTx) evict(_ context.Context, txid string) error {
+func (s *stubEvictTx) evict(_ context.Context, txid string) (EvictionOutcome, error) {
 	s.calls++
 	s.gotTxids = append(s.gotTxids, txid)
-	return s.err
+	return s.outcome, s.err
 }
 
 // samplePathHex builds a trivial single-leaf MerklePath and returns its hex
@@ -226,10 +227,10 @@ func TestArcIngestTerminalStatusEvicts(t *testing.T) {
 	}
 }
 
-// TestArcIngestTerminalStatusEvictionErrorIs500: a failed eviction must NOT
-// be acknowledged — Arcade retries the callback, giving eviction another
-// chance.
-func TestArcIngestTerminalStatusEvictionErrorIs500(t *testing.T) {
+// Wire contract §9.8: a failed eviction must NOT be acknowledged, and it is a
+// retryable dependency fault (503) — nothing was stamped, the inputs are still
+// marked spent, and Arcade must re-deliver so the unwind is attempted again.
+func TestArcIngestTerminalStatusEvictionErrorIs503(t *testing.T) {
 	h := &stubMerkleProofHandler{}
 	ev := &stubEvictTx{err: errors.New("mongo down")}
 	app := newArcIngestAppEvict(h, "", ev.evict)
@@ -238,8 +239,8 @@ func TestArcIngestTerminalStatusEvictionErrorIs500(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 
 	resp := doRequest(t, app, req)
-	if resp.StatusCode != fiber.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
 	body := decodeJSON(t, resp)
 	if body["status"] != "error" {
@@ -247,6 +248,67 @@ func TestArcIngestTerminalStatusEvictionErrorIs500(t *testing.T) {
 	}
 	if ev.calls != 1 {
 		t.Fatalf("EvictTx calls = %d, want 1", ev.calls)
+	}
+}
+
+// Wire contract §9.12 — the terminal-status 200 body, byte-for-byte: both
+// engines answer with the same message and the same six data keys, so Arcade
+// (and an operator reading its delivery log) sees one shape.
+func TestArcIngestTerminalStatusBodyMatchesTheContract(t *testing.T) {
+	h := &stubMerkleProofHandler{}
+	ev := &stubEvictTx{outcome: EvictionOutcome{
+		RestoredOutpoints: 2, RestoredTokenRows: 1, AlreadyEvicted: true,
+	}}
+	app := newArcIngestAppEvict(h, "", ev.evict)
+
+	req := httptest.NewRequest(http.MethodPost, "/arc-ingest",
+		strings.NewReader(`{"txid":"`+sampleTxidHex+`","txStatus":"REJECTED","extraInfo":"fee too low"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp := doRequest(t, app, req)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body := decodeJSON(t, resp)
+	if body["status"] != "success" || body["message"] != "Terminal transaction status processed" {
+		t.Fatalf("body = %v", body)
+	}
+	data, _ := body["data"].(map[string]any)
+	if data == nil {
+		t.Fatalf("body = %v, missing data", body)
+	}
+	want := map[string]any{
+		"txid":              sampleTxidHex,
+		"txStatus":          "REJECTED",
+		"reason":            "fee too low",
+		"restoredOutpoints": float64(2),
+		"restoredTokenRows": float64(1),
+		"alreadyEvicted":    true,
+	}
+	if len(data) != len(want) {
+		t.Fatalf("data has keys %v, want exactly %v", data, want)
+	}
+	for k, v := range want {
+		if data[k] != v {
+			t.Fatalf("data[%q] = %v, want %v", k, data[k], v)
+		}
+	}
+}
+
+// With eviction unwired the shape is unchanged — only the counts are zero.
+func TestArcIngestTerminalStatusBodyWithoutEvictionWired(t *testing.T) {
+	app := newArcIngestApp(&stubMerkleProofHandler{}, "")
+	req := httptest.NewRequest(http.MethodPost, "/arc-ingest",
+		strings.NewReader(`{"txid":"`+sampleTxidHex+`","txStatus":"REJECTED"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	body := decodeJSON(t, doRequest(t, app, req))
+	if body["message"] != "Terminal transaction status processed" {
+		t.Fatalf("body = %v", body)
+	}
+	data, _ := body["data"].(map[string]any)
+	if data["restoredOutpoints"] != float64(0) || data["alreadyEvicted"] != false {
+		t.Fatalf("data = %v", data)
 	}
 }
 
@@ -318,13 +380,44 @@ func TestArcIngestRouteAbsentWhenArcadeDisabled(t *testing.T) {
 
 func TestArcIngestRoutePresentWhenArcadeEnabled(t *testing.T) {
 	h := &stubMerkleProofHandler{}
-	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil, WithArcade(h, "", nil))
+	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil, WithArcade(h, "callback-token", nil))
 
 	req := httptest.NewRequest(http.MethodPost, "/arc-ingest", strings.NewReader(`{"txid":"`+sampleTxidHex+`","txStatus":"SENT_TO_NETWORK"}`))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer callback-token")
 
 	resp := doRequest(t, app, req)
 	if resp.StatusCode == fiber.StatusNotFound {
-		t.Fatal("status = 404, want the route to be registered when Arcade is enabled")
+		t.Fatal("status = 404, want the route to be registered when Arcade is enabled with a callback token")
+	}
+}
+
+// FIX E, second half: /arc-ingest must NOT be mounted without a callback
+// token. Eviction now restores a transaction's inputs and permanently voids
+// its σ_I, so an unauthenticated terminal-status callback is an unwind
+// primitive for anyone who can reach the node. An empty token used to mean
+// "skip the token check" (OverlayExpress's default) and left the route wide
+// open; it now means the route does not exist, while the rest of the node
+// serves normally.
+func TestArcIngestRouteAbsentWhenCallbackTokenIsEmpty(t *testing.T) {
+	h := &stubMerkleProofHandler{}
+	evict := &stubEvictTx{}
+	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil, WithArcade(h, "", evict.evict))
+
+	req := httptest.NewRequest(http.MethodPost, "/arc-ingest", strings.NewReader(`{"txid":"`+sampleTxidHex+`","txStatus":"REJECTED"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp := doRequest(t, app, req)
+	if resp.StatusCode != fiber.StatusNotFound {
+		t.Fatalf("status = %d, want 404 when the Arcade callback token is empty", resp.StatusCode)
+	}
+	if evict.calls != 0 {
+		t.Fatalf("eviction ran %d times through an unmounted route", evict.calls)
+	}
+
+	// The rest of the node still serves.
+	health := doRequest(t, app, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if health.StatusCode != fiber.StatusOK {
+		t.Fatalf("/health = %d, want the node to keep serving everything else", health.StatusCode)
 	}
 }

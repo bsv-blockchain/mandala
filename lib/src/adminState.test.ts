@@ -102,4 +102,31 @@ describe('resolveAssetState', () => {
       'http://test-overlay/admin/asset-state/deadbeef.3'
     )
   })
+
+  it('force bypasses the memo and refreshes it; a following plain call reads the refreshed value (A18)', async () => {
+    mockFetch.mockResolvedValue({ ok: true, json: async () => ({ ...SAMPLE_STATE, assetId: 'force.0', isPaused: false }) })
+    await resolveAssetState('force.0')
+
+    // Overlay state changed (e.g. a freeze just committed) — memo would hide it.
+    mockFetch.mockResolvedValue({ ok: true, json: async () => ({ ...SAMPLE_STATE, assetId: 'force.0', isPaused: true }) })
+    const stale = await resolveAssetState('force.0')
+    expect(stale?.isPaused).toBe(false)
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+
+    const fresh = await resolveAssetState('force.0', { force: true })
+    expect(fresh?.isPaused).toBe(true)
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+
+    // The forced fetch re-primed the memo — steady-state load is unchanged.
+    const again = await resolveAssetState('force.0')
+    expect(again?.isPaused).toBe(true)
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('force: false behaves like the plain call (memo applies)', async () => {
+    mockFetch.mockResolvedValue({ ok: true, json: async () => ({ ...SAMPLE_STATE, assetId: 'noforce.0' }) })
+    await resolveAssetState('noforce.0')
+    await resolveAssetState('noforce.0', { force: false })
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+  })
 })

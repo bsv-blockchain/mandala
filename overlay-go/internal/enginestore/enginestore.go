@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"slices"
 	"time"
 
 	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
@@ -43,7 +44,13 @@ var _ engine.Storage = (*Store)(nil)
 // New wires the three collections on the given db (the same db handle the
 // mandala Store uses) and idempotently ensures the indexes. The result
 // satisfies the engine.Storage the wiring package hands to engine.NewEngine.
-func New(db *mongo.Database) *Store {
+//
+// Wire contract §9.9: an index that cannot be created ABORTS STARTUP, exactly
+// as in mandala.NewStore. The unique (topic, txid, outputIndex) index is what
+// makes the engine's output store single-valued and the unique (topic, txid)
+// applied-transaction index is the dupe gate FIX C's proof rests on; a node
+// running without them would serve confident, wrong answers.
+func New(db *mongo.Database) (*Store, error) {
 	s := &Store{
 		outputs:      db.Collection("engineOutputs"),
 		applied:      db.Collection("engineAppliedTransactions"),
@@ -57,22 +64,19 @@ func New(db *mongo.Database) *Store {
 		{Keys: bson.D{{Key: "topic", Value: 1}, {Key: "spent", Value: 1}, {Key: "score", Value: 1}}},
 		{Keys: bson.D{{Key: "topic", Value: 1}, {Key: "merkleState", Value: 1}}},
 	}); err != nil {
-		// Mirror mandala.NewStore's stance: the constructor stays infallible
-		// and index trouble still surfaces on first write via the driver —
-		// but it is logged here too, exactly as mandala.NewStore does.
-		log.Printf("engine store: index creation failed on %s: %v", "engineOutputs", err)
+		return nil, fmt.Errorf("engine store: index creation failed on %s: %w", "engineOutputs", err)
 	}
 	if _, err := s.applied.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "topic", Value: 1}, {Key: "txid", Value: 1}}, Options: uniq},
 	}); err != nil {
-		log.Printf("engine store: index creation failed on %s: %v", "engineAppliedTransactions", err)
+		return nil, fmt.Errorf("engine store: index creation failed on %s: %w", "engineAppliedTransactions", err)
 	}
 	if _, err := s.interactions.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "host", Value: 1}, {Key: "topic", Value: 1}}, Options: uniq},
 	}); err != nil {
-		log.Printf("engine store: index creation failed on %s: %v", "engineInteractions", err)
+		return nil, fmt.Errorf("engine store: index creation failed on %s: %w", "engineInteractions", err)
 	}
-	return s
+	return s, nil
 }
 
 // outpointDoc is the embedded outpoint shape (txid in display hex).
@@ -395,6 +399,21 @@ func (s *Store) DeleteOutput(ctx context.Context, outpoint *transaction.Outpoint
 
 // MarkUTXOsAsSpent flags the topic's inputs of a newly submitted tx
 // (engine.markTopicUTXOsSpent), recording the spending txid.
+//
+// FIX L: this is a COMPARE-AND-SWAP, not an unconditional write. The update
+// matches only rows that are still unspent, or that this same transaction
+// already marked (the idempotent resubmit — refusing that would strand a
+// transaction whose first attempt died between marking and committing), and
+// then checks the matched count. A shortfall means some coin is already
+// spent by a different transaction: the rows this call DID take are handed
+// back, and the error names the competitor. Without the check, two concurrent
+// submits of conflicting spends both "succeeded" here and the double spend
+// was left for Arcade's broadcast race to notice — or not.
+//
+// The error is deliberately NOT a topic-manager verdict: the HTTP layer
+// classifies it as ERR_UNAVAILABLE (503, retryable), and the retry then meets
+// the manager's own conflicting-spend gate, which answers the final
+// ERR_INPUT_SPENT.
 func (s *Store) MarkUTXOsAsSpent(ctx context.Context, outpoints []*transaction.Outpoint, topic string, spendTxid *chainhash.Hash) error {
 	if len(outpoints) == 0 {
 		return nil
@@ -406,14 +425,124 @@ func (s *Store) MarkUTXOsAsSpent(ctx context.Context, outpoints []*transaction.O
 			{Key: "outputIndex", Value: o.Index},
 		})
 	}
+	spender := ""
 	set := bson.D{{Key: "spent", Value: true}}
 	if spendTxid != nil {
-		set = append(set, bson.E{Key: "spendTxid", Value: spendTxid.String()})
+		spender = spendTxid.String()
+		set = append(set, bson.E{Key: "spendTxid", Value: spender})
 	}
-	_, err := s.outputs.UpdateMany(ctx,
-		bson.D{{Key: "topic", Value: topic}, {Key: "$or", Value: ors}},
+	claimable := bson.A{bson.D{{Key: "spent", Value: false}}}
+	if spender != "" {
+		claimable = append(claimable, bson.D{{Key: "spendTxid", Value: spender}})
+	}
+	res, err := s.outputs.UpdateMany(ctx,
+		bson.D{
+			{Key: "topic", Value: topic},
+			{Key: "$and", Value: bson.A{
+				bson.D{{Key: "$or", Value: ors}},
+				bson.D{{Key: "$or", Value: claimable}},
+			}},
+		},
 		bson.D{{Key: "$set", Value: set}})
-	return err
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == int64(len(outpoints)) {
+		return nil
+	}
+	conflict := s.describeSpendConflict(ctx, topic, ors, spender)
+	if spender != "" {
+		if _, uerr := s.UnmarkSpentBySpendTxid(ctx, spender); uerr != nil {
+			log.Printf("engine store: rolling back partial spend marks of %s failed (state may need manual repair): %v", spender, uerr)
+		}
+	}
+	return fmt.Errorf("enginestore: refusing to mark inputs spent for %s: %s", spenderLabel(spender), conflict)
+}
+
+func spenderLabel(spender string) string {
+	if spender == "" {
+		return "an unnamed transaction"
+	}
+	return spender
+}
+
+// describeSpendConflict names the first already-spent outpoint and the
+// transaction holding it, for the CAS failure message.
+func (s *Store) describeSpendConflict(ctx context.Context, topic string, ors bson.A, spender string) string {
+	filter := bson.D{
+		{Key: "topic", Value: topic},
+		{Key: "spent", Value: true},
+		{Key: "$or", Value: ors},
+	}
+	if spender != "" {
+		filter = append(filter, bson.E{Key: "spendTxid", Value: bson.D{{Key: "$ne", Value: spender}}})
+	}
+	var doc outputDoc
+	if err := s.outputs.FindOne(ctx, filter).Decode(&doc); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return "an input is no longer available on this topic"
+		}
+		return "conflict lookup failed: " + err.Error()
+	}
+	return fmt.Sprintf("input %s.%d is already spent by %s", doc.Txid, doc.OutputIndex, doc.SpendTxid)
+}
+
+// SpendStateOf reports the transaction that marked (topic, txid.vout) spent,
+// or "" when the coin is live or no document exists for it at all. It backs
+// the topic manager's FIX L conflicting-spend gate. Not part of
+// engine.Storage.
+func (s *Store) SpendStateOf(ctx context.Context, topic, txid string, vout uint32) (string, error) {
+	var doc outputDoc
+	err := s.outputs.FindOne(ctx,
+		bson.D{
+			{Key: "topic", Value: topic},
+			{Key: "txid", Value: txid},
+			{Key: "outputIndex", Value: vout},
+		},
+		options.FindOne().SetProjection(bson.D{
+			{Key: "spent", Value: 1},
+			{Key: "spendTxid", Value: 1},
+		}),
+	).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !doc.Spent {
+		return "", nil
+	}
+	return doc.SpendTxid, nil
+}
+
+// AdmittedOutputIndexes lists, ascending, the output indexes this topic
+// admitted for txid — spent ones included, because admission is history, not
+// current liquidity. It is FIX C's fallback source of outputsToAdmit when the
+// mandalaAdmissions row is missing but the engine's applied-transaction store
+// still proves the transaction went through the topic. Not part of
+// engine.Storage.
+func (s *Store) AdmittedOutputIndexes(ctx context.Context, topic, txid string) ([]uint32, error) {
+	cur, err := s.outputs.Find(ctx,
+		bson.D{{Key: "topic", Value: topic}, {Key: "txid", Value: txid}},
+		options.Find().SetProjection(bson.D{{Key: "outputIndex", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	out := []uint32{}
+	for cur.Next(ctx) {
+		var doc outputDoc
+		if err := cur.Decode(&doc); err != nil {
+			return nil, err
+		}
+		out = append(out, doc.OutputIndex)
+	}
+	if err := cur.Err(); err != nil {
+		return nil, err
+	}
+	slices.Sort(out)
+	return out, nil
 }
 
 // UnmarkSpentBySpendTxid reverses MarkUTXOsAsSpent for every output document
@@ -516,6 +645,35 @@ func (s *Store) RawTxHexByTxid(ctx context.Context, txid string) (string, bool, 
 		return "", false, nil
 	}
 	return tx.Hex(), true, nil
+}
+
+// OutputBeefBytes returns the BEEF bytes stored for one (topic, txid, vout) —
+// exactly what InsertOutputs recorded, spent or not — or (nil, false, nil)
+// when the topic never admitted that outpoint. It backs the
+// /admin/registry/beef and /admin/asset-auth/beef recovery routes (A10/A17),
+// which hand a wallet the graph it needs to re-spend a chain head.
+func (s *Store) OutputBeefBytes(ctx context.Context, topic, txid string, vout uint32) ([]byte, bool, error) {
+	var doc struct {
+		Beef []byte `bson:"beef"`
+	}
+	err := s.outputs.FindOne(ctx,
+		bson.D{
+			{Key: "topic", Value: topic},
+			{Key: "txid", Value: txid},
+			{Key: "outputIndex", Value: vout},
+		},
+		options.FindOne().SetProjection(bson.D{{Key: "beef", Value: 1}}),
+	).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if len(doc.Beef) == 0 {
+		return nil, false, nil
+	}
+	return doc.Beef, true, nil
 }
 
 // DeleteAppliedTransactionsByTxid removes the applied-transaction records of

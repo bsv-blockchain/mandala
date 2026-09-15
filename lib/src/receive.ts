@@ -8,8 +8,9 @@
  */
 import { AtomicBEEF, Transaction, WalletInterface } from '@bsv/sdk'
 import { MandalaToken } from '@bsv/templates'
-import { MESSAGEBOX, BASKET } from './constants.js'
+import { MESSAGEBOX, BASKET, OVERLAY_IDENTITY_KEY } from './constants.js'
 import { resolveAssetMetadata } from './metadata.js'
+import { verifyAdmission } from './admission.js'
 
 /**
  * The message body contradicts the transaction it carries (or isn't a valid
@@ -28,8 +29,19 @@ export class InvalidTransferError extends Error {
  * output the body points at actually IS a Mandala token of the claimed asset
  * and amount before internalizing. Without this a hostile sender corrupts the
  * recipient's basket/balances with mislabeled or non-token outputs.
+ *
+ * Returns whether the message carried a σ_I this device could verify.
+ *
+ * **FIX H.** A counterparty-supplied signature is never trusted on shape. When
+ * `admission` is present it MUST verify — against this session's own overlay
+ * identity key, over this transaction's own txid and the exact admitted output
+ * set — or it is treated as **absent**: never as a decline, never as proof. A
+ * forged σ_I therefore cannot wedge a receive, and a legacy message that
+ * carries none is not penalised for it. What the flag buys the caller is the
+ * ability to credit immediately instead of waiting to confirm admission
+ * itself.
  */
-function verifyIncoming (msg: IncomingTransfer): void {
+function verifyIncoming (msg: IncomingTransfer): { admissionVerified: boolean } {
   let tx: Transaction
   try {
     tx = Transaction.fromAtomicBEEF(msg.transaction)
@@ -56,6 +68,33 @@ function verifyIncoming (msg: IncomingTransfer): void {
   if (decoded.amount !== Number(msg.amount)) {
     throw new InvalidTransferError(`amount mismatch: body says ${msg.amount}, output is ${decoded.amount}`)
   }
+  return { admissionVerified: checkAdmission(tx, msg) }
+}
+
+/** FIX H: verify, or treat as absent. Never throws, never declines. */
+function checkAdmission (tx: Transaction, msg: IncomingTransfer): boolean {
+  const a = msg.admission
+  if (a == null) return false
+  // Scope cap (A12): the key currently configured, not the key that was live
+  // at the height of the Merkle path. Rotation (R34/R69) is out of scope.
+  if (OVERLAY_IDENTITY_KEY === '') return false
+  if (a.signerKey?.toLowerCase() !== OVERLAY_IDENTITY_KEY.toLowerCase()) return false
+  // The signature must name THIS transaction, and the output we are being
+  // credited with must be one the overlay actually admitted (FIX A).
+  let txid: string
+  try {
+    txid = tx.id('hex')
+  } catch {
+    return false
+  }
+  if (a.txid !== txid) return false
+  if (!Array.isArray(a.outputsToAdmit) || !a.outputsToAdmit.includes(msg.outputIndex)) return false
+  return verifyAdmission({
+    txid,
+    outputsToAdmit: a.outputsToAdmit,
+    signature: a.signature,
+    signerKey: a.signerKey
+  })
 }
 
 /** Wallet errors meaning this output was internalized by an earlier attempt. */
@@ -69,16 +108,37 @@ export interface IncomingTransfer {
   assetId: string
   amount: string
   sender: string
+  /** Present when the remittance is A′ rather than the long-term identity. */
+  senderMode?: 'blinded' | 'identity'
   keyID: string
   protocolID: [0 | 1 | 2, string]
   transaction: AtomicBEEF
   /** Where the sender's (randomized) tx put our output; 0 for legacy messages. */
   outputIndex: number
+  /**
+   * Optional overlay acceptance proof for this very transaction (§4.5). Absent
+   * on legacy messages and on any rail whose sender had not submitted yet.
+   */
+  admission?: {
+    txid: string
+    outputsToAdmit: number[]
+    /** DER hex. */
+    signature: string
+    /** 66-hex compressed overlay identity key. */
+    signerKey: string
+  }
 }
 
 export interface ReceivedTransfer extends IncomingTransfer {
   label: string
   decimals: number
+  /**
+   * True only when the message carried a σ_I that verified against this
+   * session's overlay key, this txid and an admitted set containing our
+   * output. False means "no usable proof" — which is the normal, legacy case,
+   * not a fault (FIX H).
+   */
+  admissionVerified: boolean
 }
 
 /** Minimal MessageBox surface receiveTokens needs (keeps the client mockable). */
@@ -112,7 +172,7 @@ async function acceptOne (
 ): Promise<ReceivedTransfer> {
   // Trust the transaction, not the body — reject mismatches before any
   // wallet work (throws InvalidTransferError; caller acks + drops).
-  verifyIncoming(msg)
+  const { admissionVerified } = verifyIncoming(msg)
 
   const meta = await resolveAssetMetadata(msg.assetId)
   const label = meta?.label ?? `${msg.assetId.slice(0, 20)}…`
@@ -148,7 +208,7 @@ async function acceptOne (
     if (!isAlreadyInternalized(e)) throw e
   }
   await messageBoxClient.acknowledgeMessage({ messageIds: [msg.id] })
-  return { ...msg, label, decimals }
+  return { ...msg, label, decimals, admissionVerified }
 }
 
 /**
@@ -171,12 +231,14 @@ export async function receiveTokens (p: ReceiveParams): Promise<ReceiveResult> {
         assetId: raw.body.assetId,
         amount: raw.body.amount,
         sender: raw.body.sender,
+        senderMode: raw.body.senderMode,
         keyID: raw.body.keyID,
         protocolID: raw.body.protocolID,
         transaction: raw.body.transaction,
         // Senders now randomize output order and say where our output
         // landed; older messages predate the field (recipient was always 0).
-        outputIndex: typeof raw.body.outputIndex === 'number' ? raw.body.outputIndex : 0
+        outputIndex: typeof raw.body.outputIndex === 'number' ? raw.body.outputIndex : 0,
+        admission: raw.body.admission
       }))
     } catch (error) {
       if (error instanceof InvalidTransferError) {

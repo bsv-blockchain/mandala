@@ -1,4 +1,4 @@
-import { OVERLAY_URL } from './constants.js'
+import { OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 
 export interface AssetAdminStateView {
   assetId: string
@@ -14,10 +14,22 @@ export interface AssetAdminStateView {
 const cache = new Map<string, { at: number, val: AssetAdminStateView | null }>()
 const TTL = 10_000
 
-export async function resolveAssetState (assetId: string): Promise<AssetAdminStateView | null> {
+/**
+ * Overlay admin state for one asset, memoised for TTL. Pass `force` on the
+ * post-mutation path (an admin action just committed) so the caller does not
+ * read pre-action state out of the memo and see its freeze "not applied";
+ * the forced fetch re-primes the memo, so steady-state load is unchanged.
+ * Any remaining lag after a forced fetch is the overlay folding the admission
+ * asynchronously — a server-side item, not addressed here.
+ */
+export async function resolveAssetState (
+  assetId: string,
+  opts: { force?: boolean } = {}
+): Promise<AssetAdminStateView | null> {
   const hit = cache.get(assetId)
-  if (hit != null && Date.now() - hit.at < TTL) return hit.val
+  if (!opts.force && hit != null && Date.now() - hit.at < TTL) return hit.val
   let val: AssetAdminStateView | null = null
+  if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
   try {
     const res = await fetch(`${OVERLAY_URL}/admin/asset-state/${encodeURIComponent(assetId)}`)
     if (res.ok) val = await res.json() as AssetAdminStateView

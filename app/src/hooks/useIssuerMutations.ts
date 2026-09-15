@@ -68,12 +68,15 @@ export function useIssuerMutations() {
     onSettled: settle
   })
 
-  const issue = useMutation<Awaited<ReturnType<typeof issueTokens>>, Error, { asset: AdminAsset; amount: number }, { prev?: HolderData }>({
-    mutationFn: async ({ asset, amount }) => {
+  const issue = useMutation<Awaited<ReturnType<typeof issueTokens>>, Error, { asset: AdminAsset; amount: number; depositHash?: string }, { prev?: HolderData }>({
+    mutationFn: async ({ asset, amount, depositHash }) => {
       if (wallet == null || identityKey == null) throw new Error('Wallet not ready')
-      const gate = guardIssueSubmit({ assetId: asset.assetId, amount, walletReady: true })
+      // depositHash is the sha256 of the bank record (hashed in the panel);
+      // the guard refuses anything that is not a 64-hex digest so a raw
+      // reference can never be committed on-chain.
+      const gate = guardIssueSubmit({ assetId: asset.assetId, amount, bankRef: depositHash, walletReady: true })
       if (!gate.ok) throw new Error(gate.reason)
-      return issueTokens({ wallet: wallet as any, identityKey, asset, amount })
+      return issueTokens({ wallet: wallet as any, identityKey, asset, amount, depositHash })
     },
     onMutate: ({ asset, amount }) => adjustBalance(asset.assetId, amount),
     onSuccess: (r, { asset, amount }) => {

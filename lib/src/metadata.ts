@@ -1,7 +1,8 @@
 import { LookupResolver, Transaction, WhatsOnChain } from '@bsv/sdk'
 import { MandalaAdmin } from '@bsv/templates'
 import type { AssetMetadata } from '@bsv/templates'
-import { OVERLAY_URL, LOOKUP } from './constants.js'
+export type { AssetMetadata }
+import { OVERLAY_URL, OVERLAY_URL_UNSET, LOOKUP } from './constants.js'
 
 const cache = new Map<string, AssetMetadata | null>()
 
@@ -24,6 +25,8 @@ export function parseMetadataFromBeef (beef: number[], index: number): AssetMeta
 // the genesis output, SPV-verify the genesis tx, then decode publicData. Memoized.
 export async function resolveAssetMetadata (assetId: string): Promise<AssetMetadata | null> {
   if (cache.has(assetId)) return cache.get(assetId) ?? null
+  // Outside the try: an unconfigured overlay must not read as "no metadata".
+  if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
   let result: AssetMetadata | null = null
   try {
     const resolver = new LookupResolver({ networkPreset: 'mainnet', hostOverrides: { [LOOKUP]: [OVERLAY_URL] } })

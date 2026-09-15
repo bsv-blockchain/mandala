@@ -35,6 +35,23 @@ func run() error {
 		return err
 	}
 
+	// A13: an unset ADMIN_API_TOKEN is a supported dev default — the
+	// identity-bearing admin routes stay open — but it must be loud, hence
+	// this one startup warning rather than a silent fallback. Logged here
+	// (once, regardless of how many requests follow), not in httpapi's
+	// per-request middleware.
+	if cfg.AdminAPIToken == "" {
+		log.Print("mandala overlay-go: ADMIN_API_TOKEN is not set — /admin/registry, /admin/activity and /admin/admission/:txid are UNAUTHENTICATED. Set ADMIN_API_TOKEN before any public demo.")
+	}
+
+	// FIX E: with Arcade on but no callback token, httpapi.New refuses to
+	// mount /arc-ingest (eviction restores inputs and voids σ_I, so the route
+	// must never be open). Say so once at boot, where an operator will see it,
+	// rather than leaving them to discover a 404 from Arcade's callbacks.
+	if cfg.ArcadeURL != "" && cfg.ArcadeCallbackToken == "" {
+		log.Print("mandala overlay-go: ARCADE_CALLBACK_TOKEN is not set — /arc-ingest will NOT be mounted, so merkle proofs and terminal transaction statuses from Arcade are ignored. Set ARCADE_CALLBACK_TOKEN.")
+	}
+
 	app, err := wiring.Build(context.Background(), cfg)
 	if err != nil {
 		return fmt.Errorf("wiring.Build: %w", err)
@@ -133,6 +150,14 @@ func loadConfig(getenv envLookup) (wiring.Config, error) {
 	cfg.ArcadeCallbackToken = getenv("ARCADE_CALLBACK_TOKEN")
 	cfg.ChaintracksURL = getenv("CHAINTRACKS_URL")
 	cfg.ChaintracksPrefix = getenv("CHAINTRACKS_API_PREFIX")
+
+	// A13: ADMIN_API_TOKEN gates the identity-bearing admin routes;
+	// ADMIN_CORS_ORIGINS narrows their CORS. Resolution (the TS-parity
+	// default of HOSTING_URL's origin + the two local dev origins) lives in
+	// httpapi.ParseAdminCORSOrigins so it's tested once, in httpapi, rather
+	// than duplicated here.
+	cfg.AdminAPIToken = getenv("ADMIN_API_TOKEN")
+	cfg.AdminCORSOrigins = httpapi.ParseAdminCORSOrigins(getenv("ADMIN_CORS_ORIGINS"), cfg.HostingURL)
 
 	return cfg, nil
 }

@@ -10,9 +10,10 @@
  * acknowledges by messageId and treats an already-internalized output as
  * success.
  *
- * Same per-entry localStorage layout as txJournal (atomic per key, memory
- * fallback merged on read).
+ * Same per-entry layout as txJournal, through the same injected storage
+ * adapter (storage.ts): atomic per key, async, no memory mirror.
  */
+import { getStorage } from './storage.js'
 
 export interface PendingNotification {
   /** The committed txid — one notification per transfer. */
@@ -25,57 +26,46 @@ export interface PendingNotification {
 }
 
 const PREFIX = 'mandala.notifyJournal.'
-const memory = new Map<string, PendingNotification>()
 
-function storage (): Storage | null {
-  try {
-    return typeof localStorage !== 'undefined' ? localStorage : null
-  } catch {
-    return null
-  }
-}
-
-export function notifyList (): PendingNotification[] {
-  const byId = new Map<string, PendingNotification>(memory)
-  const ls = storage()
-  if (ls != null) {
-    for (let i = 0; i < ls.length; i++) {
-      const key = ls.key(i)
-      if (key == null || !key.startsWith(PREFIX)) continue
-      try {
-        const entry = JSON.parse(ls.getItem(key) ?? '') as PendingNotification
-        if (typeof entry?.txid === 'string') byId.set(entry.txid, entry)
-      } catch { /* one corrupted entry — skip it, keep the rest */ }
-    }
+export async function notifyList (): Promise<PendingNotification[]> {
+  const store = getStorage()
+  const byId = new Map<string, PendingNotification>()
+  for (const key of await store.keys(PREFIX)) {
+    try {
+      const raw = await store.getItem(key)
+      if (raw == null) continue // removed between keys() and getItem
+      const entry = JSON.parse(raw) as PendingNotification
+      if (typeof entry?.txid === 'string') byId.set(entry.txid, entry)
+    } catch { /* one corrupted entry — skip it, keep the rest */ }
   }
   return [...byId.values()].sort((a, b) => a.at - b.at)
 }
 
-export function notifyPut (entry: PendingNotification): void {
-  memory.set(entry.txid, entry)
+/**
+ * Journal a notification. Await it BEFORE the sendMessage it protects — that
+ * ordering is the whole point of the journal. A store failure is warned, not
+ * thrown: the transaction it belongs to is already committed.
+ */
+export async function notifyPut (entry: PendingNotification): Promise<void> {
   try {
-    storage()?.setItem(PREFIX + entry.txid, JSON.stringify(entry))
-  } catch { /* quota/unavailable — memory copy still holds for this tab */ }
+    await getStorage().setItem(PREFIX + entry.txid, JSON.stringify(entry))
+  } catch (e) {
+    console.warn(`[mandala] notifyJournal write failed for ${entry.txid}; the retry is not durable:`, e)
+  }
 }
 
-export function notifyRemove (txid: string): void {
-  memory.delete(txid)
+export async function notifyRemove (txid: string): Promise<void> {
   try {
-    storage()?.removeItem(PREFIX + txid)
-  } catch { /* unavailable — memory removal still applied */ }
+    await getStorage().removeItem(PREFIX + txid)
+  } catch (e) {
+    console.warn(`[mandala] notifyJournal remove failed for ${txid}; it will be retried (delivery is idempotent):`, e)
+  }
 }
 
 /** Test helper. */
-export function notifyClear (): void {
-  memory.clear()
-  const ls = storage()
-  if (ls == null) return
-  const doomed: string[] = []
-  for (let i = 0; i < ls.length; i++) {
-    const key = ls.key(i)
-    if (key != null && key.startsWith(PREFIX)) doomed.push(key)
-  }
-  doomed.forEach(k => ls.removeItem(k))
+export async function notifyClear (): Promise<void> {
+  const store = getStorage()
+  for (const key of await store.keys(PREFIX)) await store.removeItem(key)
 }
 
 interface Sender {
@@ -88,17 +78,17 @@ interface Sender {
  */
 export async function reconcileNotifications (messageBoxClient: Sender): Promise<string[]> {
   const delivered: string[] = []
-  for (const entry of notifyList()) {
+  for (const entry of await notifyList()) {
     try {
       await messageBoxClient.sendMessage({
         recipient: entry.recipient,
         messageBox: entry.messageBox,
         body: entry.body
       })
-      notifyRemove(entry.txid)
+      await notifyRemove(entry.txid)
       delivered.push(entry.txid)
     } catch {
-      notifyPut({ ...entry, attempts: (entry.attempts ?? 0) + 1 })
+      await notifyPut({ ...entry, attempts: (entry.attempts ?? 0) + 1 })
     }
   }
   return delivered

@@ -4,9 +4,10 @@
  * already-broadcast detection, notification retry, receive verification,
  * and cross-tab lock semantics.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { PrivateKey, Hash } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { PrivateKey, Hash, Transaction, P2PKH, LockingScript, UnlockingScript } from '@bsv/sdk'
+import { MandalaToken, MandalaAdmin } from '@bsv/templates'
+import type { MandalaActionDetails } from '@bsv/templates'
 import {
   journalPut,
   journalList,
@@ -22,11 +23,30 @@ import {
   notifyPut,
   notifyList,
   notifyClear,
-  reconcileNotifications
+  reconcileNotifications,
+  PendingNotification
 } from './notifyJournal.js'
 import { receiveTokens, InvalidTransferError } from './receive.js'
 import { tryWithLock } from './webLocks.js'
-import { isAlreadyBroadcast } from './overlay.js'
+import { isAlreadyBroadcast, submitAndBroadcast } from './overlay.js'
+import { submitAdminAction } from './assets.js'
+import type { AdminAsset } from './assets.js'
+import { registerAsset } from './issuerOps.js'
+import { clearAdminAuthGates } from './adminAuthGate.js'
+import { BusyError } from './singleFlight.js'
+import { MESSAGEBOX } from './constants.js'
+
+// Label lookup only; an unconfigured overlay URL now throws (see overlayUrlGuard.test.ts),
+// and these tests are about journal/receive ordering, not metadata.
+vi.mock('./metadata.js', () => ({ resolveAssetMetadata: vi.fn().mockResolvedValue(null) }))
+
+// The pipelines under test commit through submitAndBroadcast; the overlay
+// round-trip itself is covered by overlay.test.ts. Everything else in the
+// module (isAlreadyBroadcast, broadcastAcceptedTx for reconcile) stays real.
+vi.mock('./overlay.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./overlay.js')>()),
+  submitAndBroadcast: vi.fn()
+}))
 
 const mkWallet = (over: Partial<Record<'createAction' | 'abortAction' | 'listActions' | 'internalizeAction', any>> = {}) => ({
   createAction: vi.fn().mockResolvedValue({}),
@@ -36,62 +56,62 @@ const mkWallet = (over: Partial<Record<'createAction' | 'abortAction' | 'listAct
   ...over
 })
 
-beforeEach(() => {
-  journalClear()
-  notifyClear()
+beforeEach(async () => {
+  await journalClear()
+  await notifyClear()
 })
 
 describe('txJournal intents', () => {
   it('withIntent marks a pipeline in flight and always clears', async () => {
     await withIntent(async () => {
-      expect(hasFreshIntent()).toBe(true)
+      expect(await hasFreshIntent()).toBe(true)
     })
-    expect(hasFreshIntent()).toBe(false)
+    expect(await hasFreshIntent()).toBe(false)
     await expect(withIntent(async () => { throw new Error('boom') })).rejects.toThrow('boom')
-    expect(hasFreshIntent()).toBe(false)
+    expect(await hasFreshIntent()).toBe(false)
   })
 
   it('a fresh intent blocks the bulk sweep; a stale one is expired and unblocks it', async () => {
-    const id = journalIntentBegin()
+    const id = await journalIntentBegin()
     const wallet = mkWallet({ listActions: vi.fn().mockResolvedValue({ actions: [{ txid: 'x' }] }) })
     const r1 = await reconcileWallet(wallet as any)
     expect(r1.swept).toBe(0)
     expect(wallet.listActions).not.toHaveBeenCalled()
-    journalIntentEnd(id)
+    await journalIntentEnd(id)
 
     // Stale intent (crashed pipeline): expired on the next pass, sweep runs.
-    journalPut({ txid: 'intent:crashed', stage: 'intent', at: Date.now() - INTENT_TTL_MS - 1 })
+    await journalPut({ txid: 'intent:crashed', stage: 'intent', at: Date.now() - INTENT_TTL_MS - 1 })
     const r2 = await reconcileWallet(wallet as any)
     expect(r2.swept).toBe(1)
-    expect(journalList().filter(e => e.stage === 'intent')).toEqual([])
+    expect((await journalList()).filter(e => e.stage === 'intent')).toEqual([])
   })
 })
 
 describe('reconcile abort retention', () => {
   it('keeps a failing abort entry with attempts++ instead of dropping it', async () => {
-    journalPut({ txid: 'rej', stage: 'abort', reference: 'ref-x', at: 1 })
+    await journalPut({ txid: 'rej', stage: 'abort', reference: 'ref-x', at: 1 })
     const wallet = mkWallet({ abortAction: vi.fn().mockRejectedValue(new Error('wallet offline')) })
     await reconcileWallet(wallet as any)
-    const entry = journalList().find(e => e.txid === 'rej')
+    const entry = (await journalList()).find(e => e.txid === 'rej')
     expect(entry).toBeDefined()
     expect(entry?.attempts).toBe(1)
   })
 
   it('hands a persistently-failing abort to the sweep only after the cap', async () => {
-    journalPut({ txid: 'rej', stage: 'abort', reference: 'ref-x', at: 1, attempts: ABORT_RETRY_CAP - 1 })
+    await journalPut({ txid: 'rej', stage: 'abort', reference: 'ref-x', at: 1, attempts: ABORT_RETRY_CAP - 1 })
     const wallet = mkWallet({ abortAction: vi.fn().mockRejectedValue(new Error('still failing')) })
     await reconcileWallet(wallet as any)
-    expect(journalList()).toEqual([])
+    expect(await journalList()).toEqual([])
   })
 
   it('clears an accepted entry when the broadcast error means already-known', async () => {
-    journalPut({ txid: 'dup', stage: 'accepted', at: 1 })
+    await journalPut({ txid: 'dup', stage: 'accepted', at: 1 })
     const wallet = mkWallet({
       createAction: vi.fn().mockRejectedValue(new Error('txn-already-known'))
     })
     const r = await reconcileWallet(wallet as any)
     expect(r.rebroadcast).toEqual(['dup'])
-    expect(journalList()).toEqual([])
+    expect(await journalList()).toEqual([])
   })
 
   it('isAlreadyBroadcast matches known duplicates, not transient failures', () => {
@@ -103,11 +123,11 @@ describe('reconcile abort retention', () => {
 
 describe('notification journal', () => {
   it('retries pending notifications and clears on delivery', async () => {
-    notifyPut({ txid: 't1', recipient: '02ab', messageBox: 'mandala-payments', body: { assetId: 'a.0' }, at: 1 })
+    await notifyPut({ txid: 't1', recipient: '02ab', messageBox: 'mandala-payments', body: { assetId: 'a.0' }, at: 1 })
     const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
     const delivered = await reconcileNotifications(mbc)
     expect(delivered).toEqual(['t1'])
-    expect(notifyList()).toEqual([])
+    expect(await notifyList()).toEqual([])
     expect(mbc.sendMessage).toHaveBeenCalledWith({
       recipient: '02ab',
       messageBox: 'mandala-payments',
@@ -116,11 +136,11 @@ describe('notification journal', () => {
   })
 
   it('keeps a failed notification (attempts++) for the next pass', async () => {
-    notifyPut({ txid: 't1', recipient: '02ab', messageBox: 'mb', body: {}, at: 1 })
+    await notifyPut({ txid: 't1', recipient: '02ab', messageBox: 'mb', body: {}, at: 1 })
     const mbc = { sendMessage: vi.fn().mockRejectedValue(new Error('box down')) }
     const delivered = await reconcileNotifications(mbc)
     expect(delivered).toEqual([])
-    expect(notifyList()[0]?.attempts).toBe(1)
+    expect((await notifyList())[0]?.attempts).toBe(1)
   })
 })
 
@@ -207,5 +227,206 @@ describe('webLocks', () => {
     expect((await first)).toEqual({ acquired: true, result: 1 })
     const third = await tryWithLock('t.lock', async () => 3)
     expect(third).toEqual({ acquired: true, result: 3 })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Admin pipelines driven end-to-end with the wallet + templates stubbed.
+// ---------------------------------------------------------------------------
+
+const ASSET_ID = 'a'.repeat(64) + '.0'
+const PRIOR = 'b'.repeat(64) + '.1'
+const ISSUER = '02' + 'ab'.repeat(32)
+const RECIPIENT = '03' + 'cd'.repeat(32)
+const COMMIT_TXID = 'c'.repeat(64)
+
+/** A signable BEEF with `n` inputs — what createAction hands back for signing. */
+function signableBeef (n = 1): number[] {
+  const pkh = Hash.hash160(PrivateKey.fromRandom().toPublicKey().encode(true) as number[])
+  const src = new Transaction()
+  for (let i = 0; i < n; i++) src.addOutput({ satoshis: 2, lockingScript: new P2PKH().lock(pkh) })
+  const tx = new Transaction()
+  for (let i = 0; i < n; i++) {
+    tx.addInput({ sourceTransaction: src, sourceOutputIndex: i, unlockingScript: new UnlockingScript([]), sequence: 0xffffffff })
+  }
+  tx.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(pkh) })
+  return tx.toBEEF(true)
+}
+
+function stubTemplates (): void {
+  vi.spyOn(MandalaAdmin, 'lock').mockResolvedValue(new LockingScript([]))
+  vi.spyOn(MandalaAdmin, 'unlock').mockReturnValue({
+    sign: async () => new UnlockingScript([]),
+    estimateLength: async () => 108
+  })
+  vi.spyOn(MandalaToken.prototype, 'lockBRC29').mockResolvedValue(new LockingScript([]))
+}
+
+const mkAdminWallet = () => ({
+  listOutputs: vi.fn().mockResolvedValue({ outputs: [{ outpoint: PRIOR }], BEEF: [1] }),
+  createAction: vi.fn().mockResolvedValue({ signableTransaction: { tx: signableBeef(1), reference: 'ref-1' } }),
+  signAction: vi.fn().mockResolvedValue({ tx: [9, 9, 9], txid: COMMIT_TXID }),
+  revealSpecificKeyLinkage: vi.fn().mockResolvedValue({ keyID: 'k' }),
+  abortAction: vi.fn().mockResolvedValue({ aborted: true }),
+  listActions: vi.fn().mockResolvedValue({ actions: [] })
+})
+
+const asset: AdminAsset = {
+  assetId: ASSET_ID,
+  label: 'USD',
+  authOutpoint: PRIOR,
+  authDetails: { kind: 'issue', assetId: ASSET_ID, amount: 1, priorOutpoint: 'genesis.0' }
+}
+
+describe('A08 reissue notification is journaled before the send (submitAdminAction)', () => {
+  const reissue: MandalaActionDetails = {
+    kind: 'reissue', assetId: ASSET_ID, outpoint: 'frozen.0', amount: 5, recipient: RECIPIENT, priorOutpoint: PRIOR
+  }
+  const run = (messageBoxClient: any, details: MandalaActionDetails = reissue, ftOutput?: { recipient: string, amount: number }) =>
+    submitAdminAction({
+      wallet: mkAdminWallet() as any,
+      asset,
+      details,
+      ftOutput: ftOutput ?? (details.kind === 'reissue' ? { recipient: RECIPIENT, amount: 5 } : undefined),
+      messageBoxClient,
+      identityKey: ISSUER
+    })
+
+  beforeEach(() => {
+    clearAdminAuthGates()
+    stubTemplates()
+    vi.mocked(submitAndBroadcast).mockReset().mockResolvedValue({ outputsToAdmit: [0, 1] })
+  })
+  afterEach(() => vi.restoreAllMocks())
+
+  it('writes the journal entry before sendMessage, with outputIndex + senderMode, and clears it on success', async () => {
+    const seenAtSend: PendingNotification[] = []
+    const mbc = { sendMessage: vi.fn(async () => { seenAtSend.push(...(await notifyList())); return {} }) }
+
+    const res = await run(mbc)
+
+    expect(res.notified).toBe(true)
+    expect(res.txid).toBe(COMMIT_TXID)
+    // Journaled BEFORE the send — a crash between the two is recovered at boot.
+    expect(seenAtSend).toHaveLength(1)
+    expect(seenAtSend[0].txid).toBe(COMMIT_TXID)
+    expect(seenAtSend[0].recipient).toBe(RECIPIENT)
+    expect(seenAtSend[0].body).toMatchObject({
+      assetId: ASSET_ID,
+      amount: 5,
+      transaction: [9, 9, 9],
+      outputIndex: 0,
+      sender: ISSUER,
+      senderMode: 'unblinded'
+    })
+    expect(mbc.sendMessage).toHaveBeenCalledWith({ recipient: RECIPIENT, messageBox: MESSAGEBOX, body: seenAtSend[0].body })
+    // Delivered → entry cleared.
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('a throwing sendMessage keeps the entry, does not throw out of the committed action, and reconcileNotifications retries it', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const mbc = { sendMessage: vi.fn().mockRejectedValue(new Error('messagebox down')) }
+
+    const res = await run(mbc)
+
+    expect(res.notified).toBe(false)
+    expect(res.nextAuthOutpoint).toBe(`${COMMIT_TXID}.1`)
+    expect(warn).toHaveBeenCalled()
+    const pending = await notifyList()
+    expect(pending).toHaveLength(1)
+    expect(pending[0].txid).toBe(COMMIT_TXID)
+
+    const retry = { sendMessage: vi.fn().mockResolvedValue({}) }
+    expect(await reconcileNotifications(retry)).toEqual([COMMIT_TXID])
+    expect(retry.sendMessage).toHaveBeenCalledWith({
+      recipient: RECIPIENT,
+      messageBox: MESSAGEBOX,
+      body: expect.objectContaining({ outputIndex: 0, senderMode: 'unblinded', sender: ISSUER })
+    })
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('a reissue with no MessageBox client is still journaled for the boot-time retry', async () => {
+    const res = await run(undefined)
+    expect(res.notified).toBe(false)
+    expect((await notifyList()).map(n => n.txid)).toEqual([COMMIT_TXID])
+  })
+
+  it('actions without an FT output journal nothing and report notified', async () => {
+    const mbc = { sendMessage: vi.fn() }
+    const res = await run(mbc, { kind: 'pause', assetId: ASSET_ID, priorOutpoint: PRIOR })
+    expect(res.notified).toBe(true)
+    expect(res.nextAuthOutpoint).toBe(`${COMMIT_TXID}.0`)
+    expect(mbc.sendMessage).not.toHaveBeenCalled()
+    expect(await notifyList()).toEqual([])
+  })
+})
+
+describe('A15 registerAsset runs under an intent marker and the mandala.register lock', () => {
+  const REG_TXID = 'd'.repeat(64)
+  const mkRegWallet = () => ({
+    createAction: vi.fn().mockResolvedValue({ tx: [1, 2, 3], txid: REG_TXID }),
+    listActions: vi.fn().mockResolvedValue({ actions: [{ txid: 'stuck' }] }),
+    abortAction: vi.fn().mockResolvedValue({ aborted: true })
+  })
+  const params = (wallet: ReturnType<typeof mkRegWallet>) =>
+    ({ wallet: wallet as any, identityKey: ISSUER, label: 'Gold', ticker: 'gld', decimals: 2 })
+
+  beforeEach(() => {
+    stubTemplates()
+    vi.mocked(submitAndBroadcast).mockReset()
+  })
+  afterEach(() => vi.restoreAllMocks())
+
+  it('a crash after createAction leaves a fresh intent that the reconcile sweep respects until TTL', async () => {
+    // "Crash" = the overlay round-trip never returns; the pipeline is stuck
+    // between createAction and the journaled outcome.
+    let commit!: (v: unknown) => void
+    vi.mocked(submitAndBroadcast).mockReturnValue(new Promise(r => { commit = r }) as any)
+    const wallet = mkRegWallet()
+
+    const inFlight = registerAsset(params(wallet))
+    await vi.waitFor(() => expect(wallet.createAction).toHaveBeenCalledTimes(1))
+    expect(await hasFreshIntent()).toBe(true)
+
+    // The bulk sweep must not abort the live noSend action.
+    const r = await reconcileWallet(wallet as any)
+    expect(r.swept).toBe(0)
+    expect(wallet.listActions).not.toHaveBeenCalled()
+
+    commit({ outputsToAdmit: [0] })
+    // A12 widened the result with the overlay's acceptance proof; assetId is
+    // still the contract this test is about.
+    await expect(inFlight).resolves.toMatchObject({ assetId: `${REG_TXID}.0` })
+    expect(await hasFreshIntent()).toBe(false)
+  })
+
+  it('a second register while one is in flight is refused (not queued) and never reaches createAction', async () => {
+    let commit!: (v: unknown) => void
+    vi.mocked(submitAndBroadcast).mockReturnValue(new Promise(r => { commit = r }) as any)
+    const wallet = mkRegWallet()
+
+    const first = registerAsset(params(wallet))
+    await vi.waitFor(() => expect(wallet.createAction).toHaveBeenCalledTimes(1))
+    await expect(registerAsset(params(wallet))).rejects.toBeInstanceOf(BusyError)
+    expect(wallet.createAction).toHaveBeenCalledTimes(1)
+
+    commit({ outputsToAdmit: [0] })
+    await first
+    // Released after settle — a later register is allowed again.
+    vi.mocked(submitAndBroadcast).mockResolvedValue({ outputsToAdmit: [0] })
+    await expect(registerAsset(params(wallet))).resolves.toMatchObject({ assetId: `${REG_TXID}.0` })
+  })
+
+  it('forwards the wallet reference (when one exists) so an overlay rejection can abort the held action', async () => {
+    vi.mocked(submitAndBroadcast).mockRejectedValue(new Error('overlay rejected'))
+    const wallet = mkRegWallet()
+    wallet.createAction.mockResolvedValue({ tx: [1], txid: REG_TXID, signableTransaction: { tx: [1], reference: 'reg-ref' } })
+
+    await expect(registerAsset(params(wallet))).rejects.toThrow('overlay rejected')
+    expect(vi.mocked(submitAndBroadcast).mock.calls[0][3]).toBe('reg-ref')
+    // Intent cleared on settle either way.
+    expect(await hasFreshIntent()).toBe(false)
   })
 })

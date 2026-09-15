@@ -5,7 +5,9 @@ import {
   guardIssueSubmit,
   guardRedeemSubmit,
   guardRegisterSubmit,
-  guardAdminFields
+  guardAdminFields,
+  guardIdentityKey,
+  guardTokenRecipient
 } from './submitGuards.js'
 
 describe('guardPositiveAmount', () => {
@@ -61,6 +63,28 @@ describe('guardIssueSubmit / guardRedeemSubmit', () => {
     expect(guardIssueSubmit({ assetId: 'a.0', amount: 0, walletReady: true }).ok).toBe(false)
   })
 
+  it('issue accepts a 64-hex deposit hash as bankRef and refuses anything else when one is given (A14)', () => {
+    const base = { assetId: 'a.0', amount: 5, walletReady: true }
+    expect(guardIssueSubmit({ ...base, bankRef: 'ab'.repeat(32) }).ok).toBe(true)
+    expect(guardIssueSubmit({ ...base, bankRef: 'AB'.repeat(32) }).ok).toBe(true)
+    // Optional: absent / empty / whitespace is fine when not mandatory.
+    expect(guardIssueSubmit({ ...base, bankRef: '' }).ok).toBe(true)
+    expect(guardIssueSubmit({ ...base, bankRef: '   ' }).ok).toBe(true)
+    // Provided but not a sha256 digest — the raw bank reference must never go on-chain.
+    expect(guardIssueSubmit({ ...base, bankRef: 'BR-2024-0001' }).ok).toBe(false)
+    expect(guardIssueSubmit({ ...base, bankRef: 'ab'.repeat(31) }).ok).toBe(false)
+    expect(guardIssueSubmit({ ...base, bankRef: 'zz'.repeat(32) }).ok).toBe(false)
+    const r = guardIssueSubmit({ ...base, bankRef: 'BR-1' })
+    expect(r.ok === false && r.reason).toMatch(/64|hex|sha256/i)
+  })
+
+  it('issue requires a bankRef when the deposit reference is configured as mandatory (A14)', () => {
+    const base = { assetId: 'a.0', amount: 5, walletReady: true, requireBankRef: true }
+    expect(guardIssueSubmit({ ...base }).ok).toBe(false)
+    expect(guardIssueSubmit({ ...base, bankRef: '' }).ok).toBe(false)
+    expect(guardIssueSubmit({ ...base, bankRef: 'ab'.repeat(32) }).ok).toBe(true)
+  })
+
   it('redeem refuses amount above balance when balance is provided', () => {
     expect(
       guardRedeemSubmit({ assetId: 'a.0', amount: 50, balance: 40, walletReady: true }).ok
@@ -105,5 +129,45 @@ describe('guardAdminFields', () => {
         recipient: '02abc'
       }).ok
     ).toBe(true)
+  })
+
+  it('validates identity keys as compressed pubkeys when required', () => {
+    expect(guardAdminFields({ requireIdentity: true, identityKey: '02abc' }).ok).toBe(false)
+    expect(
+      guardAdminFields({ requireIdentity: true, identityKey: '02' + 'ab'.repeat(32) }).ok
+    ).toBe(true)
+  })
+})
+
+describe('guardIdentityKey', () => {
+  it('accepts compressed 02/03 keys and rejects empty, uncompressed, odd length', () => {
+    expect(guardIdentityKey('02' + 'ab'.repeat(32)).ok).toBe(true)
+    expect(guardIdentityKey('03' + 'cd'.repeat(32)).ok).toBe(true)
+    expect(guardIdentityKey('').ok).toBe(false)
+    expect(guardIdentityKey('04' + 'ab'.repeat(64)).ok).toBe(false)
+    expect(guardIdentityKey('02' + 'ab'.repeat(31)).ok).toBe(false)
+    expect(guardIdentityKey('zz' + 'ab'.repeat(32)).ok).toBe(false)
+  })
+})
+
+describe('guardTokenRecipient (D4 — address rail refusal is a protocol fact)', () => {
+  it('accepts a compressed identity key (no reason)', () => {
+    expect(guardTokenRecipient('02' + 'ab'.repeat(32))).toBeNull()
+    expect(guardTokenRecipient('03' + 'CD'.repeat(32))).toBeNull()
+    expect(guardTokenRecipient('  03' + 'cd'.repeat(32) + '  ')).toBeNull()
+  })
+
+  it('returns a plain reason string for anything that is not an identity key', () => {
+    // A bare P2PKH address cannot receive a Mandala token: the output key is
+    // ECDH-derived against the recipient identity key and the overlay refuses
+    // any FT output whose owner it cannot name from a linkage.
+    const addr = guardTokenRecipient('1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2')
+    expect(typeof addr).toBe('string')
+    expect(addr).toMatch(/identity key/i)
+    expect(addr).toMatch(/address/i)
+    expect(typeof guardTokenRecipient('04' + 'ab'.repeat(64))).toBe('string')
+    expect(typeof guardTokenRecipient('02' + 'ab'.repeat(31))).toBe('string')
+    expect(typeof guardTokenRecipient('')).toBe('string')
+    expect(typeof guardTokenRecipient('   ')).toBe('string')
   })
 })

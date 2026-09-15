@@ -100,8 +100,8 @@ func seedIssueTx(t *testing.T, store *mandala.Store, es *enginestore.Store, asse
 
 func TestActivity_InvalidBeforeIs400(t *testing.T) {
 	db := testAdminDB(t)
-	store := mandala.NewStore(db)
-	es := enginestore.New(db)
+	store := mustMandalaStore(t, db)
+	es := mustEngineStore(t, db)
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, store, nil, WithActivity(store, findRawTxsFromEngine(es)))
 
 	resp := doRequest(t, app, httptest.NewRequest(http.MethodGet, "/admin/activity?before=not-a-timestamp", nil))
@@ -126,8 +126,8 @@ func TestActivity_RouteNotMountedWithoutOption(t *testing.T) {
 
 func TestActivity_WireShapeForAClassifiedIssueEntry(t *testing.T) {
 	db := testAdminDB(t)
-	store := mandala.NewStore(db)
-	es := enginestore.New(db)
+	store := mustMandalaStore(t, db)
+	es := mustEngineStore(t, db)
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, store, nil, WithActivity(store, findRawTxsFromEngine(es)))
 
 	assetID := strings.Repeat("cd", 32) + ".0"
@@ -207,8 +207,8 @@ func TestActivity_WireShapeForAClassifiedIssueEntry(t *testing.T) {
 
 func TestActivity_AssetIDFilterAppliesPostClassification(t *testing.T) {
 	db := testAdminDB(t)
-	store := mandala.NewStore(db)
-	es := enginestore.New(db)
+	store := mustMandalaStore(t, db)
+	es := mustEngineStore(t, db)
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, store, nil, WithActivity(store, findRawTxsFromEngine(es)))
 
 	assetA := strings.Repeat("aa", 32) + ".0"

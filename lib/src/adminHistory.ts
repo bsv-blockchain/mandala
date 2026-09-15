@@ -1,6 +1,6 @@
 import { MandalaAdmin } from '@bsv/templates'
 import type { MandalaActionDetails } from '@bsv/templates'
-import { OVERLAY_URL } from './constants.js'
+import { OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 
 export interface AdminHistoryRow {
   assetId: string
@@ -12,6 +12,7 @@ export interface AdminHistoryRow {
 }
 
 export async function resolveAdminHistory (assetId: string): Promise<AdminHistoryRow[]> {
+  if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
   try {
     const res = await fetch(`${OVERLAY_URL}/admin/admin-history/${encodeURIComponent(assetId)}`)
     if (!res.ok) return []
@@ -41,6 +42,7 @@ export async function resolveAdminHistoryPage (
   assetId: string,
   opts: { limit?: number, offset?: number } = {}
 ): Promise<AdminHistoryRow[]> {
+  if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
   try {
     const params = new URLSearchParams()
     params.set('limit', String(opts.limit ?? 100))
@@ -66,6 +68,7 @@ export interface AdminSummary {
  * history to the client.
  */
 export async function resolveAdminSummary (assetId: string): Promise<AdminSummary | null> {
+  if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
   try {
     const res = await fetch(`${OVERLAY_URL}/admin/admin-summary/${encodeURIComponent(assetId)}`)
     if (!res.ok) return null
@@ -92,7 +95,9 @@ export function describeAction (d: MandalaActionDetails): string {
     // assetId — the assetId is the outpoint of this very tx, so it can't be a
     // field within its own payload.
     case 'register': return `Registered asset "${d.label as string}"${d.ticker != null && d.ticker !== '' ? ` (${d.ticker as string})` : ''}`
-    case 'issue': return `Issued ${d.amount} units`
+    // bankRef is the sha256 of the off-chain deposit record (R12) — shown in
+    // full so an auditor can match it against the bank's own record hash.
+    case 'issue': return `Issued ${d.amount} units${d.bankRef != null ? ` (bankRef ${d.bankRef})` : ''}`
     case 'redeem': return `Redeemed (burned) ${d.amount} units`
     case 'pause': return 'Paused transfers'
     case 'unpause': return 'Resumed transfers'
@@ -111,7 +116,7 @@ export function describeAction (d: MandalaActionDetails): string {
 const esc = (s: string): string => `"${s.replace(/"/g, '""')}"`
 
 export function exportAdminHistoryCsv (rows: AdminHistoryRow[]): string {
-  const header = ['txid', 'outputIndex', 'priorOutpoint', 'kind', 'canonicalDetailsJson', 'commitment', 'height', 'offset', 'description']
+  const header = ['txid', 'outputIndex', 'priorOutpoint', 'kind', 'bankRef', 'canonicalDetailsJson', 'commitment', 'height', 'offset', 'description']
   const lines = [header.join(',')]
   for (const r of rows) {
     const canonical = MandalaAdmin.canonicalize(r.actionDetails)
@@ -121,6 +126,7 @@ export function exportAdminHistoryCsv (rows: AdminHistoryRow[]): string {
       String(r.outputIndex),
       esc(String(r.actionDetails.priorOutpoint ?? '')),
       esc(r.actionDetails.kind),
+      esc(String(r.actionDetails.bankRef ?? '')),
       esc(canonical),
       esc(commitment),
       String(r.height),

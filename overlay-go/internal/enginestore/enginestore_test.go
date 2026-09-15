@@ -9,7 +9,9 @@ package enginestore
 // mandala_go_engine_test is dropped in cleanup).
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,11 +20,15 @@ import (
 	"github.com/bsv-blockchain/go-sdk/overlay"
 	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 const topic = "tm_mandala"
+
+// topicVar is an addressable copy of topic for FindOutput's *string param.
+var topicVar = topic
 
 func testDB(t *testing.T) *mongo.Database {
 	t.Helper()
@@ -96,11 +102,23 @@ func op(txid *chainhash.Hash, vout uint32) *transaction.Outpoint {
 	return &transaction.Outpoint{Txid: *txid, Index: vout}
 }
 
+// mustNew builds a Store and fails the test if index creation does not succeed
+// — New aborts on that (wire contract §9.9), so tests must too rather than
+// running against a half-indexed database.
+func mustNew(t *testing.T, db *mongo.Database) *Store {
+	t.Helper()
+	st, err := New(db)
+	if err != nil {
+		t.Fatalf("enginestore.New: %v", err)
+	}
+	return st
+}
+
 // --- insert / find group ---
 
 func TestInsertAndFind(t *testing.T) {
 	ctx := context.Background()
-	st := New(testDB(t))
+	st := mustNew(t, testDB(t))
 
 	tx := newTx(0x01, 2)
 	root := addProof(t, tx, 100)
@@ -192,7 +210,7 @@ func TestInsertAndFind(t *testing.T) {
 
 func TestFindUTXOsForTopic(t *testing.T) {
 	ctx := context.Background()
-	st := New(testDB(t))
+	st := mustNew(t, testDB(t))
 
 	tx1 := newTx(0x03, 1)
 	if err := st.InsertOutputs(ctx, topic, tx1.TxID(), []uint32{0}, nil, beefFor(t, tx1), nil); err != nil {
@@ -251,7 +269,7 @@ func TestFindUTXOsForTopic(t *testing.T) {
 
 func TestSpendAndConsumedBy(t *testing.T) {
 	ctx := context.Background()
-	st := New(testDB(t))
+	st := mustNew(t, testDB(t))
 
 	parent := newTx(0x05, 2)
 	parentID := parent.TxID()
@@ -317,7 +335,7 @@ func TestSpendAndConsumedBy(t *testing.T) {
 
 func TestMerkleStateLifecycle(t *testing.T) {
 	ctx := context.Background()
-	st := New(testDB(t))
+	st := mustNew(t, testDB(t))
 
 	// tx1 mined at 100 (root R1), tx2 claims height 100 with a different
 	// root, tx3 unmined.
@@ -405,7 +423,7 @@ func TestMerkleStateLifecycle(t *testing.T) {
 
 func TestAppliedTransactions(t *testing.T) {
 	ctx := context.Background()
-	st := New(testDB(t))
+	st := mustNew(t, testDB(t))
 
 	txid := newTx(0x0a, 1).TxID()
 	rec := &overlay.AppliedTransaction{Txid: txid, Topic: topic}
@@ -436,7 +454,7 @@ func TestAppliedTransactions(t *testing.T) {
 
 func TestDeleteOutput(t *testing.T) {
 	ctx := context.Background()
-	st := New(testDB(t))
+	st := mustNew(t, testDB(t))
 
 	tx := newTx(0x0b, 2)
 	txid := tx.TxID()
@@ -463,7 +481,7 @@ func TestDeleteOutput(t *testing.T) {
 
 func TestLoadAncillaryBeef(t *testing.T) {
 	ctx := context.Background()
-	st := New(testDB(t))
+	st := mustNew(t, testDB(t))
 
 	anc := newTx(0x0c, 1) // ancillary tx admitted on its own earlier
 	ancID := anc.TxID()
@@ -541,7 +559,7 @@ func TestLoadAncillaryBeef(t *testing.T) {
 
 func TestLastInteraction(t *testing.T) {
 	ctx := context.Background()
-	st := New(testDB(t))
+	st := mustNew(t, testDB(t))
 
 	score, err := st.GetLastInteraction(ctx, "https://peer.example", topic)
 	if err != nil || score != 0 {
@@ -569,7 +587,7 @@ func TestLastInteraction(t *testing.T) {
 func TestUniqueIndexes(t *testing.T) {
 	ctx := context.Background()
 	db := testDB(t)
-	st := New(db)
+	st := mustNew(t, db)
 
 	tx := newTx(0x11, 1)
 	txid := tx.TxID()
@@ -602,7 +620,7 @@ func TestUniqueIndexes(t *testing.T) {
 // assert the outputs are spendable again via FindUTXOsForTopic.
 func TestUnmarkSpentBySpendTxid(t *testing.T) {
 	ctx := context.Background()
-	st := New(testDB(t))
+	st := mustNew(t, testDB(t))
 
 	parent := newTx(0x21, 2)
 	parentID := parent.TxID()
@@ -676,7 +694,7 @@ func TestUnmarkSpentBySpendTxid(t *testing.T) {
 
 func TestFindAndDeleteOutputsByTxid(t *testing.T) {
 	ctx := context.Background()
-	st := New(testDB(t))
+	st := mustNew(t, testDB(t))
 
 	tx := newTx(0x31, 2)
 	txid := tx.TxID()
@@ -759,7 +777,7 @@ func TestFindAndDeleteOutputsByTxid(t *testing.T) {
 // pulling the transaction back out of it.
 func TestRawTxHexByTxid(t *testing.T) {
 	ctx := context.Background()
-	st := New(testDB(t))
+	st := mustNew(t, testDB(t))
 
 	tx := newTx(0x41, 2)
 	txid := tx.TxID()
@@ -812,5 +830,222 @@ func TestRawTxHexByTxid(t *testing.T) {
 
 	if _, _, err := st.RawTxHexByTxid(ctx, "not-a-txid"); err == nil {
 		t.Fatal("bad txid: want an error, got nil")
+	}
+}
+
+// OutputBeefBytes serves the stored BEEF of one (topic, txid, vout) for the
+// /admin/registry/beef and /admin/asset-auth/beef recovery routes (A10/A17):
+// the exact bytes InsertOutputs stored, spent or not, and (nil, false) when
+// the topic never admitted that outpoint.
+func TestOutputBeefBytes(t *testing.T) {
+	ctx := context.Background()
+	st := mustNew(t, testDB(t))
+	tx := newTx(0x51, 2)
+	txid := tx.TxID()
+	beef := beefFor(t, tx)
+	if err := st.InsertOutputs(ctx, "tm_mandala", txid, []uint32{1}, nil, beef, nil); err != nil {
+		t.Fatal(err)
+	}
+	want, err := beef.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := st.OutputBeefBytes(ctx, "tm_mandala", txid.String(), 1)
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("stored BEEF bytes differ")
+	}
+	// Still served once spent — recovery needs the head's BEEF even after the
+	// engine marks it spent by a later admin action.
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(txid, 1)}, "tm_mandala", newTx(0x52, 1).TxID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := st.OutputBeefBytes(ctx, "tm_mandala", txid.String(), 1); err != nil || !ok {
+		t.Fatalf("spent output: ok=%v err=%v", ok, err)
+	}
+	// Wrong vout, wrong topic, unknown txid: absent, not an error.
+	for _, c := range []struct {
+		topic string
+		txid  string
+		vout  uint32
+	}{
+		{"tm_mandala", txid.String(), 0},
+		{"tm_mandala_registry", txid.String(), 1},
+		{"tm_mandala", newTx(0x53, 1).TxID().String(), 1},
+	} {
+		if _, ok, err := st.OutputBeefBytes(ctx, c.topic, c.txid, c.vout); err != nil || ok {
+			t.Fatalf("%+v: ok=%v err=%v, want absent", c, ok, err)
+		}
+	}
+}
+
+// --- FIX L: compare-and-swap spend marking ---
+
+// TestMarkUTXOsAsSpentRefusesAConflictingSpend is the double-spend the
+// overlay used to wave through: two submitted transactions both spend the
+// same admitted coin, and the unconditional UpdateMany simply let the second
+// overwrite spendTxid. The mark is now a compare-and-swap on spent=false
+// with a rows-affected check, so the loser is refused and — crucially — the
+// coins it DID manage to mark in the same call are handed back, leaving no
+// half-spent wreckage behind.
+func TestMarkUTXOsAsSpentRefusesAConflictingSpend(t *testing.T) {
+	ctx := context.Background()
+	st := mustNew(t, testDB(t))
+
+	parent := newTx(0x41, 2)
+	parentID := parent.TxID()
+	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0, 1}, nil, beefFor(t, parent), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	winner := newTx(0x42, 1).TxID()
+	loser := newTx(0x43, 1).TxID()
+
+	// Winner takes output 0 only.
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(parentID, 0)}, topic, winner); err != nil {
+		t.Fatal(err)
+	}
+	// Loser wants both 0 (contested) and 1 (free).
+	err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(parentID, 0), op(parentID, 1)}, topic, loser)
+	if err == nil {
+		t.Fatal("the conflicting spend was accepted")
+	}
+	if !strings.Contains(err.Error(), "already spent") {
+		t.Fatalf("error = %v, want it to name the conflict", err)
+	}
+	if !strings.Contains(err.Error(), winner.String()) {
+		t.Fatalf("error = %v, want it to name the competing txid %s", err, winner)
+	}
+
+	// Output 0 still belongs to the winner.
+	got, err := st.FindOutput(ctx, op(parentID, 0), &topicVar, nil, false)
+	if err != nil || got == nil || !got.Spent {
+		t.Fatalf("winner's mark was lost: %+v %v", got, err)
+	}
+	if by, err := st.SpendStateOf(ctx, topic, parentID.String(), 0); err != nil || by != winner.String() {
+		t.Fatalf("spendTxid = %q (%v), want the winner %s", by, err, winner)
+	}
+	// Output 1 was rolled back: the loser holds nothing.
+	if by, err := st.SpendStateOf(ctx, topic, parentID.String(), 1); err != nil || by != "" {
+		t.Fatalf("output 1 spendTxid = %q (%v), want empty — the failed mark must roll back", by, err)
+	}
+	utxos, err := st.FindUTXOsForTopic(ctx, topic, 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(utxos) != 1 || utxos[0].Outpoint.Index != 1 {
+		t.Fatalf("spendable outputs = %+v, want only parent:1", utxos)
+	}
+}
+
+// Re-marking a coin this very transaction already spent is not a conflict:
+// it is the idempotent resubmit path, and refusing it would strand a
+// transaction whose first attempt died between marking and committing.
+func TestMarkUTXOsAsSpentIsIdempotentForTheSameSpender(t *testing.T) {
+	ctx := context.Background()
+	st := mustNew(t, testDB(t))
+
+	parent := newTx(0x44, 1)
+	parentID := parent.TxID()
+	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, beefFor(t, parent), nil); err != nil {
+		t.Fatal(err)
+	}
+	spender := newTx(0x45, 1).TxID()
+	for i := 0; i < 2; i++ {
+		if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(parentID, 0)}, topic, spender); err != nil {
+			t.Fatalf("mark %d: %v", i, err)
+		}
+	}
+	if by, _ := st.SpendStateOf(ctx, topic, parentID.String(), 0); by != spender.String() {
+		t.Fatalf("spendTxid = %q, want %s", by, spender)
+	}
+}
+
+// SpendStateOf reports "" for a live coin and for a coin no document exists
+// for at all — a missing row is not evidence of a spend.
+func TestSpendStateOfLiveAndUnknownOutpoints(t *testing.T) {
+	ctx := context.Background()
+	st := mustNew(t, testDB(t))
+
+	parent := newTx(0x46, 1)
+	parentID := parent.TxID()
+	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, beefFor(t, parent), nil); err != nil {
+		t.Fatal(err)
+	}
+	if by, err := st.SpendStateOf(ctx, topic, parentID.String(), 0); err != nil || by != "" {
+		t.Fatalf("live coin: %q %v", by, err)
+	}
+	if by, err := st.SpendStateOf(ctx, topic, newTx(0x47, 1).TxID().String(), 0); err != nil || by != "" {
+		t.Fatalf("unknown outpoint: %q %v, want empty and no error", by, err)
+	}
+}
+
+// --- FIX C: deriving outputsToAdmit from the engine's own stored outputs ---
+
+func TestAdmittedOutputIndexes(t *testing.T) {
+	ctx := context.Background()
+	st := mustNew(t, testDB(t))
+
+	tx := newTx(0x48, 4)
+	txid := tx.TxID()
+	if err := st.InsertOutputs(ctx, topic, txid, []uint32{2, 0}, nil, beefFor(t, tx), nil); err != nil {
+		t.Fatal(err)
+	}
+	// A different topic's admission of the same txid must not leak in.
+	if err := st.InsertOutputs(ctx, "tm_other", txid, []uint32{3}, nil, beefFor(t, tx), nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.AdmittedOutputIndexes(ctx, topic, txid.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != 0 || got[1] != 2 {
+		t.Fatalf("admitted indexes = %v, want [0 2] ascending", got)
+	}
+	// Spent outputs still count: admission is history, not current liquidity.
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(txid, 0)}, topic, newTx(0x49, 1).TxID()); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.AdmittedOutputIndexes(ctx, topic, txid.String())
+	if err != nil || len(got) != 2 {
+		t.Fatalf("admitted indexes after spend = %v (%v), want both still listed", got, err)
+	}
+	empty, err := st.AdmittedOutputIndexes(ctx, topic, newTx(0x4a, 1).TxID().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("unknown txid = %v, want empty", empty)
+	}
+}
+
+// Wire contract §9.9 — index creation failures abort startup. The unique
+// (topic, txid, outputIndex) index is what makes this store single-valued per
+// admitted output; two rows already violating it make the index impossible to
+// build, and New must refuse rather than hand back a store that silently lost
+// the guarantee.
+func TestNewAbortsWhenAnIndexCannotBeCreated(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	dupe := bson.D{
+		{Key: "topic", Value: topic},
+		{Key: "txid", Value: strings.Repeat("ab", 32)},
+		{Key: "outputIndex", Value: int32(0)},
+	}
+	if _, err := db.Collection("engineOutputs").InsertMany(ctx, []any{dupe, dupe}); err != nil {
+		t.Fatal("seeding the duplicate rows:", err)
+	}
+	st, err := New(db)
+	if err == nil {
+		t.Fatal("New returned a Store without its unique output index")
+	}
+	if st != nil {
+		t.Fatalf("New returned a non-nil Store alongside its error: %+v", st)
+	}
+	if !strings.Contains(err.Error(), "engineOutputs") {
+		t.Fatalf("error must name the collection that failed, got: %v", err)
 	}
 }

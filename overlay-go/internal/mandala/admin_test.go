@@ -150,3 +150,50 @@ func TestLockAdminRoundTrip(t *testing.T) {
 		}
 	})
 }
+
+// A09 — every admin-auth output carries an on-chain marker
+// {"t":"mandala-admin","assetId":"<txid>.<vout>"} as OP_DROP publicData, so a
+// wallet cannot reclassify it as vanilla P2PKH and drop its bookkeeping. The
+// vector is emitted by @bsv/templates MandalaAdmin.lock (testdata/gen/gen.mjs);
+// Go's json.Unmarshal into map[string]any is stricter than JSON.parse, so the
+// marker's decode is proven here rather than assumed.
+func TestDecodeAdminMarkerVector(t *testing.T) {
+	const wantAssetID = "abababababababababababababababababababababababababababababababab.0"
+	var found bool
+	for i, av := range loadAdminVectors(t).AdminScripts {
+		if av.PublicData == nil || av.PublicData["t"] != "mandala-admin" {
+			continue
+		}
+		found = true
+		s, err := script.NewFromHex(av.ScriptHex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chunks, err := s.Chunks()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(chunks) != 7 || chunks[1].Op != script.OpDROP {
+			t.Fatalf("vector %d: want 7-chunk <push> OP_DROP <p2pkh> form, got %d chunks", i, len(chunks))
+		}
+		d, err := DecodeAdmin(s)
+		if err != nil {
+			t.Fatalf("vector %d: %v", i, err)
+		}
+		if !bytes.Equal(d.PubKeyHash[:], av.PubKeyHash) {
+			t.Fatalf("vector %d: pubKeyHash mismatch", i)
+		}
+		if d.PublicData["t"] != "mandala-admin" || d.PublicData["assetId"] != wantAssetID {
+			t.Fatalf("vector %d: publicData = %+v", i, d.PublicData)
+		}
+		// The marker is outside the commitment: the same details lock to the
+		// same key with or without it, so existing chains stay spendable.
+		plain := loadAdminVectors(t).AdminScripts[0]
+		if !bytes.Equal(plain.PubKeyHash, av.PubKeyHash) {
+			t.Fatalf("vector %d: marker changed the derived pubKeyHash", i)
+		}
+	}
+	if !found {
+		t.Fatal("no mandala-admin marker vector in testdata/vectors.json")
+	}
+}

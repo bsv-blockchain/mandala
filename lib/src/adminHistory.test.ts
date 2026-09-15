@@ -59,6 +59,14 @@ describe('describeAction', () => {
     expect(describeAction({ kind: 'issue', assetId: 'x.0', amount: 500 })).toMatch(/issu/i)
   })
 
+  it('renders the committed deposit-record hash (bankRef) for issue, and omits it when absent (A14)', () => {
+    const ref = 'f'.repeat(64)
+    const withRef = describeAction({ kind: 'issue', assetId: 'x.0', amount: 500, bankRef: ref })
+    expect(withRef).toMatch(/issu/i)
+    expect(withRef).toContain(ref)
+    expect(describeAction({ kind: 'issue', assetId: 'x.0', amount: 500 })).not.toMatch(/bankRef/)
+  })
+
   it('describes redeem in human-readable form', () => {
     expect(describeAction({ kind: 'redeem', assetId: 'x.0', amount: 100 })).toMatch(/redeem/i)
   })
@@ -104,6 +112,18 @@ describe('exportAdminHistoryCsv', () => {
     expect(header).toContain('height')
     expect(header).toContain('offset')
     expect(header).toContain('description')
+    expect(header).toContain('bankRef')
+  })
+
+  it('bankRef column carries the issue deposit hash and is empty for ref-less rows (A14)', () => {
+    const ref = 'e'.repeat(64)
+    const issued: AdminHistoryRow = { ...row, txid: 'ti', actionDetails: { kind: 'issue', assetId: 'x.0', amount: 5, priorOutpoint: 'p.0', bankRef: ref } }
+    const csv = exportAdminHistoryCsv([issued, row])
+    const [header, issueLine, pauseLine] = csv.split('\n')
+    const col = header.split(',').indexOf('bankRef')
+    expect(col).toBeGreaterThan(-1)
+    expect(issueLine.split(',')[col]).toBe(`"${ref}"`)
+    expect(pauseLine.split(',')[col]).toBe('""')
   })
 
   it('commitment cell equals MandalaAdmin.commitment(row.actionDetails) — third-party verifiable', () => {

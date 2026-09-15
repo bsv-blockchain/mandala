@@ -2,6 +2,7 @@ package mandala
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -21,6 +22,20 @@ import (
 type fakeState struct {
 	states map[string]AssetAdminState
 	tokens map[string]*TokenRow
+	// adminOutpoints keys are "<assetId>|<txid>.<vout>" for admin outputs this
+	// topic previously admitted for that asset.
+	adminOutpoints map[string]bool
+	// issuers is what IssuerIdentityKeys reports (the store-wide issuer set
+	// the membership gate exempts); the per-asset states above are separate.
+	issuers []string
+}
+
+func (f *fakeState) IsAdminOutpoint(_ context.Context, assetID, txid string, vout uint32) (bool, error) {
+	return f.adminOutpoints[assetID+"|"+fmtOutpoint(txid, vout)], nil
+}
+
+func (f *fakeState) IssuerIdentityKeys(context.Context) ([]string, error) {
+	return f.issuers, nil
 }
 
 func (f *fakeState) GetAssetState(_ context.Context, id string) (AssetAdminState, error) {
@@ -232,7 +247,7 @@ func newHarness(t *testing.T) *harness {
 		},
 	}
 
-	h.state = &fakeState{states: map[string]AssetAdminState{}, tokens: map[string]*TokenRow{}}
+	h.state = &fakeState{states: map[string]AssetAdminState{}, tokens: map[string]*TokenRow{}, adminOutpoints: map[string]bool{}}
 	h.screen = sanctioned{}
 	h.tm = NewTopicManager(h.verifier, h.adminW, h.screen, h.state)
 	h.refresh(t)
@@ -260,11 +275,22 @@ func (h *harness) run(t *testing.T, previousCoins []uint32) (overlay.AdmittanceI
 }
 
 // addPriorAuthInput appends an extra (dummy) input the admin action's
-// priorOutpoint check can chain to, returning its outpoint string.
+// priorOutpoint can point at. The outpoint is NOT recorded as an admin output,
+// so on its own it does not anchor the admin chain — use
+// addRecordedAdminPrior for a legitimate action.
 func (h *harness) addPriorAuthInput(fill byte, vout uint32) string {
 	in := dummyInput(fill, vout)
 	h.tx.AddInput(in)
 	return fmtOutpoint(in.SourceTXID.String(), vout)
+}
+
+// addRecordedAdminPrior appends the input a legitimate admin action spends and
+// records it as an admin-auth output this topic already admitted for the
+// harness asset — the anchor real admin actions chain to.
+func (h *harness) addRecordedAdminPrior(fill byte, vout uint32) string {
+	prior := h.addPriorAuthInput(fill, vout)
+	h.state.adminOutpoints[h.assetID+"|"+prior] = true
+	return prior
 }
 
 // addAdminOutput appends a verified-shape admin output (P2PKH whose pkh is
@@ -321,24 +347,189 @@ func TestAdmitsBalancedTransferWithLinkage(t *testing.T) {
 	}
 }
 
-func TestMissingOutputLinkageBreaksConservation(t *testing.T) {
+// FIX A (§3.1, wire contract §6): a MandalaToken-decodable output with no
+// linkage entry at its index REJECTS the whole submission. It used to be a
+// silent skip, which let conservation hold over the admitted subset while an
+// un-admitted token output of arbitrary size rode along in the same signed
+// txid (the EB-1/SM-1 phantom coin).
+func TestMissingOutputLinkageRejectsWholeTx(t *testing.T) {
 	h := newHarness(t)
-	h.payload.Outputs = h.payload.Outputs[:1] // drop the change linkage: out 60 != in 100
-	_, err := h.tm.IdentifyAdmissibleOutputs(WithPayload(context.Background(), h.payload), h.beef, h.txid, []uint32{0})
-	wantReject(t, err, "conservation violated")
+	h.payload.Outputs = h.payload.Outputs[:1] // drop the change linkage
+	res, err := h.tm.IdentifyAdmissibleOutputs(WithPayload(context.Background(), h.payload), h.beef, h.txid, []uint32{0})
+	wantReject(t, err, "output 1: MandalaToken-decodable output with no verified linkage")
+	if len(res.OutputsToAdmit) != 0 {
+		t.Fatalf("expected no admits on whole-tx rejection, got %v", res.OutputsToAdmit)
+	}
+	if strings.Contains(err.Error(), "conservation violated") {
+		t.Fatalf("must fail on linkage, not conservation: %v", err)
+	}
 }
 
-func TestWrongPKHLinkageSilentlySkipsOutput(t *testing.T) {
+func TestWrongPKHLinkageRejectsWholeTx(t *testing.T) {
 	h := newHarness(t)
-	// Swap the two output linkages: both fail the pkh match, both outputs are
-	// silently skipped, and the tx then fails conservation (out 0 vs in 100 is
-	// unconstrained — asset only on input side), so it admits nothing.
+	// Swap the two output linkages: both fail the pkh match. A clean pkh
+	// MISMATCH is now a rejection, not a skip (FIX A).
 	h.payload.Outputs[0].Index, h.payload.Outputs[1].Index = 1, 0
 	res, err := h.run(t, []uint32{0})
-	if err != nil {
-		t.Fatal(err)
+	wantReject(t, err, "output 0: MandalaToken-decodable output with no verified linkage")
+	if len(res.OutputsToAdmit) != 0 {
+		t.Fatalf("expected no admits on whole-tx rejection, got %v", res.OutputsToAdmit)
 	}
-	wantAdmitted(t, res) // consume-only: no admissions, no error
+}
+
+// TestUnlinkedPhantomTokenOutputRejectsWholeTx is the EB-1/SM-1 regression:
+// the admitted subset balances perfectly on its own (100 in, 100 out at index
+// 0), so pre-FIX-A conservation was satisfied and the overlay signed the txid
+// while an un-admitted 1,000,000-unit MandalaToken output sat at index 1.
+// An offline verifier crediting on σ_I coverage of the txid would have
+// credited the phantom. The whole transaction must now be refused.
+func TestUnlinkedPhantomTokenOutputRejectsWholeTx(t *testing.T) {
+	h := newHarness(t)
+	h.tx.Outputs[0].LockingScript = mustLockToken(t, h.assetID, 100, h.tokenPKH(t, "out-0", h.recipientPub))
+	h.tx.Outputs[1].LockingScript = mustLockToken(t, h.assetID, 1_000_000, h.tokenPKH(t, "phantom", h.holderPub))
+	h.payload.Outputs = h.payload.Outputs[:1] // only output 0 is linked
+
+	res, err := h.run(t, []uint32{0})
+	wantReject(t, err, "output 1: MandalaToken-decodable output with no verified linkage")
+	if len(res.OutputsToAdmit) != 0 {
+		t.Fatalf("expected no admits on whole-tx rejection, got %v", res.OutputsToAdmit)
+	}
+	if strings.Contains(err.Error(), "conservation violated") {
+		t.Fatalf("conservation held over the admitted subset — the rejection must come from the linkage gate: %v", err)
+	}
+}
+
+// TestRejectionsAreTypedVerdicts pins FIX D's structural precondition: every
+// rejection the manager mints is a *RejectError, so the HTTP layer can tell a
+// manager verdict (400/409) from an infrastructure fault (503) without
+// inspecting strings it did not produce.
+func TestRejectionsAreTypedVerdicts(t *testing.T) {
+	h := newHarness(t)
+	h.payload.Outputs = h.payload.Outputs[:1]
+	_, err := h.run(t, []uint32{0})
+	var rej *RejectError
+	if !errors.As(err, &rej) {
+		t.Fatalf("rejection is not a *RejectError: %#v", err)
+	}
+	if rej.Topic != "tm_mandala" {
+		t.Fatalf("RejectError.Topic = %q, want tm_mandala", rej.Topic)
+	}
+}
+
+// fakeSpendChecker maps "<txid>.<vout>" to the txid that already spent it
+// ("" = live), the FIX L seam wiring backs with the engine store's spent
+// flag plus the admission record's evictedAt.
+type fakeSpendChecker map[string]string
+
+func (f fakeSpendChecker) SpentBy(_ context.Context, txid string, vout uint32) (string, error) {
+	return f[fmtOutpoint(txid, vout)], nil
+}
+
+// FIX L (wire contract §7): the overlay refuses a conflicting second spend
+// itself rather than leaving it to Arcade's broadcast race.
+func TestConflictingSpendIsRefusedWithTheCompetingTxid(t *testing.T) {
+	h := newHarness(t)
+	competitor := strings.Repeat("cd", 32)
+	h.tm.WithSpendChecker(fakeSpendChecker{h.srcOutpoint: competitor})
+
+	res, err := h.run(t, []uint32{0})
+	wantReject(t, err, "already spent by "+competitor)
+	if len(res.OutputsToAdmit) != 0 {
+		t.Fatalf("expected no admits, got %v", res.OutputsToAdmit)
+	}
+	var rej *RejectError
+	if !errors.As(err, &rej) {
+		t.Fatalf("not a *RejectError: %#v", err)
+	}
+	if rej.SpendTxid != competitor {
+		t.Fatalf("RejectError.SpendTxid = %q, want %q", rej.SpendTxid, competitor)
+	}
+}
+
+func TestSpendGuardAdmitsALiveCoin(t *testing.T) {
+	h := newHarness(t)
+	h.tm.WithSpendChecker(fakeSpendChecker{})
+	res, err := h.run(t, []uint32{0})
+	if err != nil {
+		t.Fatalf("a live coin was refused: %v", err)
+	}
+	wantAdmitted(t, res, 0, 1)
+}
+
+// A resubmit of the very transaction that marked the input spent is not a
+// conflicting spend — the dupe path, not a refusal.
+func TestSpendGuardIgnoresASpendByThisSameTx(t *testing.T) {
+	h := newHarness(t)
+	h.refresh(t)
+	h.tm.WithSpendChecker(fakeSpendChecker{h.srcOutpoint: h.txid.String()})
+	res, err := h.run(t, []uint32{0})
+	if err != nil {
+		t.Fatalf("a resubmit of the spending tx itself was refused: %v", err)
+	}
+	wantAdmitted(t, res, 0, 1)
+}
+
+// failingState turns every asset-state read into a dependency fault.
+type failingState struct {
+	*fakeState
+	err error
+}
+
+func (f failingState) GetAssetState(context.Context, string) (AssetAdminState, error) {
+	return AssetAdminState{}, f.err
+}
+
+// failingScreen is a ScreeningProvider that is simply unreachable.
+type failingScreen struct{ err error }
+
+func (f failingScreen) IsSanctioned(context.Context, string) (bool, error) { return false, f.err }
+
+// FIX D's allowlist discipline, at the source: a dependency fault must NOT
+// leave the manager typed as a verdict, or the HTTP layer would mint a
+// permanent 4xx ("this transaction is invalid forever") out of a Mongo blip.
+func TestStoreFaultIsNotAVerdict(t *testing.T) {
+	h := newHarness(t)
+	h.tm = NewTopicManager(h.verifier, h.adminW, h.screen, failingState{fakeState: h.state, err: errors.New("mongo down")})
+	_, err := h.run(t, []uint32{0})
+	if err == nil {
+		t.Fatal("expected the store fault to surface")
+	}
+	var rej *RejectError
+	if errors.As(err, &rej) {
+		t.Fatalf("a store fault was minted as a manager verdict: %v", err)
+	}
+}
+
+func TestScreeningProviderFaultIsNotAVerdict(t *testing.T) {
+	h := newHarness(t)
+	h.tm = NewTopicManager(h.verifier, h.adminW, failingScreen{err: errors.New("provider unreachable")}, h.state)
+	_, err := h.run(t, []uint32{0})
+	if err == nil {
+		t.Fatal("expected the provider fault to surface")
+	}
+	var rej *RejectError
+	if errors.As(err, &rej) {
+		t.Fatalf("a sanctions-provider fault was minted as a manager verdict: %v", err)
+	}
+}
+
+func TestSpendCheckerFaultIsNotAVerdict(t *testing.T) {
+	h := newHarness(t)
+	h.tm.WithSpendChecker(failingSpendChecker{err: errors.New("mongo down")})
+	_, err := h.run(t, []uint32{0})
+	if err == nil {
+		t.Fatal("expected the spend-checker fault to surface")
+	}
+	var rej *RejectError
+	if errors.As(err, &rej) {
+		t.Fatalf("a spend-state store fault was minted as a manager verdict: %v", err)
+	}
+}
+
+type failingSpendChecker struct{ err error }
+
+func (f failingSpendChecker) SpentBy(context.Context, string, uint32) (string, error) {
+	return "", f.err
 }
 
 func TestTamperedOutputLinkagePropagatesError(t *testing.T) {
@@ -406,11 +597,11 @@ func TestPauseBlocksPeerTransferButNotAdmin(t *testing.T) {
 	t.Run("verified admin action exempt", func(t *testing.T) {
 		h := newHarness(t)
 		h.state.states[h.assetID] = pausedState(h)
-		prior := h.addPriorAuthInput(0x77, 1)
+		prior := h.addRecordedAdminPrior(0x77, 1)
 		h.addAdminOutput(t, ActionDetails{
 			"kind": "unpause", "assetId": h.assetID, "priorOutpoint": prior,
 		})
-		res, err := h.run(t, []uint32{0})
+		res, err := h.run(t, []uint32{0, 1})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -420,13 +611,15 @@ func TestPauseBlocksPeerTransferButNotAdmin(t *testing.T) {
 	t.Run("unverified admin payload entry does NOT exempt", func(t *testing.T) {
 		h := newHarness(t)
 		h.state.states[h.assetID] = pausedState(h)
-		prior := h.addPriorAuthInput(0x77, 1)
+		prior := h.addRecordedAdminPrior(0x77, 1)
 		details := ActionDetails{"kind": "unpause", "assetId": h.assetID, "priorOutpoint": prior}
 		h.addAdminOutput(t, details)
 		// Corrupt the on-chain pkh so pkh re-derivation fails: the raw payload
-		// admin entry alone must not grant the exemption.
+		// admin entry alone must not grant the exemption. The entry itself IS
+		// anchored (previousCoins includes the recorded prior at input 1), so
+		// guard 3 passes and the pkh mismatch is the only thing under test.
 		h.tx.Outputs[2].LockingScript = p2pkhScript(t, [20]byte{0xde, 0xad})
-		_, err := h.run(t, []uint32{0})
+		_, err := h.run(t, []uint32{0, 1})
 		wantReject(t, err, "control gate rejected")
 	})
 }
@@ -439,7 +632,7 @@ func TestMalformedAdminCounterpartyHexPropagatesError(t *testing.T) {
 	// the WHOLE tx (TS parity: adminWallet.getPublicKey is awaited uncaught in
 	// verifyAdminOutput), not just silently skip the admin output while still
 	// admitting the two otherwise-valid FT outputs.
-	prior := h.addPriorAuthInput(0x77, 1)
+	prior := h.addRecordedAdminPrior(0x77, 1)
 	details := ActionDetails{
 		"kind": "unpause", "assetId": h.assetID, "priorOutpoint": prior,
 		"counterparty": "zz",
@@ -453,7 +646,7 @@ func TestMalformedAdminCounterpartyHexPropagatesError(t *testing.T) {
 		Index:         uint32(len(h.tx.Outputs) - 1),
 		ActionDetails: details,
 	})
-	res, err := h.run(t, []uint32{0})
+	res, err := h.run(t, []uint32{0, 1})
 	if err == nil {
 		t.Fatalf("expected malformed admin counterparty hex to reject the whole tx, got admits %v", res.OutputsToAdmit)
 	}
@@ -521,12 +714,12 @@ func TestFrozenInputRejectsAllTxs(t *testing.T) {
 	t.Run("verified admin tx rejected too (gate 1 has no admin exemption)", func(t *testing.T) {
 		h := newHarness(t)
 		h.state.states[h.assetID] = frozenState(h)
-		prior := h.addPriorAuthInput(0x77, 1)
+		prior := h.addRecordedAdminPrior(0x77, 1)
 		h.addAdminOutput(t, ActionDetails{
 			"kind": "unfreezeOutput", "assetId": h.assetID,
 			"outpoint": h.srcOutpoint, "priorOutpoint": prior,
 		})
-		_, err := h.run(t, []uint32{0})
+		_, err := h.run(t, []uint32{0, 1})
 		wantReject(t, err, "control gate rejected")
 	})
 
@@ -579,6 +772,7 @@ func TestReissueGuards(t *testing.T) {
 		prior := dummyInput(0x99, 0)
 		rtx.AddInput(prior)
 		priorOp := fmtOutpoint(prior.SourceTXID.String(), 0)
+		h.state.adminOutpoints[h.assetID+"|"+priorOp] = true
 		if withFtInput {
 			rtx.AddInput(&transaction.TransactionInput{
 				SourceTXID:        srcTx2.TxID(),
@@ -613,7 +807,8 @@ func TestReissueGuards(t *testing.T) {
 		if _, err := beef.MergeTransaction(rtx); err != nil {
 			t.Fatal(err)
 		}
-		return h.tm.IdentifyAdmissibleOutputs(WithPayload(h.ctx, payload), beef, rtx.TxID(), nil)
+		// Input 0 is the admin-auth coin the engine previously admitted.
+		return h.tm.IdentifyAdmissibleOutputs(WithPayload(h.ctx, payload), beef, rtx.TxID(), []uint32{0})
 	}
 
 	t.Run("valid reissue passes", func(t *testing.T) {
@@ -673,10 +868,10 @@ func TestOneSatRule(t *testing.T) {
 
 	t.Run("verified admin output over 1 sat rejects", func(t *testing.T) {
 		h := newHarness(t)
-		prior := h.addPriorAuthInput(0x02, 0)
+		prior := h.addRecordedAdminPrior(0x02, 0)
 		h.addAdminOutput(t, ActionDetails{"kind": "pause", "assetId": h.assetID, "priorOutpoint": prior})
 		h.tx.Outputs[len(h.tx.Outputs)-1].Satoshis = 2
-		_, err := h.run(t, []uint32{0})
+		_, err := h.run(t, []uint32{0, 1})
 		wantReject(t, err, "admin output 2 must carry exactly 1 satoshi")
 	})
 

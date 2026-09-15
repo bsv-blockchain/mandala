@@ -89,6 +89,60 @@ func (v *Verifier) VerifyKeyLinkage(ctx context.Context, l *SpecificLinkage) (st
 	return l.Counterparty, pkh, nil
 }
 
+// VerifyInputLinkage reconstructs the key a linkage attests to for a coin
+// BEING SPENT, and names the party that holds it.
+//
+// For an OUTPUT the linkage declares the recipient, so the derived key is
+// counterparty + L·G (VerifyKeyLinkage). For an INPUT the revealer is the
+// spender: the coin was locked to the spender's own child key, so the key is
+// prover + L·G and the party is the prover. Checking an input against
+// counterparty reconstructs the key of whoever PAID that coin, which never
+// matches the coin being spent and, under sender blinding, is a one-time key
+// that is not an identity at all.
+func (v *Verifier) VerifyInputLinkage(ctx context.Context, l *SpecificLinkage) (string, []byte, error) {
+	if l == nil {
+		return "", nil, fmt.Errorf("nil linkage")
+	}
+	proverPub, err := ec.PublicKeyFromString(l.Prover)
+	if err != nil {
+		return "", nil, fmt.Errorf("prover key: %w", err)
+	}
+	offset, err := v.linkageOffset(ctx, l, proverPub)
+	if err != nil {
+		return "", nil, err
+	}
+	curve := ec.S256()
+	lx, ly := curve.ScalarBaseMult(offset.Bytes())
+	dx, dy := curve.Add(proverPub.X, proverPub.Y, lx, ly)
+	derived := &ec.PublicKey{Curve: curve, X: dx, Y: dy}
+	return l.Prover, hash.Hash160(derived.Compressed()), nil
+}
+
+// linkageOffset decrypts the BRC-72 revelation and returns L mod n.
+func (v *Verifier) linkageOffset(ctx context.Context, l *SpecificLinkage, proverPub *ec.PublicKey) (*big.Int, error) {
+	wrapper := wallet.Protocol{
+		SecurityLevel: wallet.SecurityLevelEveryAppAndCounterparty, // 2
+		Protocol: fmt.Sprintf("specific linkage revelation %d %s",
+			l.ProtocolID.SecurityLevel, l.ProtocolID.Name),
+	}
+	dec, err := v.pw.Decrypt(ctx, wallet.DecryptArgs{
+		EncryptionArgs: wallet.EncryptionArgs{
+			ProtocolID: wrapper,
+			KeyID:      l.KeyID,
+			Counterparty: wallet.Counterparty{
+				Type:         wallet.CounterpartyTypeOther,
+				Counterparty: proverPub,
+			},
+		},
+		Ciphertext: []byte(l.EncryptedLinkage),
+	}, "")
+	if err != nil {
+		return nil, fmt.Errorf("linkage decrypt: %w", err)
+	}
+	scalar := new(big.Int).SetBytes(dec.Plaintext)
+	return scalar.Mod(scalar, ec.S256().Params().N), nil
+}
+
 // LinkageControlsPKH reports whether l's specific key linkage controls pkh.
 // It returns false on any error (bad keys, failed decrypt/GCM auth, length
 // mismatch) rather than propagating the error, and compares in constant

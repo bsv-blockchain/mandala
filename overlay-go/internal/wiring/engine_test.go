@@ -288,12 +288,20 @@ func TestBuildArcadeCompensationRoundTrip(t *testing.T) {
 	}
 
 	// The submit handler snapshots BEFORE Engine.Submit.
-	compensate, err := app.PrepareSubmitCompensation(ctx, beefBytes)
+	compensate, restore, err := app.PrepareSubmitCompensation(ctx, beefBytes)
 	if err != nil {
 		t.Fatal("prepare:", err)
 	}
 	if compensate == nil {
 		t.Fatal("prepare returned nil compensation for a valid BEEF")
+	}
+	// The same snapshot must also come back as a plain value, for the
+	// admission record to persist (FIX E).
+	if restore == nil || len(restore.TokenRows) != 1 || restore.TokenRows[0].Amount != 40 {
+		t.Fatalf("restore snapshot = %+v, want the pre-spend parent row", restore)
+	}
+	if len(restore.SpentOutpoints) != 1 || restore.SpentOutpoints[0] != parentID.String()+".0" {
+		t.Fatalf("restore.spentOutpoints = %v", restore.SpentOutpoints)
 	}
 
 	// Replay what v1.3.2's markSpentAndNotify does before broadcastIfNeeded
@@ -402,7 +410,7 @@ func TestBuildArcadeCompensationSkipsAlreadyCommittedTx(t *testing.T) {
 
 	// The submit handler snapshots BEFORE Engine.Submit, exactly as it would
 	// for the duplicate resubmit attempt.
-	compensate, err := app.PrepareSubmitCompensation(ctx, beefBytes)
+	compensate, _, err := app.PrepareSubmitCompensation(ctx, beefBytes)
 	if err != nil {
 		t.Fatal("prepare:", err)
 	}
@@ -484,7 +492,7 @@ func TestBuildArcadeEvictTxRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := app.EvictTx(ctx, txidStr); err != nil {
+	if _, err := app.EvictTx(ctx, txidStr); err != nil {
 		t.Fatal("EvictTx:", err)
 	}
 
@@ -507,7 +515,7 @@ func TestBuildArcadeEvictTxRoundTrip(t *testing.T) {
 	}
 
 	// Evicting the same txid again is a no-op.
-	if err := app.EvictTx(ctx, txidStr); err != nil {
+	if _, err := app.EvictTx(ctx, txidStr); err != nil {
 		t.Fatal("second EvictTx:", err)
 	}
 }
@@ -576,5 +584,214 @@ func TestFindRawTxsBatchesOverEnginestore(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("len(got) = %d, want 2", len(got))
+	}
+}
+
+// TestBuildArcadeEvictTxRestoresInputs is FIX E: an /arc-ingest terminal
+// status used to delete the transaction's outputs and walk away, leaving the
+// coin it spent marked spent forever with no token row — provably unspent on
+// chain, unspendable through the overlay. Eviction must now be the exact
+// inverse of admission for inputs: unmark the engine-side spend, replay the
+// token rows from the snapshot persisted on the admission record, stamp
+// evictedAt, and only then delete the evicted outputs.
+func TestBuildArcadeEvictTxRestoresInputs(t *testing.T) {
+	requireMongo(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	app, err := Build(ctx, Config{
+		NodeName:         "mandala_wiring_test_evict_restore",
+		ServerPrivKeyHex: testPrivHex,
+		HostingURL:       "https://overlay.example.com",
+		MongoURL:         "mongodb://localhost:27017",
+		Network:          "test",
+		ArcadeURL:        "https://arcade.example.com",
+	})
+	if err != nil {
+		t.Fatal("Build:", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_ = app.Mongo.Drop(cleanupCtx)
+		_ = app.Mongo.Client().Disconnect(cleanupCtx)
+	})
+
+	const topic = "tm_mandala"
+	parent := wiringTestTx(t, nil, 0, 1, 0x61)
+	parentID := parent.TxID()
+	child := wiringTestTx(t, parent, 0, 1, 0)
+	childID := child.TxID()
+	childStr := childID.String()
+
+	st := app.Engine.Storage
+	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertOutputs(ctx, topic, childID, []uint32{0}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: childID, Topic: topic}); err != nil {
+		t.Fatal(err)
+	}
+	// The child spent the parent's coin: engine mark + the mandala row gone.
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *parentID, Index: 0}}, topic, childID); err != nil {
+		t.Fatal(err)
+	}
+	// ... and the admission recorded the pre-spend snapshot, exactly as the
+	// submit handler persists it.
+	if err := app.Store.RecordAdmission(ctx, mandala.AdmissionRecord{
+		Txid:                 childStr,
+		Topics:               []string{topic},
+		OutputsToAdmit:       []uint32{0},
+		AdmissionSignature:   "3044",
+		AdmissionIdentityKey: "02aa",
+		Restore: &mandala.RestoreSnapshot{
+			SpentOutpoints: []string{parentID.String() + ".0"},
+			TokenRows: []mandala.TokenRow{{
+				Txid: parentID.String(), OutputIndex: 0, AssetID: "a.0",
+				Amount: 40, IdentityKey: "02k", CreatedAt: time.Now(),
+			}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := app.EvictTx(ctx, childStr); err != nil {
+		t.Fatal("EvictTx:", err)
+	}
+
+	topicName := topic
+	unspent := false
+	got, err := st.FindOutput(ctx, &transaction.Outpoint{Txid: *parentID, Index: 0}, &topicName, &unspent, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Spent {
+		t.Fatalf("the evicted tx's input must be spendable again, got %+v", got)
+	}
+	row, err := app.Store.GetTokenRow(ctx, parentID.String(), 0)
+	if err != nil || row == nil || row.Amount != 40 {
+		t.Fatalf("token row not restored from the admission snapshot: %+v %v", row, err)
+	}
+	if b, _ := app.Store.GetBalance(ctx, "02k"); b != 40 {
+		t.Fatalf("balance after restore = %d, want 40", b)
+	}
+	rec, err := app.Store.GetAdmission(ctx, childStr)
+	if err != nil || rec == nil || rec.EvictedAt == "" {
+		t.Fatalf("evictedAt not stamped: %+v %v", rec, err)
+	}
+	// The evicted transaction's own outputs are gone, as before.
+	outs, err := st.FindOutputsForTransaction(ctx, childID, false)
+	if err != nil || len(outs) != 0 {
+		t.Fatalf("evicted outputs = %d err %v, want 0", len(outs), err)
+	}
+
+	// And the restored coin now reads as LIVE to the FIX L spend guard, even
+	// though an engine row still names the evicted tx elsewhere: a client
+	// racing the restore must never be told the coin is gone.
+	by, err := spendChecker(app.EngineStore, app.Store).SpentBy(ctx, parentID.String(), 0)
+	if err != nil || by != "" {
+		t.Fatalf("spend guard after eviction = %q (%v), want live", by, err)
+	}
+}
+
+// TestSpendCheckerNamesTheCompetingSpender is the other half of the guard:
+// a coin spent by a live (un-evicted) transaction reports that transaction.
+func TestSpendCheckerNamesTheCompetingSpender(t *testing.T) {
+	requireMongo(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	app, err := Build(ctx, Config{
+		NodeName:         "mandala_wiring_test_spendguard",
+		ServerPrivKeyHex: testPrivHex,
+		HostingURL:       "http://localhost:8080",
+		MongoURL:         "mongodb://localhost:27017",
+		Network:          "test",
+	})
+	if err != nil {
+		t.Fatal("Build:", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_ = app.Mongo.Drop(cleanupCtx)
+		_ = app.Mongo.Client().Disconnect(cleanupCtx)
+	})
+
+	const topic = "tm_mandala"
+	parent := wiringTestTx(t, nil, 0, 1, 0x71)
+	parentID := parent.TxID()
+	child := wiringTestTx(t, parent, 0, 1, 0)
+	childID := child.TxID()
+
+	st := app.Engine.Storage
+	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	guard := spendChecker(app.EngineStore, app.Store)
+	if by, err := guard.SpentBy(ctx, parentID.String(), 0); err != nil || by != "" {
+		t.Fatalf("live coin reported spent by %q (%v)", by, err)
+	}
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *parentID, Index: 0}}, topic, childID); err != nil {
+		t.Fatal(err)
+	}
+	if by, err := guard.SpentBy(ctx, parentID.String(), 0); err != nil || by != childID.String() {
+		t.Fatalf("spend guard = %q (%v), want %s", by, err, childID)
+	}
+}
+
+// TestAppliedAdmissionProofDerivesOutputsFromTheEngine is FIX C: the engine's
+// own applied-transaction record plus its stored outputs are enough to
+// re-sign an admission whose mandalaAdmissions row never existed.
+func TestAppliedAdmissionProofDerivesOutputsFromTheEngine(t *testing.T) {
+	requireMongo(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	app, err := Build(ctx, Config{
+		NodeName:         "mandala_wiring_test_proof",
+		ServerPrivKeyHex: testPrivHex,
+		HostingURL:       "http://localhost:8080",
+		MongoURL:         "mongodb://localhost:27017",
+		Network:          "test",
+	})
+	if err != nil {
+		t.Fatal("Build:", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_ = app.Mongo.Drop(cleanupCtx)
+		_ = app.Mongo.Client().Disconnect(cleanupCtx)
+	})
+	if app.AppliedAdmissionProof == nil {
+		t.Fatal("AppliedAdmissionProof must always be wired")
+	}
+
+	const topic = "tm_mandala"
+	tx := wiringTestTx(t, nil, 0, 3, 0x81)
+	txid := tx.TxID()
+
+	applied, outputs, err := app.AppliedAdmissionProof(ctx, txid.String())
+	if err != nil || applied || len(outputs) != 0 {
+		t.Fatalf("unknown txid: applied=%v outputs=%v err=%v", applied, outputs, err)
+	}
+	// A malformed txid is "not applied", never an error.
+	if applied, _, err := app.AppliedAdmissionProof(ctx, "not-a-txid"); err != nil || applied {
+		t.Fatalf("malformed txid: applied=%v err=%v", applied, err)
+	}
+
+	st := app.Engine.Storage
+	if err := st.InsertOutputs(ctx, topic, txid, []uint32{2, 0}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: txid, Topic: topic}); err != nil {
+		t.Fatal(err)
+	}
+	applied, outputs, err = app.AppliedAdmissionProof(ctx, txid.String())
+	if err != nil || !applied {
+		t.Fatalf("applied=%v err=%v", applied, err)
+	}
+	if len(outputs) != 2 || outputs[0] != 0 || outputs[1] != 2 {
+		t.Fatalf("outputs = %v, want [0 2]", outputs)
 	}
 }

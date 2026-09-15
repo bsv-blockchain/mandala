@@ -1,21 +1,245 @@
-import { HTTPSOverlayBroadcastFacilitator, WalletInterface } from '@bsv/sdk'
-import { TOPIC, OVERLAY_URL } from './constants.js'
+import { Utils, WalletInterface } from '@bsv/sdk'
+import { TOPIC, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 import { journalPut, journalRemove } from './txJournal.js'
 
+export interface OverlayAdmitResult {
+  /**
+   * The submitted topic's own admitted output indexes — for a token submission
+   * this is the `tm_mandala` entry's set, which is exactly what σ_I commits to
+   * (admission.ts; FIX A). Never trust an admission for an output that is not
+   * in here.
+   */
+  outputsToAdmit: number[]
+  /** Overlay ECDSA signature over admissionDigestV2(txid, outputsToAdmit). */
+  admissionSignature?: string
+  admissionIdentityKey?: string
+}
+
+/**
+ * The overlay's acceptance proof, threaded out of every pipeline that commits
+ * a transaction (A12). Three fields travel together because σ_I is meaningless
+ * without the set it signed over and the key that signed it.
+ */
+export interface AdmissionReceipt {
+  admissionSignature?: string
+  admissionIdentityKey?: string
+  outputsToAdmit?: number[]
+}
+
+/** Narrow an OverlayAdmitResult to the receipt fields a pipeline returns. */
+export function admissionReceipt (r: OverlayAdmitResult): AdmissionReceipt {
+  return {
+    admissionSignature: r.admissionSignature,
+    admissionIdentityKey: r.admissionIdentityKey,
+    outputsToAdmit: r.outputsToAdmit
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Structured refusals — wire contract v2 §2 (FIX D)
+// ---------------------------------------------------------------------------
+
+/**
+ * The overlay's verdict codes. Only the topic manager's own `reject(...)` may
+ * produce a 4xx/409 code; everything else (SPV, storage, broadcast, sanctions
+ * provider, unknown internal error) is ERR_UNAVAILABLE.
+ */
+export type OverlayErrorCode =
+  | 'ERR_CONSERVATION' | 'ERR_LINKAGE' | 'ERR_SHAPE' | 'ERR_SATOSHIS' | 'ERR_INPUT_SPENT'
+  | 'ERR_PAUSED' | 'ERR_FROZEN' | 'ERR_SANCTIONED' | 'ERR_ACCESS' | 'ERR_MEMBERSHIP'
+  | 'ERR_EVICTED' | 'ERR_UNAVAILABLE'
+
+/**
+ * Whether the same bytes may be re-submitted later and succeed. The table is
+ * the wire contract's, not the server's: a server that mislabels a liftable
+ * policy refusal as permanent must not be able to strand a payment, and one
+ * that mislabels a permanent refusal as retryable must not make a wallet spin.
+ * An unrecognised code falls back to whatever the body claimed.
+ */
+const RETRYABLE_BY_CODE: Record<string, boolean> = {
+  ERR_CONSERVATION: false,
+  ERR_LINKAGE: false,
+  ERR_SHAPE: false,
+  ERR_SATOSHIS: false,
+  ERR_INPUT_SPENT: false,
+  ERR_EVICTED: false,
+  ERR_PAUSED: true,
+  ERR_FROZEN: true,
+  ERR_SANCTIONED: true,
+  ERR_ACCESS: true,
+  ERR_MEMBERSHIP: true,
+  ERR_UNAVAILABLE: true
+}
+
+/**
+ * A structured refusal from `POST /submit` (wire contract §2).
+ *
+ * `retryable` is the only field callers should branch on for liveness: a
+ * retryable refusal means the overlay's condition (pause, freeze, screening,
+ * membership, or plain unavailability) can lift and the SAME transaction may
+ * be submitted again — so its inputs must stay held. A non-retryable one is a
+ * final verdict for these bytes, persisted server-side and served identically
+ * to every later submitter of the same txid ("verdict wins").
+ */
+export class OverlayRefusedError extends Error {
+  readonly code: string
+  readonly retryable: boolean
+  /** For ERR_INPUT_SPENT: the competing, still-admitted transaction. */
+  readonly spendTxid?: string
+  /** 0 when the request never produced a response (network fault). */
+  readonly httpStatus: number
+
+  constructor (p: { code: string, description?: string, retryable?: boolean, spendTxid?: string, httpStatus?: number }) {
+    super(p.description != null && p.description !== '' ? `overlay refused (${p.code}): ${p.description}` : `overlay refused (${p.code})`)
+    this.name = 'OverlayRefusedError'
+    this.code = p.code
+    this.retryable = RETRYABLE_BY_CODE[p.code] ?? p.retryable === true
+    this.spendTxid = p.spendTxid
+    this.httpStatus = p.httpStatus ?? 0
+  }
+}
+
+/**
+ * Map an HTTP status + raw body to a refusal. Only a body that actually
+ * carries the contract's `{status:'error', code}` shape is trusted for its
+ * code; a non-JSON body, an empty body, or an unexpected shape is
+ * ERR_UNAVAILABLE/retryable — "not a manager verdict" is the contract's own
+ * catch-all, and it is the direction that keeps a payment alive.
+ */
+export function overlayErrorFromResponse (httpStatus: number, body: string | null | undefined): OverlayRefusedError {
+  let parsed: any
+  try {
+    parsed = body == null || body === '' ? undefined : JSON.parse(body)
+  } catch {
+    parsed = undefined
+  }
+  if (parsed?.status === 'error' && typeof parsed.code === 'string' && parsed.code !== '') {
+    return new OverlayRefusedError({
+      code: parsed.code,
+      description: typeof parsed.description === 'string' ? parsed.description : undefined,
+      retryable: parsed.retryable === true,
+      spendTxid: typeof parsed.spendTxid === 'string' ? parsed.spendTxid : undefined,
+      httpStatus
+    })
+  }
+  return new OverlayRefusedError({
+    code: 'ERR_UNAVAILABLE',
+    description: `overlay returned ${httpStatus} with no structured error body`,
+    retryable: true,
+    httpStatus
+  })
+}
+
+/** Anything thrown below the facilitator that is not already a structured refusal. */
+function asRefusal (e: unknown): OverlayRefusedError {
+  if (e instanceof OverlayRefusedError) return e
+  return new OverlayRefusedError({
+    code: 'ERR_UNAVAILABLE',
+    description: String((e as any)?.message ?? e),
+    retryable: true,
+    httpStatus: 0
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Submission
+// ---------------------------------------------------------------------------
+
 interface OverlayBroadcastFacilitator {
-  send(url: string, taggedBEEF: { beef: number[]; topics: string[]; offChainValues?: number[] }): Promise<Record<string, { outputsToAdmit: number[] }>>
+  send: (url: string, taggedBEEF: { beef: number[], topics: string[], offChainValues?: number[] }) => Promise<Record<string, OverlayAdmitResult>>
+}
+
+/** The slice of `Response` the facilitator needs (keeps it mockable + RN-safe). */
+export interface OverlayFetchResponse {
+  ok: boolean
+  status: number
+  text: () => Promise<string>
+}
+export type OverlayFetch = (url: string, init: any) => Promise<OverlayFetchResponse>
+
+/**
+ * The default `POST /submit` facilitator.
+ *
+ * Wire-identical to @bsv/sdk's `HTTPSOverlayBroadcastFacilitator` (same path,
+ * headers and varint-framed off-chain-values body) but it READS the error
+ * body: the SDK's facilitator throws a bare `Error('Failed to facilitate
+ * broadcast')` for every non-2xx, which discards exactly the structured
+ * verdict FIX D depends on. Uses `fetch` only — no Node built-ins.
+ */
+export function createOverlayFacilitator (fetchImpl?: OverlayFetch): OverlayBroadcastFacilitator {
+  const doFetch: OverlayFetch = fetchImpl ?? ((url, init) => (globalThis as any).fetch(url, init))
+  return {
+    async send (url, taggedBEEF) {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/octet-stream',
+        'X-Topics': JSON.stringify(taggedBEEF.topics)
+      }
+      let body: Uint8Array
+      if (Array.isArray(taggedBEEF.offChainValues)) {
+        headers['x-includes-off-chain-values'] = 'true'
+        const w = new Utils.Writer()
+        w.writeVarIntNum(taggedBEEF.beef.length)
+        w.write(taggedBEEF.beef)
+        w.write(taggedBEEF.offChainValues)
+        body = new Uint8Array(w.toArray())
+      } else {
+        body = new Uint8Array(taggedBEEF.beef)
+      }
+
+      let response: OverlayFetchResponse
+      try {
+        response = await doFetch(`${url}/submit`, { method: 'POST', headers, body })
+      } catch (e) {
+        // Network fault — never a verdict, always retryable.
+        throw asRefusal(e)
+      }
+      let text = ''
+      try {
+        text = await response.text()
+      } catch { /* treat an unreadable body as no body */ }
+      if (!response.ok) throw overlayErrorFromResponse(response.status, text)
+      try {
+        return JSON.parse(text)
+      } catch (e) {
+        throw new OverlayRefusedError({
+          code: 'ERR_UNAVAILABLE',
+          description: `overlay returned ${response.status} with an unparseable STEAK body`,
+          retryable: true,
+          httpStatus: response.status
+        })
+      }
+    }
+  }
 }
 
 export async function submitToOverlay (
   beef: number[],
   offChainValues?: number[],
-  facilitator: OverlayBroadcastFacilitator = new HTTPSOverlayBroadcastFacilitator(undefined, true)
-): Promise<number[]> {
-  const taggedBEEF = { beef, topics: [TOPIC], offChainValues }
-  const steak = await facilitator.send(OVERLAY_URL, taggedBEEF)
-  const admit = steak[TOPIC]?.outputsToAdmit ?? []
+  facilitator: OverlayBroadcastFacilitator = createOverlayFacilitator(),
+  topics: string[] = [TOPIC]
+): Promise<OverlayAdmitResult> {
+  // Fail loudly: without configureMandala this would POST to a relative /submit.
+  if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
+  const taggedBEEF = { beef, topics, offChainValues }
+  let steak: Record<string, OverlayAdmitResult>
+  try {
+    steak = await facilitator.send(OVERLAY_URL, taggedBEEF)
+  } catch (e) {
+    // Every transport/HTTP failure reaches the caller as a structured verdict,
+    // so a retryable fault is never mistaken for a permanent refusal (FIX D).
+    throw asRefusal(e)
+  }
+  // The admitted set comes from the submitted topic's own STEAK entry
+  // (`tm_mandala` for token traffic) — a registry-only admission must never be
+  // read as a token admission.
+  const topic = topics.map(t => steak[t]).find(t => (t?.outputsToAdmit?.length ?? 0) > 0) ?? steak[topics[0]]
+  const admit = topic?.outputsToAdmit ?? []
   if (admit.length === 0) throw new Error('overlay rejected the transaction')
-  return admit
+  return {
+    outputsToAdmit: admit,
+    admissionSignature: topic?.admissionSignature,
+    admissionIdentityKey: topic?.admissionIdentityKey
+  }
 }
 
 /**
@@ -51,6 +275,17 @@ export function isAlreadyBroadcast (e: unknown): boolean {
  * protection — a failure keeps the 'accepted' entry and reconcileWallet
  * retries it; it must never be aborted (that would desync wallet from overlay).
  *
+ * **Nothing is ever broadcast after an `OverlayRefusedError`** — retryable or
+ * not, a refusal means the overlay has not folded these bytes into its state.
+ *
+ * **A RETRYABLE refusal does not abort the action.** Pause, freeze, screening,
+ * membership and plain unavailability all lift; the same transaction may be
+ * submitted again, and releasing its inputs would force a rebuild (and, for an
+ * offline hand-over, invalidate evidence the counterparty already holds). The
+ * error is rethrown with `retryable: true` so the caller can back off and
+ * retry, and the action stays alive for it. Only a FINAL verdict (or any
+ * non-refusal failure, e.g. an unconfigured overlay URL) aborts.
+ *
  * `reference` is the `createAction` signableTransaction.reference; pass it for
  * signable actions so a rejected tx's inputs are released. Genesis/register
  * actions have no signable reference — omit it (only wallet-managed funding is
@@ -58,23 +293,51 @@ export function isAlreadyBroadcast (e: unknown): boolean {
  */
 export async function submitAndBroadcast (
   wallet: WalletInterface,
-  signed: { tx: number[]; txid: string },
+  signed: { tx: number[], txid: string },
   offChainValues: number[] | undefined,
   reference?: string,
-  facilitator?: OverlayBroadcastFacilitator
-): Promise<number[]> {
-  let admitted: number[]
+  facilitator?: OverlayBroadcastFacilitator,
+  topics: string[] = [TOPIC]
+): Promise<OverlayAdmitResult> {
+  let admitted: OverlayAdmitResult
   try {
-    admitted = await submitToOverlay(signed.tx, offChainValues, facilitator)
+    admitted = await submitToOverlay(signed.tx, offChainValues, facilitator, topics)
   } catch (e) {
-    // Overlay refused (policy/pause/insufficient) — release the held inputs.
-    if (reference != null) {
+    // Retryable: keep the inputs held so the identical tx can be re-submitted
+    // once the overlay's condition lifts.
+    const retryable = e instanceof OverlayRefusedError && e.retryable
+    if (retryable) {
+      // §9.11. A live noSend action with NO durable record was the hole: the
+      // caller is told "retry later", and if it never does (crash, tab closed,
+      // user walks away) the inputs stay held by an action nothing remembers,
+      // and the bulk sweep cannot tell it from an abandoned one. Journal the
+      // refusal — with the exact bytes — BEFORE rethrowing, so reconcile can
+      // re-submit it and, at RETRY_CAP, release the inputs.
+      //
+      // Awaited: a crash between this write and the rethrow must leave the
+      // entry behind, not the error.
+      await journalPut({
+        txid: signed.txid,
+        stage: 'retryable',
+        at: Date.now(),
+        code: (e as OverlayRefusedError).code,
+        attempts: 0,
+        ...(reference != null ? { reference } : {}),
+        submit: {
+          txHex: Utils.toHex(signed.tx),
+          ...(offChainValues != null ? { offChainHex: Utils.toHex(offChainValues) } : {}),
+          topics
+        }
+      })
+    } else if (reference != null) {
+      // Final refusal — release the held inputs.
       try {
         await wallet.abortAction({ reference })
       } catch {
         // Inputs still held by the dead action — journal so reconcileWallet
         // retries the abort on the next load instead of the asset vanishing.
-        journalPut({ txid: signed.txid, stage: 'abort', reference, at: Date.now() })
+        // Awaited: the entry must be durable before we hand the error back.
+        await journalPut({ txid: signed.txid, stage: 'abort', reference, at: Date.now() })
       }
     }
     throw e
@@ -84,13 +347,22 @@ export async function submitAndBroadcast (
   // network. Journal first, then broadcast in the background: the entry only
   // clears on success, so an interrupted/failed broadcast is retried by
   // reconcileWallet.
-  journalPut({ txid: signed.txid, stage: 'accepted', at: Date.now() })
+  //
+  // THE COMMIT POINT. This write is awaited, so the broadcast provably does not
+  // start until the 'accepted' entry has landed in the store — a crash in the
+  // window between them is recoverable by construction (storage.test.ts holds
+  // the write open and asserts createAction({sendWith}) has not been called).
+  //
+  // It also carries σ_I (A12): the acceptance proof lands durably here, at no
+  // extra I/O, so a client that loses the overlay's admission record still
+  // holds its own copy.
+  await journalPut({ txid: signed.txid, stage: 'accepted', at: Date.now(), ...admissionReceipt(admitted) })
   void broadcastAcceptedTx(wallet, signed.txid)
-    .then(() => journalRemove(signed.txid))
-    .catch(e => {
+    .then(async () => { await journalRemove(signed.txid) })
+    .catch(async e => {
       if (isAlreadyBroadcast(e)) {
         // The network already has it — recovery complete, clear the entry.
-        journalRemove(signed.txid)
+        await journalRemove(signed.txid)
         return
       }
       console.warn(

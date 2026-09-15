@@ -12,6 +12,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/arcade"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
 
 // MerkleProofHandler is the narrow slice of *engine.Engine that POST
@@ -24,13 +25,18 @@ type MerkleProofHandler interface {
 
 var _ MerkleProofHandler = (*engine.Engine)(nil)
 
+// EvictionOutcome is the /arc-ingest terminal-status report (wire contract
+// §9.12); it is declared in the domain package because wiring, which produces
+// it, cannot import this one.
+type EvictionOutcome = mandala.EvictionOutcome
+
 // EvictTx removes an applied transaction from the overlay on a terminal
 // Arcade txStatus — the Go stand-in for the TS /arc-ingest route's
 // Engine.evictAppliedTransaction (which deletes the tx's outputs and
 // notifies each lookup service via OutputEvicted). go-overlay-services
 // v1.3.2's engine exposes no eviction API, so wiring.Build assembles the
 // equivalent from the concrete enginestore + ls_mandala and threads it here.
-type EvictTx func(ctx context.Context, txid string) error
+type EvictTx func(ctx context.Context, txid string) (EvictionOutcome, error)
 
 // registerArcIngestRoutes wires POST /arc-ingest (OverlayExpress.ts
 // ~1578-1653) — the Arcade broadcast-status/proof callback. Callers
@@ -81,21 +87,37 @@ func arcIngestHandler(h MerkleProofHandler, callbackToken string, evict EvictTx)
 		}
 
 		if arcade.IsTerminalStatus(body.TxStatus, body.ExtraInfo) {
+			var outcome EvictionOutcome
+			var err error
 			if evict == nil {
 				log.Printf("arc-ingest: terminal status %q for txid %s (eviction not wired — state left in place)", body.TxStatus, body.Txid)
-				return c.Status(fiber.StatusOK).JSON(fiber.Map{
-					"status":  "success",
-					"message": "Terminal transaction status received",
-				})
+			} else if outcome, err = evict(c.UserContext(), body.Txid); err != nil {
+				// Wire contract §9.8: the restore is the whole point of the
+				// eviction, and it runs BEFORE evictedAt is stamped. A failure
+				// here means nothing was stamped and the inputs are still
+				// marked spent, so this is a retryable dependency fault (503)
+				// — Arcade re-delivers and the unwind is attempted again. A
+				// 4xx/5xx-final answer would have Arcade give up on a callback
+				// that must not be lost.
+				log.Printf("arc-ingest: eviction for terminal status %q txid %s failed (nothing stamped, inputs still spent): %v", body.TxStatus, body.Txid, err)
+				return errorResponse(c, fiber.StatusServiceUnavailable, "failed to evict transaction: "+err.Error())
+			} else {
+				log.Printf("arc-ingest: terminal status %q for txid %s — applied transaction evicted (outpoints=%d tokenRows=%d alreadyEvicted=%v)",
+					body.TxStatus, body.Txid, outcome.RestoredOutpoints, outcome.RestoredTokenRows, outcome.AlreadyEvicted)
 			}
-			if err := evict(c.UserContext(), body.Txid); err != nil {
-				log.Printf("arc-ingest: eviction for terminal status %q txid %s failed: %v", body.TxStatus, body.Txid, err)
-				return errorResponse(c, fiber.StatusInternalServerError, "failed to evict transaction: "+err.Error())
-			}
-			log.Printf("arc-ingest: terminal status %q for txid %s — applied transaction evicted", body.TxStatus, body.Txid)
+			// Wire contract §9.12 — the terminal-status body, identical on
+			// both engines.
 			return c.Status(fiber.StatusOK).JSON(fiber.Map{
 				"status":  "success",
-				"message": "Terminal transaction status received",
+				"message": "Terminal transaction status processed",
+				"data": fiber.Map{
+					"txid":              body.Txid,
+					"txStatus":          body.TxStatus,
+					"reason":            body.ExtraInfo,
+					"restoredOutpoints": outcome.RestoredOutpoints,
+					"restoredTokenRows": outcome.RestoredTokenRows,
+					"alreadyEvicted":    outcome.AlreadyEvicted,
+				},
 			})
 		}
 

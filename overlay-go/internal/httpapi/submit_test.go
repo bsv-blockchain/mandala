@@ -363,7 +363,12 @@ func TestSubmit_SuccessReturnsBareSteak(t *testing.T) {
 	}
 }
 
-func TestSubmit_EngineErrorReturns400(t *testing.T) {
+// FIX D: an engine error that is NOT a topic-manager verdict (here, an
+// unknown topic) is a dependency/infrastructure fault and must answer 503
+// ERR_UNAVAILABLE, retryable — never a permanent 400. The old handler
+// returned 400 for every Submit error uniformly, which is exactly the
+// unsoundness that let a Mongo blip look like "this transaction is invalid".
+func TestSubmit_NonVerdictEngineErrorIs503Unavailable(t *testing.T) {
 	stub := &stubSubmitter{err: errors.New("unknown-topic")}
 	app := newServer(stub, nil, nil, nil)
 
@@ -371,15 +376,15 @@ func TestSubmit_EngineErrorReturns400(t *testing.T) {
 	req.Header.Set("X-Topics", `["tm_mandala"]`)
 
 	resp := doRequest(t, app, req)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
 	body := decodeJSON(t, resp)
-	if body["status"] != "error" {
-		t.Fatalf("body = %v, want status:error", body)
+	if body["status"] != "error" || body["code"] != CodeUnavailable || body["retryable"] != true {
+		t.Fatalf("body = %v, want ERR_UNAVAILABLE retryable", body)
 	}
-	if body["message"] != "unknown-topic" {
-		t.Fatalf("message = %v, want %q", body["message"], "unknown-topic")
+	if body["description"] != "unknown-topic" {
+		t.Fatalf("description = %v, want %q", body["description"], "unknown-topic")
 	}
 }
 
@@ -435,22 +440,23 @@ func TestUnknownRoute404(t *testing.T) {
 type stubCompensation struct {
 	prepareErr    error
 	compensateErr error
+	restore       *mandala.RestoreSnapshot
 
 	prepareCalls    int
 	compensateCalls int
 	gotBeef         []byte
 }
 
-func (s *stubCompensation) prepare(_ context.Context, beef []byte) (func(context.Context) error, error) {
+func (s *stubCompensation) prepare(_ context.Context, beef []byte) (func(context.Context) error, *mandala.RestoreSnapshot, error) {
 	s.prepareCalls++
 	s.gotBeef = append([]byte(nil), beef...)
 	if s.prepareErr != nil {
-		return nil, s.prepareErr
+		return nil, nil, s.prepareErr
 	}
 	return func(context.Context) error {
 		s.compensateCalls++
 		return s.compensateErr
-	}, nil
+	}, s.restore, nil
 }
 
 func submitReq(body []byte) *http.Request {
@@ -467,8 +473,8 @@ func TestSubmit_BroadcastFailureRunsCompensation(t *testing.T) {
 	beef := []byte{0xde, 0xad, 0xbe, 0xef}
 	resp := doRequest(t, app, submitReq(beef))
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 (broadcast failure still rejects the submit)", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (a broadcast failure is retryable, not a verdict)", resp.StatusCode)
 	}
 	body := decodeJSON(t, resp)
 	if body["status"] != "error" {
@@ -492,8 +498,8 @@ func TestSubmit_NonBroadcastErrorSkipsCompensation(t *testing.T) {
 
 	resp := doRequest(t, app, submitReq([]byte{0x01}))
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
 	if comp.compensateCalls != 0 {
 		t.Fatalf("compensate calls = %d, want 0 (validation errors occur before the engine marks anything)", comp.compensateCalls)
@@ -520,7 +526,8 @@ func TestSubmit_SuccessSkipsCompensation(t *testing.T) {
 
 // TestSubmit_PrepareErrorRejectsBeforeSubmit: if the snapshot cannot be
 // taken, submitting would risk unrecoverable state on a broadcast failure —
-// the handler refuses (500) without calling Submit.
+// the handler refuses without calling Submit. The refusal is a storage
+// fault, so it is 503 ERR_UNAVAILABLE (retryable), not a verdict.
 func TestSubmit_PrepareErrorRejectsBeforeSubmit(t *testing.T) {
 	comp := &stubCompensation{prepareErr: errors.New("mongo down")}
 	stub := &stubSubmitter{steak: overlay.Steak{}}
@@ -528,8 +535,11 @@ func TestSubmit_PrepareErrorRejectsBeforeSubmit(t *testing.T) {
 
 	resp := doRequest(t, app, submitReq([]byte{0x01}))
 
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if body := decodeJSON(t, resp); body["code"] != CodeUnavailable {
+		t.Fatalf("code = %v, want %s", body["code"], CodeUnavailable)
 	}
 	if stub.gotCtx != nil {
 		t.Fatal("Submit must not be called when the compensation snapshot failed")
@@ -537,7 +547,8 @@ func TestSubmit_PrepareErrorRejectsBeforeSubmit(t *testing.T) {
 }
 
 // TestSubmit_CompensationErrorStillReturns400: a failing compensation is
-// logged, not surfaced — the client still sees the broadcast failure.
+// logged, not surfaced — the client still sees the broadcast failure
+// (retryable, 503).
 func TestSubmit_CompensationErrorStillReturns400(t *testing.T) {
 	comp := &stubCompensation{compensateErr: errors.New("restore failed")}
 	stub := &stubSubmitter{err: &transaction.BroadcastFailure{Code: "REJECTED", Description: "terminal"}}
@@ -545,8 +556,8 @@ func TestSubmit_CompensationErrorStillReturns400(t *testing.T) {
 
 	resp := doRequest(t, app, submitReq([]byte{0x01}))
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
 	if comp.compensateCalls != 1 {
 		t.Fatalf("compensate calls = %d, want 1", comp.compensateCalls)
@@ -560,7 +571,7 @@ func TestSubmit_NoCompensationConfiguredStillWorks(t *testing.T) {
 	app := newServer(stub, nil, nil, nil)
 
 	resp := doRequest(t, app, submitReq([]byte{0x01}))
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
 }

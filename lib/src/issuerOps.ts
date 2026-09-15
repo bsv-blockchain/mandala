@@ -8,15 +8,17 @@ import { Transaction, Beef, WalletInterface } from '@bsv/sdk'
 import { MandalaToken, MandalaAdmin } from '@bsv/templates'
 import { BASKET, FT_PROTOCOL } from './constants.js'
 import { encodeLinkagePayload, MandalaActionDetails } from './encoding.js'
-import { submitAndBroadcast } from './overlay.js'
+import { AdmissionReceipt, admissionReceipt, submitAndBroadcast } from './overlay.js'
 import { outpoint, revealLinkage } from './tokens.js'
 import { walletMandalaUnlock } from './unlock.js'
 import { loadFtCandidates } from './ftCandidates.js'
 import { selectFtInputs } from './ftSelect.js'
-import { AdminAsset, adminCustomInstructions } from './assets.js'
+import { AdminAsset, adminCustomInstructions, adminMarker, withBankRef } from './assets.js'
 import { withAdminAuthGate, assertSpendablePrior } from './adminAuthGate.js'
 import { guardRedeemSubmit } from './submitGuards.js'
 import { withIntent } from './txJournal.js'
+import { tryWithLock } from './webLocks.js'
+import { BusyError } from './singleFlight.js'
 
 // ---------------------------------------------------------------------------
 // Register: ONE tx, ONE output that both carries the public metadata blob and
@@ -33,7 +35,40 @@ export interface RegisterParams {
   decimals: number
 }
 
-export async function registerAsset (p: RegisterParams): Promise<{ assetId: string }> {
+/**
+ * A12: every admin/treasury pipeline hands its overlay acceptance proof back to
+ * the caller. σ_I is the receipt that the overlay folded THIS spend into its
+ * state; discarding it at the call site (as every pipeline but transfer did)
+ * threw away the only client-side evidence of admission.
+ */
+export interface RegisterResult extends AdmissionReceipt {
+  assetId: string
+}
+
+export interface IssuerOpResult extends AdmissionReceipt {
+  txid: string
+  nextAuthOutpoint: string
+  nextAuthDetails: MandalaActionDetails
+}
+
+export async function registerAsset (p: RegisterParams): Promise<RegisterResult> {
+  // No prior to serialise on (genesis), so the per-asset admin gate does not
+  // apply — but a second register in another tab of the same wallet is still
+  // a double-submit. registerFlight covers same-tab re-entry; this web lock
+  // covers other tabs. Never queue: busy means reject.
+  const { acquired, result } = await tryWithLock('mandala.register', async () =>
+    // Intent marker: a crash between createAction and the journaled overlay
+    // outcome leaves a fresh intent the reconcile sweep respects until TTL,
+    // instead of aborting the live noSend action from under us.
+    await withIntent(async () => await registerPipeline(p))
+  )
+  if (!acquired || result == null) {
+    throw new BusyError('Register already in progress in another tab')
+  }
+  return result
+}
+
+async function registerPipeline (p: RegisterParams): Promise<RegisterResult> {
   const { wallet, identityKey } = p
   // issuer = our identity key, baked into the on-chain publicData so any holder
   // can SPV-verify it and return funds to the issuer.
@@ -66,10 +101,16 @@ export async function registerAsset (p: RegisterParams): Promise<{ assetId: stri
     outputs: [],
     admin: [{ index: 0, actionDetails: regDetails }]
   })
-  // Genesis has no signable FT inputs — no reference to abort; overlay gates,
-  // then broadcast.
-  await submitAndBroadcast(wallet as any, { tx: reg.tx as number[], txid: reg.txid }, offChainValues)
-  return { assetId }
+  // Genesis has no signable FT inputs, so the wallet normally returns no
+  // reference — but forward one whenever it does, so an overlay rejection
+  // aborts the held action instead of leaving it stuck for the sweep.
+  const admitted = await submitAndBroadcast(
+    wallet as any,
+    { tx: reg.tx as number[], txid: reg.txid },
+    offChainValues,
+    reg.signableTransaction?.reference
+  )
+  return { assetId, ...admissionReceipt(admitted) }
 }
 
 // ---------------------------------------------------------------------------
@@ -81,10 +122,16 @@ export interface IssueParams {
   identityKey: string
   asset: AdminAsset
   amount: number
+  /**
+   * sha256 hex of the off-chain deposit record backing this issuance. Committed
+   * on-chain as `bankRef` inside the auth details (R12 / R22) — the bank
+   * record itself stays off-chain. Omitted when empty (see withBankRef).
+   */
+  depositHash?: string
 }
 
-export async function issueTokens (p: IssueParams): Promise<{ txid: string, nextAuthOutpoint: string, nextAuthDetails: MandalaActionDetails }> {
-  const { wallet, identityKey, asset, amount } = p
+export async function issueTokens (p: IssueParams): Promise<IssuerOpResult> {
+  const { wallet, identityKey, asset, amount, depositHash } = p
   // Serialize same-asset admin-auth so two issue/redeem/regulatory pipelines
   // cannot both commit on one priorOutpoint; the intent marker keeps the
   // reconcile sweep away from the live noSend action while it runs.
@@ -100,13 +147,13 @@ export async function issueTokens (p: IssueParams): Promise<{ txid: string, next
     )
 
     const priorOutpoint = asset.authOutpoint
-    const issueDetails: MandalaActionDetails = {
+    const issueDetails: MandalaActionDetails = withBankRef({
       kind: 'issue',
       assetId: asset.assetId,
       amount,
       priorOutpoint
-    }
-    const nextAuthLock = await MandalaAdmin.lock({ wallet: wallet as any, data: issueDetails })
+    }, depositHash)
+    const nextAuthLock = await MandalaAdmin.lock({ wallet: wallet as any, data: issueDetails, publicData: adminMarker(asset.assetId) })
 
     // Fetch BEEF for the prior auth outpoint.
     const listResult = await wallet.listOutputs({
@@ -171,11 +218,16 @@ export async function issueTokens (p: IssueParams): Promise<{ txid: string, next
       outputs: [{ index: 0, linkage }],
       admin: [{ index: 1, actionDetails: issueDetails }]
     })
-    await submitAndBroadcast(wallet as any, { tx: signed.tx as number[], txid: signed.txid }, offChainValues, created.signableTransaction.reference)
+    const admitted = await submitAndBroadcast(wallet as any, { tx: signed.tx as number[], txid: signed.txid }, offChainValues, created.signableTransaction.reference)
     // Output order is fixed (randomizeOutputs: false): FT at 0, next auth at 1.
     // nextAuthDetails must travel with the outpoint — the next action's unlock
     // derives from the details the new auth output was locked with.
-    return { txid: signed.txid, nextAuthOutpoint: outpoint(signed.txid, 1), nextAuthDetails: issueDetails }
+    return {
+      txid: signed.txid,
+      nextAuthOutpoint: outpoint(signed.txid, 1),
+      nextAuthDetails: issueDetails,
+      ...admissionReceipt(admitted)
+    }
   }))
 }
 
@@ -196,7 +248,7 @@ export interface RedeemParams {
   balance?: number
 }
 
-export async function redeemTokens (p: RedeemParams): Promise<{ txid: string, nextAuthOutpoint: string, nextAuthDetails: MandalaActionDetails }> {
+export async function redeemTokens (p: RedeemParams): Promise<IssuerOpResult> {
   const { wallet, identityKey, asset, amount, balance } = p
   // Client-side amount gate first — no gate acquire / wallet I/O on bad amount.
   const amountGate = guardRedeemSubmit({
@@ -229,7 +281,7 @@ export async function redeemTokens (p: RedeemParams): Promise<{ txid: string, ne
       amount,
       priorOutpoint: asset.authOutpoint
     }
-    const nextAuthLock = await MandalaAdmin.lock({ wallet: wallet as any, data: redeemDetails })
+    const nextAuthLock = await MandalaAdmin.lock({ wallet: wallet as any, data: redeemDetails, publicData: adminMarker(asset.assetId) })
 
     const inputs = [
       ...ftInputs,
@@ -301,8 +353,13 @@ export async function redeemTokens (p: RedeemParams): Promise<{ txid: string, ne
       outputs: outLinks,
       admin: [{ index: 0, actionDetails: redeemDetails }]
     })
-    await submitAndBroadcast(wallet as any, { tx: signed.tx as number[], txid: signed.txid }, offChainValues, created.signableTransaction.reference)
+    const admitted = await submitAndBroadcast(wallet as any, { tx: signed.tx as number[], txid: signed.txid }, offChainValues, created.signableTransaction.reference)
     // Output order is fixed (randomizeOutputs: false): next auth at 0.
-    return { txid: signed.txid, nextAuthOutpoint: outpoint(signed.txid, 0), nextAuthDetails: redeemDetails }
+    return {
+      txid: signed.txid,
+      nextAuthOutpoint: outpoint(signed.txid, 0),
+      nextAuthDetails: redeemDetails,
+      ...admissionReceipt(admitted)
+    }
   }))
 }

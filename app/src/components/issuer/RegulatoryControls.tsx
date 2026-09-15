@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Search } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
 import { useIdentitySearch } from '@bsv/identity-react'
 import { Input } from '../ui/input'
@@ -250,7 +251,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
     const amount = Number(reissueAmount)
     const amountGate = guardPositiveAmount(amount)
     if (!amountGate.ok) { toast.error(amountGate.reason); return }
-    await submitAction({
+    const res = await submitAction({
       asset: asset!,
       details: withReason({
         kind: 'reissue',
@@ -262,7 +263,16 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
       }, reason),
       ftOutput: { recipient, amount }
     })
-    toast.success(`Reissued ${formatAmount(amount, decimals)} ${asset!.label} to ${recipient.slice(0, 12)}…`)
+    const summary = `Reissued ${formatAmount(amount, decimals)} ${asset!.label} to ${recipient.slice(0, 12)}…`
+    if (res.notified === false) {
+      // The reissue is committed (overlay accepted + broadcast); only the
+      // recipient's MessageBox remittance is outstanding. It is journaled and
+      // retried by reconcileNotifications — do NOT retry the action, a second
+      // attempt would die on the spent prior.
+      toast.warning(`${summary}; recipient notification pending — it will be retried automatically`)
+    } else {
+      toast.success(summary)
+    }
     setReissueOutpoint('')
     setReissueAmount('')
     setReissueRecipient('')
@@ -532,6 +542,13 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
 
           {(op === 'blockIdentity' || op === 'unblockIdentity' || op === 'allowIdentity' || op === 'unallowIdentity') && (
             <>
+              <p className="text-[12px] text-subtle-foreground leading-[1.5] mb-[13px]">
+                This is the per-asset allow/block list. Overlay KYC is a separate chain — admit the key under{' '}
+                <Link to="/issuer/identities" className="text-primary font-medium hover:underline">
+                  Identities
+                </Link>{' '}
+                first, or the overlay will still refuse the transfer.
+              </p>
               {/* Identity search */}
               <Input
                 icon={<Search className="h-[18px] w-[18px]" />}

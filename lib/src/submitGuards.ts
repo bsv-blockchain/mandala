@@ -59,12 +59,31 @@ export interface IssueRedeemSubmitInput {
   /** Redeem only — must not burn more than held. Issue has no upper bound here. */
   balance?: number
   walletReady: boolean
+  /**
+   * Issue only — sha256 hex of the off-chain deposit record, committed on-chain
+   * as `bankRef` (R12). Must be a 64-hex digest when given: the raw bank
+   * reference itself must never reach the chain.
+   */
+  bankRef?: string
+  /** Issue only — refuse a ref-less issue when the deployment mandates a deposit ref. */
+  requireBankRef?: boolean
 }
+
+const SHA256_HEX = /^[0-9a-fA-F]{64}$/
 
 export function guardIssueSubmit(input: IssueRedeemSubmitInput): GuardResult {
   if (!input.walletReady) return fail('Wallet not ready')
   if (input.assetId.trim() === '') return fail('Select an asset')
-  return guardPositiveAmount(input.amount)
+  const pos = guardPositiveAmount(input.amount)
+  if (!pos.ok) return pos
+  const ref = input.bankRef?.trim() ?? ''
+  if (ref === '') {
+    return input.requireBankRef ? fail('Deposit reference is required') : ok
+  }
+  if (!SHA256_HEX.test(ref)) {
+    return fail('Deposit reference must be a sha256 digest (64 hex chars) — hash the bank record, never send it raw')
+  }
+  return ok
 }
 
 export function guardRedeemSubmit(input: IssueRedeemSubmitInput): GuardResult {
@@ -108,6 +127,34 @@ export interface AdminFieldSubmitInput {
   requireRecipient?: boolean
 }
 
+/** Compressed secp256k1 identity pubkey (33-byte hex, 02/03 prefix). */
+export function guardIdentityKey(identityKey: string): GuardResult {
+  const key = identityKey.trim()
+  if (key === '') return fail('Identity key is required')
+  if (!/^(02|03)[0-9a-fA-F]{64}$/.test(key)) {
+    return fail('Identity key must be a compressed pubkey (66 hex chars, 02/03 prefix)')
+  }
+  return ok
+}
+
+/**
+ * Recipient rail check for a Mandala token send (D4). Returns null when
+ * `recipient` is a compressed identity key, otherwise the plain reason a
+ * wallet's rail selector shows for "address unavailable". The reason is a
+ * protocol fact, not a UI opinion: the token output key is ECDH-derived
+ * against the recipient identity key (MandalaToken.lockBRC29), and the
+ * overlay refuses a transaction carrying an FT output whose owner it cannot
+ * name from a linkage — so a bare P2PKH address can never receive one.
+ */
+export function guardTokenRecipient(recipient: string): string | null {
+  const key = recipient.trim()
+  if (key === '') return 'Recipient identity key is required'
+  if (!/^(02|03)[0-9a-fA-F]{64}$/.test(key)) {
+    return 'Mandala tokens can only be sent to an identity key (66-hex compressed public key), not to an address — the token output is derived against the recipient identity and the overlay refuses anything else'
+  }
+  return null
+}
+
 /** Regulatory required fields — empty strings reject without starting a pipeline. */
 export function guardAdminFields(input: AdminFieldSubmitInput): GuardResult {
   if (input.requireOutpoint && (input.outpoint == null || input.outpoint.trim() === '')) {
@@ -118,6 +165,9 @@ export function guardAdminFields(input: AdminFieldSubmitInput): GuardResult {
   }
   if (input.requireRecipient && (input.recipient == null || input.recipient.trim() === '')) {
     return fail('Recipient is required')
+  }
+  if (input.requireIdentity && input.identityKey != null && input.identityKey.trim() !== '') {
+    return guardIdentityKey(input.identityKey)
   }
   return ok
 }

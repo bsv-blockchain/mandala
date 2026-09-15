@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -72,23 +71,36 @@ type counterDoc struct {
 }
 
 // Store is the Go port of MandalaStorageManager: Mongo-backed projections
-// for the 7 mandala collections, wire-compatible with the TS overlay.
+// for the mandala collections, wire-compatible with the TS overlay.
 type Store struct {
-	tokens, linkage, balances, metadata, states, history, counters *mongo.Collection
+	tokens, linkage, balances, metadata, states, history, counters, registry *mongo.Collection
+	// admissions is the σ_I / verdict record (wire contract §4); see
+	// admissions.go.
+	admissions *mongo.Collection
 }
 
-// NewStore wires up the 7 collections and idempotently ensures all indexes
+// NewStore wires up the collections and idempotently ensures all indexes
 // (including the two boot-time indexes from overlay/src/index.ts:112-118).
 // No TTL index exists anywhere in this store.
-func NewStore(db *mongo.Database) *Store {
+//
+// Wire contract §9.9: an index that cannot be created ABORTS STARTUP. These
+// are not performance hints — the unique index on mandalaAdmissions.txid is
+// what makes "one verdict per transaction" true under concurrency, and the
+// unique outpoint indexes are what stop a replayed fold from double-crediting
+// a balance. A node that came up without them would look healthy while
+// silently losing those guarantees, so the error is returned rather than
+// logged.
+func NewStore(db *mongo.Database) (*Store, error) {
 	s := &Store{
-		tokens:   db.Collection("mandalaTokens"),
-		linkage:  db.Collection("mandalaLinkageRecords"),
-		balances: db.Collection("mandalaBalances"),
-		metadata: db.Collection("mandalaMetadata"),
-		states:   db.Collection("mandalaAssetStates"),
-		history:  db.Collection("mandalaAdminHistory"),
-		counters: db.Collection("mandalaCounters"),
+		tokens:     db.Collection("mandalaTokens"),
+		linkage:    db.Collection("mandalaLinkageRecords"),
+		balances:   db.Collection("mandalaBalances"),
+		metadata:   db.Collection("mandalaMetadata"),
+		states:     db.Collection("mandalaAssetStates"),
+		history:    db.Collection("mandalaAdminHistory"),
+		counters:   db.Collection("mandalaCounters"),
+		registry:   db.Collection("mandalaRegistry"),
+		admissions: db.Collection(AdmissionsCollection),
 	}
 	ctx := context.Background()
 	uniq := options.Index().SetUnique(true)
@@ -98,38 +110,53 @@ func NewStore(db *mongo.Database) *Store {
 		{Keys: bson.D{{Key: "assetId", Value: 1}}},
 		{Keys: bson.D{{Key: "identityKey", Value: 1}}},
 	}); err != nil {
-		log.Printf("mandala store: index creation failed on %s: %v", "mandalaTokens", err)
+		return nil, fmt.Errorf("mandala store: index creation failed on %s: %w", "mandalaTokens", err)
 	}
 	if _, err := s.linkage.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: outpointKeys},
 		{Keys: bson.D{{Key: "identityKey", Value: 1}}},
 		{Keys: bson.D{{Key: "createdAt", Value: -1}}}, // activity paging; NO TTL
 	}); err != nil {
-		log.Printf("mandala store: index creation failed on %s: %v", "mandalaLinkageRecords", err)
+		return nil, fmt.Errorf("mandala store: index creation failed on %s: %w", "mandalaLinkageRecords", err)
 	}
 	if _, err := s.balances.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "identityKey", Value: 1}}, Options: uniq},
 	}); err != nil {
-		log.Printf("mandala store: index creation failed on %s: %v", "mandalaBalances", err)
+		return nil, fmt.Errorf("mandala store: index creation failed on %s: %w", "mandalaBalances", err)
 	}
 	if _, err := s.metadata.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: outpointKeys, Options: uniq},
 		{Keys: bson.D{{Key: "assetId", Value: 1}}},
 	}); err != nil {
-		log.Printf("mandala store: index creation failed on %s: %v", "mandalaMetadata", err)
+		return nil, fmt.Errorf("mandala store: index creation failed on %s: %w", "mandalaMetadata", err)
 	}
 	if _, err := s.states.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "assetId", Value: 1}}, Options: uniq},
 	}); err != nil {
-		log.Printf("mandala store: index creation failed on %s: %v", "mandalaAssetStates", err)
+		return nil, fmt.Errorf("mandala store: index creation failed on %s: %w", "mandalaAssetStates", err)
 	}
 	if _, err := s.history.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "assetId", Value: 1}, {Key: "height", Value: 1}, {Key: "offset", Value: 1}, {Key: "admitSeq", Value: 1}}},
 		{Keys: bson.D{{Key: "assetId", Value: 1}, {Key: "admitSeq", Value: -1}}},
+		// Admin-chain anchoring looks this up once per admin output per submit.
+		{Keys: bson.D{{Key: "assetId", Value: 1}, {Key: "txid", Value: 1}, {Key: "outputIndex", Value: 1}}},
 	}); err != nil {
-		log.Printf("mandala store: index creation failed on %s: %v", "mandalaAdminHistory", err)
+		return nil, fmt.Errorf("mandala store: index creation failed on %s: %w", "mandalaAdminHistory", err)
 	}
-	return s
+	if _, err := s.registry.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "identityKey", Value: 1}}, Options: uniq},
+		{Keys: bson.D{{Key: "status", Value: 1}}},
+	}); err != nil {
+		return nil, fmt.Errorf("mandala store: index creation failed on %s: %w", "mandalaRegistry", err)
+	}
+	if _, err := s.admissions.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		// Unique on txid (wire contract §4): one verdict per transaction, so
+		// two concurrent submitters can never persist divergent answers.
+		{Keys: bson.D{{Key: "txid", Value: 1}}, Options: uniq},
+	}); err != nil {
+		return nil, fmt.Errorf("mandala store: index creation failed on %s: %w", AdmissionsCollection, err)
+	}
+	return s, nil
 }
 
 // --- tokens ---
@@ -380,6 +407,23 @@ func (s *Store) GetAssetState(ctx context.Context, assetID string) (AssetAdminSt
 	return st, nil
 }
 
+// IssuerIdentityKeys lists every distinct non-empty issuerIdentityKey in the
+// asset-state cache. The membership gate (A04) exempts these identities, so
+// the read is live per check — a fresh register is honoured on the next
+// submit, never answered from a cache.
+func (s *Store) IssuerIdentityKeys(ctx context.Context) ([]string, error) {
+	res := s.states.Distinct(ctx, "issuerIdentityKey",
+		bson.D{{Key: "issuerIdentityKey", Value: bson.D{{Key: "$ne", Value: ""}}}})
+	if err := res.Err(); err != nil {
+		return nil, err
+	}
+	var keys []string
+	if err := res.Decode(&keys); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
 func (s *Store) PutAssetState(ctx context.Context, st AssetAdminState) error {
 	_, err := s.states.UpdateOne(ctx,
 		bson.D{{Key: "assetId", Value: st.AssetID}},
@@ -393,6 +437,25 @@ func (s *Store) PutAssetState(ctx context.Context, st AssetAdminState) error {
 func (s *Store) AppendAdminHistory(ctx context.Context, e AdminHistoryEntry) error {
 	_, err := s.history.InsertOne(ctx, e)
 	return err
+}
+
+// IsAdminOutpoint reports whether this topic already admitted the given
+// outpoint as an admin-auth output of assetID. It anchors the admin chain:
+// an admin action is authorised by SPENDING the recorded prior, never by
+// re-deriving a lock key that the named counterparty could also derive.
+func (s *Store) IsAdminOutpoint(ctx context.Context, assetID, txid string, vout uint32) (bool, error) {
+	err := s.history.FindOne(ctx, bson.D{
+		{Key: "assetId", Value: assetID},
+		{Key: "txid", Value: txid},
+		{Key: "outputIndex", Value: vout},
+	}).Err()
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) FindAdminHistoryByAssetID(ctx context.Context, assetID string) ([]AdminHistoryEntry, error) {

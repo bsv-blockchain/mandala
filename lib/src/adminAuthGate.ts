@@ -86,6 +86,36 @@ export async function withAdminAuthGate<T>(
   }
 }
 
+export interface AdminAuthClaim {
+  assetId: string
+  priorOutpoint: string
+}
+
+/**
+ * Composed gate for a pipeline that spends several assets' admin-auth priors
+ * in ONE transaction (submitGlobalAdminAction). Acquires each per-asset gate
+ * in sorted assetId order — every caller takes the same order, so two
+ * overlapping global actions cannot deadlock on each other — and releases
+ * every acquired gate (in reverse) on settle, including when a later asset
+ * is busy or `fn` throws. Never queues: a busy asset fails fast (BusyError).
+ */
+export async function withAdminAuthGates<T>(
+  claims: ReadonlyArray<AdminAuthClaim>,
+  fn: () => Promise<T>
+): Promise<T> {
+  const sorted = [...claims].sort((a, b) => (a.assetId < b.assetId ? -1 : a.assetId > b.assetId ? 1 : 0))
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].assetId === sorted[i - 1].assetId) {
+      throw new Error(`duplicate assetId in admin action: ${sorted[i].assetId}`)
+    }
+  }
+  const run = async (i: number): Promise<T> =>
+    i === sorted.length
+      ? await fn()
+      : await withAdminAuthGate(sorted[i].assetId, sorted[i].priorOutpoint, async () => await run(i + 1))
+  return await run(0)
+}
+
 /**
  * Pure check used before createAction when the wallet basket is already listed:
  * refuse a prior that is no longer among spendable outputs (stale cache after

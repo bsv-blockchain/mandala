@@ -2,6 +2,7 @@ package mandala
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,9 +27,21 @@ func testDB(t *testing.T) *mongo.Database {
 	return db
 }
 
+// mustStore builds a Store and fails the test if index creation does not
+// succeed — NewStore aborts on that (wire contract §9.9), so tests must too
+// rather than running against a half-indexed database.
+func mustStore(t *testing.T, db *mongo.Database) *Store {
+	t.Helper()
+	s, err := NewStore(db)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	return s
+}
+
 func TestTokenLifecycleAndBalances(t *testing.T) {
 	ctx := context.Background()
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 	row := TokenRow{Txid: "aa", OutputIndex: 1, AssetID: "a.0", Amount: 40, IdentityKey: "02k", CreatedAt: time.Now()}
 	if err := s.StoreToken(ctx, row); err != nil {
 		t.Fatal(err)
@@ -55,7 +68,7 @@ func TestTokenLifecycleAndBalances(t *testing.T) {
 
 func TestFindByAssetIDExcludesEvicted(t *testing.T) {
 	ctx := context.Background()
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 	_ = s.StoreToken(ctx, TokenRow{Txid: "t1", OutputIndex: 0, AssetID: "a.0", Amount: 1, CreatedAt: time.Now()})
 	_ = s.StoreToken(ctx, TokenRow{Txid: "t2", OutputIndex: 0, AssetID: "a.0", Amount: 1, CreatedAt: time.Now()})
 	st := DefaultAssetState("a.0")
@@ -69,7 +82,7 @@ func TestFindByAssetIDExcludesEvicted(t *testing.T) {
 
 func TestAdminHistoryOrderingAndSummary(t *testing.T) {
 	ctx := context.Background()
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 	seq1, _ := s.NextAdmitSeq(ctx)
 	seq2, _ := s.NextAdmitSeq(ctx)
 	if seq2 != seq1+1 {
@@ -100,7 +113,7 @@ func TestAdminHistoryOrderingAndSummary(t *testing.T) {
 // (txid, outputIndex) before summing, or totals double-count.
 func TestAdminSummaryDedupsReAdmits(t *testing.T) {
 	ctx := context.Background()
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 	seq1, _ := s.NextAdmitSeq(ctx)
 	seq2, _ := s.NextAdmitSeq(ctx)
 	seq3, _ := s.NextAdmitSeq(ctx)
@@ -123,7 +136,7 @@ func TestAdminSummaryDedupsReAdmits(t *testing.T) {
 // with seq=0, rather than being swallowed into the TS-parity (1, nil)
 // fallback — which must be reserved for the "no document yet" case only.
 func TestNextAdmitSeqPropagatesRealErrors(t *testing.T) {
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already canceled — FindOneAndUpdate must fail with a real error
 	seq, err := s.NextAdmitSeq(ctx)
@@ -136,7 +149,7 @@ func TestNextAdmitSeqPropagatesRealErrors(t *testing.T) {
 }
 
 func TestGetAssetStateDefault(t *testing.T) {
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 	st, err := s.GetAssetState(context.Background(), "missing.0")
 	if err != nil || st.AccessMode != "denylist" || st.BlockedIdentities == nil {
 		t.Fatalf("%+v %v", st, err)
@@ -151,7 +164,7 @@ func TestGetAssetStateDefault(t *testing.T) {
 // must still decode cleanly through the Go port.
 func TestLinkageReadsTSShapeDocument(t *testing.T) {
 	ctx := context.Background()
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 
 	tsDoc := bson.D{
 		{Key: "txid", Value: "deadbeef"},
@@ -205,7 +218,7 @@ func TestLinkageReadsTSShapeDocument(t *testing.T) {
 // documents, so each method under test must guard against that.
 func TestListMethodsReturnEmptyNotNil(t *testing.T) {
 	ctx := context.Background()
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 
 	t.Run("FindByOutpoint", func(t *testing.T) {
 		rows, err := s.FindByOutpoint(ctx, "nonexistent", 0)
@@ -278,7 +291,7 @@ func TestListMethodsReturnEmptyNotNil(t *testing.T) {
 // BSON binary.
 func TestStoreLinkageWritesTSShape(t *testing.T) {
 	ctx := context.Background()
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 
 	row := LinkageRow{
 		Txid:        "cafef00d",
@@ -351,7 +364,7 @@ func TestStoreLinkageWritesTSShape(t *testing.T) {
 // and the balance is re-credited.
 func TestSnapshotAndRestoreTokensRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 
 	owned := TokenRow{Txid: "aa", OutputIndex: 0, AssetID: "a.0", Amount: 40, IdentityKey: "02k", CreatedAt: time.Now()}
 	anon := TokenRow{Txid: "bb", OutputIndex: 2, AssetID: "a.0", Amount: 7, IdentityKey: "", CreatedAt: time.Now()}
@@ -415,7 +428,7 @@ func TestSnapshotAndRestoreTokensRoundTrip(t *testing.T) {
 // upsert actually re-inserted the row.
 func TestRestoreTokensIdempotent(t *testing.T) {
 	ctx := context.Background()
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 
 	row := TokenRow{Txid: "dd", OutputIndex: 1, AssetID: "a.0", Amount: 25, IdentityKey: "02k", CreatedAt: time.Now()}
 	if err := s.StoreToken(ctx, row); err != nil {
@@ -461,7 +474,7 @@ func TestRestoreTokensIdempotent(t *testing.T) {
 
 func TestSnapshotTokensEmpty(t *testing.T) {
 	ctx := context.Background()
-	s := NewStore(testDB(t))
+	s := mustStore(t, testDB(t))
 	rows, err := s.SnapshotTokens(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -471,5 +484,36 @@ func TestSnapshotTokensEmpty(t *testing.T) {
 	}
 	if err := s.RestoreTokens(ctx, nil); err != nil {
 		t.Fatal("empty restore:", err)
+	}
+}
+
+// Wire contract §9.9 — index creation failures abort startup. A pre-existing
+// index with the same key but different options is the deterministic way to
+// make Mongo refuse (it will not silently change an existing index's options),
+// and it stands in for every other reason index creation can fail: the
+// constructor must refuse to hand back a Store that is missing the uniqueness
+// its invariants rest on.
+func TestNewStoreAbortsWhenAnIndexCannotBeCreated(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	// NewStore wants {txid:1} UNIQUE on mandalaAdmissions ("one verdict per
+	// transaction"). Two rows already sharing a txid make that index
+	// impossible to build — the same situation a node would hit on a database
+	// that had been written without it.
+	if _, err := db.Collection(AdmissionsCollection).InsertMany(ctx, []any{
+		bson.D{{Key: "txid", Value: recTxid}},
+		bson.D{{Key: "txid", Value: recTxid}},
+	}); err != nil {
+		t.Fatal("seeding the duplicate rows:", err)
+	}
+	s, err := NewStore(db)
+	if err == nil {
+		t.Fatal("NewStore returned a Store without the unique admissions index")
+	}
+	if s != nil {
+		t.Fatalf("NewStore returned a non-nil Store alongside its error: %+v", s)
+	}
+	if !strings.Contains(err.Error(), AdmissionsCollection) {
+		t.Fatalf("error must name the collection that failed, got: %v", err)
 	}
 }

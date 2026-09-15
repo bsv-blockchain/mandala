@@ -31,15 +31,15 @@ var _ ActivityLinkage = (*mandala.Store)(nil)
 // struct just to reference one field. wiring.App.FindRawTxs satisfies it.
 type FindRawTxsFunc func(ctx context.Context, txids []string) (map[string]string, error)
 
-// registerActivityRoute mounts GET /admin/activity. Unlike the four routes
-// in admin.go, this one is wired through a ServerOption (WithActivity) —
-// see server.go — rather than being an unconditional registerAdminRoutes
-// call, purely so the ~40 existing newServer(...) call sites elsewhere in
-// this package's tests don't all need a new required parameter; New(app)
-// always supplies WithActivity in production, so the route is unconditional
-// there too.
-func registerActivityRoute(f *fiber.App, linkage ActivityLinkage, findRawTxs FindRawTxsFunc) {
-	f.Get("/admin/activity", activityHandler(linkage, findRawTxs))
+// registerActivityRoute mounts GET /admin/activity behind adminToken (A13).
+// Unlike the four routes in admin.go, this one is wired through a
+// ServerOption (WithActivity) — see server.go — rather than being an
+// unconditional registerAdminRoutes call, purely so the ~40 existing
+// newServer(...) call sites elsewhere in this package's tests don't all need
+// a new required parameter; New(app) always supplies WithActivity in
+// production, so the route is unconditional there too.
+func registerActivityRoute(f *fiber.App, linkage ActivityLinkage, findRawTxs FindRawTxsFunc, adminToken string) {
+	f.Get("/admin/activity", AdminAuthMiddleware(adminToken), activityHandler(linkage, findRawTxs))
 }
 
 func activityHandler(linkage ActivityLinkage, findRawTxs FindRawTxsFunc) fiber.Handler {

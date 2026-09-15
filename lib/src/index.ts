@@ -18,9 +18,10 @@ import {
   AdminAsset,
   listAdminAssets,
   submitAdminAction,
-  SubmitAdminActionParams
+  SubmitAdminActionParams,
+  SubmitAdminActionResult
 } from './assets.js'
-import { registerAsset, issueTokens, redeemTokens } from './issuerOps.js'
+import { registerAsset, issueTokens, redeemTokens, IssuerOpResult, RegisterResult } from './issuerOps.js'
 import { reconcileWallet, ReconcileResult } from './reconcile.js'
 
 export interface MandalaClientOptions extends MandalaEndpoints {
@@ -50,12 +51,17 @@ export interface MandalaClient {
   send: (args: SendArgs) => Promise<TransferResult>
   /** Internalize + acknowledge all pending incoming transfers. */
   receive: (args?: ReceiveArgs) => Promise<ReceiveResult>
-  /** Submit a regulatory/treasury admin action (freeze, pause, reissue, …). */
-  admin: (args: AdminArgs) => Promise<{ txid: string, nextAuthOutpoint: string }>
+  /**
+   * Submit a regulatory/treasury admin action (freeze, pause, reissue, …).
+   * `notified` is false when a reissue committed but the recipient notify is
+   * still pending (journaled; retried by reconcile) — never retry the action.
+   */
+  admin: (args: AdminArgs) => Promise<SubmitAdminActionResult>
   /** Issuer treasury ops. */
-  register: (args: { label: string, ticker: string, decimals: number }) => Promise<{ assetId: string }>
-  issue: (args: { asset: AdminAsset, amount: number }) => Promise<{ txid: string }>
-  redeem: (args: { asset: AdminAsset, amount: number, balance?: number }) => Promise<{ txid: string }>
+  register: (args: { label: string, ticker: string, decimals: number }) => Promise<RegisterResult>
+  /** `depositHash`: sha256 hex of the deposit record, committed on-chain as bankRef. */
+  issue: (args: { asset: AdminAsset, amount: number, depositHash?: string }) => Promise<IssuerOpResult>
+  redeem: (args: { asset: AdminAsset, amount: number, balance?: number }) => Promise<IssuerOpResult>
   assets: () => Promise<AdminAsset[]>
   /** Self-heal half-finished state (stuck aborts, pending broadcasts). */
   reconcile: () => Promise<ReconcileResult>
@@ -111,8 +117,8 @@ export function createMandalaClient (opts: MandalaClientOptions = {}): MandalaCl
       } as SubmitAdminActionParams),
     register: async args =>
       registerAsset({ wallet: wallet as any, identityKey: await identityKey(), ...args }),
-    issue: async ({ asset, amount }) =>
-      issueTokens({ wallet: wallet as any, identityKey: await identityKey(), asset, amount }),
+    issue: async ({ asset, amount, depositHash }) =>
+      issueTokens({ wallet: wallet as any, identityKey: await identityKey(), asset, amount, depositHash }),
     redeem: async ({ asset, amount, balance }) =>
       redeemTokens({ wallet: wallet as any, identityKey: await identityKey(), asset, amount, balance }),
     assets: async () => listAdminAssets(wallet),
@@ -122,10 +128,21 @@ export function createMandalaClient (opts: MandalaClientOptions = {}): MandalaCl
 
 // Re-export the core surface for direct use.
 export { configureMandala } from './constants.js'
+export * from './storage.js'
+export * from './metadata.js'
+export * from './txJournal.js'
+export * from './overlay.js'
+export * from './admission.js'
+export * from './bundle.js'
 export * from './transfer.js'
 export * from './receive.js'
 export * from './assets.js'
 export * from './issuerOps.js'
+export * from './registry.js'
+export * from './registryRecover.js'
+export * from './assetRecover.js'
+export * from './blinding.js'
+export * from './blindingJournal.js'
 export * from './reconcile.js'
 export * from './submitGuards.js'
 export * from './singleFlight.js'

@@ -66,9 +66,19 @@ const adminDecodedWithData = MandalaAdmin.decode(adminScriptWithData)
 assert.deepEqual(adminDecodedWithData.publicData, adminPublicData, 'admin publicData: round trip mismatch')
 assert.deepEqual(adminDecodedWithData.pubKeyHash, adminDecodedPlain.pubKeyHash, 'admin publicData: same action/keyID must derive the same pubKeyHash')
 
+// A09: the on-chain marker every admin-auth output now carries (lib/src/assets.ts,
+// issuerOps.ts) so wallets cannot reclassify it as vanilla P2PKH. The 100-byte
+// JSON needs OP_PUSHDATA1, which is the case Go's chunker must get right.
+const adminMarker = { t: 'mandala-admin', assetId: ASSET }
+const adminScriptWithMarker = await MandalaAdmin.lock({ wallet: adminWallet, data: adminData, publicData: adminMarker })
+const adminDecodedWithMarker = MandalaAdmin.decode(adminScriptWithMarker)
+assert.deepEqual(adminDecodedWithMarker.publicData, adminMarker, 'admin marker: round trip mismatch')
+assert.deepEqual(adminDecodedWithMarker.pubKeyHash, adminDecodedPlain.pubKeyHash, 'admin marker: publicData must not change the derived key')
+
 const adminScripts = [
   { publicData: null, pubKeyHash: adminDecodedPlain.pubKeyHash, scriptHex: adminScriptPlain.toHex() },
-  { publicData: adminPublicData, pubKeyHash: adminDecodedWithData.pubKeyHash, scriptHex: adminScriptWithData.toHex() }
+  { publicData: adminPublicData, pubKeyHash: adminDecodedWithData.pubKeyHash, scriptHex: adminScriptWithData.toHex() },
+  { publicData: adminMarker, pubKeyHash: adminDecodedWithMarker.pubKeyHash, scriptHex: adminScriptWithMarker.toHex() }
 ]
 
 // --- commitment canonical-JSON cases ---

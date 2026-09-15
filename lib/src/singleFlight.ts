@@ -58,3 +58,6 @@ export const sendFlight = createSingleFlight('send')
 
 /** Process-wide register latch — one genesis register at a time. */
 export const registerFlight = createSingleFlight('register')
+
+/** Overlay-wide identity registry chain — one admit/revoke/open at a time. */
+export const registryFlight = createSingleFlight('registry')

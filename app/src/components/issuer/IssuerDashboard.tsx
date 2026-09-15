@@ -1,12 +1,14 @@
 import { useEffect } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import {
-  LayoutDashboard, ShieldCheck, Banknote, Wallet, Activity, ChevronDown
+  LayoutDashboard, ShieldCheck, Banknote, Wallet, Activity, ChevronDown, IdCard
 } from 'lucide-react'
 import { useWallet } from '../../context/WalletContext'
 import { AdminAsset } from '@bsv/mandala/assets'
 import { useAdminAssets, useInvalidateAdminAssets } from '../../hooks/useAdminAssets'
+import { useAssetAuth, useReattachAssetAuth } from '../../hooks/useAssetAuth'
 import { BrandMark } from '../ui/BrandMark'
+import { Button } from '../ui/button'
 import { cn } from '@/lib/utils'
 import IssuerPanel from '../IssuerPanel'
 import OverviewSection from './OverviewSection'
@@ -15,8 +17,9 @@ import RegulatoryControls from './RegulatoryControls'
 import BankingMock from './BankingMock'
 import OverlayActivity from './OverlayActivity'
 import TreasurySection from './TreasurySection'
+import IdentityRegistry from './IdentityRegistry'
 
-type Section = 'overview' | 'treasury' | 'operations' | 'activity' | 'banking'
+type Section = 'overview' | 'treasury' | 'operations' | 'identities' | 'activity' | 'banking'
 
 const NAV_ITEMS: Array<{
   id: Section
@@ -26,6 +29,7 @@ const NAV_ITEMS: Array<{
   { id: 'overview',    label: 'Overview',    icon: LayoutDashboard },
   { id: 'treasury',    label: 'Treasury',    icon: Wallet },
   { id: 'operations',  label: 'Operations',  icon: ShieldCheck },
+  { id: 'identities',  label: 'Identities',  icon: IdCard },
   { id: 'activity',    label: 'Activity',    icon: Activity },
   { id: 'banking',     label: 'Banking',     icon: Banknote },
 ]
@@ -93,6 +97,42 @@ function AssetSwitcher({ assets, currentAssetId, onChange }: AssetSwitcherProps)
   )
 }
 
+// ── ReattachAssetAuthorityCard ────────────────────────────────────────────────
+
+/**
+ * Shown when the URL names an asset the overlay knows but this wallet's
+ * basket does not list. The live admin-auth UTXO is on chain and admitted;
+ * only the wallet's bookkeeping for it is gone (a 1-sat P2PKH reclassified
+ * as plain change). Re-attach puts that existing UTXO back in the basket —
+ * it does not register a second asset. Mirrors the identity-chain card in
+ * IdentityRegistry.
+ */
+function ReattachAssetAuthorityCard({ assetId, authOutpoint }: { assetId: string; authOutpoint: string }) {
+  const reattach = useReattachAssetAuth()
+  return (
+    <div className="bg-card border border-border rounded-md p-[18px] flex flex-col gap-4 mb-[26px]">
+      <div>
+        <p className="text-[15px] font-semibold leading-tight">Re-attach asset authority</p>
+        <p className="text-[12.5px] text-subtle-foreground mt-1 leading-[1.55]">
+          The overlay holds admin history for asset {assetId.slice(0, 12)}… with live authority at{' '}
+          <span className="font-mono">{authOutpoint.slice(0, 12)}…</span>, but this wallet is not listing that
+          1-sat authorization with its bookkeeping. Re-attach puts the existing UTXO back in the basket — it
+          does not create a new asset.
+        </p>
+      </div>
+      <Button
+        onClick={() => reattach.mutate(assetId)}
+        disabled={reattach.isPending}
+        loading={reattach.isPending}
+        loadingText="Re-attaching…"
+        className="w-full sm:w-auto"
+      >
+        Re-attach asset authority
+      </Button>
+    </div>
+  )
+}
+
 // ── IssuerDashboard ───────────────────────────────────────────────────────────
 
 const SECTION_IDS = NAV_ITEMS.map(n => n.id) as string[]
@@ -135,19 +175,30 @@ export default function IssuerDashboard() {
     }
   }, [params.section, searchParams, navigate])
 
+  const currentAsset = assets.find(a => a.assetId === currentAssetId) ?? null
+
+  // The URL names an asset this basket does not list. Ask the overlay whether
+  // it holds admin history for it — if so, the wallet lost the auth output's
+  // bookkeeping and the re-attach card is the way back (A10). Only consulted
+  // in that case; a basket-listed asset never hits the overlay for this.
+  const missingFromBasket = currentAssetId !== '' && currentAsset == null
+  const authQuery = useAssetAuth(missingFromBasket ? currentAssetId : '')
+  const overlayKnowsAsset = missingFromBasket && authQuery.data != null
+
   // Auto-select the first asset into ?asset when the URL has no valid selection.
   useEffect(() => {
     if (assets.length === 0) return
     const valid = currentAssetId !== '' && assets.some(a => a.assetId === currentAssetId)
     if (valid) return
+    // Keep a URL asset the overlay still knows (or has not yet answered for):
+    // replacing it would hide the re-attach card behind the first basket asset.
+    if (missingFromBasket && (authQuery.isPending || authQuery.data != null)) return
     setSearchParams(prev => {
       const next = new URLSearchParams(prev)
       next.set('asset', assets[0].assetId)
       return next
     }, { replace: true })
-  }, [assets, currentAssetId, setSearchParams])
-
-  const currentAsset = assets.find(a => a.assetId === currentAssetId) ?? null
+  }, [assets, currentAssetId, missingFromBasket, authQuery.isPending, authQuery.data, setSearchParams])
 
   // Derive issuer initials for the footer chip from identityKey (first 2 hex chars → uppercase)
   const initials = identityKey != null && identityKey.length >= 4
@@ -236,6 +287,9 @@ export default function IssuerDashboard() {
         </div>
 
         <div className="p-[26px_30px]">
+          {overlayKnowsAsset && (
+            <ReattachAssetAuthorityCard assetId={currentAssetId} authOutpoint={authQuery.data!.authOutpoint} />
+          )}
           {section === 'overview' && (
             <OverviewSection
               assetId={currentAssetId}
@@ -268,6 +322,9 @@ export default function IssuerDashboard() {
                 />
               </div>
             )
+          )}
+          {section === 'identities' && (
+            <IdentityRegistry />
           )}
           {section === 'activity' && (
             <OverlayActivity

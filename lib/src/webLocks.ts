@@ -6,6 +6,13 @@
  * synchronously; these locks extend the same guarantee across tabs of the
  * same origin. Cross-DEVICE races remain — the overlay's admission check and
  * assertSpendablePrior are the backstop there.
+ *
+ * Lock names in use (one per cross-tab-exclusive pipeline):
+ *   'mandala.send'             — holder transfer (transfer.ts)
+ *   'mandala.register'         — asset genesis (issuerOps.ts registerAsset);
+ *                                registerFlight covers same-tab re-entry only
+ *   'mandala.admin.<assetId>'  — per-asset admin-auth spend (adminAuthGate.ts)
+ *   'mandala.reconcile'        — the recovery pass (reconcile.ts)
  */
 
 export interface TryLockResult<T> {
