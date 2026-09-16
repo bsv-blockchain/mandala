@@ -48,7 +48,7 @@ const mkWallet = (): any => ({
   getPublicKey: vi.fn().mockResolvedValue({ publicKey: RECIPIENT })
 })
 
-const send = async (): Promise<{ body: any, result: any }> => {
+const send = async (overrides: Record<string, unknown> = {}): Promise<{ body: any, result: any, wallet: any }> => {
   const wallet = mkWallet()
   const messageBoxClient = { sendMessage: vi.fn().mockResolvedValue({}) }
   const result = await transferTokens({
@@ -57,9 +57,10 @@ const send = async (): Promise<{ body: any, result: any }> => {
     identityKey: '02' + '11'.repeat(32),
     assetId: ASSET,
     amount: 5,
-    recipientKey: RECIPIENT
+    recipientKey: RECIPIENT,
+    ...overrides
   })
-  return { body: messageBoxClient.sendMessage.mock.calls[0][0].body, result }
+  return { body: messageBoxClient.sendMessage.mock.calls[0][0].body, result, wallet }
 }
 
 beforeEach(async () => {
@@ -119,6 +120,41 @@ describe('transferTokens — A12 receipt and the optional wire admission', () =>
     vi.mocked(submitAndBroadcast).mockResolvedValue({ outputsToAdmit: [0], admissionSignature: 'deadbeef' })
     const { body } = await send()
     expect('admission' in body).toBe(false)
+  })
+})
+
+describe('transferTokens — the optional sender note', () => {
+  it('uses the sender’s note as the action description in place of the fixed wording', async () => {
+    vi.mocked(submitAndBroadcast).mockResolvedValue({ outputsToAdmit: [0] })
+    const { wallet } = await send({ note: 'lunch split' })
+    const args = wallet.createAction.mock.calls[0][0]
+    expect(args.description).toBe('lunch split')
+  })
+
+  it('falls back to the fixed "Send N of assetId" wording when no note is given', async () => {
+    vi.mocked(submitAndBroadcast).mockResolvedValue({ outputsToAdmit: [0] })
+    const { wallet } = await send()
+    const args = wallet.createAction.mock.calls[0][0]
+    expect(args.description).toBe(`Send 5 of ${ASSET}`)
+  })
+
+  it('carries the note on the MessageBox body so the recipient can show it too', async () => {
+    vi.mocked(submitAndBroadcast).mockResolvedValue({ outputsToAdmit: [0] })
+    const { body } = await send({ note: 'thanks!' })
+    expect(body.note).toBe('thanks!')
+  })
+
+  it('omits the note from the body entirely when none is given', async () => {
+    vi.mocked(submitAndBroadcast).mockResolvedValue({ outputsToAdmit: [0] })
+    const { body } = await send()
+    expect('note' in body).toBe(false)
+  })
+
+  it('trims whitespace-only notes to nothing, on both the description and the body', async () => {
+    vi.mocked(submitAndBroadcast).mockResolvedValue({ outputsToAdmit: [0] })
+    const { wallet, body } = await send({ note: '   ' })
+    expect(wallet.createAction.mock.calls[0][0].description).toBe(`Send 5 of ${ASSET}`)
+    expect('note' in body).toBe(false)
   })
 })
 

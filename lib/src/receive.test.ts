@@ -121,3 +121,23 @@ describe('A12 / FIX H — a counterparty-supplied σ_I is verified, never truste
     expect(wallet.internalizeAction).not.toHaveBeenCalled()
   })
 })
+
+describe('the sender’s optional note', () => {
+  it('uses the sender’s note as the credited action’s description', async () => {
+    const { wallet } = await receive({ note: 'thanks!' })
+    const args = wallet.internalizeAction.mock.calls[0][0]
+    expect(args.description).toBe('thanks!')
+  })
+
+  it('falls back to the fixed "Receive N of assetId" wording when the body carries no note', async () => {
+    const { wallet } = await receive()
+    const args = wallet.internalizeAction.mock.calls[0][0]
+    expect(args.description).toBe(`Receive ${AMOUNT} of ${ASSET}`)
+  })
+
+  it('never lets a non-string note field through as a description', async () => {
+    const { wallet } = await receive({ note: 12345 })
+    const args = wallet.internalizeAction.mock.calls[0][0]
+    expect(args.description).toBe(`Receive ${AMOUNT} of ${ASSET}`)
+  })
+})
