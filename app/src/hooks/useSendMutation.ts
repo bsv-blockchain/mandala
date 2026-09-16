@@ -14,6 +14,9 @@ export interface SendVars {
   assetId: string
   amount: number
   recipientKey: string
+  /** The sender's own note — becomes the recipient's action description in
+   * place of the fixed "Receive N of assetId" wording (see transfer.ts). */
+  note?: string
 }
 
 /**
@@ -49,7 +52,8 @@ export function useSendMutation() {
         identityKey,
         assetId: vars.assetId,
         amount: vars.amount,
-        recipientKey: vars.recipientKey
+        recipientKey: vars.recipientKey,
+        note: vars.note
       })
     },
 

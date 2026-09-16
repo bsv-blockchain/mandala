@@ -269,6 +269,19 @@ describe('robustness wiring (shipped source)', () => {
     expect(s).toMatch(/resolveAssetState\([^)]*\{\s*force:\s*true\s*\}/)
   })
 
+  it('the note SendTokens captures reaches transferTokens, not just the Review screen', () => {
+    const ui = src('components/SendTokens.tsx')
+    const mut = src('hooks/useSendMutation.ts')
+    const transfer = lib('transfer.ts')
+    // The field exists and is shown back on Review (already true) — the gap is
+    // whether it is actually sent anywhere beyond that.
+    expect(ui).toContain('const [note, setNote] = useState')
+    expect(ui).toMatch(/sendMutation\.mutate\(\s*\{[\s\S]*?note[\s\S]*?\}/)
+    expect(mut).toMatch(/interface SendVars\s*\{[\s\S]*?note\??:\s*string/)
+    expect(mut).toMatch(/transferTokens\(\{[\s\S]*?note[\s\S]*?\}/)
+    expect(transfer).toContain('note?: string')
+  })
+
   it('A14: IssuerPanel hashes the deposit ref client-side and the issue mutation passes depositHash through the guard + issueTokens', () => {
     const panel = src('components/IssuerPanel.tsx')
     const mut = src('hooks/useIssuerMutations.ts')

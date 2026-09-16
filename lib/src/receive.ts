@@ -188,6 +188,12 @@ export interface IncomingTransfer {
     linkage: WireLinkage[]
     admissions: WireAdmission[]
   }
+  /**
+   * The sender's own note, when they gave one. Overrides the fixed
+   * `Receive ${amount} of ${assetId}` action description. Absent on any
+   * message from a sender build that predates this field.
+   */
+  note?: string
 }
 
 export interface ReceivedTransfer extends IncomingTransfer {
@@ -333,7 +339,7 @@ async function acceptOne (
           tags: ['mandala', 'received', msg.assetId]
         }
       }],
-      description: `Receive ${msg.amount} of ${msg.assetId}`
+      description: (typeof msg.note === 'string' && msg.note.trim()) || `Receive ${msg.amount} of ${msg.assetId}`
     })
   } catch (e) {
     // Internalize + acknowledge are not atomic: an earlier attempt may have
@@ -415,6 +421,7 @@ export async function receiveTokens (p: ReceiveParams): Promise<ReceiveResult> {
         // landed; older messages predate the field (recipient was always 0).
         outputIndex: typeof raw.body.outputIndex === 'number' ? raw.body.outputIndex : 0,
         admission: raw.body.admission,
+        ...(typeof raw.body.note === 'string' ? { note: raw.body.note } : {}),
         ...(isHandover
           ? {
               handover: {

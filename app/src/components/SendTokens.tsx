@@ -297,7 +297,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
     // Review with the error (the wallet action was aborted, inputs released).
     setStep('sending')
     sendMutation.mutate(
-      { assetId, amount: sendAmount, recipientKey: recipient },
+      { assetId, amount: sendAmount, recipientKey: recipient, note },
       {
         onSuccess: res => {
           setSentTxid(res.txid)

@@ -100,6 +100,15 @@ export interface TransferParams {
    * correctness dependency.
    */
   submitAfterHandover?: boolean
+  /**
+   * The sender's own note for this payment. Overrides the fixed
+   * `Send ${amount} of ${assetId}` action description, and rides on the
+   * MessageBox body (as `note`) so the recipient's own credited action can
+   * show it too, in place of its own fixed `Receive ${amount} of ${assetId}`
+   * wording — mirroring how a nearby/local rail's payment frame already
+   * carries a sender's note. Trimmed; blank and absent are treated alike.
+   */
+  note?: string
 }
 
 /**
@@ -169,6 +178,7 @@ export async function transferTokens (p: TransferParams): Promise<TransferResult
 async function transferPipeline (p: TransferParams): Promise<TransferResult> {
   const { wallet, messageBoxClient, identityKey, assetId, amount, recipientKey } = p
   const handover = p.mode === 'handover'
+  const note = p.note?.trim() || undefined
 
   // Token-aware coin selection: confirmed-first, fewest UTXOs (see ftSelect).
   const { candidates, beef: beefBytes } = await loadFtCandidates(wallet as any, assetId)
@@ -258,7 +268,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
   const intent = await journalIntentBegin()
   try {
     const created = await wallet.createAction({
-      description: `Send ${amount} of ${assetId}`,
+      description: note ?? `Send ${amount} of ${assetId}`,
       // The recipient key rides as an action label: output customInstructions
       // are erased when the output is later spent/relinquished, but labels stay
       // with the action for good — history reads the counterparty from here.
@@ -390,6 +400,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     messageBox: MESSAGEBOX,
     body: {
       ...(handoverExtras ?? {}),
+      ...(note != null ? { note } : {}),
       assetId,
       amount,
       transaction: signedTx,
