@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { LockingScript, Transaction } from '@bsv/sdk'
 import { fetchAssetAuthHead, fetchAssetAuthBeef, recoverAdminAuth } from './assetRecover.js'
 import { parseAdminCI } from './assets.js'
 
@@ -15,7 +16,13 @@ vi.mock('./metadata', () => ({ resolveAssetMetadata: (id: string) => resolveAsse
 
 const TXID = 'ab'.repeat(32)
 const ASSET = `${TXID}.0`
-const HEAD_TXID = 'cd'.repeat(32)
+// A real head tx: the overlay serves plain BEEF and the wallet's
+// internalizeAction demands AtomicBEEF, so the fixture has to parse.
+const HEAD_TX = new Transaction()
+HEAD_TX.addOutput({ lockingScript: LockingScript.fromASM('OP_TRUE'), satoshis: 1 })
+HEAD_TX.addOutput({ lockingScript: LockingScript.fromASM('OP_TRUE'), satoshis: 1 })
+const HEAD_TXID = HEAD_TX.id('hex')
+const HEAD_BEEF = HEAD_TX.toBEEF()
 const registerDetails = { kind: 'register', label: 'Test Coin', ticker: 'TST', decimals: 2, issuer: '02' + 'aa'.repeat(32) }
 const unpauseDetails = { kind: 'unpause', assetId: ASSET, priorOutpoint: `${TXID}.0` }
 
@@ -67,7 +74,7 @@ describe('recoverAdminAuth', () => {
   const headResponses = (details: Record<string, unknown>): void => {
     mockFetch
       .mockResolvedValueOnce(json(200, { authOutpoint: `${HEAD_TXID}.1`, authDetails: details }))
-      .mockResolvedValueOnce(json(200, { beef: [1, 1, 1, 1], outputIndex: 1 }))
+      .mockResolvedValueOnce(json(200, { beef: HEAD_BEEF, outputIndex: 1 }))
   }
 
   it('internalizes the overlay head with basket insertion + admin CI and returns it even when the basket stays empty', async () => {
@@ -83,7 +90,9 @@ describe('recoverAdminAuth', () => {
     })
     expect(wallet.internalizeAction).toHaveBeenCalledTimes(1)
     const args = wallet.internalizeAction.mock.calls[0][0]
-    expect(args.tx).toEqual([1, 1, 1, 1])
+    // 2026-09-17: BSV Desktop refuses plain BEEF here ("must be valid AtomicBEEF").
+    expect(args.tx.slice(0, 4)).toEqual([1, 1, 1, 1])
+    expect(Transaction.fromAtomicBEEF(args.tx).id('hex')).toBe(HEAD_TXID)
     expect(args.outputs).toHaveLength(1)
     expect(args.outputs[0].outputIndex).toBe(1)
     expect(args.outputs[0].protocol).toBe('basket insertion')
