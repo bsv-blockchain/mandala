@@ -509,3 +509,34 @@ describe('submitToOverlay requires a verifying admission signature when a key is
     expect(wallet.createAction).not.toHaveBeenCalled()
   })
 })
+
+// 2026-09-17 — σ_I rides on the tm_mandala entry only (wire contract §1/§2).
+// A registry-only submit (tm_mandala_registry) is never signed by either
+// overlay, so demanding a signature there refused every identity-chain action
+// AFTER the overlay had folded and broadcast it (testnet 4b0464ad…).
+describe('submitToOverlay does not demand σ_I for a registry-only submit', () => {
+  const OVERLAY_PRIV = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000d4')
+  const OVERLAY_KEY = OVERLAY_PRIV.toPublicKey().toString()
+  const tx = new Transaction()
+  tx.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
+  const beef = new Beef(); beef.mergeTransaction(tx)
+  const bytes = beef.toBinaryAtomic(tx.id('hex'))
+  const REGISTRY = ['tm_mandala_registry']
+
+  beforeEach(() => configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: OVERLAY_KEY }))
+
+  it('accepts an unsigned tm_mandala_registry admission when a key is configured', async () => {
+    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala_registry: { outputsToAdmit: [0], coinsToRetain: [] } }) }
+    await expect(submitToOverlay(bytes, undefined, facilitator as any, REGISTRY)).resolves.toMatchObject({ outputsToAdmit: [0] })
+  })
+  it('broadcasts a registry-only admission and journals it as accepted', async () => {
+    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala_registry: { outputsToAdmit: [0], coinsToRetain: [] } }) }
+    const wallet = { createAction: vi.fn().mockImplementation(postingWallet), abortAction: vi.fn() }
+    await submitAndBroadcast(wallet as any, { tx: bytes, txid: tx.id('hex') } as any, undefined, undefined, facilitator as any, REGISTRY)
+    expect(wallet.createAction).toHaveBeenCalledWith(expect.objectContaining({ options: expect.objectContaining({ sendWith: [tx.id('hex')] }) }))
+  })
+  it('still demands σ_I when the submit names tm_mandala', async () => {
+    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] }, tm_mandala_registry: { outputsToAdmit: [], coinsToRetain: [] } }) }
+    await expect(submitToOverlay(bytes, undefined, facilitator as any, ['tm_mandala', 'tm_mandala_registry'])).rejects.toMatchObject({ code: 'ERR_NO_ADMISSION' })
+  })
+})
