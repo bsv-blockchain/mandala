@@ -15,7 +15,7 @@ import type { MandalaActionDetails } from '@bsv/templates'
 import { adminAuthHeaders, BASKET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 import { AdminAsset, adminCustomInstructions, listAdminAssets } from './assets.js'
 import { resolveAssetMetadata } from './metadata.js'
-import { beefFromWhatsOnChain } from './registryRecover.js'
+import { beefFromWhatsOnChain, toAtomicBeef } from './registryRecover.js'
 
 /** The overlay's view of an asset's live admin authority (`GET /admin/asset-auth/:assetId`). */
 export interface OverlayAssetAuth {
@@ -116,7 +116,7 @@ export async function recoverAdminAuth (p: {
   const { label, metadata } = await describeAsset(p.assetId, head.authDetails, listed)
   try {
     await p.wallet.internalizeAction({
-      tx: beef,
+      tx: toAtomicBeef(beef, txid),
       labels: ['mandala', 'admin', 'recover'],
       outputs: [{
         outputIndex: vout,

@@ -15,6 +15,7 @@ import {
   fetchRegistryBeef,
   loadRegistryInputBeef,
   pickRecoverableRegistryRow,
+  recoverRegistryAuth,
   toSpendingBeef
 } from './registryRecover.js'
 import { OverlayRegistryRow } from './registry.js'
@@ -282,5 +283,45 @@ describe('fetchRegistryBeef / loadRegistryInputBeef', () => {
   it('loadRegistryInputBeef rejects a malformed outpoint before any fetch', async () => {
     await expect(loadRegistryInputBeef({} as any, '.0')).rejects.toThrow(/bad registry auth outpoint/)
     expect(mockFetch).not.toHaveBeenCalled()
+  })
+})
+
+// 2026-09-17 — BSV Desktop (wallet-toolbox 2.4.4) validates internalizeAction's
+// `tx` as AtomicBEEF ("The tx parameter must be valid AtomicBEEF"). The Go
+// overlay's /admin/registry/beef serves plain BEEF V2, which re-attach passed
+// straight through and the wallet refused. Testnet head 4b0464ad…:0.
+describe('recoverRegistryAuth hands the wallet AtomicBEEF', () => {
+  const mockFetch = vi.fn()
+  const tx = mkTx(1)
+  const TXID = tx.id('hex')
+  const ISSUER = '02' + 'ab'.repeat(32)
+  const row: OverlayRegistryRow = {
+    identityKey: ISSUER, status: 'admitted', txid: TXID, outputIndex: 0, admitSeq: 4, createdAt: '',
+    actionDetails: { kind: 'register', issuer: ISSUER, identityKey: ISSUER }
+  }
+
+  beforeEach(() => {
+    mockFetch.mockReset()
+    vi.stubGlobal('fetch', mockFetch)
+    configureMandala({ overlayUrl: 'http://test-overlay' })
+    mockFetch.mockImplementation(async (url: string) => {
+      if (url.endsWith('/admin/registry')) return { ok: true, json: async () => [row] }
+      if (url.includes('/admin/registry/beef/')) return { ok: true, json: async () => ({ beef: tx.toBEEF() }) }
+      return { ok: false, json: async () => ({}), text: async () => '' }
+    })
+  })
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('converts the overlay’s plain BEEF to AtomicBEEF for the head txid before internalizing', async () => {
+    const wallet = {
+      listOutputs: vi.fn().mockResolvedValue({ outputs: [], totalOutputs: 0 }),
+      internalizeAction: vi.fn().mockResolvedValue({ accepted: true })
+    }
+    const live = await recoverRegistryAuth({ wallet: wallet as any, issuerIdentityKey: ISSUER })
+    expect(live).toMatchObject({ authOutpoint: `${TXID}.0` })
+    expect(wallet.internalizeAction).toHaveBeenCalledTimes(1)
+    const sent = wallet.internalizeAction.mock.calls[0][0].tx as number[]
+    expect(sent.slice(0, 4)).toEqual([1, 1, 1, 1])
+    expect(Transaction.fromAtomicBEEF(sent).id('hex')).toBe(TXID)
   })
 })

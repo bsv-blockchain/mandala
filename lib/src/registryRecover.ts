@@ -99,6 +99,17 @@ export function beefContainsTxid (beef: number[], txid: string): boolean {
   }
 }
 
+/**
+ * Wallet internalizeAction wants AtomicBEEF for the subject tx ("The tx
+ * parameter must be valid AtomicBEEF", wallet-toolbox 2.4.4); the overlays
+ * serve plain BEEF. Accepts either and always hands back the atomic form.
+ */
+export function toAtomicBeef (beef: number[], txid: string): number[] {
+  const b = Beef.fromBinary(beef)
+  if (b.findTxid(txid) == null) throw new Error(`BEEF does not contain ${txid}`)
+  return b.toBinaryAtomic(txid)
+}
+
 /** Wallet createAction inputBEEF wants a BEEF graph, not AtomicBEEF-of-subject. */
 export function toSpendingBeef (beef: number[], txid: string): number[] {
   const b = Beef.fromBinary(beef)
@@ -236,7 +247,7 @@ export async function recoverRegistryAuth (p: {
   if (beef == null) throw new Error(`could not load registry tx ${row.txid}`)
   try {
     await p.wallet.internalizeAction({
-      tx: beef,
+      tx: toAtomicBeef(beef, row.txid),
       labels: ['mandala', 'registry', 'recover'],
       outputs: [{
         outputIndex: row.outputIndex,
