@@ -248,7 +248,12 @@ export async function submitToOverlay (
     admissionSignature: topic?.admissionSignature,
     admissionIdentityKey: topic?.admissionIdentityKey
   }
-  requireVerifiedAdmission(beef, result)
+  // σ_I speaks for the tm_mandala admitted set only (wire contract §1/§2):
+  // neither overlay signs a registry-only admission, so demanding one there
+  // refused every identity-chain action AFTER the overlay had already folded
+  // and broadcast it (testnet, 2026-09-17). The registry chain is
+  // authenticated by spending its live head, not by σ_I.
+  if (topics.includes(TOPIC)) requireVerifiedAdmission(beef, result)
   return result
 }
 
