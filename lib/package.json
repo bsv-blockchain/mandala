@@ -1,6 +1,6 @@
 {
   "name": "@bsv/mandala",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Token client for Mandala overlay assets — send, receive, and administer any asset with overlay-first commit and journaled recovery.",
   "license": "Open BSV",
   "type": "module",
