@@ -411,6 +411,15 @@ const main = async (): Promise<void> => {
         await (server.engine as unknown as {
           evictAppliedTransaction: (t: string, o: { reason?: string }) => Promise<unknown>
         }).evictAppliedTransaction(txid, { reason }),
+      purgeAdminHistory: async (txid) => {
+        const assets = (await adminHistoryCol.distinct('assetId', { txid })) as string[]
+        if (assets.length > 0) await adminHistoryCol.deleteMany({ txid })
+        return assets.sort()
+      },
+      // A second service instance over the same sharedStorage: rebuildState
+      // only touches storage, so it sees exactly what the mounted one does.
+      rebuildAssetState: async (assetId) =>
+        await createMandalaLookupService(mandalaWallet, sharedStorage)(lookupDb).rebuildState(assetId),
       ingestProof: async (txid, merklePathHex, blockHeight) => {
         await (server.engine as unknown as {
           handleNewMerkleProof: (t: string, p: MerklePath, h?: number) => Promise<unknown>

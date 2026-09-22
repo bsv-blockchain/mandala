@@ -204,6 +204,33 @@ func (l *LookupService) foldContext(ctx context.Context, details ActionDetails) 
 	return fctx, nil
 }
 
+// RebuildState replays the asset's surviving admin history from the default
+// state and persists the result — the TS MandalaLookupService.rebuildState
+// counterpart, used after an eviction has deleted rows (the incremental fold
+// in OutputAdmittedByTopic cannot un-apply an action). The ordering cursor
+// follows the last surviving row; with no rows left it is the default state.
+func (l *LookupService) RebuildState(ctx context.Context, assetID string) (AssetAdminState, error) {
+	rows, err := l.store.FindAdminHistoryByAssetID(ctx, assetID)
+	if err != nil {
+		return AssetAdminState{}, err
+	}
+	state := DefaultAssetState(assetID)
+	for _, e := range rows {
+		fctx, err := l.foldContext(ctx, e.ActionDetails)
+		if err != nil {
+			return AssetAdminState{}, err
+		}
+		state = FoldAction(state, e.ActionDetails, fctx)
+		state.LastProcessedHeight = e.Height
+		state.LastProcessedOffset = e.Offset
+		state.LastAdmitSeq = e.AdmitSeq
+	}
+	if err := l.store.PutAssetState(ctx, state); err != nil {
+		return AssetAdminState{}, err
+	}
+	return state, nil
+}
+
 // OutputSpent implements §4.3: decrement the identity's balance (if the spent
 // token row had one) and delete the row, unconditionally.
 func (l *LookupService) OutputSpent(ctx context.Context, p *engine.OutputSpent) error {

@@ -795,3 +795,115 @@ func TestAppliedAdmissionProofDerivesOutputsFromTheEngine(t *testing.T) {
 		t.Fatalf("outputs = %v, want [0 2]", outputs)
 	}
 }
+
+// TestBuildArcadeEvictTxPurgesAdminHistory — 2026-09-21 incident: eviction
+// restored the inputs but left the evicted tx's admin-history row behind, so
+// PickAssetAuthHead kept naming the evicted tx as the live auth head and the
+// asset state kept its folded (never-mined) action. Eviction must delete the
+// rows and rebuild the state — and must do so on a REPEAT callback too, since
+// the production heads were stuck behind an eviction that had already been
+// stamped before this fix existed.
+func TestBuildArcadeEvictTxPurgesAdminHistory(t *testing.T) {
+	requireMongo(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	app, err := Build(ctx, Config{
+		NodeName:         "mandala_wiring_test_evict_history",
+		ServerPrivKeyHex: testPrivHex,
+		HostingURL:       "https://overlay.example.com",
+		MongoURL:         "mongodb://localhost:27017",
+		Network:          "test",
+		ArcadeURL:        "https://arcade.example.com",
+	})
+	if err != nil {
+		t.Fatal("Build:", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_ = app.Mongo.Drop(cleanupCtx)
+		_ = app.Mongo.Client().Disconnect(cleanupCtx)
+	})
+
+	const topic = "tm_mandala"
+	parent := wiringTestTx(t, nil, 0, 1, 0x62)
+	parentID := parent.TxID()
+	parentStr := parentID.String()
+	child := wiringTestTx(t, parent, 0, 1, 0)
+	childID := child.TxID()
+	childStr := childID.String()
+	assetID := parentStr + ".0"
+	issuer := "03" + "ab"[:2] + parentStr[:62]
+
+	st := app.Engine.Storage
+	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertOutputs(ctx, topic, childID, []uint32{0}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: childID, Topic: topic}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *parentID, Index: 0}}, topic, childID); err != nil {
+		t.Fatal(err)
+	}
+	// Admin chain: parent.0 registered the asset (seq 1); child.0 paused it
+	// (seq 2) and is the current head + the folded state.
+	for _, e := range []mandala.AdminHistoryEntry{
+		{AssetID: assetID, Txid: parentStr, OutputIndex: 0, Height: 9007199254740991, AdmitSeq: 1,
+			ActionDetails: mandala.ActionDetails{"kind": "register", "assetId": assetID, "issuer": issuer}, CreatedAt: time.Now()},
+		{AssetID: assetID, Txid: childStr, OutputIndex: 0, Height: 9007199254740991, AdmitSeq: 2,
+			ActionDetails: mandala.ActionDetails{"kind": "pause", "assetId": assetID, "priorOutpoint": assetID}, CreatedAt: time.Now()},
+	} {
+		if err := app.Store.AppendAdminHistory(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := app.Store.PutAssetState(ctx, mandala.AssetAdminState{
+		AssetID: assetID, IssuerIdentityKey: issuer, IsPaused: true, AccessMode: "denylist",
+		BlockedIdentities: []string{}, AllowedIdentities: []string{}, FrozenOutpoints: []mandala.FrozenRef{}, EvictedOutpoints: []string{},
+		LastProcessedHeight: 9007199254740991, LastAdmitSeq: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Store.RecordAdmission(ctx, mandala.AdmissionRecord{
+		Txid: childStr, Topics: []string{topic}, OutputsToAdmit: []uint32{0},
+		AdmissionSignature: "3044", AdmissionIdentityKey: "02aa",
+		Restore: &mandala.RestoreSnapshot{SpentOutpoints: []string{assetID}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The production case: already stamped by an eviction that predates the
+	// history purge. The repeat must still purge.
+	if err := app.Store.MarkEvicted(ctx, childStr); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := app.EvictTx(ctx, childStr)
+	if err != nil {
+		t.Fatal("EvictTx:", err)
+	}
+	if !out.AlreadyEvicted {
+		t.Fatalf("expected the repeat eviction to report alreadyEvicted, got %+v", out)
+	}
+
+	rows, err := app.Store.FindAdminHistoryByAssetID(ctx, assetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Txid != parentStr {
+		t.Fatalf("admin history after eviction = %+v, want only the register row", rows)
+	}
+	head, ok := mandala.PickAssetAuthHead(rows)
+	if !ok || head.Txid != parentStr || head.OutputIndex != 0 {
+		t.Fatalf("auth head after eviction = %+v (%v), want %s.0", head, ok, parentStr)
+	}
+	state, err := app.Store.GetAssetState(ctx, assetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.IsPaused || state.LastAdmitSeq != 1 || state.IssuerIdentityKey != issuer {
+		t.Fatalf("asset state after eviction = %+v, want unpaused, seq 1, issuer kept", state)
+	}
+}
