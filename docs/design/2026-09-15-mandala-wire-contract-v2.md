@@ -101,3 +101,16 @@ Binding on both engines, the lib and the wallet. Supersedes the conflicting sent
 ```
 
 No `/submit` call and no broadcast happen at send time, and the body carries no σ_I for the tip — only whatever admission evidence (`admissions[]`) the sender already holds locally for the transfer's ancestors, exactly as assembled for the AdmissionBundle (§1.1 of the offline-settlement spec). The recipient runs `COVER` against its own configured overlay key (§9.10), credits the payment, then submits via `mustSubmit` (ancestors first, tip last — the overlay broadcasts what it admits); the sender's own drain/reconcile may submit the same bytes later, harmlessly, since `/submit` is idempotent (§2). Legacy v1 bodies (sender submitted online before handing over) remain accepted by the recipient. This supersedes any earlier text in this document or the UX/settlement specs implying the handle rail submits or contacts the overlay before hand-over. After a successful hand-over an online payer SHOULD submit immediately; it MUST NOT submit before the hand-over is acknowledged.
+
+## 10. Amendment v2.2 (2026-09-22) — issuer-paid fees
+
+Binding rows live in `2026-09-22-mandala-token-fee-design.md` §3: `POST /fuel/draft`,
+`POST /fuel/release` and `GET /fuel/info` (requests signed with counterparty
+`'anyone'`, refusal tables), the `/submit` verdict
+row `ERR_FUEL` (400, retryable:false, NEVER persisted — like `ERR_INPUT_SPENT`),
+manager reason strings `fuel input <i>: …`, the `fuel` field on the admission
+record, the `mandalaFuelDrafts` / `mandalaFuelNonces` collections, and
+`feeRatePerKb` on `GET /admin/asset-state/:assetId`. Guard order (§9.6) becomes:
+unlinked-token → conflicting-spend → admin-chain anchoring → fuel → topic manager.
+§9.13 carve-out: a send in fee mode (`feeMode:'issuer'`) is submit-first; every
+other send stays hand-over-first.
