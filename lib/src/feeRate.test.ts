@@ -55,4 +55,33 @@ describe('setFeeRate', () => {
     await expect(setFeeRate({ wallet, asset, identityKey: '02', feeRatePerKb: 0 })).rejects.toThrow('safe integer')
     expect(submitAdminAction).not.toHaveBeenCalled()
   })
+
+  it('folds a non-blank reason into the submitted details', async () => {
+    vi.mocked(submitAdminAction).mockResolvedValueOnce({ txid: 'c'.repeat(64), nextAuthOutpoint: 'c'.repeat(64) + '.0', notified: true })
+    await setFeeRate({ wallet, asset, identityKey: '02' + 'ab'.repeat(32), feeRatePerKb: 25, reason: 'court order 12/A' })
+    expect(vi.mocked(submitAdminAction).mock.calls[0][0].details).toEqual({
+      kind: 'setFeeRate', assetId: ASSET_ID, priorOutpoint: PRIOR, feeRatePerKb: 25, reason: 'court order 12/A'
+    })
+  })
+
+  it('omits reason when blank or absent', async () => {
+    vi.mocked(submitAdminAction).mockResolvedValue({ txid: 'c'.repeat(64), nextAuthOutpoint: 'c'.repeat(64) + '.0', notified: true })
+    await setFeeRate({ wallet, asset, identityKey: '02' + 'ab'.repeat(32), feeRatePerKb: 25, reason: '   ' })
+    expect(vi.mocked(submitAdminAction).mock.calls[0][0].details).toEqual({
+      kind: 'setFeeRate', assetId: ASSET_ID, priorOutpoint: PRIOR, feeRatePerKb: 25
+    })
+    await setFeeRate({ wallet, asset, identityKey: '02' + 'ab'.repeat(32), feeRatePerKb: 25 })
+    expect(vi.mocked(submitAdminAction).mock.calls[1][0].details).toEqual({
+      kind: 'setFeeRate', assetId: ASSET_ID, priorOutpoint: PRIOR, feeRatePerKb: 25
+    })
+  })
+
+  it('returns nextAuthDetails equal to the submitted details', async () => {
+    vi.mocked(submitAdminAction).mockResolvedValueOnce({ txid: 'c'.repeat(64), nextAuthOutpoint: 'c'.repeat(64) + '.0', notified: true })
+    const res = await setFeeRate({ wallet, asset, identityKey: '02' + 'ab'.repeat(32), feeRatePerKb: 25, reason: 'note' })
+    expect(res.nextAuthDetails).toEqual({
+      kind: 'setFeeRate', assetId: ASSET_ID, priorOutpoint: PRIOR, feeRatePerKb: 25, reason: 'note'
+    })
+    expect(res.nextAuthDetails).toEqual(vi.mocked(submitAdminAction).mock.calls[0][0].details)
+  })
 })

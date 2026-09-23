@@ -85,16 +85,33 @@ export async function resolveAdminSummary (assetId: string): Promise<AdminSummar
 
 const short = (k?: string): string => k == null ? '' : `${k.slice(0, 8)}…`
 
+/** A safe-integer ≥ 1 fee rate carried in details, else undefined (byte-identical gate to feeRateFromDetails/feeRateOf). */
+const feeRateOf = (d: Record<string, unknown>): number | undefined => {
+  const v = d.feeRatePerKb
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 1 ? v : undefined
+}
+
 export function describeAction (d: MandalaActionDetails): string {
   // 'recover' was removed as an action kind (recovery is now the guarded
   // 'reissue'), but legacy on-chain admin records may still carry it — describe
   // it without referencing the removed union member.
   if ((d.kind as string) === 'recover') return `Recovered ${d.amount} units to ${short(d.recipient as string)} (legacy)`
+  // 'setFeeRate' is not yet in the pinned MandalaActionKind union (ts-stack PR
+  // pending) — same situation as the removed 'recover', described outside the
+  // (exhaustively typed) switch below.
+  if ((d.kind as string) === 'setFeeRate') {
+    const rate = (d as unknown as { feeRatePerKb?: number | null }).feeRatePerKb
+    return rate == null ? 'Issuer-paid fees disabled' : `Fee rate set to ${rate} units/KB`
+  }
   switch (d.kind) {
     // The register action carries the genesis metadata (label/ticker), not an
     // assetId — the assetId is the outpoint of this very tx, so it can't be a
     // field within its own payload.
-    case 'register': return `Registered asset "${d.label as string}"${d.ticker != null && d.ticker !== '' ? ` (${d.ticker as string})` : ''}`
+    case 'register': {
+      const rate = feeRateOf(d as unknown as Record<string, unknown>)
+      const feeSuffix = rate != null ? ` · fee rate ${rate} units/KB` : ''
+      return `Registered asset "${d.label as string}"${d.ticker != null && d.ticker !== '' ? ` (${d.ticker as string})` : ''}${feeSuffix}`
+    }
     // bankRef is the sha256 of the off-chain deposit record (R12) — shown in
     // full so an auditor can match it against the bank's own record hash.
     case 'issue': return `Issued ${d.amount} units${d.bankRef != null ? ` (bankRef ${d.bankRef})` : ''}`

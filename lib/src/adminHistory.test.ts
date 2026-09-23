@@ -55,6 +55,25 @@ describe('describeAction', () => {
     expect(desc).toBe('Registered asset "Gold Coin"')
   })
 
+  it('appends the fee rate to register when the details carry a valid rate', () => {
+    const desc = describeAction({ kind: 'register', label: 'Gold Coin', ticker: 'GLD', feeRatePerKb: 25 } as any)
+    expect(desc).toBe('Registered asset "Gold Coin" (GLD) · fee rate 25 units/KB')
+  })
+
+  it('omits the fee rate suffix from register when the rate is absent or invalid', () => {
+    expect(describeAction({ kind: 'register', label: 'Gold Coin' })).toBe('Registered asset "Gold Coin"')
+    expect(describeAction({ kind: 'register', label: 'Gold Coin', feeRatePerKb: 0 } as any)).toBe('Registered asset "Gold Coin"')
+    expect(describeAction({ kind: 'register', label: 'Gold Coin', feeRatePerKb: null } as any)).toBe('Registered asset "Gold Coin"')
+  })
+
+  it('describes setFeeRate in human-readable form', () => {
+    expect(describeAction({ kind: 'setFeeRate' as any, assetId: 'x.0', feeRatePerKb: 25 } as any)).toBe('Fee rate set to 25 units/KB')
+  })
+
+  it('describes setFeeRate with a null rate as disabling issuer-paid fees', () => {
+    expect(describeAction({ kind: 'setFeeRate' as any, assetId: 'x.0', feeRatePerKb: null } as any)).toBe('Issuer-paid fees disabled')
+  })
+
   it('describes issue in human-readable form', () => {
     expect(describeAction({ kind: 'issue', assetId: 'x.0', amount: 500 })).toMatch(/issu/i)
   })
