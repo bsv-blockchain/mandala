@@ -931,11 +931,11 @@ their phase.
 
 - **P0 — register hardening (both engines).** Reject `register` with a
   non-empty `assetId`; key register history/state by its own outpoint;
-  regression tests (§2.1).
+  regression tests (§2.1). — done 2026-09-22, commits 83b4e15…d03b7c0
 - **P1 — asset parameter.** Go reducer + tests; TS repo-local fold +
   asset-state merge + tests; lib `RegisterParams.feeRatePerKb`, `setFeeRate`,
   `AssetAdminStateView.feeRatePerKb`; console controls; ts-stack PR opened
-  (non-blocking).
+  (non-blocking). — done 2026-09-22, commits 48db465…26401db
 - **P2 — fuelKeeper.** New module: storage server + wallet + keeper wiring
   (dashboard pattern), fee script encoder + parity vectors, request
   verification (`anyone`), claim/detach/verify/sign/commit draft flow with a

@@ -78,6 +78,9 @@ describe('feeRateFromDetails (TS ≡ Go feeRateOf)', () => {
       expect(feeRateFromDetails({ kind: 'setFeeRate', feeRatePerKb: v })).toBeNull()
     }
   })
+  it('disables on register without a rate (parity: Go "register without rate leaves nil")', () => {
+    expect(feeRateFromDetails({ kind: 'register' })).toBeNull()
+  })
   it('is undefined for every other kind', () => {
     expect(feeRateFromDetails({ kind: 'pause', feeRatePerKb: 7 })).toBeUndefined()
     expect(feeRateFromDetails({ kind: 'issue' })).toBeUndefined()
@@ -129,6 +132,15 @@ describe('withFeeRateFold', () => {
     await ls.outputAdmittedByTopic!(admitted(beef, payload({ kind: 'setFeeRate', assetId: ASSET, feeRatePerKb: 5 }, 1)))
     expect(store.rows.size).toBe(0)
     expect(inner.outputAdmittedByTopic).toHaveBeenCalledTimes(3)
+  })
+
+  it('leaves an existing rate untouched on pause (parity: Go "pause leaves rate alone")', async () => {
+    const inner = fakeInner(); const store = fakeStore()
+    await store.upsert({ assetId: ASSET, feeRatePerKb: 7, setByOutpoint: `${'ee'.repeat(32)}.0` })
+    const ls = withFeeRateFold(inner, store)
+    const { beef } = buildTx()
+    await ls.outputAdmittedByTopic!(admitted(beef, payload({ kind: 'pause', assetId: ASSET })))
+    expect(store.rows.get(ASSET)?.feeRatePerKb).toBe(7)
   })
 
   it('does not fold an admin entry attached to a non-admin (FT) output', async () => {
