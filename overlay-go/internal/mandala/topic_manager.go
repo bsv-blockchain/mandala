@@ -573,25 +573,6 @@ func (m *TopicManager) freezeTargetHasRow(ctx context.Context, details ActionDet
 	return fmt.Errorf("tm_mandala: freezeOutput targets an outpoint with no token row: %s", op)
 }
 
-// priorOutpointSpent chains every admin action to spending the previous
-// admin-auth output: kind "register" is exempt; otherwise details.priorOutpoint
-// must equal some tx input's "<sourceTXID>.<sourceOutputIndex>".
-func priorOutpointSpent(tx *transaction.Transaction, details ActionDetails) bool {
-	if details.Kind() == "register" {
-		return registerIsGenesis(details)
-	}
-	prior, ok := details.Str("priorOutpoint")
-	if !ok {
-		return false
-	}
-	for _, in := range tx.Inputs {
-		if inputOutpointString(in) == prior {
-			return true
-		}
-	}
-	return false
-}
-
 // inputOutpointString renders an input's outpoint as
 // "<txid>.<sourceOutputIndex>" where txid is SourceTXID, else the source
 // tx's computed id, else the empty string (TS parity — §0.2, §3.6).
