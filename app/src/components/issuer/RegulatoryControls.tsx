@@ -16,6 +16,7 @@ import { isAdminAuthInFlight } from '@bsv/mandala/adminAuthGate'
 import { useAssetState, useInvalidateAssetState } from '../../hooks/useAssetState'
 import { useInvalidateAdminHistory } from '../../hooks/useAdminHistory'
 import { useAdvanceAdminAuth } from '../../hooks/useAdminAssets'
+import { parseFeeRateInput } from './RegisterAssetStrip'
 
 interface Props {
   assets: AdminAsset[]
@@ -26,7 +27,7 @@ interface Props {
   embedded?: boolean
 }
 
-type ActionKey = 'pause' | 'accessMode' | 'freeze' | 'unfreeze' | 'blockIdentity' | 'unblockIdentity' | 'allowIdentity' | 'unallowIdentity' | 'reissue'
+type ActionKey = 'pause' | 'accessMode' | 'feeRate' | 'freeze' | 'unfreeze' | 'blockIdentity' | 'unblockIdentity' | 'allowIdentity' | 'unallowIdentity' | 'reissue'
 
 export default function RegulatoryControls({ assets, onActionComplete, assetId: controlledAssetId, embedded = false }: Props) {
   const { wallet, messageBoxClient, identityKey } = useWallet()
@@ -57,6 +58,9 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
   // Access mode
   const [newAccessMode, setNewAccessMode] = useState<'denylist' | 'allowlist'>('denylist')
 
+  // Fee rate (token-fee design §2)
+  const [newFeeRate, setNewFeeRate] = useState('')
+
   // Reissue
   const [reissueOutpoint, setReissueOutpoint] = useState('')
   const [reissueAmount, setReissueAmount] = useState('')
@@ -80,7 +84,10 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
 
   // Keep the access-mode segmented control in sync with freshly loaded state.
   useEffect(() => {
-    if (stateQuery.data !== undefined) setNewAccessMode(stateQuery.data?.accessMode ?? 'denylist')
+    if (stateQuery.data !== undefined) {
+      setNewAccessMode(stateQuery.data?.accessMode ?? 'denylist')
+      setNewFeeRate(stateQuery.data?.feeRatePerKb == null ? '' : String(stateQuery.data.feeRatePerKb))
+    }
   }, [stateQuery.data])
 
   // Pre-fill reissue amount when a frozen outpoint is selected
@@ -236,6 +243,22 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
   })
 
   // ---------------------------------------------------------------------------
+  // Set network fee rate (token-fee design §2). Blank disables.
+  // ---------------------------------------------------------------------------
+  const handleSetFeeRate = () => void run('feeRate', async () => {
+    const parsed = parseFeeRateInput(newFeeRate)
+    if (!parsed.ok) { toast.error(parsed.reason); return }
+    const feeRatePerKb = parsed.value ?? null
+    await submitAction({
+      asset: asset!,
+      details: withReason({
+        kind: 'setFeeRate', assetId: asset!.assetId, priorOutpoint: asset!.authOutpoint, feeRatePerKb
+      } as unknown as SubmitAdminActionParams['details'], reason)
+    })
+    toast.success(feeRatePerKb === null ? 'Issuer-paid fees disabled' : `Fee rate set to ${feeRatePerKb} units/KB`)
+  })
+
+  // ---------------------------------------------------------------------------
   // Reissue (from frozen outpoint)
   // ---------------------------------------------------------------------------
   const handleReissue = () => void run('reissue', async () => {
@@ -295,6 +318,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
   const isPaused = state?.isPaused ?? false
   const hasFrozen = (state?.frozenOutpoints.length ?? 0) > 0
   const identityKeyEmpty = resolvedIdentityKey === '' && publicKeyInput.trim() === ''
+  const labelCls = 'block text-[10px] font-medium text-subtle-foreground mb-[4px]'
 
   // Per-action "is this ready to submit" gate for the shared submit button.
   const opDisabled = (() => {
@@ -316,6 +340,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
   const submitLabel: Record<ActionKey, string> = {
     pause: isPaused ? 'Unpause transfers' : 'Pause transfers',
     accessMode: 'Apply access mode',
+    feeRate: 'Apply fee rate',
     freeze: 'Freeze',
     unfreeze: 'Unfreeze',
     blockIdentity: 'Block',
@@ -329,6 +354,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
     switch (op) {
       case 'pause': handlePauseToggle(); break
       case 'accessMode': handleSetAccessMode(); break
+      case 'feeRate': handleSetFeeRate(); break
       case 'freeze': handleFreeze(); break
       case 'unfreeze': handleUnfreeze(); break
       case 'blockIdentity': handleIdentityAction('blockIdentity'); break
@@ -412,6 +438,9 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
           <div className="text-[13px] font-semibold capitalize">
             {state == null ? '—' : (state.accessMode ?? '—')}
           </div>
+          <div className="text-[11px] text-subtle-foreground mt-[3px]">
+            Fee rate: {state?.feeRatePerKb == null ? 'off' : `${state.feeRatePerKb} units/KB`}
+          </div>
         </div>
 
         <div className="w-px bg-separator self-stretch mx-4" />
@@ -457,6 +486,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
         >
           <option value="pause">{isPaused ? 'Unpause transfers' : 'Pause transfers'}</option>
           <option value="accessMode">Set access mode</option>
+          <option value="feeRate">Set network fee rate</option>
           <option value="freeze">Freeze output</option>
           <option value="unfreeze">Unfreeze output</option>
           <option value="blockIdentity">Block identity</option>
@@ -510,6 +540,22 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
                 </p>
               )}
             </>
+          )}
+
+          {op === 'feeRate' && (
+            <div className="flex flex-col">
+              <label className={labelCls} htmlFor="fee-rate">Fee rate (token units per KB, blank = off)</label>
+              <Input
+                id="fee-rate"
+                type="number"
+                min="1"
+                step="1"
+                value={newFeeRate}
+                onChange={e => setNewFeeRate(e.target.value)}
+                placeholder="off"
+                className="h-[30px] bg-input border-input-border rounded-sm px-[10px] py-0 text-[12px] tabular-nums"
+              />
+            </div>
           )}
 
           {(op === 'freeze' || op === 'unfreeze') && (
