@@ -17,12 +17,12 @@
  *
  * This wrapper closes it without changing the upstream package: before the
  * inner manager runs, every admin entry in the payload must either be a
- * genesis `register` (which creates its own asset and confers authority over
- * nothing that exists) or name a `priorOutpoint` that is BOTH an input the
- * engine lists in `previousCoins` — outputs this topic previously admitted —
- * AND a recorded admin output of that same asset. Delegation still works:
- * whoever the new admin output is locked to holds authority next, because
- * producing it required spending the recorded prior.
+ * genesis `register` (which creates its own asset and carries no assetId, and
+ * confers authority over nothing that exists) or name a `priorOutpoint` that is
+ * BOTH an input the engine lists in `previousCoins` — outputs this topic
+ * previously admitted — AND a recorded admin output of that same asset.
+ * Delegation still works: whoever the new admin output is locked to holds
+ * authority next, because producing it required spending the recorded prior.
  *
  * Remove this wrapper once the equivalent gate ships in
  * `@bsv/overlay-topics`; the rule must be identical on both.
@@ -85,7 +85,11 @@ export const adminEntryAnchored = async (
   admittedInputs: Set<string>,
   store: AdminChainStore
 ): Promise<boolean> => {
-  if (details.kind === 'register') return true
+  // P0 (token-fee design §2.1): register is genesis — its assetId IS its own
+  // outpoint — so it must not name one. Anything but absent/'' is an attempt
+  // to graft onto an existing asset's chain. Byte-identical rule in
+  // overlay-go registerIsGenesis.
+  if (details.kind === 'register') return details.assetId === undefined || details.assetId === ''
   const prior = typeof details.priorOutpoint === 'string' ? details.priorOutpoint : ''
   const assetId = typeof details.assetId === 'string' ? details.assetId : ''
   if (prior === '' || assetId === '') return false

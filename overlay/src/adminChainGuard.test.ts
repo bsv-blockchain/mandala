@@ -103,6 +103,21 @@ describe('withAdminChainAnchor', () => {
   it('ignores a malformed payload rather than throwing', () => {
     expect(parseAdminEntries(Utils.toArray('not json', 'utf8'))).toEqual([])
   })
+
+  it('refuses a register that names an existing asset (P0, token-fee spec §2.1)', async () => {
+    const { beef } = buildTx()
+    const tm = withAdminChainAnchor(inner, store([]))
+    await expect(tm.identifyAdmissibleOutputs(
+      beef, [0], payload({ kind: 'register', assetId: ASSET, issuer: '02' + 'ab'.repeat(32) })
+    )).rejects.toThrow('admin action is not anchored to the asset admin chain')
+  })
+
+  it('still admits a genesis register that carries no assetId', async () => {
+    const { beef } = buildTx()
+    const tm = withAdminChainAnchor(inner, store([]))
+    const res = await tm.identifyAdmissibleOutputs(beef, [0], payload({ kind: 'register', issuer: '02' + 'ab'.repeat(32) }))
+    expect(res.outputsToAdmit).toEqual([0])
+  })
 })
 
 // A16 — a freeze whose target has no token row folds to {amount: 0, owner: ''}
@@ -215,5 +230,16 @@ describe('withAdminChainAnchor — a store fault is an InfraError, never a verdi
       .catch((e: unknown) => e)
     expect(isInfraError(err)).toBe(false)
     expect((err as Error).message).toBe(FREEZE_NO_ROW('nonsense'))
+  })
+})
+
+describe('adminEntryAnchored — register (P0)', () => {
+  it('is genesis only when assetId is absent or empty', async () => {
+    const s = store([])
+    expect(await adminEntryAnchored({ kind: 'register' }, new Set(), s)).toBe(true)
+    expect(await adminEntryAnchored({ kind: 'register', assetId: '' }, new Set(), s)).toBe(true)
+    expect(await adminEntryAnchored({ kind: 'register', assetId: ASSET }, new Set(), s)).toBe(false)
+    expect(await adminEntryAnchored({ kind: 'register', assetId: null }, new Set(), s)).toBe(false)
+    expect(await adminEntryAnchored({ kind: 'register', assetId: 7 }, new Set(), s)).toBe(false)
   })
 })
