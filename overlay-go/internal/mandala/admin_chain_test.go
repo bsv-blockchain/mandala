@@ -148,3 +148,37 @@ func mustPubHex(t *testing.T, privHex string) string {
 	}
 	return p.PubKey().ToDERHex()
 }
+
+// P0 (token-fee spec §2.1): register is unauthenticated (its lock key is
+// re-derived against the payload's counterparty), so the only thing that keeps
+// a third party from grafting itself onto an EXISTING asset's admin chain is
+// refusing any register that names an assetId. A genesis has none.
+func TestRegisterNamingAnExistingAssetIsRejected(t *testing.T) {
+	h := newHarness(t)
+	h.addAdminOutput(t, ActionDetails{
+		"kind": "register", "assetId": h.assetID, "issuer": mustPubHex(t, adminKeyHex),
+	})
+	_, err := h.run(t, []uint32{0})
+	if err == nil {
+		t.Fatal("register carrying an assetId was admitted: a third party can claim an existing asset's chain")
+	}
+	if err.Error() != AdminNotAnchoredReason {
+		t.Fatalf("reason = %q, want AdminNotAnchoredReason", err.Error())
+	}
+}
+
+func TestRegisterWithEmptyAssetIdIsStillGenesis(t *testing.T) {
+	h := newHarness(t)
+	h.addAdminOutput(t, ActionDetails{"kind": "register", "assetId": ""})
+	if _, err := h.run(t, []uint32{0}); err != nil {
+		t.Fatalf("genesis register with empty assetId rejected: %v", err)
+	}
+}
+
+func TestRegisterWithNonStringAssetIdIsRejected(t *testing.T) {
+	h := newHarness(t)
+	h.addAdminOutput(t, ActionDetails{"kind": "register", "assetId": 7.0})
+	if _, err := h.run(t, []uint32{0}); err == nil {
+		t.Fatal("register with a non-string assetId was admitted")
+	}
+}

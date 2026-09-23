@@ -503,6 +503,20 @@ func (m *TopicManager) verifyAdminOutput(idx uint32, out *transaction.Transactio
 	return expected == decoded.PubKeyHash, nil
 }
 
+// registerIsGenesis is the P0 rule (token-fee design §2.1): a register is a
+// genesis whose assetId IS its own outpoint, so it may carry no assetId at all
+// (absent or ""). Anything else is an attempt to graft onto an existing
+// asset's chain and is refused with the anchoring reason. Byte-identical
+// rule in overlay/src/adminChainGuard.ts.
+func registerIsGenesis(details ActionDetails) bool {
+	v, present := details["assetId"]
+	if !present {
+		return true
+	}
+	s, ok := v.(string)
+	return ok && s == ""
+}
+
 // priorAnchored enforces the chain of spends that IS the admin authority.
 //
 // Re-deriving the lock key cannot prove authorship: details.counterparty comes
@@ -513,11 +527,10 @@ func (m *TopicManager) verifyAdminOutput(idx uint32, out *transaction.Transactio
 // spends the admin output this topic already recorded for that asset. Whoever
 // the new output is locked to holds authority next, so delegation works.
 //
-// "register" is exempt: it is a genesis whose assetId is its own outpoint, so
-// it confers authority over nothing that already exists.
+// "register" carries no prior: it is a genesis whose assetId is its own outpoint, so it must not name one (registerIsGenesis).
 func (m *TopicManager) priorAnchored(ctx context.Context, details ActionDetails, admittedInputs map[string]bool) (bool, error) {
 	if details.Kind() == "register" {
-		return true, nil
+		return registerIsGenesis(details), nil
 	}
 	prior, ok := details.Str("priorOutpoint")
 	if !ok || prior == "" {
@@ -565,7 +578,7 @@ func (m *TopicManager) freezeTargetHasRow(ctx context.Context, details ActionDet
 // must equal some tx input's "<sourceTXID>.<sourceOutputIndex>".
 func priorOutpointSpent(tx *transaction.Transaction, details ActionDetails) bool {
 	if details.Kind() == "register" {
-		return true
+		return registerIsGenesis(details)
 	}
 	prior, ok := details.Str("priorOutpoint")
 	if !ok {
