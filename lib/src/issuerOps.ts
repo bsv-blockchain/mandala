@@ -8,6 +8,7 @@ import { Transaction, Beef, WalletInterface } from '@bsv/sdk'
 import { MandalaToken, MandalaAdmin } from '@bsv/templates'
 import { BASKET, FT_PROTOCOL } from './constants.js'
 import { encodeLinkagePayload, MandalaActionDetails } from './encoding.js'
+import { assertFeeRate } from './feeRate.js'
 import { AdmissionReceipt, admissionReceipt, submitAndBroadcast } from './overlay.js'
 import { outpoint, revealLinkage } from './tokens.js'
 import { walletMandalaUnlock } from './unlock.js'
@@ -33,6 +34,12 @@ export interface RegisterParams {
   label: string
   ticker: string
   decimals: number
+  /**
+   * Token-fee design §2: token base units per 1000 bytes charged for
+   * issuer-paid network fees. Omit to leave issuer-paid fees disabled; can be
+   * set or changed later with setFeeRate().
+   */
+  feeRatePerKb?: number
 }
 
 /**
@@ -68,12 +75,30 @@ export async function registerAsset (p: RegisterParams): Promise<RegisterResult>
   return result
 }
 
+/**
+ * The genesis action details. Pure so the shape is testable without a wallet.
+ * issuer = our identity key, baked into the on-chain publicData so any holder
+ * can SPV-verify it and return funds to the issuer. feeRatePerKb rides in
+ * BOTH the commitment (actionDetails) and publicData when present.
+ */
+export function registerDetails (
+  p: Pick<RegisterParams, 'label' | 'ticker' | 'decimals' | 'identityKey' | 'feeRatePerKb'>
+): { metadata: Record<string, unknown>, regDetails: MandalaActionDetails } {
+  if (p.feeRatePerKb !== undefined) assertFeeRate(p.feeRatePerKb)
+  const metadata: Record<string, unknown> = {
+    label: p.label.trim(),
+    ticker: p.ticker.trim().toUpperCase(),
+    decimals: p.decimals,
+    issuer: p.identityKey,
+    ...(p.feeRatePerKb !== undefined ? { feeRatePerKb: p.feeRatePerKb } : {})
+  }
+  const regDetails = { kind: 'register', ...metadata } as MandalaActionDetails
+  return { metadata, regDetails }
+}
+
 async function registerPipeline (p: RegisterParams): Promise<RegisterResult> {
   const { wallet, identityKey } = p
-  // issuer = our identity key, baked into the on-chain publicData so any holder
-  // can SPV-verify it and return funds to the issuer.
-  const metadata = { label: p.label.trim(), ticker: p.ticker.trim().toUpperCase(), decimals: p.decimals, issuer: identityKey }
-  const regDetails: MandalaActionDetails = { kind: 'register', ...metadata }
+  const { metadata, regDetails } = registerDetails({ ...p, identityKey })
   const genesisLock = await MandalaAdmin.lock({ wallet: wallet as any, data: regDetails, publicData: metadata })
 
   const reg = await wallet.createAction({
@@ -86,7 +111,7 @@ async function registerPipeline (p: RegisterParams): Promise<RegisterResult> {
       basket: BASKET,
       // Bookkeeping rides on the admin UTXO itself — the wallet basket is the
       // source of truth for the auth chain (no localStorage, no on-chain marker).
-      customInstructions: adminCustomInstructions('', metadata.label, regDetails, metadata)
+      customInstructions: adminCustomInstructions('', String(metadata.label), regDetails, metadata)
     }],
     options: { randomizeOutputs: false, noSend: true } // hold — broadcast after overlay accepts
   })
