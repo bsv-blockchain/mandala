@@ -2,8 +2,8 @@ import { describe, it, expect, vi } from 'vitest'
 import { Transaction, UnlockingScript, P2PKH, PrivateKey, Utils } from '@bsv/sdk'
 import { MandalaToken } from '@bsv/templates'
 import {
-  feeRateFromDetails, feeRateAssetId, withFeeRateFold, withFeeRate,
-  type FeeRateRow, type FeeRateStore
+  feeRateFromDetails, feeRateAssetId, withFeeRateFold, withFeeRate, recomputeFeeRate, rebuildFeeRate,
+  type FeeRateRow, type FeeRateStore, type FeeRateHistoryEntry
 } from './feeRates.js'
 
 const ASSET = 'ab'.repeat(32) + '.0'
@@ -33,12 +33,13 @@ const buildTokenTx = (): { beef: number[], txid: string } => {
 const payload = (details: Record<string, unknown>, index = 0): number[] =>
   Utils.toArray(JSON.stringify({ admin: [{ index, actionDetails: details }] }), 'utf8')
 
-const fakeStore = (): FeeRateStore & { rows: Map<string, FeeRateRow> } => {
+const fakeStore = (history: FeeRateHistoryEntry[] = []): FeeRateStore & { rows: Map<string, FeeRateRow> } => {
   const rows = new Map<string, FeeRateRow>()
   return {
     rows,
     get: async assetId => rows.get(assetId) ?? null,
-    upsert: async row => { rows.set(row.assetId, row) }
+    upsert: async row => { rows.set(row.assetId, row) },
+    historyFor: async () => history
   }
 }
 const fakeInner = () => ({
@@ -177,5 +178,81 @@ describe('withFeeRate', () => {
 
   it('the row wins over the state when both are present', () => {
     expect(withFeeRate({ assetId: ASSET, feeRatePerKb: 4 }, { assetId: ASSET, feeRatePerKb: 9, setByOutpoint: 'x.0' }).feeRatePerKb).toBe(9)
+  })
+})
+
+// PR #11 (2026-09-22): eviction purges the evicted txid's mandalaAdminHistory
+// rows and refolds each touched asset. Go's RebuildState folds feeRatePerKb
+// through FoldAction; the pinned TS reducer ignores it, so the TS eviction step
+// replays the surviving history into mandalaFeeRates with the same rule.
+const G = 'aa'.repeat(32)
+const S = 'bb'.repeat(32)
+const P = 'cc'.repeat(32)
+const entry = (txid: string, outputIndex: number, actionDetails: Record<string, unknown>): FeeRateHistoryEntry =>
+  ({ txid, outputIndex, actionDetails })
+
+describe('recomputeFeeRate (TS ≡ Go RebuildState fold of feeRatePerKb)', () => {
+  it('the last fee-bearing entry wins: register(7) then setFeeRate(12) → 12, set by the setFeeRate outpoint', () => {
+    expect(recomputeFeeRate([
+      entry(G, 0, { kind: 'register', feeRatePerKb: 7 }),
+      entry(S, 1, { kind: 'setFeeRate', assetId: `${G}.0`, feeRatePerKb: 12 })
+    ])).toEqual({ feeRatePerKb: 12, setByOutpoint: `${S}.1` })
+  })
+
+  it('register(7) alone → 7, set by the genesis outpoint', () => {
+    expect(recomputeFeeRate([entry(G, 0, { kind: 'register', feeRatePerKb: 7 })]))
+      .toEqual({ feeRatePerKb: 7, setByOutpoint: `${G}.0` })
+  })
+
+  it('register(7) then setFeeRate(null) → null, set by the setFeeRate outpoint', () => {
+    expect(recomputeFeeRate([
+      entry(G, 0, { kind: 'register', feeRatePerKb: 7 }),
+      entry(S, 0, { kind: 'setFeeRate', assetId: `${G}.0`, feeRatePerKb: null })
+    ])).toEqual({ feeRatePerKb: null, setByOutpoint: `${S}.0` })
+  })
+
+  it('no history → null with no setter', () => {
+    expect(recomputeFeeRate([])).toEqual({ feeRatePerKb: null, setByOutpoint: '' })
+  })
+
+  it('skips non-fee-bearing entries (a pause between them changes nothing)', () => {
+    expect(recomputeFeeRate([
+      entry(G, 0, { kind: 'register', feeRatePerKb: 7 }),
+      entry(P, 0, { kind: 'pause', assetId: `${G}.0`, feeRatePerKb: 99 })
+    ])).toEqual({ feeRatePerKb: 7, setByOutpoint: `${G}.0` })
+    expect(recomputeFeeRate([
+      entry(G, 0, { kind: 'register', feeRatePerKb: 7 }),
+      entry(P, 0, { kind: 'pause', assetId: `${G}.0` }),
+      entry(S, 2, { kind: 'setFeeRate', assetId: `${G}.0`, feeRatePerKb: 12 })
+    ])).toEqual({ feeRatePerKb: 12, setByOutpoint: `${S}.2` })
+  })
+
+  it('history with only non-fee-bearing entries → null with no setter', () => {
+    expect(recomputeFeeRate([entry(P, 0, { kind: 'pause', assetId: `${G}.0` })]))
+      .toEqual({ feeRatePerKb: null, setByOutpoint: '' })
+  })
+})
+
+describe('rebuildFeeRate', () => {
+  it('upserts the row recomputed from the asset\'s surviving history', async () => {
+    const store = fakeStore([
+      entry(G, 0, { kind: 'register', feeRatePerKb: 7 }),
+      entry(S, 1, { kind: 'setFeeRate', assetId: `${G}.0`, feeRatePerKb: 12 })
+    ])
+    const historyFor = vi.spyOn(store, 'historyFor')
+    const upsert = vi.spyOn(store, 'upsert')
+    await rebuildFeeRate(store, `${G}.0`)
+    expect(historyFor).toHaveBeenCalledWith(`${G}.0`)
+    expect(upsert).toHaveBeenCalledTimes(1)
+    expect(upsert).toHaveBeenCalledWith({ assetId: `${G}.0`, feeRatePerKb: 12, setByOutpoint: `${S}.1` })
+  })
+
+  it('rolls an evicted rate back: with no surviving rows the row is cleared, not left stale', async () => {
+    const store = fakeStore([])
+    await store.upsert({ assetId: `${G}.0`, feeRatePerKb: 12, setByOutpoint: `${S}.1` })
+    const upsert = vi.spyOn(store, 'upsert')
+    await rebuildFeeRate(store, `${G}.0`)
+    expect(upsert).toHaveBeenCalledWith({ assetId: `${G}.0`, feeRatePerKb: null, setByOutpoint: '' })
+    expect(store.rows.get(`${G}.0`)).toEqual({ assetId: `${G}.0`, feeRatePerKb: null, setByOutpoint: '' })
   })
 })

@@ -21,7 +21,7 @@ import { withSpentInputGuard, casMarkUTXOAsSpent, InFlightOutpoints, type SpentI
 import { mountArcIngest } from './eviction.js'
 import { withAdminChainAnchor } from './adminChainGuard.js'
 import { assetAuthHeadHandler, assetAuthBeefHandler, withFrozenRowFlags, type AdminHistoryRowLite } from './assetAuth.js'
-import { withFeeRateFold, withFeeRate, type FeeRateStore, type FeeRateRow } from './feeRates.js'
+import { withFeeRateFold, withFeeRate, rebuildFeeRate, type FeeRateStore, type FeeRateRow, type FeeRateHistoryEntry } from './feeRates.js'
 import { adminAuth, adminCors, parseAdminCorsOrigins, warnIfAdminAuthDisabled } from './adminAuth.js'
 import {
   RegistryStore, RegistryTopicManager, createRegistryLookup,
@@ -245,7 +245,14 @@ const main = async (): Promise<void> => {
       (await feeRatesCol.findOne({ assetId }, { projection: { _id: 0 } })) as unknown as FeeRateRow | null,
     upsert: async row => {
       await feeRatesCol.updateOne({ assetId: row.assetId }, { $set: row }, { upsert: true })
-    }
+    },
+    // Oldest first, the pinned findAdminHistoryByAssetId / Go
+    // FindAdminHistoryByAssetID order — the eviction rebuild replays it.
+    historyFor: async assetId =>
+      (await adminHistoryCol.find({ assetId })
+        .sort({ height: 1, offset: 1, admitSeq: 1 })
+        .project({ _id: 0, txid: 1, outputIndex: 1, actionDetails: 1 })
+        .toArray()) as unknown as FeeRateHistoryEntry[]
   }
 
   // Membership (A04): once the registry has a row, non-admitted identities are
@@ -433,8 +440,13 @@ const main = async (): Promise<void> => {
       },
       // A second service instance over the same sharedStorage: rebuildState
       // only touches storage, so it sees exactly what the mounted one does.
-      rebuildAssetState: async (assetId) =>
-        await createMandalaLookupService(mandalaWallet, sharedStorage)(lookupDb).rebuildState(assetId),
+      rebuildAssetState: async (assetId) => {
+        await createMandalaLookupService(mandalaWallet, sharedStorage)(lookupDb).rebuildState(assetId)
+        // The pinned reducer ignores feeRatePerKb, so refold the repo-local
+        // row from the same surviving history — Go's RebuildState folds the
+        // rate natively, and the two must roll an evicted rate back alike.
+        await rebuildFeeRate(feeRateStore, assetId)
+      },
       ingestProof: async (txid, merklePathHex, blockHeight) => {
         await (server.engine as unknown as {
           handleNewMerkleProof: (t: string, p: MerklePath, h?: number) => Promise<unknown>

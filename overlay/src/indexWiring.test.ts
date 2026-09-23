@@ -108,6 +108,26 @@ describe('index.ts — boot safety (§9.9)', () => {
   })
 })
 
+describe('index.ts — eviction rebuild (PR #11 + token-fee §2)', () => {
+  const deps = CODE.slice(CODE.indexOf('mountArcIngest('))
+  const rebuild = deps.slice(deps.indexOf('rebuildAssetState:'), deps.indexOf('ingestProof:'))
+
+  it('rebuilds the repo-local fee rate after the pinned asset-state rebuild', () => {
+    // The pinned reducer ignores feeRatePerKb, so without this an evicted
+    // register/setFeeRate leaves its rate in mandalaFeeRates while Go's
+    // RebuildState rolls it back.
+    expect(rebuild).toContain('.rebuildState(assetId)')
+    expect(rebuild).toContain('rebuildFeeRate(feeRateStore, assetId)')
+    expect(orderOf(rebuild, ['.rebuildState(assetId)', 'rebuildFeeRate(feeRateStore, assetId)']))
+      .toEqual(['.rebuildState(assetId)', 'rebuildFeeRate(feeRateStore, assetId)'])
+  })
+
+  it('reads fee-rate history oldest first, in the pinned findAdminHistoryByAssetId order', () => {
+    const store = CODE.slice(CODE.indexOf('const feeRateStore'), CODE.indexOf('const assetStatesCol'))
+    expect(store).toMatch(/historyFor:[\s\S]*?adminHistoryCol\.find\(\{ assetId \}\)[\s\S]*?\.sort\(\{ height: 1, offset: 1, admitSeq: 1 \}\)/)
+  })
+})
+
 // ───────────── the same order, asserted behaviourally over real guards ───────
 
 describe('§9.6 guard order — first refusal wins, over the real guards', () => {

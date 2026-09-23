@@ -15,13 +15,15 @@
  * anyone could attach `{index: <FT vout>, kind: 'register', feeRatePerKb: N}`
  * to their own FT transfer and create a row keyed by an FT outpoint.
  *
- * Eviction does NOT roll the rate back. overlay-go's OutputEvicted leaves
- * FeeRatePerKb unchanged and has no rebuild-on-evict path — a legally evicted
- * admin output leaves the last-folded rate in place, the same way the pinned
- * service treats pause/freeze state. `outputEvicted` is therefore left
- * unoverridden here; it resolves straight through to `inner` (via the Proxy
- * below when `inner` is a class instance whose method lives on the
- * prototype).
+ * Eviction rolls the rate back. Since 2026-09-22 (PR #11) eviction on both
+ * engines purges the evicted txid's `mandalaAdminHistory` rows and refolds
+ * every touched asset from the surviving rows (Go `RebuildState`, which folds
+ * FeeRatePerKb through FoldAction; TS the pinned `rebuildState`, which ignores
+ * it). The TS eviction step therefore also rebuilds this row from the same
+ * surviving history (`rebuildFeeRate`) in the same call, matching Go's fold.
+ * The engine's own `outputEvicted` callback is left unoverridden here; it
+ * resolves straight through to `inner` (via the Proxy below when `inner` is a
+ * class instance whose method lives on the prototype).
  */
 import { Transaction, Utils } from '@bsv/sdk'
 import type { LookupService } from '@bsv/overlay'
@@ -29,9 +31,18 @@ import { MandalaAdmin } from '@bsv/templates'
 
 export interface FeeRateRow { assetId: string, feeRatePerKb: number | null, setByOutpoint: string }
 
+/** One `mandalaAdminHistory` row, as much of it as the fee-rate replay reads. */
+export interface FeeRateHistoryEntry { txid: string, outputIndex: number, actionDetails: Record<string, unknown> }
+
 export interface FeeRateStore {
   get: (assetId: string) => Promise<FeeRateRow | null>
   upsert: (row: FeeRateRow) => Promise<void>
+  /**
+   * The asset's admin-history rows, oldest first — sorted
+   * `{ height: 1, offset: 1, admitSeq: 1 }`, the order the pinned
+   * `findAdminHistoryByAssetId` and Go `FindAdminHistoryByAssetID` use.
+   */
+  historyFor: (assetId: string) => Promise<FeeRateHistoryEntry[]>
 }
 
 const FEE_KINDS = new Set(['register', 'setFeeRate'])
@@ -41,6 +52,29 @@ export const feeRateFromDetails = (details: Record<string, unknown>): number | n
   if (typeof details.kind !== 'string' || !FEE_KINDS.has(details.kind)) return undefined
   const v = details.feeRatePerKb
   return typeof v === 'number' && Number.isSafeInteger(v) && v >= 1 ? v : null
+}
+
+/**
+ * Replay an asset's admin history (oldest first) into its fee-rate row, the
+ * way Go's RebuildState folds FeeRatePerKb: every register/setFeeRate entry
+ * overwrites the rate (null included), every other kind is skipped. The
+ * history is already keyed by asset (a register's row sits under its own
+ * genesis outpoint) and eviction has already purged the evicted rows, so the
+ * replay takes the rows as they are. No fee-bearing entry → null, no setter.
+ */
+export const recomputeFeeRate = (history: FeeRateHistoryEntry[]): Omit<FeeRateRow, 'assetId'> => {
+  let out: Omit<FeeRateRow, 'assetId'> = { feeRatePerKb: null, setByOutpoint: '' }
+  for (const e of history) {
+    const rate = feeRateFromDetails(e.actionDetails)
+    if (rate === undefined) continue
+    out = { feeRatePerKb: rate, setByOutpoint: `${e.txid}.${e.outputIndex}` }
+  }
+  return out
+}
+
+/** Rebuild the asset's fee-rate row from its surviving admin history (eviction). */
+export const rebuildFeeRate = async (store: FeeRateStore, assetId: string): Promise<void> => {
+  await store.upsert({ assetId, ...recomputeFeeRate(await store.historyFor(assetId)) })
 }
 
 export const feeRateAssetId = (details: Record<string, unknown>, txid: string, outputIndex: number): string | null => {

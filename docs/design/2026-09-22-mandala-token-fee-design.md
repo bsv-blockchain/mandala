@@ -220,10 +220,12 @@ Y simply costs the payer X tokens for nothing.
   setByOutpoint }`; `GET /admin/asset-state/:assetId` merges it like
   `withFrozenRowFlags` (`O/index.ts:436-446`, `O/assetAuth.ts:113-122`). The
   fold applies only to outputs that decode as `MandalaAdmin` (as the pinned
-  service and Go's `DecodeAdmin` gate do). Eviction does NOT roll the rate
-  back: neither engine rolls admin state (pause, freeze, rate) back on
-  eviction today and the pinned TS service never deletes admin history, so a
-  recompute would resurrect evicted rates (P1 review, 2026-09-22). An upstream ts-stack PR (kind union in
+  service and Go's `DecodeAdmin` gate do). Eviction: since PR #11
+  (2026-09-22) both engines purge the evicted txid's admin-history rows and
+  refold each touched asset; Go's `RebuildState` folds `feeRatePerKb`
+  natively, and the TS eviction step rebuilds `mandalaFeeRates` from the
+  surviving history (`rebuildFeeRate`) in the same call, so the rate rolls
+  back identically on both engines. An upstream ts-stack PR (kind union in
   `TPL/MandalaAdmin.ts:25-38`, reducer field + handler) is desirable, NOT a
   blocker (PR only, per the ts-stack workflow).
 - Lib: `RegisterParams.feeRatePerKb?: number` (`L/issuerOps.ts:30-36`),
@@ -681,7 +683,8 @@ row at the head of `REASON_TABLE` (:102-113); NOT in `FINAL_CODES` (:83-85).
 
 ### 5.5 Asset state
 
-`mandalaFeeRates` fold wrapper around the lookup service (§2); merged into
+`mandalaFeeRates` fold wrapper around the lookup service (§2), rebuilt from
+the surviving admin history on eviction (`rebuildFeeRate`, §2); merged into
 `GET /admin/asset-state/:assetId` next to `withFrozenRowFlags`.
 
 ## 6. Go overlay (`OG/`)
@@ -999,3 +1002,4 @@ code before adoption):
 - §3.1: requests signed with counterparty `'anyone'`; keeper verifies
   independently; verify-result semantics pinned per SDK; parse boundary.
 - §10, §7.2 step 4: privacy claims corrected; lib-side shuffle of payer outputs.
+- §2 (post-P1 merge with PR #11): eviction rebuilds the TS fee-rate row from surviving history; parity with Go's fold-based rebuild restored.
