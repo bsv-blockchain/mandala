@@ -1003,3 +1003,4 @@ code before adoption):
   independently; verify-result semantics pinned per SDK; parse boundary.
 - §10, §7.2 step 4: privacy claims corrected; lib-side shuffle of payer outputs.
 - §2 (post-P1 merge with PR #11): eviction rebuilds the TS fee-rate row from surviving history; parity with Go's fold-based rebuild restored.
+- §2 (2026-09-23, rebuild-first eviction): both engines rebuild each touched asset's state and fee rate from its history EXCLUDING the evicted txid's rows, and delete those rows only afterwards, so a 503 retry after a failed rebuild re-runs the whole sequence and converges.

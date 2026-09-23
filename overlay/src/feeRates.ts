@@ -77,6 +77,17 @@ export const rebuildFeeRate = async (store: FeeRateStore, assetId: string): Prom
   await store.upsert({ assetId, ...recomputeFeeRate(await store.historyFor(assetId)) })
 }
 
+/**
+ * Eviction (rebuild-first): the rate from a caller-supplied row set — the
+ * asset's history with the evicted txid's rows excluded — so it is computed
+ * from the identical rows the state replay folded.
+ */
+export const rebuildFeeRateFromHistory = async (
+  store: FeeRateStore, assetId: string, history: FeeRateHistoryEntry[]
+): Promise<void> => {
+  await store.upsert({ assetId, ...recomputeFeeRate(history) })
+}
+
 export const feeRateAssetId = (details: Record<string, unknown>, txid: string, outputIndex: number): string | null => {
   if (details.kind === 'register') return `${txid}.${outputIndex}`
   return typeof details.assetId === 'string' && details.assetId !== '' ? details.assetId : null

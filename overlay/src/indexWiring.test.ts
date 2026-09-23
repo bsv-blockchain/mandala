@@ -108,23 +108,37 @@ describe('index.ts — boot safety (§9.9)', () => {
   })
 })
 
-describe('index.ts — eviction rebuild (PR #11 + token-fee §2)', () => {
+describe('index.ts — eviction rebuild (PR #11 + token-fee §2, rebuild-first)', () => {
   const deps = CODE.slice(CODE.indexOf('mountArcIngest('))
-  const rebuild = deps.slice(deps.indexOf('rebuildAssetState:'), deps.indexOf('ingestProof:'))
+  const rebuild = deps.slice(deps.indexOf('rebuildAssetStateExcluding:'), deps.indexOf('purgeAdminHistory:'))
 
-  it('rebuilds the repo-local fee rate after the pinned asset-state rebuild', () => {
-    // The pinned reducer ignores feeRatePerKb, so without this an evicted
-    // register/setFeeRate leaves its rate in mandalaFeeRates while Go's
-    // RebuildState rolls it back.
-    expect(rebuild).toContain('.rebuildState(assetId)')
-    expect(rebuild).toContain('rebuildFeeRate(feeRateStore, assetId)')
-    expect(orderOf(rebuild, ['.rebuildState(assetId)', 'rebuildFeeRate(feeRateStore, assetId)']))
-      .toEqual(['.rebuildState(assetId)', 'rebuildFeeRate(feeRateStore, assetId)'])
+  it('replays the history EXCLUDING the evicted txid, oldest first', () => {
+    expect(rebuild).toMatch(/adminHistoryCol\.find\(\{ assetId, txid: \{ \$ne: txid \} \}\)[\s\S]*?\.sort\(\{ height: 1, offset: 1, admitSeq: 1 \}\)/)
   })
 
-  it('reads fee-rate history oldest first, in the pinned findAdminHistoryByAssetId order', () => {
-    const store = CODE.slice(CODE.indexOf('const feeRateStore'), CODE.indexOf('const assetStatesCol'))
-    expect(store).toMatch(/historyFor:[\s\S]*?adminHistoryCol\.find\(\{ assetId \}\)[\s\S]*?\.sort\(\{ height: 1, offset: 1, admitSeq: 1 \}\)/)
+  it('folds state via the pinned reducer, then the fee rate from the identical row set', () => {
+    expect(orderOf(rebuild, ['replayAssetState(', 'rebuildFeeRateFromHistory(feeRateStore, assetId, history)']))
+      .toEqual(['replayAssetState(', 'rebuildFeeRateFromHistory(feeRateStore, assetId, history)'])
+    expect(rebuild).not.toContain('createMandalaLookupService')
+  })
+
+  it('purge only deletes; the assets query is distinct+sorted', () => {
+    const purge = deps.slice(deps.indexOf('purgeAdminHistory:'), deps.indexOf('ingestProof:'))
+    expect(purge).toContain('adminHistoryCol.deleteMany({ txid })')
+    expect(purge).not.toContain('distinct')
+    const assets = deps.slice(deps.indexOf('assetsTouchedBy:'), deps.indexOf('rebuildAssetStateExcluding:'))
+    expect(assets).toMatch(/adminHistoryCol\.distinct\('assetId', \{ txid \}\)[\s\S]*?\.sort\(\)/)
+  })
+
+  it('eviction.ts purges only after every rebuild (rebuild-first)', () => {
+    const ev = readFileSync(new URL('./eviction.ts', import.meta.url), 'utf8')
+    const body = ev.slice(ev.indexOf('export const evictWithRestore'))
+    const iAssets = body.indexOf('deps.assetsTouchedBy(txid)')
+    const iRebuild = body.indexOf('deps.rebuildAssetStateExcluding(assetId, txid)')
+    const iPurge = body.indexOf('deps.purgeAdminHistory(txid)')
+    expect(iAssets).toBeGreaterThan(0)
+    expect(iRebuild).toBeGreaterThan(iAssets)
+    expect(iPurge).toBeGreaterThan(iRebuild)
   })
 })
 

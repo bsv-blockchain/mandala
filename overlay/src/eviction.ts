@@ -17,8 +17,11 @@
  * wrapper's capture) so the post-hoc path can read it back.
  *
  * Order (contract §5): unmark spent → restore token rows → stamp `evictedAt` →
- * delete the evicted outputs as today → purge the tx's admin-history rows and
- * rebuild each touched asset's state. `evictedAt` lands BEFORE the deletion so
+ * delete the evicted outputs as today → find the assets whose admin-history
+ * rows carry the tx → rebuild each one's state from its history EXCLUDING
+ * those rows → only then delete the rows. Rebuild-first: the rows are the only
+ * record of which assets need a rebuild, so a 503 retry after any failure
+ * redoes the whole idempotent sequence and converges. `evictedAt` lands BEFORE the deletion so
  * a /submit racing the callback already sees the 410 verdict rather than
  * re-admitting the same bytes. The history purge is last and never skipped on
  * a repeat callback: it is what moves the asset-auth head off a never-mined
@@ -60,14 +63,16 @@ export interface EvictionDeps {
   /** `engine.evictAppliedTransaction(txid, { reason })`. */
   evict: (txid: string, reason?: string) => Promise<unknown>
   /**
-   * Delete every `mandalaAdminHistory` row this txid produced; resolves the
-   * distinct asset IDs that lost a row. Those rows are what the asset-auth head
-   * and the state rebuild read, so an evicted (never-mined) admin action left
-   * behind keeps naming the evicted tx as the live head (2026-09-21 incident).
+   * Distinct asset IDs (sorted) whose `mandalaAdminHistory` rows carry this
+   * txid. Those rows are what the asset-auth head and the state rebuild read,
+   * so an evicted (never-mined) admin action left behind keeps naming the
+   * evicted tx as the live head (2026-09-21 incident).
    */
-  purgeAdminHistory: (txid: string) => Promise<string[]>
-  /** `MandalaLookupService.rebuildState(assetId)` — refold the surviving rows. */
-  rebuildAssetState: (assetId: string) => Promise<unknown>
+  assetsTouchedBy: (txid: string) => Promise<string[]>
+  /** Refold the asset's state (and fee rate) from its history minus this txid's rows; persist. */
+  rebuildAssetStateExcluding: (assetId: string, txid: string) => Promise<unknown>
+  /** Delete every history row this txid produced. Called only after every rebuild succeeded. */
+  purgeAdminHistory: (txid: string) => Promise<void>
   now?: () => string
 }
 
@@ -152,23 +157,28 @@ export const evictWithRestore = async (
 
   const engine = await deps.evict(txid, reason)
 
-  // The evicted tx's admin actions never happened: drop its history rows and
-  // refold each touched asset. NOT gated on alreadyEvicted — a repeat callback
-  // must repair a head stuck behind an eviction stamped before this purge
-  // existed. A failure here is retryable: evictedAt is already on record and
-  // the purge/rebuild are idempotent.
+  // The evicted tx's admin actions never happened: refold each touched asset
+  // without its rows, THEN drop the rows. NOT gated on alreadyEvicted — a
+  // repeat callback must repair a head stuck behind an older eviction. Nothing
+  // is deleted until every rebuild succeeded, so a failure leaves the rows that
+  // name the assets in place and the retry redoes the whole sequence.
   let assets: string[]
   try {
-    assets = await deps.purgeAdminHistory(txid)
+    assets = await deps.assetsTouchedBy(txid)
   } catch (e) {
-    throw new InfraError(`could not purge the admin history of ${txid}; retry`, e)
+    throw new InfraError(`could not find the assets touched by ${txid}; retry`, e)
   }
   for (const assetId of assets) {
     try {
-      await deps.rebuildAssetState(assetId)
+      await deps.rebuildAssetStateExcluding(assetId, txid)
     } catch (e) {
       throw new InfraError(`could not rebuild the state of ${assetId} after evicting ${txid}; retry`, e)
     }
+  }
+  try {
+    await deps.purgeAdminHistory(txid)
+  } catch (e) {
+    throw new InfraError(`could not purge the admin history of ${txid}; retry`, e)
   }
   return { txid, reason, restoredOutpoints, restoredTokenRows, alreadyEvicted, engine }
 }

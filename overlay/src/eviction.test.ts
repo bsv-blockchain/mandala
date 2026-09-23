@@ -42,8 +42,9 @@ const deps = (rec: AdmissionRecord | null, over: Partial<EvictionDeps> = {}) => 
     unmarkSpent: async (txid, vout) => { order.push('unmark'); unmarked.push(`${txid}.${vout}`) },
     restoreTokenRow: async (row) => { order.push('restore'); restored.push(`${row.txid}.${row.outputIndex}`) },
     evict: async (txid, reason) => { order.push('evict'); evicted.push(`${txid}|${reason ?? ''}`); return { evictedOutputs: 1 } },
-    purgeAdminHistory: async (txid) => { order.push('purge'); purged.push(txid); return ['a.0', 'b.0'] },
-    rebuildAssetState: async (assetId) => { order.push('rebuild'); rebuilt.push(assetId) },
+    assetsTouchedBy: async () => { order.push('assets'); return ['a.0', 'b.0'] },
+    rebuildAssetStateExcluding: async (assetId, txid) => { order.push(`rebuild(${assetId})`); rebuilt.push(`${assetId}|${txid}`) },
+    purgeAdminHistory: async (txid) => { order.push('purge'); purged.push(txid) },
     now: () => '2026-09-14T09:00:00.000Z',
     ...over
   }
@@ -80,7 +81,7 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
     expect(h.restored).toEqual([`${IN0}.0`])
     expect(h.rows[TXID].evictedAt).toBe('2026-09-14T09:00:00.000Z')
     expect(h.evicted).toEqual([`${TXID}|REJECTED`])
-    expect(h.order).toEqual(['unmark', 'unmark', 'restore', 'markEvicted', 'evict', 'purge', 'rebuild', 'rebuild'])
+    expect(h.order).toEqual(['unmark', 'unmark', 'restore', 'markEvicted', 'evict', 'assets', 'rebuild(a.0)', 'rebuild(b.0)', 'purge'])
     expect(report.restoredOutpoints).toBe(2)
     expect(report.restoredTokenRows).toBe(1)
   })
@@ -111,22 +112,67 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
     const h = deps(record())
     await evictWithRestore(TXID, 'REJECTED', h.d)
     expect(h.purged).toEqual([TXID])
-    expect(h.rebuilt).toEqual(['a.0', 'b.0'])
-    expect(h.order).toEqual(['unmark', 'unmark', 'restore', 'markEvicted', 'evict', 'purge', 'rebuild', 'rebuild'])
+    expect(h.rebuilt).toEqual([`a.0|${TXID}`, `b.0|${TXID}`])
+    expect(h.order).toEqual(['unmark', 'unmark', 'restore', 'markEvicted', 'evict', 'assets', 'rebuild(a.0)', 'rebuild(b.0)', 'purge'])
   })
 
   it('purges admin history on a repeat callback too — production heads were stuck behind a pre-fix eviction', async () => {
     const h = deps(record({ evictedAt: '2026-09-13T00:00:00.000Z' }))
     await evictWithRestore(TXID, 'REJECTED', h.d)
     expect(h.purged).toEqual([TXID])
-    expect(h.rebuilt).toEqual(['a.0', 'b.0'])
+    expect(h.rebuilt).toEqual([`a.0|${TXID}`, `b.0|${TXID}`])
   })
 
-  it('a failed history purge is retryable (InfraError) — evictedAt is already stamped, the retry re-runs the purge', async () => {
+  it('a failed history purge is retryable (InfraError) — it runs only after every rebuild succeeded', async () => {
     const h = deps(record(), { purgeAdminHistory: async () => { throw new Error('mongo down') } })
     const err = await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e)
     expect(isInfraError(err)).toBe(true)
+    expect(h.rebuilt).toEqual([`a.0|${TXID}`, `b.0|${TXID}`])
+  })
+
+  it('a failed asset lookup is an InfraError and rebuilds/purges nothing', async () => {
+    const h = deps(record(), { assetsTouchedBy: async () => { throw new Error('mongo down') } })
+    const err = await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e)
+    expect(isInfraError(err)).toBe(true)
     expect(h.rebuilt).toEqual([])
+    expect(h.purged).toEqual([])
+  })
+
+  // Rebuild-first: the rows are the only record of which assets need a
+  // rebuild, so deleting them before the rebuild succeeds strands the asset.
+  it('a failed rebuild leaves purge uncalled and raises an InfraError', async () => {
+    const h = deps(record(), {
+      rebuildAssetStateExcluding: async (assetId) => { if (assetId === 'b.0') throw new Error('mongo down') }
+    })
+    const err = await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e)
+    expect(isInfraError(err)).toBe(true)
+    expect((err as Error).message).toMatch(/retry/)
+    expect(h.purged).toEqual([])
+    expect(h.order).not.toContain('purge')
+  })
+
+  it('a repeat callback after a failed rebuild runs the full sequence again (rows still present) and converges', async () => {
+    const rowsLeft = new Set([TXID])
+    let fail = true
+    const rebuilt: string[] = []
+    const order: string[] = []
+    const h = deps(record(), {
+      assetsTouchedBy: async (txid) => { order.push('assets'); return rowsLeft.has(txid) ? ['a.0', 'b.0'] : [] },
+      rebuildAssetStateExcluding: async (assetId) => {
+        order.push(`rebuild(${assetId})`)
+        if (fail && assetId === 'b.0') throw new Error('mongo down')
+        rebuilt.push(assetId)
+      },
+      purgeAdminHistory: async (txid) => { order.push('purge'); rowsLeft.delete(txid) }
+    })
+    expect(isInfraError(await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e))).toBe(true)
+    expect(rowsLeft.has(TXID)).toBe(true)
+    fail = false
+    order.length = 0
+    await evictWithRestore(TXID, 'REJECTED', h.d)
+    expect(order).toEqual(['assets', 'rebuild(a.0)', 'rebuild(b.0)', 'purge'])
+    expect(rebuilt).toEqual(['a.0', 'a.0', 'b.0'])
+    expect(rowsLeft.has(TXID)).toBe(false)
   })
 
   // §9.8 — this USED to log and carry on, stamping evictedAt anyway. That

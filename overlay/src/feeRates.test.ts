@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { Transaction, UnlockingScript, P2PKH, PrivateKey, Utils } from '@bsv/sdk'
 import { MandalaToken } from '@bsv/templates'
 import {
-  feeRateFromDetails, feeRateAssetId, withFeeRateFold, withFeeRate, recomputeFeeRate, rebuildFeeRate,
+  feeRateFromDetails, feeRateAssetId, withFeeRateFold, withFeeRate, recomputeFeeRate, rebuildFeeRate, rebuildFeeRateFromHistory,
   type FeeRateRow, type FeeRateStore, type FeeRateHistoryEntry
 } from './feeRates.js'
 
@@ -253,6 +253,23 @@ describe('rebuildFeeRate', () => {
     const upsert = vi.spyOn(store, 'upsert')
     await rebuildFeeRate(store, `${G}.0`)
     expect(upsert).toHaveBeenCalledWith({ assetId: `${G}.0`, feeRatePerKb: null, setByOutpoint: '' })
+    expect(store.rows.get(`${G}.0`)).toEqual({ assetId: `${G}.0`, feeRatePerKb: null, setByOutpoint: '' })
+  })
+})
+
+describe('rebuildFeeRateFromHistory (eviction, rebuild-first)', () => {
+  it('upserts from the given (txid-excluded) rows and never reads the store history', async () => {
+    const store = fakeStore([entry(S, 1, { kind: 'setFeeRate', assetId: `${G}.0`, feeRatePerKb: 12 })])
+    const historyFor = vi.spyOn(store, 'historyFor')
+    await rebuildFeeRateFromHistory(store, `${G}.0`, [entry(G, 0, { kind: 'register', feeRatePerKb: 7 })])
+    expect(historyFor).not.toHaveBeenCalled()
+    expect(store.rows.get(`${G}.0`)).toEqual({ assetId: `${G}.0`, feeRatePerKb: 7, setByOutpoint: `${G}.0` })
+  })
+
+  it('an excluded setFeeRate does not survive: empty surviving history clears the row', async () => {
+    const store = fakeStore()
+    await store.upsert({ assetId: `${G}.0`, feeRatePerKb: 12, setByOutpoint: `${S}.1` })
+    await rebuildFeeRateFromHistory(store, `${G}.0`, [])
     expect(store.rows.get(`${G}.0`)).toEqual({ assetId: `${G}.0`, feeRatePerKb: null, setByOutpoint: '' })
   })
 })

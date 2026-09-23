@@ -19,9 +19,10 @@ import { SubmitSideChannel, withVerdictCapture, type AdmissionTokenRow } from '.
 import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
 import { withSpentInputGuard, casMarkUTXOAsSpent, InFlightOutpoints, type SpentInputStore } from './spentGuard.js'
 import { mountArcIngest } from './eviction.js'
+import { replayAssetState, type ReplayStorage } from './pinnedReducer.js'
 import { withAdminChainAnchor } from './adminChainGuard.js'
 import { assetAuthHeadHandler, assetAuthBeefHandler, withFrozenRowFlags, type AdminHistoryRowLite } from './assetAuth.js'
-import { withFeeRateFold, withFeeRate, rebuildFeeRate, type FeeRateStore, type FeeRateRow, type FeeRateHistoryEntry } from './feeRates.js'
+import { withFeeRateFold, withFeeRate, rebuildFeeRateFromHistory, type FeeRateStore, type FeeRateRow, type FeeRateHistoryEntry } from './feeRates.js'
 import { adminAuth, adminCors, parseAdminCorsOrigins, warnIfAdminAuthDisabled } from './adminAuth.js'
 import {
   RegistryStore, RegistryTopicManager, createRegistryLookup,
@@ -433,19 +434,22 @@ const main = async (): Promise<void> => {
         await (server.engine as unknown as {
           evictAppliedTransaction: (t: string, o: { reason?: string }) => Promise<unknown>
         }).evictAppliedTransaction(txid, { reason }),
-      purgeAdminHistory: async (txid) => {
-        const assets = (await adminHistoryCol.distinct('assetId', { txid })) as string[]
-        if (assets.length > 0) await adminHistoryCol.deleteMany({ txid })
-        return assets.sort()
+      assetsTouchedBy: async (txid) =>
+        ((await adminHistoryCol.distinct('assetId', { txid })) as string[]).sort(),
+      // Rebuild-first: the pinned rebuildState reads every row, so replay the
+      // history minus this txid's rows with the pinned reducer (same ctx
+      // sourcing), then refold the repo-local fee rate from the identical rows
+      // — Go's RebuildStateExcluding folds the rate natively.
+      rebuildAssetStateExcluding: async (assetId, txid) => {
+        const history = (await adminHistoryCol.find({ assetId, txid: { $ne: txid } })
+          .sort({ height: 1, offset: 1, admitSeq: 1 })
+          .project({ _id: 0, txid: 1, outputIndex: 1, actionDetails: 1 })
+          .toArray()) as unknown as FeeRateHistoryEntry[]
+        await replayAssetState(assetId, history, sharedStorage as unknown as ReplayStorage)
+        await rebuildFeeRateFromHistory(feeRateStore, assetId, history)
       },
-      // A second service instance over the same sharedStorage: rebuildState
-      // only touches storage, so it sees exactly what the mounted one does.
-      rebuildAssetState: async (assetId) => {
-        await createMandalaLookupService(mandalaWallet, sharedStorage)(lookupDb).rebuildState(assetId)
-        // The pinned reducer ignores feeRatePerKb, so refold the repo-local
-        // row from the same surviving history — Go's RebuildState folds the
-        // rate natively, and the two must roll an evicted rate back alike.
-        await rebuildFeeRate(feeRateStore, assetId)
+      purgeAdminHistory: async (txid) => {
+        await adminHistoryCol.deleteMany({ txid })
       },
       ingestProof: async (txid, merklePathHex, blockHeight) => {
         await (server.engine as unknown as {
