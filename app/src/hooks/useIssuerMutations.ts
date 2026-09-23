@@ -47,7 +47,7 @@ export function useIssuerMutations() {
   }
 
   const register = useMutation({
-    mutationFn: async (vars: { label: string; ticker: string; decimals: number }) => {
+    mutationFn: async (vars: { label: string; ticker: string; decimals: number; feeRatePerKb?: number }) => {
       if (wallet == null || identityKey == null) throw new Error('Wallet not ready')
       const gate = guardRegisterSubmit({
         label: vars.label,

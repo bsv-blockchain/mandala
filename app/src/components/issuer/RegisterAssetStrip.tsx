@@ -7,6 +7,17 @@ import { registerFlight } from '@bsv/mandala/singleFlight'
 import { Input } from '../ui/input'
 import { Spinner } from '../ui/spinner'
 
+export type FeeRateParse = { ok: true, value: number | undefined } | { ok: false, reason: string }
+
+/** Blank = leave issuer-paid fees disabled; otherwise a whole number ≥ 1 (token units per KB). */
+export function parseFeeRateInput (raw: string): FeeRateParse {
+  const s = raw.trim()
+  if (s === '') return { ok: true, value: undefined }
+  const n = Number(s)
+  if (!Number.isSafeInteger(n) || n < 1) return { ok: false, reason: 'Fee rate must be a whole number ≥ 1 (units per KB)' }
+  return { ok: true, value: n }
+}
+
 /**
  * "Register a new asset" — the rare genesis action, kept as a slim dashed
  * strip on the Overview page (most issuers run a single stablecoin).
@@ -16,6 +27,7 @@ export default function RegisterAssetStrip() {
   const [label, setLabel] = useState('')
   const [ticker, setTicker] = useState('')
   const [decimals, setDecimals] = useState('0')
+  const [feeRate, setFeeRate] = useState('')
   const { register } = useIssuerMutations()
   const startedRef = useRef(false)
 
@@ -32,9 +44,14 @@ export default function RegisterAssetStrip() {
       toast.error(gate.reason)
       return
     }
+    const fee = parseFeeRateInput(feeRate)
+    if (!fee.ok) {
+      toast.error(fee.reason)
+      return
+    }
     startedRef.current = true
-    register.mutate({ label, ticker, decimals: dec }, {
-      onSuccess: () => { setLabel(''); setTicker(''); setDecimals('0') },
+    register.mutate({ label, ticker, decimals: dec, feeRatePerKb: fee.value }, {
+      onSuccess: () => { setLabel(''); setTicker(''); setDecimals('0'); setFeeRate('') },
       onSettled: () => { startedRef.current = false }
     })
   }
@@ -82,6 +99,19 @@ export default function RegisterAssetStrip() {
               value={decimals}
               onChange={e => setDecimals(e.target.value)}
               placeholder="0"
+              className="h-[30px] bg-input border-input-border rounded-sm px-[10px] py-0 text-[12px] placeholder:text-subtle-foreground tabular-nums"
+            />
+          </div>
+          <div className="flex flex-col min-w-[96px]">
+            <label className={labelCls} htmlFor="reg-fee-rate">Fee rate (units/KB)</label>
+            <Input
+              id="reg-fee-rate"
+              type="number"
+              min="1"
+              step="1"
+              value={feeRate}
+              onChange={e => setFeeRate(e.target.value)}
+              placeholder="off"
               className="h-[30px] bg-input border-input-border rounded-sm px-[10px] py-0 text-[12px] placeholder:text-subtle-foreground tabular-nums"
             />
           </div>
