@@ -517,3 +517,50 @@ func TestNewStoreAbortsWhenAnIndexCannotBeCreated(t *testing.T) {
 		t.Fatalf("error must name the collection that failed, got: %v", err)
 	}
 }
+
+// Eviction must take the evicted tx's admin-history rows with it: they are
+// what PickAssetAuthHead and the asset-state rebuild read, so a row left
+// behind keeps naming the evicted tx as the live auth head (2026-09-21
+// incident). The delete reports every asset touched so the caller can
+// rebuild exactly those states.
+func TestDeleteAdminHistoryByTxidReturnsAffectedAssets(t *testing.T) {
+	ctx := context.Background()
+	s := mustStore(t, testDB(t))
+	keep := strings.Repeat("11", 32)
+	gone := strings.Repeat("22", 32)
+	rows := []AdminHistoryEntry{
+		{AssetID: "a.0", Txid: keep, OutputIndex: 1, Height: 9007199254740991, AdmitSeq: 1, ActionDetails: ActionDetails{"kind": "register"}},
+		{AssetID: "a.0", Txid: gone, OutputIndex: 0, Height: 9007199254740991, AdmitSeq: 2, ActionDetails: ActionDetails{"kind": "pause"}},
+		{AssetID: "b.0", Txid: gone, OutputIndex: 1, Height: 9007199254740991, AdmitSeq: 3, ActionDetails: ActionDetails{"kind": "pause"}},
+	}
+	for _, r := range rows {
+		if err := s.AppendAdminHistory(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	assets, err := s.DeleteAdminHistoryByTxid(ctx, gone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assets) != 2 || assets[0] != "a.0" || assets[1] != "b.0" {
+		t.Fatalf("affected assets = %v, want [a.0 b.0]", assets)
+	}
+	left, err := s.FindAdminHistoryByAssetID(ctx, "a.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 1 || left[0].Txid != keep {
+		t.Fatalf("a.0 history after delete = %+v, want only %s", left, keep)
+	}
+	leftB, err := s.FindAdminHistoryByAssetID(ctx, "b.0")
+	if err != nil || len(leftB) != 0 {
+		t.Fatalf("b.0 history after delete = %+v (%v), want empty", leftB, err)
+	}
+
+	// A txid with no rows is not an error and touches nothing.
+	assets, err = s.DeleteAdminHistoryByTxid(ctx, strings.Repeat("33", 32))
+	if err != nil || len(assets) != 0 {
+		t.Fatalf("delete of unknown txid = %v, %v; want no assets, no error", assets, err)
+	}
+}

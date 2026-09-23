@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -456,6 +457,32 @@ func (s *Store) IsAdminOutpoint(ctx context.Context, assetID, txid string, vout 
 		return false, err
 	}
 	return true, nil
+}
+
+// DeleteAdminHistoryByTxid removes every admin-history row the given
+// transaction produced and reports the (sorted, distinct) asset IDs that lost
+// a row, so the caller can rebuild exactly those asset states. Eviction is the
+// only caller: an evicted transaction never reached the chain, so the actions
+// it recorded never happened and must stop being picked as the auth head
+// (PickAssetAuthHead) or folded into state. A txid with no rows is a no-op.
+func (s *Store) DeleteAdminHistoryByTxid(ctx context.Context, txid string) ([]string, error) {
+	filter := bson.D{{Key: "txid", Value: txid}}
+	res := s.history.Distinct(ctx, "assetId", filter)
+	if err := res.Err(); err != nil {
+		return nil, err
+	}
+	var assets []string
+	if err := res.Decode(&assets); err != nil {
+		return nil, err
+	}
+	if len(assets) == 0 {
+		return []string{}, nil
+	}
+	if _, err := s.history.DeleteMany(ctx, filter); err != nil {
+		return nil, err
+	}
+	sort.Strings(assets)
+	return assets, nil
 }
 
 func (s *Store) FindAdminHistoryByAssetID(ctx context.Context, assetID string) ([]AdminHistoryEntry, error) {
