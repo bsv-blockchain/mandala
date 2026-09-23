@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest'
 import { Transaction, UnlockingScript, P2PKH, PrivateKey, Utils } from '@bsv/sdk'
+import { MandalaToken } from '@bsv/templates'
 import {
-  feeRateFromDetails, feeRateAssetId, withFeeRateFold, withFeeRate, recomputeFeeRate,
+  feeRateFromDetails, feeRateAssetId, withFeeRateFold, withFeeRate,
   type FeeRateRow, type FeeRateStore
 } from './feeRates.js'
 
@@ -17,19 +18,27 @@ const buildTx = (): { beef: number[], txid: string } => {
   tx.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(key.toAddress()) })
   return { beef: tx.toBEEF(), txid: tx.id('hex') }
 }
+// Output 0 is a MandalaToken (FT) script, not an admin P2PKH — used to prove
+// an admin entry attached to a non-admin output does not fold.
+const buildTokenTx = (): { beef: number[], txid: string } => {
+  const key = PrivateKey.fromRandom()
+  const src = new Transaction()
+  src.addInput({ sourceTXID: '11'.repeat(32), sourceOutputIndex: 0, unlockingScript: new UnlockingScript() })
+  src.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(key.toAddress()) })
+  const tx = new Transaction()
+  tx.addInput({ sourceTransaction: src, sourceOutputIndex: 0, unlockingScript: new UnlockingScript() })
+  tx.addOutput({ satoshis: 1, lockingScript: new MandalaToken().lock(ASSET, 100, key.toPublicKey().toHash() as number[]) })
+  return { beef: tx.toBEEF(), txid: tx.id('hex') }
+}
 const payload = (details: Record<string, unknown>, index = 0): number[] =>
   Utils.toArray(JSON.stringify({ admin: [{ index, actionDetails: details }] }), 'utf8')
 
-const fakeStore = (): FeeRateStore & { rows: Map<string, FeeRateRow>, history: Map<string, any[]> } => {
+const fakeStore = (): FeeRateStore & { rows: Map<string, FeeRateRow> } => {
   const rows = new Map<string, FeeRateRow>()
-  const history = new Map<string, any[]>()
   return {
     rows,
-    history,
     get: async assetId => rows.get(assetId) ?? null,
-    findBySetBy: async outpoint => [...rows.values()].find(r => r.setByOutpoint === outpoint) ?? null,
-    upsert: async row => { rows.set(row.assetId, row) },
-    historyFor: async assetId => history.get(assetId) ?? []
+    upsert: async row => { rows.set(row.assetId, row) }
   }
 }
 const fakeInner = () => ({
@@ -39,6 +48,25 @@ const fakeInner = () => ({
   outputEvicted: vi.fn(async () => {}),
   getMetaData: async () => ({ name: 'ls_mandala', shortDescription: 'x' })
 }) as any
+
+// A REAL class instance: outputAdmittedByTopic/outputEvicted/getMetaData live
+// on the prototype, not as own instance properties, so `{...inner}` does not
+// copy them — only the Proxy fallback in withFeeRateFold makes them resolve.
+// If that Proxy were removed, ls.outputEvicted/ls.getMetaData would be
+// undefined and this test would fail.
+class RealInner {
+  deps = { name: 'ls_mandala' }
+  admissionMode = 'whole-tx'
+  spendNotificationMode = 'script'
+  evictedCalls: Array<[string, number]> = []
+  async outputAdmittedByTopic (): Promise<void> {}
+  async outputEvicted (txid: string, outputIndex: number): Promise<void> {
+    this.evictedCalls.push([txid, outputIndex])
+  }
+  async getMetaData (): Promise<{ name: string, shortDescription: string }> {
+    return { name: this.deps.name, shortDescription: 'x' }
+  }
+}
 
 describe('feeRateFromDetails (TS ≡ Go feeRateOf)', () => {
   it('sets on a safe integer ≥ 1 for register and setFeeRate', () => {
@@ -103,40 +131,21 @@ describe('withFeeRateFold', () => {
     expect(inner.outputAdmittedByTopic).toHaveBeenCalledTimes(3)
   })
 
-  it('recomputes from history when the setting outpoint is evicted', async () => {
+  it('does not fold an admin entry attached to a non-admin (FT) output', async () => {
     const inner = fakeInner(); const store = fakeStore()
     const ls = withFeeRateFold(inner, store)
-    const t1 = 'aa'.repeat(32); const t2 = 'bb'.repeat(32)
-    store.rows.set(ASSET, { assetId: ASSET, feeRatePerKb: 12, setByOutpoint: `${t2}.0` })
-    store.history.set(ASSET, [
-      { txid: t1, outputIndex: 0, actionDetails: { kind: 'setFeeRate', assetId: ASSET, feeRatePerKb: 7 } },
-      { txid: t2, outputIndex: 0, actionDetails: { kind: 'setFeeRate', assetId: ASSET, feeRatePerKb: 12 } }
-    ])
-    await ls.outputEvicted!(t2, 0)
-    expect(inner.outputEvicted).toHaveBeenCalledWith(t2, 0)
-    expect(store.rows.get(ASSET)).toEqual({ assetId: ASSET, feeRatePerKb: 7, setByOutpoint: `${t1}.0` })
+    const { beef } = buildTokenTx()
+    await ls.outputAdmittedByTopic!(admitted(beef, payload({ kind: 'register', assetId: ASSET, feeRatePerKb: 7 })))
+    expect(inner.outputAdmittedByTopic).toHaveBeenCalledTimes(1)
+    expect(store.rows.size).toBe(0)
   })
 
-  it('leaves rows alone when an unrelated outpoint is evicted, and preserves prototype methods', async () => {
-    const inner = fakeInner(); const store = fakeStore()
-    const ls = withFeeRateFold(inner, store)
-    store.rows.set(ASSET, { assetId: ASSET, feeRatePerKb: 12, setByOutpoint: 'cc'.repeat(32) + '.0' })
+  it('resolves outputEvicted to the inner service through the Proxy, and preserves prototype-bound methods', async () => {
+    const inner = new RealInner()
+    const ls = withFeeRateFold(inner as any, fakeStore())
     await ls.outputEvicted!('dd'.repeat(32), 0)
-    expect(store.rows.get(ASSET)?.feeRatePerKb).toBe(12)
+    expect(inner.evictedCalls).toEqual([['dd'.repeat(32), 0]])
     expect((await ls.getMetaData()).name).toBe('ls_mandala')
-  })
-})
-
-describe('recomputeFeeRate', () => {
-  it('folds register then setFeeRate in order, skipping the excluded outpoint', () => {
-    const t1 = 'aa'.repeat(32); const t2 = 'bb'.repeat(32)
-    const history = [
-      { txid: t1, outputIndex: 0, actionDetails: { kind: 'register', feeRatePerKb: 3 } },
-      { txid: t2, outputIndex: 0, actionDetails: { kind: 'setFeeRate', assetId: `${t1}.0`, feeRatePerKb: 9 } }
-    ]
-    expect(recomputeFeeRate(history, `${t2}.0`)).toEqual({ feeRatePerKb: 3, setByOutpoint: `${t1}.0` })
-    expect(recomputeFeeRate(history, `${t1}.0`)).toEqual({ feeRatePerKb: 9, setByOutpoint: `${t2}.0` })
-    expect(recomputeFeeRate([], 'x.0')).toEqual({ feeRatePerKb: null, setByOutpoint: '' })
   })
 })
 
