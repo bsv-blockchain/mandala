@@ -5,6 +5,8 @@ export interface AssetAdminStateView {
   issuerIdentityKey: string
   isPaused: boolean
   accessMode: 'denylist' | 'allowlist'
+  /** Token-fee design §2: base units per 1000 bytes; null/absent = issuer-paid fees disabled. */
+  feeRatePerKb?: number | null
   blockedIdentities: string[]
   allowedIdentities: string[]
   frozenOutpoints: Array<{ outpoint: string, amount: number, owner: string, reason: string }>
