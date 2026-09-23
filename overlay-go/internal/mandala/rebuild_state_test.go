@@ -140,7 +140,8 @@ func TestRebuildStateExcludingSkipsTxidRowsAndRate(t *testing.T) {
 		t.Fatalf("history after rebuild = %d rows (%v), want 3 untouched", len(all), err)
 	}
 
-	// Excluding the genesis too leaves nothing: default state, no rate.
+	// Excluding the genesis leaves only the ee rows: issuer unset (no register),
+	// but the later setFeeRate/pause rows still fold (known quirk, pre-existing).
 	got, err = ls.RebuildStateExcluding(ctx, assetID, genesis)
 	if err != nil {
 		t.Fatal(err)

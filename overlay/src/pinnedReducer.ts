@@ -1,5 +1,6 @@
 /**
  * Shim over the pinned @bsv/overlay-topics mandala reducer.
+ * Requires Node >= 20.6 (synchronous, unflagged import.meta.resolve); overlay/Dockerfile pins node:20.18.
  *
  * The eviction rebuild must replay an asset's admin history EXCLUDING the
  * evicted txid's rows (rebuild-first, then delete), which the pinned
