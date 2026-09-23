@@ -142,10 +142,7 @@ func (l *LookupService) indexAdminOutput(ctx context.Context, tx *transaction.Tr
 		return nil // metadata may already have been stored above
 	}
 
-	assetID, ok := details.Str("assetId")
-	if !ok || assetID == "" {
-		assetID = fmtOutpoint(txid, outputIndex)
-	}
+	assetID := adminAssetID(details, txid, outputIndex)
 
 	height, offset := txOrdering(tx, txid)
 	admitSeq, err := l.store.NextAdmitSeq(ctx)
@@ -173,6 +170,19 @@ func (l *LookupService) indexAdminOutput(ctx context.Context, tx *transaction.Tr
 	next.LastProcessedOffset = offset
 	next.LastAdmitSeq = admitSeq
 	return l.store.PutAssetState(ctx, next)
+}
+
+// adminAssetID is the asset an admitted admin output belongs to. A register
+// is ALWAYS its own genesis — its outpoint — whatever the payload says (P0,
+// token-fee design §2.1); every other kind names its asset in the details and
+// falls back to its own outpoint when it does not.
+func adminAssetID(details ActionDetails, txid string, outputIndex uint32) string {
+	if details.Kind() != "register" {
+		if id, ok := details.Str("assetId"); ok && id != "" {
+			return id
+		}
+	}
+	return fmtOutpoint(txid, outputIndex)
 }
 
 // foldContext sources the ctx.issuer / ctx.frozenAmount / ctx.frozenOwner

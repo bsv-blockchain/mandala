@@ -394,9 +394,9 @@ func TestOutputAdmittedByTopicRegisterAdmin(t *testing.T) {
 	tx.AddInput(lsDummyInput(0x03, 0))
 	tx.AddOutput(&transaction.TransactionOutput{Satoshis: 1, LockingScript: lockScript})
 
-	assetID := strings.Repeat("cc", 32) + ".0"
+	foreignAssetID := strings.Repeat("cc", 32) + ".0"
 	issuerKey := strings.Repeat("03", 33)
-	details := ActionDetails{"kind": "register", "assetId": assetID, "issuer": issuerKey}
+	details := ActionDetails{"kind": "register", "assetId": foreignAssetID, "issuer": issuerKey}
 	payload := &LinkagePayload{Admin: []IndexedAdmin{{Index: 0, ActionDetails: details}}}
 	offChain, err := json.Marshal(payload)
 	if err != nil {
@@ -412,6 +412,7 @@ func TestOutputAdmittedByTopicRegisterAdmin(t *testing.T) {
 	}
 
 	txid := tx.TxID().String()
+	genesis := fmtOutpoint(txid, 0)
 	meta, err := store.FindMetadataByAssetID(ctx, fmtOutpoint(txid, 0))
 	if err != nil {
 		t.Fatal(err)
@@ -420,7 +421,7 @@ func TestOutputAdmittedByTopicRegisterAdmin(t *testing.T) {
 		t.Fatalf("metadata: %+v", meta)
 	}
 
-	hist, err := store.FindAdminHistoryByAssetID(ctx, assetID)
+	hist, err := store.FindAdminHistoryByAssetID(ctx, genesis)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,8 +434,11 @@ func TestOutputAdmittedByTopicRegisterAdmin(t *testing.T) {
 	if hist[0].AdmitSeq < 1 {
 		t.Fatalf("admitSeq not assigned: %+v", hist[0])
 	}
+	if rows, err := store.FindAdminHistoryByAssetID(ctx, foreignAssetID); err != nil || len(rows) != 0 {
+		t.Fatalf("register was folded under the payload's assetId: rows=%+v err=%v", rows, err)
+	}
 
-	state, err := store.GetAssetState(ctx, assetID)
+	state, err := store.GetAssetState(ctx, genesis)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -569,5 +573,28 @@ func TestLookupUnsupportedQuery(t *testing.T) {
 	}
 	if err.Error() != "Unsupported query" {
 		t.Fatalf("error = %q, want %q", err.Error(), "Unsupported query")
+	}
+}
+
+func TestAdminAssetIDKeysRegisterByOwnOutpoint(t *testing.T) {
+	txid := strings.Repeat("ab", 32)
+	foreign := strings.Repeat("cc", 32) + ".0"
+	cases := []struct {
+		name    string
+		details ActionDetails
+		want    string
+	}{
+		{"register ignores payload assetId", ActionDetails{"kind": "register", "assetId": foreign}, fmtOutpoint(txid, 2)},
+		{"register without assetId", ActionDetails{"kind": "register"}, fmtOutpoint(txid, 2)},
+		{"pause uses payload assetId", ActionDetails{"kind": "pause", "assetId": foreign}, foreign},
+		{"pause without assetId falls back to own outpoint", ActionDetails{"kind": "pause"}, fmtOutpoint(txid, 2)},
+		{"setFeeRate uses payload assetId", ActionDetails{"kind": "setFeeRate", "assetId": foreign}, foreign},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := adminAssetID(c.details, txid, 2); got != c.want {
+				t.Fatalf("adminAssetID = %q, want %q", got, c.want)
+			}
+		})
 	}
 }
