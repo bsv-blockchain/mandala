@@ -17,9 +17,13 @@
  * wrapper's capture) so the post-hoc path can read it back.
  *
  * Order (contract §5): unmark spent → restore token rows → stamp `evictedAt` →
- * delete the evicted outputs as today. `evictedAt` lands BEFORE the deletion so
+ * delete the evicted outputs as today → purge the tx's admin-history rows and
+ * rebuild each touched asset's state. `evictedAt` lands BEFORE the deletion so
  * a /submit racing the callback already sees the 410 verdict rather than
- * re-admitting the same bytes.
+ * re-admitting the same bytes. The history purge is last and never skipped on
+ * a repeat callback: it is what moves the asset-auth head off a never-mined
+ * admin action (2026-09-21 incident), and re-delivering the terminal status
+ * is the operator's repair path for heads stuck behind an older eviction.
  *
  * /arc-ingest auth: the pinned overlay-express route mounts whenever ARC or
  * Arcade is configured and checks the callback token only WHEN IT IS NON-EMPTY
@@ -55,6 +59,15 @@ export interface EvictionDeps {
   restoreTokenRow: (row: AdmissionTokenRow) => Promise<void>
   /** `engine.evictAppliedTransaction(txid, { reason })`. */
   evict: (txid: string, reason?: string) => Promise<unknown>
+  /**
+   * Delete every `mandalaAdminHistory` row this txid produced; resolves the
+   * distinct asset IDs that lost a row. Those rows are what the asset-auth head
+   * and the state rebuild read, so an evicted (never-mined) admin action left
+   * behind keeps naming the evicted tx as the live head (2026-09-21 incident).
+   */
+  purgeAdminHistory: (txid: string) => Promise<string[]>
+  /** `MandalaLookupService.rebuildState(assetId)` — refold the surviving rows. */
+  rebuildAssetState: (assetId: string) => Promise<unknown>
   now?: () => string
 }
 
@@ -138,6 +151,25 @@ export const evictWithRestore = async (
   })
 
   const engine = await deps.evict(txid, reason)
+
+  // The evicted tx's admin actions never happened: drop its history rows and
+  // refold each touched asset. NOT gated on alreadyEvicted — a repeat callback
+  // must repair a head stuck behind an eviction stamped before this purge
+  // existed. A failure here is retryable: evictedAt is already on record and
+  // the purge/rebuild are idempotent.
+  let assets: string[]
+  try {
+    assets = await deps.purgeAdminHistory(txid)
+  } catch (e) {
+    throw new InfraError(`could not purge the admin history of ${txid}; retry`, e)
+  }
+  for (const assetId of assets) {
+    try {
+      await deps.rebuildAssetState(assetId)
+    } catch (e) {
+      throw new InfraError(`could not rebuild the state of ${assetId} after evicting ${txid}; retry`, e)
+    }
+  }
   return { txid, reason, restoredOutpoints, restoredTokenRows, alreadyEvicted, engine }
 }
 

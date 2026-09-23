@@ -526,6 +526,21 @@ func evictTx(es *enginestore.Store, ls *mandala.LookupService, store *mandala.St
 		if err := es.DeleteAppliedTransactionsByTxid(ctx, txid); err != nil {
 			return out, fmt.Errorf("wiring: delete applied tx records of %s: %w", txid, err)
 		}
+		// The evicted tx's admin actions never happened: drop its history
+		// rows (what PickAssetAuthHead and the state rebuild read) and refold
+		// each touched asset. Runs on a repeat callback too — deliberately
+		// not gated on AlreadyEvicted — so a head stuck behind an eviction
+		// stamped before this purge existed is repaired by re-delivering the
+		// terminal status (2026-09-21 incident).
+		assets, err := store.DeleteAdminHistoryByTxid(ctx, txid)
+		if err != nil {
+			return out, fmt.Errorf("wiring: purge admin history of %s: %w", txid, err)
+		}
+		for _, assetID := range assets {
+			if _, err := ls.RebuildState(ctx, assetID); err != nil {
+				return out, fmt.Errorf("wiring: rebuild asset state %s after evicting %s: %w", assetID, txid, err)
+			}
+		}
 		return out, nil
 	}
 }
