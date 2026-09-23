@@ -1,7 +1,9 @@
 package mandala
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -109,5 +111,62 @@ func TestFreezeReasonRebuildParity(t *testing.T) {
 	}
 	if live.FrozenOutpoints[0].Reason != "aml hold" {
 		t.Fatalf("reason lost: %+v", live.FrozenOutpoints[0])
+	}
+}
+
+func TestFoldActionFeeRate(t *testing.T) {
+	s0 := DefaultAssetState("a.0")
+	seven := int64(7)
+	twelve := int64(12)
+	cases := []struct {
+		name    string
+		prev    AssetAdminState
+		details ActionDetails
+		want    *int64
+	}{
+		{"register sets rate", s0, ActionDetails{"kind": "register", "feeRatePerKb": 7.0}, &seven},
+		{"register without rate leaves nil", s0, ActionDetails{"kind": "register"}, nil},
+		{"setFeeRate sets", withRate(s0, 7), ActionDetails{"kind": "setFeeRate", "feeRatePerKb": 12.0}, &twelve},
+		{"setFeeRate null disables", withRate(s0, 7), ActionDetails{"kind": "setFeeRate", "feeRatePerKb": nil}, nil},
+		{"setFeeRate absent disables", withRate(s0, 7), ActionDetails{"kind": "setFeeRate"}, nil},
+		{"setFeeRate zero disables", withRate(s0, 7), ActionDetails{"kind": "setFeeRate", "feeRatePerKb": 0.0}, nil},
+		{"setFeeRate negative disables", withRate(s0, 7), ActionDetails{"kind": "setFeeRate", "feeRatePerKb": -3.0}, nil},
+		{"setFeeRate fraction disables", withRate(s0, 7), ActionDetails{"kind": "setFeeRate", "feeRatePerKb": 1.5}, nil},
+		{"setFeeRate string disables", withRate(s0, 7), ActionDetails{"kind": "setFeeRate", "feeRatePerKb": "7"}, nil},
+		{"setFeeRate unsafe integer disables", withRate(s0, 7), ActionDetails{"kind": "setFeeRate", "feeRatePerKb": 9007199254740994.0}, nil},
+		{"pause leaves rate alone", withRate(s0, 7), ActionDetails{"kind": "pause"}, &seven},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := FoldAction(c.prev, c.details, FoldContext{}).FeeRatePerKb
+			switch {
+			case c.want == nil && got != nil:
+				t.Fatalf("feeRatePerKb = %d, want nil", *got)
+			case c.want != nil && (got == nil || *got != *c.want):
+				t.Fatalf("feeRatePerKb = %v, want %d", got, *c.want)
+			}
+		})
+	}
+}
+
+func withRate(s AssetAdminState, r int64) AssetAdminState {
+	s.FeeRatePerKb = &r
+	return s
+}
+
+func TestAssetStateJSONFeeRateShape(t *testing.T) {
+	raw, err := json.Marshal(DefaultAssetState("a.0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"feeRatePerKb":null`) {
+		t.Fatalf("default state must serialize feeRatePerKb as null: %s", raw)
+	}
+	raw, err = json.Marshal(withRate(DefaultAssetState("a.0"), 7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"feeRatePerKb":7`) {
+		t.Fatalf("set state must serialize the number: %s", raw)
 	}
 }

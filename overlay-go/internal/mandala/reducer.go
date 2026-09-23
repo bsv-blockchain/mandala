@@ -12,10 +12,15 @@ type FrozenRef struct {
 }
 
 type AssetAdminState struct {
-	AssetID             string      `json:"assetId" bson:"assetId"`
-	IssuerIdentityKey   string      `json:"issuerIdentityKey" bson:"issuerIdentityKey"`
-	IsPaused            bool        `json:"isPaused" bson:"isPaused"`
-	AccessMode          string      `json:"accessMode" bson:"accessMode"`
+	AssetID           string `json:"assetId" bson:"assetId"`
+	IssuerIdentityKey string `json:"issuerIdentityKey" bson:"issuerIdentityKey"`
+	IsPaused          bool   `json:"isPaused" bson:"isPaused"`
+	AccessMode        string `json:"accessMode" bson:"accessMode"`
+	// FeeRatePerKb is the token-fee design §2 parameter: token base units per
+	// 1000 bytes charged by the issuer for issuer-paid network fees; nil =
+	// disabled. bson has NO omitempty on purpose: PutAssetState does `$set:
+	// st`, and clearing the rate must write null, not leave the old value.
+	FeeRatePerKb        *int64      `json:"feeRatePerKb" bson:"feeRatePerKb"`
 	BlockedIdentities   []string    `json:"blockedIdentities" bson:"blockedIdentities"`
 	AllowedIdentities   []string    `json:"allowedIdentities" bson:"allowedIdentities"`
 	FrozenOutpoints     []FrozenRef `json:"frozenOutpoints" bson:"frozenOutpoints"`
@@ -70,6 +75,18 @@ func removeFrozen(xs []FrozenRef, outpoint string) []FrozenRef {
 	return out
 }
 
+// feeRateOf reads feeRatePerKb (token-fee design §2): a safe integer ≥ 1 sets
+// it; null, absent or anything else disables (nil). Byte-for-byte the rule the
+// TS overlay's repo-local fold applies (overlay/src/feeRates.ts
+// feeRateFromDetails).
+func feeRateOf(details ActionDetails) *int64 {
+	v, ok := details.Num("feeRatePerKb")
+	if !ok || v < 1 {
+		return nil
+	}
+	return &v
+}
+
 func FoldAction(prev AssetAdminState, details ActionDetails, ctx FoldContext) AssetAdminState {
 	s := prev // value copy; slice fields replaced below before any change
 	switch details.Kind() {
@@ -77,6 +94,9 @@ func FoldAction(prev AssetAdminState, details ActionDetails, ctx FoldContext) As
 		if ctx.Issuer != "" {
 			s.IssuerIdentityKey = ctx.Issuer
 		}
+		s.FeeRatePerKb = feeRateOf(details)
+	case "setFeeRate":
+		s.FeeRatePerKb = feeRateOf(details)
 	case "pause":
 		s.IsPaused = true
 	case "unpause":
