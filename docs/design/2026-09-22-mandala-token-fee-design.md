@@ -217,7 +217,7 @@ Y simply costs the payer X tokens for nothing.
   `register` copies only `issuer` (`AssetStateReducer.ts:56-61`). A wrapper on
   the lookup service's `outputAdmittedByTopic` folds `register.feeRatePerKb`
   and `setFeeRate` into `mandalaFeeRates { assetId (unique), feeRatePerKb,
-  setByOutpoint, admitSeq }`; `GET /admin/asset-state/:assetId` merges it like
+  setByOutpoint }`; `GET /admin/asset-state/:assetId` merges it like
   `withFrozenRowFlags` (`O/index.ts:436-446`, `O/assetAuth.ts:113-122`). The
   fold applies only to outputs that decode as `MandalaAdmin` (as the pinned
   service and Go's `DecodeAdmin` gate do). Eviction does NOT roll the rate
@@ -934,7 +934,7 @@ their phase.
   regression tests (§2.1). — done 2026-09-22, commits 83b4e15…d03b7c0
 - **P1 — asset parameter.** Go reducer + tests; TS repo-local fold +
   asset-state merge + tests; lib `RegisterParams.feeRatePerKb`, `setFeeRate`,
-  `AssetAdminStateView.feeRatePerKb`; console controls; ts-stack PR opened
+  `AssetAdminStateView.feeRatePerKb`; console controls; ts-stack PR not yet opened
   (non-blocking). — done 2026-09-22, commits 48db465…26401db
 - **P2 — fuelKeeper.** New module: storage server + wallet + keeper wiring
   (dashboard pattern), fee script encoder + parity vectors, request
@@ -959,6 +959,11 @@ their phase.
   config `FUEL_ASSET_IDS`; console wallet re-pointed at the shared storage;
   fund the issuer wallet; runbook section; confirm `BSV_RATE`/`D` against the
   testnet Arcade policy.
+  - Pre-P0 graft audit (both engines, same `mandalaAdminHistory` collection):
+    before relying on the register rule, run
+    `db.mandalaAdminHistory.find({"actionDetails.kind":"register",$expr:{$ne:["$assetId",{$concat:["$txid",".",{$toString:"$outputIndex"}]}]}})`
+    and, for any hit, delete the row and rebuild that asset's state; a
+    register row keyed under a foreign assetId is a forged prior.
 
 ## 13. Revision log
 

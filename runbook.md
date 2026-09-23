@@ -288,3 +288,19 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 Then bump the tags in the flux manifests. `ADMIN_API_TOKEN` is deliberately unset (would have to be baked into the public bundle).
+
+## Token-fee P0 deploy check
+
+Before relying on the P0 register-hardening rule (a `register` naming an
+existing `assetId` is refused) on either engine, audit for pre-P0 grafted
+register rows in `mandalaAdminHistory` (same collection on both engines):
+
+```js
+db.mandalaAdminHistory.find({
+  "actionDetails.kind": "register",
+  $expr: { $ne: ["$assetId", { $concat: ["$txid", ".", { $toString: "$outputIndex" }] }] }
+})
+```
+
+For any hit, delete the row and rebuild that asset's state — a register row
+keyed under a foreign `assetId` is a forged prior (spec §12 P5).
