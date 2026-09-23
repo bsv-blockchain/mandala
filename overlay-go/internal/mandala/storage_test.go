@@ -547,20 +547,20 @@ func TestAssetStateFeeRateRoundTripsAndClears(t *testing.T) {
 	}
 }
 
-// Eviction must take the evicted tx's admin-history rows with it: they are
-// what PickAssetAuthHead and the asset-state rebuild read, so a row left
-// behind keeps naming the evicted tx as the live auth head (2026-09-21
-// incident). The delete reports every asset touched so the caller can
-// rebuild exactly those states.
-func TestDeleteAdminHistoryByTxidReturnsAffectedAssets(t *testing.T) {
+// Eviction is rebuild-first: find the touched assets, rebuild each from its
+// history EXCLUDING the evicted txid, and only then delete the rows. Every
+// step is idempotent so a 503 retry after any failure converges; the rows are
+// the only record of which assets need a rebuild (2026-09-21 incident).
+func TestEvictionHistoryQueriesAndDelete(t *testing.T) {
 	ctx := context.Background()
 	s := mustStore(t, testDB(t))
 	keep := strings.Repeat("11", 32)
 	gone := strings.Repeat("22", 32)
 	rows := []AdminHistoryEntry{
-		{AssetID: "a.0", Txid: keep, OutputIndex: 1, Height: 9007199254740991, AdmitSeq: 1, ActionDetails: ActionDetails{"kind": "register"}},
-		{AssetID: "a.0", Txid: gone, OutputIndex: 0, Height: 9007199254740991, AdmitSeq: 2, ActionDetails: ActionDetails{"kind": "pause"}},
 		{AssetID: "b.0", Txid: gone, OutputIndex: 1, Height: 9007199254740991, AdmitSeq: 3, ActionDetails: ActionDetails{"kind": "pause"}},
+		{AssetID: "a.0", Txid: gone, OutputIndex: 0, Height: 9007199254740991, AdmitSeq: 2, ActionDetails: ActionDetails{"kind": "pause"}},
+		{AssetID: "a.0", Txid: keep, OutputIndex: 2, Height: 9007199254740991, AdmitSeq: 4, ActionDetails: ActionDetails{"kind": "unpause"}},
+		{AssetID: "a.0", Txid: keep, OutputIndex: 1, Height: 9007199254740991, AdmitSeq: 1, ActionDetails: ActionDetails{"kind": "register"}},
 	}
 	for _, r := range rows {
 		if err := s.AppendAdminHistory(ctx, r); err != nil {
@@ -568,28 +568,47 @@ func TestDeleteAdminHistoryByTxidReturnsAffectedAssets(t *testing.T) {
 		}
 	}
 
-	assets, err := s.DeleteAdminHistoryByTxid(ctx, gone)
+	assets, err := s.FindAssetsTouchedByTxid(ctx, gone)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(assets) != 2 || assets[0] != "a.0" || assets[1] != "b.0" {
-		t.Fatalf("affected assets = %v, want [a.0 b.0]", assets)
+		t.Fatalf("touched assets = %v, want [a.0 b.0]", assets)
 	}
-	left, err := s.FindAdminHistoryByAssetID(ctx, "a.0")
+	// Read-only: asking twice gives the same answer (retry-safe).
+	if again, err := s.FindAssetsTouchedByTxid(ctx, gone); err != nil || len(again) != 2 {
+		t.Fatalf("second lookup = %v, %v", again, err)
+	}
+	if none, err := s.FindAssetsTouchedByTxid(ctx, strings.Repeat("33", 32)); err != nil || none == nil || len(none) != 0 {
+		t.Fatalf("unknown txid = %#v, %v; want empty non-nil slice", none, err)
+	}
+
+	ex, err := s.FindAdminHistoryByAssetIDExcluding(ctx, "a.0", gone)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(left) != 1 || left[0].Txid != keep {
-		t.Fatalf("a.0 history after delete = %+v, want only %s", left, keep)
+	if len(ex) != 2 || ex[0].AdmitSeq != 1 || ex[1].AdmitSeq != 4 {
+		t.Fatalf("excluding history = %+v, want seq [1 4] oldest first", ex)
 	}
-	leftB, err := s.FindAdminHistoryByAssetID(ctx, "b.0")
-	if err != nil || len(leftB) != 0 {
-		t.Fatalf("b.0 history after delete = %+v (%v), want empty", leftB, err)
+	if exB, err := s.FindAdminHistoryByAssetIDExcluding(ctx, "b.0", gone); err != nil || exB == nil || len(exB) != 0 {
+		t.Fatalf("b.0 excluding = %#v, %v; want empty non-nil", exB, err)
 	}
 
-	// A txid with no rows is not an error and touches nothing.
-	assets, err = s.DeleteAdminHistoryByTxid(ctx, strings.Repeat("33", 32))
-	if err != nil || len(assets) != 0 {
-		t.Fatalf("delete of unknown txid = %v, %v; want no assets, no error", assets, err)
+	if err := s.DeleteAdminHistoryByTxid(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+	left, err := s.FindAdminHistoryByAssetID(ctx, "a.0")
+	if err != nil || len(left) != 2 || left[0].Txid != keep || left[1].Txid != keep {
+		t.Fatalf("a.0 history after delete = %+v (%v), want only %s rows", left, err, keep)
+	}
+	if leftB, err := s.FindAdminHistoryByAssetID(ctx, "b.0"); err != nil || len(leftB) != 0 {
+		t.Fatalf("b.0 history after delete = %+v (%v), want empty", leftB, err)
+	}
+	// Repeat delete / unknown txid: no error, nothing touched.
+	if err := s.DeleteAdminHistoryByTxid(ctx, gone); err != nil {
+		t.Fatal("repeat delete:", err)
+	}
+	if after, err := s.FindAssetsTouchedByTxid(ctx, gone); err != nil || len(after) != 0 {
+		t.Fatalf("touched after delete = %v, %v", after, err)
 	}
 }

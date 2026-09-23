@@ -459,15 +459,11 @@ func (s *Store) IsAdminOutpoint(ctx context.Context, assetID, txid string, vout 
 	return true, nil
 }
 
-// DeleteAdminHistoryByTxid removes every admin-history row the given
-// transaction produced and reports the (sorted, distinct) asset IDs that lost
-// a row, so the caller can rebuild exactly those asset states. Eviction is the
-// only caller: an evicted transaction never reached the chain, so the actions
-// it recorded never happened and must stop being picked as the auth head
-// (PickAssetAuthHead) or folded into state. A txid with no rows is a no-op.
-func (s *Store) DeleteAdminHistoryByTxid(ctx context.Context, txid string) ([]string, error) {
-	filter := bson.D{{Key: "txid", Value: txid}}
-	res := s.history.Distinct(ctx, "assetId", filter)
+// FindAssetsTouchedByTxid reports the (sorted, distinct) asset IDs whose
+// admin-history rows carry the given txid. Eviction step 1 (rebuild-first):
+// read-only, so a retry after any later failure sees the same set.
+func (s *Store) FindAssetsTouchedByTxid(ctx context.Context, txid string) ([]string, error) {
+	res := s.history.Distinct(ctx, "assetId", bson.D{{Key: "txid", Value: txid}})
 	if err := res.Err(); err != nil {
 		return nil, err
 	}
@@ -475,18 +471,37 @@ func (s *Store) DeleteAdminHistoryByTxid(ctx context.Context, txid string) ([]st
 	if err := res.Decode(&assets); err != nil {
 		return nil, err
 	}
-	if len(assets) == 0 {
-		return []string{}, nil
-	}
-	if _, err := s.history.DeleteMany(ctx, filter); err != nil {
-		return nil, err
+	if assets == nil {
+		assets = []string{}
 	}
 	sort.Strings(assets)
 	return assets, nil
 }
 
+// FindAdminHistoryByAssetIDExcluding is FindAdminHistoryByAssetID minus the
+// rows the given txid produced (same order): the history an eviction rebuild
+// folds while those rows still exist.
+func (s *Store) FindAdminHistoryByAssetIDExcluding(ctx context.Context, assetID, txid string) ([]AdminHistoryEntry, error) {
+	return s.findAdminHistory(ctx, bson.D{{Key: "assetId", Value: assetID}, {Key: "txid", Value: bson.D{{Key: "$ne", Value: txid}}}})
+}
+
+// DeleteAdminHistoryByTxid removes every admin-history row the given
+// transaction produced. Eviction is the only caller, and calls it LAST —
+// after every touched asset was rebuilt without these rows — since the rows
+// are the only record of which assets need a rebuild. An evicted transaction
+// never reached the chain, so its actions must stop being picked as the auth
+// head (PickAssetAuthHead). A txid with no rows is a no-op.
+func (s *Store) DeleteAdminHistoryByTxid(ctx context.Context, txid string) error {
+	_, err := s.history.DeleteMany(ctx, bson.D{{Key: "txid", Value: txid}})
+	return err
+}
+
 func (s *Store) FindAdminHistoryByAssetID(ctx context.Context, assetID string) ([]AdminHistoryEntry, error) {
-	cur, err := s.history.Find(ctx, bson.D{{Key: "assetId", Value: assetID}},
+	return s.findAdminHistory(ctx, bson.D{{Key: "assetId", Value: assetID}})
+}
+
+func (s *Store) findAdminHistory(ctx context.Context, filter bson.D) ([]AdminHistoryEntry, error) {
+	cur, err := s.history.Find(ctx, filter,
 		options.Find().SetSort(bson.D{{Key: "height", Value: 1}, {Key: "offset", Value: 1}, {Key: "admitSeq", Value: 1}}))
 	if err != nil {
 		return nil, err

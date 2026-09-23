@@ -224,6 +224,22 @@ func (l *LookupService) RebuildState(ctx context.Context, assetID string) (Asset
 	if err != nil {
 		return AssetAdminState{}, err
 	}
+	return l.replayState(ctx, assetID, rows)
+}
+
+// RebuildStateExcluding is RebuildState over the history minus the given
+// txid's rows. Eviction runs it BEFORE deleting those rows (rebuild-first),
+// so a failure leaves the rows that name the asset for the retry.
+func (l *LookupService) RebuildStateExcluding(ctx context.Context, assetID, txid string) (AssetAdminState, error) {
+	rows, err := l.store.FindAdminHistoryByAssetIDExcluding(ctx, assetID, txid)
+	if err != nil {
+		return AssetAdminState{}, err
+	}
+	return l.replayState(ctx, assetID, rows)
+}
+
+// replayState folds rows (oldest first) from the default state and persists it.
+func (l *LookupService) replayState(ctx context.Context, assetID string, rows []AdminHistoryEntry) (AssetAdminState, error) {
 	state := DefaultAssetState(assetID)
 	for _, e := range rows {
 		fctx, err := l.foldContext(ctx, e.ActionDetails)

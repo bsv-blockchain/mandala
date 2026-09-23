@@ -526,21 +526,49 @@ func evictTx(es *enginestore.Store, ls *mandala.LookupService, store *mandala.St
 		if err := es.DeleteAppliedTransactionsByTxid(ctx, txid); err != nil {
 			return out, fmt.Errorf("wiring: delete applied tx records of %s: %w", txid, err)
 		}
-		// The evicted tx's admin actions never happened: drop its history
-		// rows (what PickAssetAuthHead and the state rebuild read) and refold
-		// each touched asset. Runs on a repeat callback too — deliberately
-		// not gated on AlreadyEvicted — so a head stuck behind an eviction
-		// stamped before this purge existed is repaired by re-delivering the
-		// terminal status (2026-09-21 incident).
-		assets, err := store.DeleteAdminHistoryByTxid(ctx, txid)
-		if err != nil {
-			return out, fmt.Errorf("wiring: purge admin history of %s: %w", txid, err)
-		}
-		for _, assetID := range assets {
-			if _, err := ls.RebuildState(ctx, assetID); err != nil {
-				return out, fmt.Errorf("wiring: rebuild asset state %s after evicting %s: %w", assetID, txid, err)
-			}
+		// The evicted tx's admin actions never happened: rebuild each touched
+		// asset without its rows, then drop the rows (what PickAssetAuthHead
+		// reads). Runs on a repeat callback too — deliberately not gated on
+		// AlreadyEvicted — so a head stuck behind an older eviction is
+		// repaired by re-delivering the terminal status (2026-09-21 incident).
+		if err := rebuildThenPurgeAdminHistory(ctx, txid, evictHistoryDeps{
+			assetsTouched: store.FindAssetsTouchedByTxid,
+			rebuildExcluding: func(ctx context.Context, assetID, txid string) error {
+				_, err := ls.RebuildStateExcluding(ctx, assetID, txid)
+				return err
+			},
+			purge: store.DeleteAdminHistoryByTxid,
+		}); err != nil {
+			return out, err
 		}
 		return out, nil
 	}
+}
+
+type evictHistoryDeps struct {
+	assetsTouched    func(ctx context.Context, txid string) ([]string, error)
+	rebuildExcluding func(ctx context.Context, assetID, txid string) error
+	purge            func(ctx context.Context, txid string) error
+}
+
+// rebuildThenPurgeAdminHistory is eviction's history step, rebuild-first:
+// find the assets whose rows carry txid, rebuild each from its history
+// excluding those rows, and only then delete the rows. Nothing is deleted
+// before every rebuild succeeded, so a 503 retry after any failure finds the
+// rows again and redoes the whole idempotent sequence — the same order as the
+// TS overlay's evictWithRestore.
+func rebuildThenPurgeAdminHistory(ctx context.Context, txid string, d evictHistoryDeps) error {
+	assets, err := d.assetsTouched(ctx, txid)
+	if err != nil {
+		return fmt.Errorf("wiring: find assets touched by %s: %w", txid, err)
+	}
+	for _, assetID := range assets {
+		if err := d.rebuildExcluding(ctx, assetID, txid); err != nil {
+			return fmt.Errorf("wiring: rebuild asset state %s after evicting %s: %w", assetID, txid, err)
+		}
+	}
+	if err := d.purge(ctx, txid); err != nil {
+		return fmt.Errorf("wiring: purge admin history of %s: %w", txid, err)
+	}
+	return nil
 }
