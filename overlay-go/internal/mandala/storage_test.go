@@ -517,3 +517,32 @@ func TestNewStoreAbortsWhenAnIndexCannotBeCreated(t *testing.T) {
 		t.Fatalf("error must name the collection that failed, got: %v", err)
 	}
 }
+
+func TestAssetStateFeeRateRoundTripsAndClears(t *testing.T) {
+	ctx := context.Background()
+	store := mustStore(t, testDB(t))
+	st := DefaultAssetState("fee.0")
+	seven := int64(7)
+	st.FeeRatePerKb = &seven
+	if err := store.PutAssetState(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetAssetState(ctx, "fee.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FeeRatePerKb == nil || *got.FeeRatePerKb != 7 {
+		t.Fatalf("feeRatePerKb after set = %v, want 7", got.FeeRatePerKb)
+	}
+	st.FeeRatePerKb = nil
+	if err := store.PutAssetState(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.GetAssetState(ctx, "fee.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FeeRatePerKb != nil {
+		t.Fatalf("feeRatePerKb after clear = %d, want nil (bson must not be omitempty)", *got.FeeRatePerKb)
+	}
+}

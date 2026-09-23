@@ -911,3 +911,24 @@ func TestParseAdminCORSOrigins(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminAssetState_FeeRateNullByDefaultAndSurfacedWhenSet(t *testing.T) {
+	store := mustMandalaStore(t, testAdminDB(t))
+	app := newServer(&stubSubmitter{}, &stubLookuper{}, store, nil)
+
+	resp := doRequest(t, app, httptest.NewRequest(http.MethodGet, "/admin/asset-state/fee-asset.0", nil))
+	if raw := readRawBody(t, resp); !strings.Contains(string(raw), `"feeRatePerKb":null`) {
+		t.Fatalf("default body must carry feeRatePerKb:null, got %s", raw)
+	}
+
+	st := mandala.DefaultAssetState("fee-asset.0")
+	rate := int64(25)
+	st.FeeRatePerKb = &rate
+	if err := store.PutAssetState(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	resp = doRequest(t, app, httptest.NewRequest(http.MethodGet, "/admin/asset-state/fee-asset.0", nil))
+	if raw := readRawBody(t, resp); !strings.Contains(string(raw), `"feeRatePerKb":25`) {
+		t.Fatalf("set body must carry the rate, got %s", raw)
+	}
+}
