@@ -21,6 +21,7 @@ import { withSpentInputGuard, casMarkUTXOAsSpent, InFlightOutpoints, type SpentI
 import { mountArcIngest } from './eviction.js'
 import { withAdminChainAnchor } from './adminChainGuard.js'
 import { assetAuthHeadHandler, assetAuthBeefHandler, withFrozenRowFlags, type AdminHistoryRowLite } from './assetAuth.js'
+import { withFeeRateFold, withFeeRate, type FeeRateStore, type FeeRateRow } from './feeRates.js'
 import { adminAuth, adminCors, parseAdminCorsOrigins, warnIfAdminAuthDisabled } from './adminAuth.js'
 import {
   RegistryStore, RegistryTopicManager, createRegistryLookup,
@@ -234,6 +235,19 @@ const main = async (): Promise<void> => {
     hasTokenRow
   }
 
+  // Per-asset feeRatePerKb (token-fee design §2), folded repo-locally from
+  // register/setFeeRate admin outputs because the pinned reducer ignores the
+  // field. Served merged into /admin/asset-state like withFrozenRowFlags.
+  const feeRatesCol = lookupDb.collection('mandalaFeeRates')
+  await feeRatesCol.createIndex({ assetId: 1 }, { unique: true })
+  const feeRateStore: FeeRateStore = {
+    get: async assetId =>
+      (await feeRatesCol.findOne({ assetId }, { projection: { _id: 0 } })) as unknown as FeeRateRow | null,
+    upsert: async row => {
+      await feeRatesCol.updateOne({ assetId: row.assetId }, { $set: row }, { upsert: true })
+    }
+  }
+
   // Membership (A04): once the registry has a row, non-admitted identities are
   // refused — except asset issuers and this overlay, exactly as Go's
   // membershipHolds. Issuer keys are read live from the asset-state cache on
@@ -336,7 +350,8 @@ const main = async (): Promise<void> => {
       }
     }
   ))
-  server.configureLookupServiceWithMongo('ls_mandala', createMandalaLookupService(mandalaWallet, sharedStorage))
+  const mandalaLookup = createMandalaLookupService(mandalaWallet, sharedStorage)
+  server.configureLookupServiceWithMongo('ls_mandala', (db) => withFeeRateFold(mandalaLookup(db), feeRateStore))
   // The registry manager is wrapped for capture too, so a registry-only
   // submission that the pinned engine swallows into an empty STEAK still comes
   // back as a structured 4xx rather than an ambiguous 200. Its verdict is never
@@ -438,7 +453,8 @@ const main = async (): Promise<void> => {
     void (async () => {
       try {
         const state = await sharedStorage.getAssetState(req.params.assetId)
-        res.json(await withFrozenRowFlags(state, hasTokenRow))
+        const feeRow = await feeRateStore.get(req.params.assetId)
+        res.json(await withFrozenRowFlags(withFeeRate(state, feeRow), hasTokenRow))
       } catch (e) {
         res.status(500).json({ error: String(e) })
       }
