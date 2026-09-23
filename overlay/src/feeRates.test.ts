@@ -166,4 +166,16 @@ describe('withFeeRate', () => {
     expect(withFeeRate({ assetId: ASSET, isPaused: false }, null)).toEqual({ assetId: ASSET, isPaused: false, feeRatePerKb: null })
     expect(withFeeRate({ assetId: ASSET }, { assetId: ASSET, feeRatePerKb: 4, setByOutpoint: 'x.0' }).feeRatePerKb).toBe(4)
   })
+
+  it('falls back to the state\'s own feeRatePerKb when there is no repo-local row (a future pinned reducer that already carries the field)', () => {
+    expect(withFeeRate({ assetId: ASSET, feeRatePerKb: 4 }, null).feeRatePerKb).toBe(4)
+  })
+
+  it('is null when neither the state nor a row carries the field', () => {
+    expect(withFeeRate({ assetId: ASSET }, null).feeRatePerKb).toBeNull()
+  })
+
+  it('the row wins over the state when both are present', () => {
+    expect(withFeeRate({ assetId: ASSET, feeRatePerKb: 4 }, { assetId: ASSET, feeRatePerKb: 9, setByOutpoint: 'x.0' }).feeRatePerKb).toBe(9)
+  })
 })

@@ -59,7 +59,10 @@ const adminEntryAt = (offChainValues: number[] | undefined, outputIndex: number)
 }
 
 export const withFeeRate = <S extends object>(state: S, row: FeeRateRow | null): S & { feeRatePerKb: number | null } =>
-  ({ ...state, feeRatePerKb: row?.feeRatePerKb ?? null })
+  ({
+    ...state,
+    feeRatePerKb: row != null ? row.feeRatePerKb : ((state as { feeRatePerKb?: number | null }).feeRatePerKb ?? null)
+  })
 
 export const withFeeRateFold = (inner: LookupService, store: FeeRateStore): LookupService => {
   const wrapped: LookupService = {
