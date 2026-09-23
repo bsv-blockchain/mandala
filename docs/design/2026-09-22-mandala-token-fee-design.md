@@ -218,9 +218,12 @@ Y simply costs the payer X tokens for nothing.
   the lookup service's `outputAdmittedByTopic` folds `register.feeRatePerKb`
   and `setFeeRate` into `mandalaFeeRates { assetId (unique), feeRatePerKb,
   setByOutpoint, admitSeq }`; `GET /admin/asset-state/:assetId` merges it like
-  `withFrozenRowFlags` (`O/index.ts:436-446`, `O/assetAuth.ts:113-122`). On
-  eviction of `setByOutpoint` the value is recomputed from the repo-local
-  admin history (`O/index.ts:227-235`). An upstream ts-stack PR (kind union in
+  `withFrozenRowFlags` (`O/index.ts:436-446`, `O/assetAuth.ts:113-122`). The
+  fold applies only to outputs that decode as `MandalaAdmin` (as the pinned
+  service and Go's `DecodeAdmin` gate do). Eviction does NOT roll the rate
+  back: neither engine rolls admin state (pause, freeze, rate) back on
+  eviction today and the pinned TS service never deletes admin history, so a
+  recompute would resurrect evicted rates (P1 review, 2026-09-22). An upstream ts-stack PR (kind union in
   `TPL/MandalaAdmin.ts:25-38`, reducer field + handler) is desirable, NOT a
   blocker (PR only, per the ts-stack workflow).
 - Lib: `RegisterParams.feeRatePerKb?: number` (`L/issuerOps.ts:30-36`),
@@ -979,6 +982,9 @@ code before adoption):
   high-id candidate selection; chain checks via `IsUtxo(scriptHash)`.
 - §3.4: recognizer keyed per draft, upsert, no TTL; guard matches by
   `feeScript`; `consumedTxid`/`releasedAt` bookkeeping.
+- §2 (P1 implementation review): TS fee fold gated on `MandalaAdmin.decode`;
+  no eviction recompute (parity with Go; admin state is never rolled back on
+  eviction on either engine).
 - §3.3, §7.2 step 9: signed `/fuel/release` route; lib releases only when no
   submit was attempted or after a final refusal + abort.
 - §3.1, §4.3 step 2: quotas moved to the keeper (outstanding drafts, daily
