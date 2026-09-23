@@ -15,4 +15,15 @@ describe('parseFeeRateInput', () => {
       expect(parseFeeRateInput(s).ok).toBe(false)
     }
   })
+  it('never silently disables fees on a mistyped rate: exponent, hex and trailing junk are refused, not coerced to a number', () => {
+    for (const s of ['1e3', '0x10', '25-']) {
+      expect(parseFeeRateInput(s).ok).toBe(false)
+    }
+  })
+  it('trims surrounding whitespace on an otherwise-valid rate', () => {
+    expect(parseFeeRateInput(' 7 ')).toEqual({ ok: true, value: 7 })
+  })
+  it('accepts leading zeros', () => {
+    expect(parseFeeRateInput('007')).toEqual({ ok: true, value: 7 })
+  })
 })

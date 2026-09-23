@@ -9,12 +9,20 @@ import { Spinner } from '../ui/spinner'
 
 export type FeeRateParse = { ok: true, value: number | undefined } | { ok: false, reason: string }
 
-/** Blank = leave issuer-paid fees disabled; otherwise a whole number ≥ 1 (token units per KB). */
+/**
+ * Blank = leave issuer-paid fees disabled; otherwise a whole number ≥ 1
+ * (token units per KB). The input is type="text" (see below), so this is the
+ * only gate against a mistyped rate — `/^\d+$/` refuses anything `Number()`
+ * would otherwise silently coerce (`'1e3'`, `'0x10'`, `'25-'`) into a rate
+ * that looks like "off" was never intended.
+ */
 export function parseFeeRateInput (raw: string): FeeRateParse {
   const s = raw.trim()
   if (s === '') return { ok: true, value: undefined }
   const n = Number(s)
-  if (!Number.isSafeInteger(n) || n < 1) return { ok: false, reason: 'Fee rate must be a whole number ≥ 1 (units per KB)' }
+  if (!/^\d+$/.test(s) || !Number.isSafeInteger(n) || n < 1) {
+    return { ok: false, reason: 'Fee rate must be a whole number ≥ 1 (units per KB)' }
+  }
   return { ok: true, value: n }
 }
 
@@ -106,9 +114,9 @@ export default function RegisterAssetStrip() {
             <label className={labelCls} htmlFor="reg-fee-rate">Fee rate (units/KB)</label>
             <Input
               id="reg-fee-rate"
-              type="number"
-              min="1"
-              step="1"
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
               value={feeRate}
               onChange={e => setFeeRate(e.target.value)}
               placeholder="off"

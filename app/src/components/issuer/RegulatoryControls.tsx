@@ -8,6 +8,7 @@ import { Select } from '../ui/select'
 import { Spinner } from '../ui/spinner'
 import { useWallet } from '../../context/WalletContext'
 import { AdminAsset, submitAdminAction, SubmitAdminActionParams, withReason } from '@bsv/mandala/assets'
+import { setFeeRate } from '@bsv/mandala/feeRate'
 import { AssetAdminStateView } from '@bsv/mandala/adminState'
 import { formatAmount } from '@bsv/mandala/amount'
 import { guardAdminFields, guardPositiveAmount } from '@bsv/mandala/submitGuards'
@@ -249,12 +250,15 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
     const parsed = parseFeeRateInput(newFeeRate)
     if (!parsed.ok) { toast.error(parsed.reason); return }
     const feeRatePerKb = parsed.value ?? null
-    await submitAction({
+    const res = await setFeeRate({
+      wallet: wallet as any,
       asset: asset!,
-      details: withReason({
-        kind: 'setFeeRate', assetId: asset!.assetId, priorOutpoint: asset!.authOutpoint, feeRatePerKb
-      } as unknown as SubmitAdminActionParams['details'], reason)
+      identityKey: identityKey!,
+      messageBoxClient: messageBoxClient ?? undefined,
+      feeRatePerKb,
+      reason
     })
+    advanceAdminAuth(asset!.assetId, res.nextAuthOutpoint, res.nextAuthDetails)
     toast.success(feeRatePerKb === null ? 'Issuer-paid fees disabled' : `Fee rate set to ${feeRatePerKb} units/KB`)
   })
 
@@ -547,9 +551,9 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
               <label className={labelCls} htmlFor="fee-rate">Fee rate (token units per KB, blank = off)</label>
               <Input
                 id="fee-rate"
-                type="number"
-                min="1"
-                step="1"
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
                 value={newFeeRate}
                 onChange={e => setNewFeeRate(e.target.value)}
                 placeholder="off"
