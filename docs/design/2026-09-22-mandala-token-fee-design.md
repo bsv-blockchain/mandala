@@ -945,7 +945,7 @@ their phase.
   go-sdk verification test (skeleton extended by a token tx must verify),
   reservation CAS + batch consume + sweeper tests (SQLite and Postgres),
   routes, deny list, Dockerfile, `/health`. — done 2026-09-23, commits
-  fba6799…38d156f (incl. review fix rounds)
+  fba6799…42dc855 (incl. review fix rounds)
 - **P3 — overlays.** TS: routes (draft/release/info/resettle), `withFuelGuard`
   with intent write, settle hook + dupe path + sweeper, verdict row,
   recognizer/nonce collections, `putAdmitted` `fuel` field; Go: the same;
