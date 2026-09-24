@@ -4,6 +4,15 @@
 // An error is never an answer. Callers must leave a row unchanged when the
 // check fails, so a missing or rate-limited chain service delays a release
 // but can never cause one.
+//
+// A "spent" answer is ambiguous, and this package cannot tell the cases
+// apart: go-wallet-toolbox v0.186.3's WhatsOnChain lookup maps "script not
+// found" to an empty UTXO list, so IsUtxo reports (false, nil) for an output
+// the indexer has never seen (not yet indexed, the wrong network — ttn/tstn
+// are sent to the public testnet endpoint — or a lagging mirror) exactly as
+// for a spent one. The checker surfaces that answer unchanged; the sweeper
+// compensates (a canary on a known-unspent pool row, and two "spent" readings
+// at least 10 min apart before rule 2 acts).
 package chain
 
 import (

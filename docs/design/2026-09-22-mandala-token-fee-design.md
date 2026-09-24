@@ -1077,3 +1077,49 @@ Revision 3 (2026-09-23, P2 implementation):
   carry `settled_at`. The "two unspent observations ≥ 10 min apart" memory
   behind the 404 branch is in-process (already noted above re: restarts).
 - §12: P2 marked done with the commit range.
+- §4.5: `released → reserving` (re-draft) removed for P2 — a fuel output that reached `reserved` is never re-issued; released rows stay `released` and their satoshis are consolidated by a follow-up 'relink' task (InternalizeAction basket insertion of the keeper's own proven output back into the pool basket). Late submit by the last holder is unchanged. Consequence: each requester release strands `D` sat until consolidation, bounded by `FUEL_DAILY_PAIRS`.
+  Implementation: `Claim` is a plain insert (`ON CONFLICT DO NOTHING`) — any
+  outpoint already in `fuel_reservations`, in any state, loses — so the
+  `fuel_beef`/`created_at` re-claim notes above now describe first claims
+  only. For the relink task: the drafter never claims a known outpoint, and
+  `/health`/the §4.8 watch count every proven pool-basket output, so a
+  relinked output must be spent into a new outpoint (consolidation), not just
+  listed in the pool basket again.
+- §4.7 rule 2 (final review): WhatsOnChain answers "script not found" as no
+  UTXOs, so `IsUtxo` returns `(false, nil)` for an output it has never
+  indexed exactly as for a spent one, and go-wallet-toolbox sends `ttn`/`tstn`
+  lookups to the public testnet endpoint. Hence: the chain check runs only on
+  `main` and `test` (on `ttn`/`tstn` it is off even with `FK_WOC_API_KEY`,
+  logged at Error); each tick with pending rows first asks about one proven
+  pool row (canary) — no pool row skips rule 2, and an error or a "spent"
+  answer for a row the wallet still holds as spendable skips it with
+  `alert=chain_check_untrusted`; and `spent_external` (with any deny) needs two
+  "spent" readings of the outpoint at least 10 min apart (in-process memory; a
+  later "unspent" reading clears it; the first reading only bumps the row to
+  the back of the queue).
+- §4.8: the alerts live in the sweeper tick, after the rules: `low_water`
+  (proven pool < `targetPoolSize × lowWaterPercent / 100`),
+  `issuer_balance_low` (< `20 × D × targetPoolSize`) and
+  `pool_drain_unexplained`. The drain check compares the drop in proven pool
+  rows since the previous tick with the growth in `fuel_reservations` rows
+  (every status), not with `consumed + settled`: the drafter detaches fuel
+  from the pool at claim time, so a draft shrinks the pool long before its row
+  is consumed, and a consumed/settled delta would alert on every draft.
+  `/settle` requests that can never succeed (malformed txid or BEEF, BEEF
+  without the txid, a tx that does not spend a row's fuel or pays a different
+  fee script) answer `400 ERR_SETTLE_INVALID` (retryable false) with
+  `alert=settle_invalid`; other failures stay `503`.
+- §4.3/§4.8 (listing cost): the fuel listing drops outputs below `D` before
+  sorting and truncating, so small outputs cannot crowd fuel out of the
+  drafter's `4k` window; `/health` caches the pool listing and the store counts
+  for 10 s; `GET /livez` answers `{"ok":true}` with no I/O. `/consume`,
+  `/settle` and eviction `/release` refuse a txid that is not 64 lowercase hex,
+  and `/consume`/`/release` an outpoint that is not canonical
+  `<txid>.<vout>`, with `400 ERR_SHAPE`.
+- §4.2: `observability.metrics.enabled: true` in the infra yaml is now a
+  startup error (it was a recommendation above).
+- Deployment: fuelKeeper assumes a single replica — sweeper rule 2's "spent"
+  readings, rule 4's unspent observations and the pool-drain snapshot are
+  in-process memory, one pool keeper fans out, and the default store is a
+  SQLite file. P5's NetworkPolicy must cover `FK_API_PORT` (overlay pods only)
+  as well as the storage port.

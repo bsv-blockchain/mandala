@@ -115,6 +115,14 @@ func TestCheckStorageConfig(t *testing.T) {
 	require.NotContains(t, err.Error(), "FUEL_D", "only the reserve basket differs")
 
 	s = throughputInfra()
+	s.Observability.Metrics.Enabled = true
+	err = checkStorageConfig(keeperCfg(), &s)
+	require.ErrorContains(t, err, "observability.metrics.enabled must be false")
+	require.NotContains(t, err.Error(), "FUEL_D", "only metrics differ")
+	s.Observability.Metrics.Enabled = false
+	require.NoError(t, checkStorageConfig(keeperCfg(), &s))
+
+	s = throughputInfra()
 	s.UTXOManagement.Throughput.DenominationSatoshis = 0 // derive...
 	s.UTXOManagement.Throughput.ExpectedTxSizeBytes = 0  // ...from an empty shape
 	s.UTXOManagement.Throughput.ExpectedOutputSatoshis = 0
@@ -138,20 +146,47 @@ func TestServicesConfig(t *testing.T) {
 	base := defs.DefaultServicesConfig(defs.NetworkTestnet)
 	base.ChaintracksClient.Enabled = true
 	require.True(t, base.WhatsOnChain.Enabled)
+	test := config.Config{Network: defs.NetworkTestnet}
 
-	svc, on := servicesConfig(config.Config{}, base)
+	svc, on, off := servicesConfig(test, base)
 	require.False(t, on, "no FK_WOC_API_KEY")
+	require.Contains(t, off, "FK_WOC_API_KEY")
 	require.False(t, svc.ChaintracksClient.Enabled)
 	require.True(t, base.ChaintracksClient.Enabled, "base is not mutated")
 
-	svc, on = servicesConfig(config.Config{WoCAPIKey: "k"}, base)
+	test.WoCAPIKey = "k"
+	svc, on, off = servicesConfig(test, base)
 	require.True(t, on)
+	require.Empty(t, off)
 	require.Equal(t, "k", svc.WhatsOnChain.APIKey)
 	require.Empty(t, base.WhatsOnChain.APIKey)
 
+	mainnet := config.Config{Network: defs.NetworkMainnet, WoCAPIKey: "k"}
+	_, on, _ = servicesConfig(mainnet, defs.DefaultServicesConfig(defs.NetworkMainnet))
+	require.True(t, on, "main has its own WhatsOnChain index")
+
 	base.WhatsOnChain.Enabled = false
-	_, on = servicesConfig(config.Config{WoCAPIKey: "k"}, base)
-	require.False(t, on, "WhatsOnChain disabled in the storage config (e.g. tstn)")
+	_, on, off = servicesConfig(test, base)
+	require.False(t, on, "WhatsOnChain disabled in the storage config")
+	require.Contains(t, off, "whats_on_chain")
+}
+
+// ttn/tstn have no WhatsOnChain index of their own: go-wallet-toolbox sends
+// their lookups to public testnet, which answers "script not found" — the
+// same (false, nil) as "spent". The chain check stays off even with a key
+// and an enabled WhatsOnChain service.
+func TestServicesConfig_TeratestnetsNeverCheck(t *testing.T) {
+	for _, n := range []defs.BSVNetwork{defs.NetworkTTN, defs.NetworkTSTN} {
+		base := defs.DefaultServicesConfig(defs.NetworkTestnet)
+		base.WhatsOnChain.Enabled = true
+		svc, on, off := servicesConfig(config.Config{Network: n, WoCAPIKey: "k"}, base)
+		require.False(t, on, n)
+		require.Contains(t, off, string(n))
+		require.Empty(t, svc.WhatsOnChain.APIKey, "the key is not handed to a lookup that must not run")
+		require.False(t, chainCheckNetwork(n))
+	}
+	require.True(t, chainCheckNetwork(defs.NetworkMainnet))
+	require.True(t, chainCheckNetwork(defs.NetworkTestnet))
 }
 
 type fakeLister struct {
@@ -171,7 +206,7 @@ type fakeProven struct {
 	err  error
 }
 
-func (f fakeProven) ListProven(context.Context, string, int) ([]fuel.Row, error) {
+func (f fakeProven) ListProven(context.Context, string, int, uint64) ([]fuel.Row, error) {
 	return f.rows, f.err
 }
 

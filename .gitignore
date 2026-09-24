@@ -6,3 +6,4 @@ dist/
 
 /fuelkeeper/fuelkeeper
 /fuelkeeper/*.sqlite*
+/fuelkeeper/fuelkeeper-infra.yaml

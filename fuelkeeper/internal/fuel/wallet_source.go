@@ -55,9 +55,9 @@ func NewWalletSource(w *wallet.Wallet, reader OutputsReader, kd *sdk.KeyDeriver,
 func (s *WalletSource) IdentityKeyHex() string { return s.kd.IdentityKeyHex() }
 
 // ListProven intersects the basket listing (which carries BEEF) with the
-// storage rows that are self-owned change, spendable, unspent and belong to a
-// completed (proven) tx.
-func (s *WalletSource) ListProven(ctx context.Context, basket string, max int) ([]Row, error) {
+// storage rows that are self-owned change, spendable, unspent, worth at least
+// minSats and belong to a completed (proven) tx.
+func (s *WalletSource) ListProven(ctx context.Context, basket string, max int, minSats uint64) ([]Row, error) {
 	if max <= 0 {
 		return nil, nil
 	}
@@ -89,7 +89,7 @@ func (s *WalletSource) ListProven(ctx context.Context, basket string, max int) (
 			return nil, fmt.Errorf("basket beef: %w", err)
 		}
 	}
-	out, skipped := selectProven(rows, inBasket, beef, s.IdentityKeyHex())
+	out, skipped := selectProven(rows, inBasket, beef, s.IdentityKeyHex(), minSats)
 	if skipped > 0 {
 		s.logger.WarnContext(ctx, "fuel rows skipped: no proof material in basket BEEF",
 			slog.String("basket", basket),
@@ -105,14 +105,15 @@ func (s *WalletSource) ListProven(ctx context.Context, basket string, max int) (
 }
 
 // selectProven keeps the storage rows usable as fuel, sorted OutputID desc:
-// in the basket listing, spendable, unspent, change, positive value, with a
-// BRC-29 derivation, not locked by a foreign sender (the unlocker assumes a
-// self→self lock) and with the tx and its own BUMP present in beef. skipped
-// counts otherwise-eligible rows dropped only for missing proof material
-// (absent, txid-only or unproven BEEF entry).
-func selectProven(rows wdk.TableOutputs, inBasket map[string]sdk.Output, beef *transaction.Beef, self string) (out []Row, skipped int) {
+// in the basket listing, spendable, unspent, change, positive value of at
+// least minSats, with a BRC-29 derivation, not locked by a foreign sender (the
+// unlocker assumes a self→self lock) and with the tx and its own BUMP present
+// in beef. skipped counts otherwise-eligible rows dropped only for missing
+// proof material (absent, txid-only or unproven BEEF entry); a row under
+// minSats is not otherwise eligible and is not counted.
+func selectProven(rows wdk.TableOutputs, inBasket map[string]sdk.Output, beef *transaction.Beef, self string, minSats uint64) (out []Row, skipped int) {
 	for _, r := range rows {
-		if r.TxID == nil || r.SpentBy != nil || !r.Spendable || !r.Change || r.Satoshis <= 0 {
+		if r.TxID == nil || r.SpentBy != nil || !r.Spendable || !r.Change || r.Satoshis <= 0 || uint64(r.Satoshis) < minSats {
 			continue
 		}
 		if r.SenderIdentityKey != nil && *r.SenderIdentityKey != self {

@@ -1,10 +1,10 @@
 package store
 
 // Spec §4.4 plus three columns this implementation needs: fuel_beef (the
-// proven source BEEF captured at first claim so a re-drafted released row,
-// which is no longer in the toolbox basket, can still be shipped),
-// derivation_prefix/suffix (to sign it), and pair_index (the fee output's
-// vout inside its draft, needed by /settle).
+// proven source BEEF captured at claim, which the relink follow-up needs once
+// the row has left the toolbox basket), derivation_prefix/suffix (to sign
+// it), and pair_index (the fee output's vout inside its draft, needed by
+// /settle).
 const schemaSQLite = `
 CREATE TABLE IF NOT EXISTS fuel_requests (
   nonce TEXT PRIMARY KEY, requester TEXT NOT NULL, ts INTEGER NOT NULL, created_at INTEGER NOT NULL);

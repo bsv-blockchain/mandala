@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sirdeggen/mandala/fuelkeeper/internal/chain"
 	"github.com/sirdeggen/mandala/fuelkeeper/internal/fuel"
 	"github.com/sirdeggen/mandala/fuelkeeper/internal/store"
 )
@@ -26,6 +28,7 @@ const (
 	reservingTTL = 60
 	draftTTL     = 600
 	assetID      = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd.0"
+	poolBasket   = "fuel"
 )
 
 // ---------------------------------------------------------------------------
@@ -210,6 +213,9 @@ type env struct {
 	logs   *logBuf
 	sw     *Sweeper
 	reqNo  int
+	// pool is a proven pool row the checker calls unspent: rule 2's canary
+	// (the highest-id row in the basket unless a test adds claim-only rows).
+	pool fuel.Row
 }
 
 func newEnv(t *testing.T) *env { return newEnvWith(t, true) }
@@ -226,13 +232,19 @@ func newEnvWith(t *testing.T, withOverlay bool) *env {
 	fake := fuel.NewFake(priv)
 	e := &env{ctx: context.Background(), st: st, dbPath: dbPath, fake: fake, src: &flakySource{Fake: fake}, c: c,
 		chk: newFakeChecker(), ov: newFakeOverlay(), logs: &logBuf{}}
+	e.pool = fake.AddFuel(t, 1000)
+	e.chk.set(e.pool.Outpoint, true, nil)
 	var ov OverlayClient
 	if withOverlay {
 		ov = e.ov
 	}
-	logger := slog.New(slog.NewJSONHandler(e.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	e.sw = New(st, e.src, e.chk, ov, c.now, logger, reservingTTL)
+	// Pool target 0: no level alerts unless a test asks for them.
+	e.sw = New(st, e.src, e.chk, ov, c.now, e.logger(), WithPoolWatch(poolBasket, 0, 60, 1000))
 	return e
+}
+
+func (e *env) logger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(e.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
 func requester(t *testing.T) string {
@@ -269,13 +281,15 @@ func (e *env) claim(t *testing.T, who string, n int) (string, []fuel.Row) {
 	return reqID, rows
 }
 
-// draft claims and commits n rows (reserved).
+// draft claims and commits n rows (reserved). Like the drafter, it detaches
+// every committed row from the pool basket.
 func (e *env) draft(t *testing.T, who string, n int) (string, []fuel.Row) {
 	t.Helper()
 	reqID, rows := e.claim(t, who, n)
 	pairs := make([]store.CommitPair, n)
 	for i, r := range rows {
 		pairs[i] = store.CommitPair{Outpoint: r.Outpoint, FeeScript: "76a914" + hex.EncodeToString([]byte(r.Outpoint))[:40] + "88ac", KeyID: "fee-" + r.Outpoint, FeeAmount: "20"}
+		require.NoError(t, e.fake.Detach(e.ctx, r.Outpoint))
 	}
 	_, err := e.st.Commit(e.ctx, reqID, pairs, draftTTL)
 	require.NoError(t, err)
@@ -350,7 +364,7 @@ func (e *env) denied(t *testing.T, who string) bool {
 
 func (e *env) inBasket(t *testing.T, op string) bool {
 	t.Helper()
-	rows, err := e.fake.ListProven(e.ctx, "fuel", 1000)
+	rows, err := e.fake.ListProven(e.ctx, poolBasket, 1000, 0)
 	require.NoError(t, err)
 	for _, r := range rows {
 		if r.Outpoint == op {
@@ -419,27 +433,29 @@ func TestRule0_ErrorLeavesRowReserving(t *testing.T) {
 	require.False(t, r.NeedsRecheck)
 }
 
-func TestRule0_RowTakenByNewerRequestIsUntouched(t *testing.T) {
+// A stale rule-0 verdict never overrides a row that moved on while the
+// sweeper was inside detach+verify: here the slow drafter commits its expired
+// reservation meanwhile, so the row is a live draft. (A newer request cannot
+// take the row instead: an outpoint is never claimed twice, §13 rev 3.)
+func TestRule0_RowThatMovedOnIsUntouched(t *testing.T) {
 	e := newEnv(t)
 	who := requester(t)
 	req, rows := e.claim(t, who, 1)
 	op := rows[0].Outpoint
 	e.c.add((reservingTTL + 1) * time.Second)
-	// While the sweeper is inside detach+verify for the expired row, the
-	// late drafter releases it and a newer request re-claims it.
 	e.src.onDetach = func(string) {
-		n, err := e.st.ReleaseReserving(e.ctx, req, false)
+		n, err := e.st.Commit(e.ctx, req, []store.CommitPair{{Outpoint: op, FeeScript: "00", KeyID: "k", FeeAmount: "20"}}, draftTTL)
 		require.NoError(t, err)
 		require.EqualValues(t, 1, n)
 		ok, err := e.st.Claim(e.ctx, store.Candidate{Outpoint: op, Satoshis: 1000, FuelScript: "00", FuelBeef: "00",
 			DerivationPrefix: "p", DerivationSuffix: "s"}, "req-newer", who, assetID, 0, reservingTTL)
 		require.NoError(t, err)
-		require.True(t, ok)
+		require.False(t, ok, "an outpoint is never claimed twice")
 	}
 	e.tick(t)
-	r := e.rows(t, "req-newer")
-	require.Len(t, r, 1)
-	require.Equal(t, store.StatusReserving, r[0].Status, "the stale rule-0 verdict must not release the newer claim")
+	r := e.row(t, req, op)
+	require.Equal(t, store.StatusReserved, r.Status, "the stale rule-0 verdict must not release the committed draft")
+	require.Empty(t, e.rows(t, "req-newer"))
 	require.Contains(t, e.logs.String(), "moved on meanwhile")
 }
 
@@ -476,15 +492,20 @@ func TestRule2_UnspentClearsRecheck(t *testing.T) {
 	req, fr := e.released(t, who)
 	e.chk.set(fr.Outpoint, true, nil)
 	e.tick(t)
+	require.Equal(t, 1, e.chk.calls[e.pool.Outpoint], "the canary vouched for the chain service first")
 	r := e.row(t, req, fr.Outpoint)
 	require.Equal(t, store.StatusReleased, r.Status)
 	require.False(t, r.NeedsRecheck)
 	require.False(t, e.denied(t, who))
 	cands, err := e.st.ReleasedCandidates(e.ctx, 10)
 	require.NoError(t, err)
-	require.Len(t, cands, 1, "claimable again")
+	require.Len(t, cands, 1, "cleared: released, needs_recheck=0 (never re-drafted; its last holder may still submit late)")
 }
 
+// A "spent" reading is acted on only after a second one at least 10 min
+// after the first: the first reading only touches the row (back of the
+// queue) and is remembered; a second reading inside the gap does nothing;
+// the one at the gap moves the row to spent_external and denies.
 func TestRule2_SpentMarksSpentExternalAndDenies(t *testing.T) {
 	e := newEnv(t)
 	who, bystander := requester(t), requester(t)
@@ -492,14 +513,96 @@ func TestRule2_SpentMarksSpentExternalAndDenies(t *testing.T) {
 	_, other := e.released(t, bystander)
 	e.chk.set(fr.Outpoint, false, nil)
 	e.chk.set(other.Outpoint, true, nil)
-	e.tick(t)
+	before := e.row(t, req, fr.Outpoint)
+
+	e.c.add(time.Minute)
+	e.tick(t) // first reading: no-op
 	r := e.row(t, req, fr.Outpoint)
+	require.Equal(t, e.c.now().Unix(), r.UpdatedAt, "moved to the back of the recheck queue")
+	r.UpdatedAt = before.UpdatedAt
+	require.Equal(t, before, r, "otherwise unchanged: still released, needs_recheck=1")
+	require.False(t, e.denied(t, who))
+	require.NotContains(t, e.logs.String(), `"alert":"spent_external"`)
+	require.Contains(t, e.logs.String(), "first reading recorded")
+	require.Contains(t, e.sw.firstSpent, fr.Outpoint)
+
+	e.c.add(Rule2ConfirmGap - time.Second)
+	e.tick(t) // second reading inside the gap: still nothing
+	require.Equal(t, store.StatusReleased, e.row(t, req, fr.Outpoint).Status)
+	require.False(t, e.denied(t, who))
+	require.NotContains(t, e.logs.String(), `"alert":"spent_external"`)
+
+	e.c.add(time.Second)
+	e.tick(t) // reading at the gap: acted on
+	r = e.row(t, req, fr.Outpoint)
 	require.Equal(t, store.StatusSpentExternal, r.Status)
 	require.False(t, r.NeedsRecheck)
 	require.Empty(t, r.Txid, "a draft released unconsumed: only such rows deny")
 	require.True(t, e.denied(t, who))
 	require.False(t, e.denied(t, bystander))
 	require.Contains(t, e.logs.String(), `"alert":"spent_external"`)
+	require.NotContains(t, e.sw.firstSpent, fr.Outpoint, "the reading is consumed by the verdict")
+}
+
+// An unspent reading clears the remembered "spent" reading, so a later spent
+// reading of the same outpoint starts the gap over. Here the row returns to
+// the recheck queue through a late submit by its last holder and an
+// eviction, more than 10 min after the first spent reading.
+func TestRule2_UnspentReadingClearsTheSpentMemory(t *testing.T) {
+	e := newEnv(t)
+	who := requester(t)
+	req, fr := e.released(t, who)
+	op := fr.Outpoint
+	e.chk.set(op, false, nil)
+	e.tick(t) // first spent reading
+	require.Contains(t, e.sw.firstSpent, op)
+
+	e.chk.set(op, true, nil)
+	e.c.add(time.Minute)
+	e.tick(t) // unspent: row cleared, memory cleared
+	require.NotContains(t, e.sw.firstSpent, op)
+	require.False(t, e.row(t, req, op).NeedsRecheck)
+
+	txid := randTxid(t)
+	ref, err := e.st.Consume(e.ctx, txid, []store.ConsumeItem{{Outpoint: op, RequestID: req}})
+	require.NoError(t, err)
+	require.Nil(t, ref, "late submit by the last holder")
+	n, err := e.st.ReleaseEvicted(e.ctx, txid, []string{op})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+
+	e.chk.set(op, false, nil)
+	e.c.add(Rule2ConfirmGap)
+	e.tick(t) // ≥ 10 min after the very first spent reading, but it was cleared
+	r := e.row(t, req, op)
+	require.Equal(t, store.StatusReleased, r.Status, "a fresh first reading, not a verdict")
+	require.True(t, r.NeedsRecheck)
+	require.NotContains(t, e.logs.String(), `"alert":"spent_external"`)
+
+	e.c.add(Rule2ConfirmGap)
+	e.tick(t)
+	require.Equal(t, store.StatusSpentExternal, e.row(t, req, op).Status)
+	require.False(t, e.denied(t, who), "the row carries the evicted txid: alert, no deny")
+}
+
+// A remembered reading is forgotten once its row leaves the recheck queue.
+func TestRule2_SpentMemoryIsForgottenWhenTheRowLeavesTheQueue(t *testing.T) {
+	e := newEnv(t)
+	txid := randTxid(t)
+	req, rows := e.consumed(t, requester(t), txid, 1)
+	op := rows[0].Outpoint
+	_, err := e.st.ReleaseEvicted(e.ctx, txid, []string{op})
+	require.NoError(t, err)
+	e.chk.set(op, false, nil)
+	e.tick(t)
+	require.Contains(t, e.sw.firstSpent, op)
+
+	ok, err := e.st.MarkSettled(e.ctx, op, txid) // /settle repairs the row
+	require.NoError(t, err)
+	require.True(t, ok)
+	e.tick(t)
+	require.NotContains(t, e.sw.firstSpent, op)
+	require.Equal(t, store.StatusConsumed, e.row(t, req, op).Status)
 }
 
 func TestRule2_CheckerErrorLeavesRowAndNeverDenies(t *testing.T) {
@@ -573,7 +676,11 @@ func TestRule2_SpentRowWithTxidAlertsWithoutDeny(t *testing.T) {
 
 	e.chk.set(rowsE[0].Outpoint, false, nil)
 	e.chk.set(rows4[0].Outpoint, false, nil)
-	e.tick(t)
+	e.tick(t) // first spent readings
+	require.Equal(t, store.StatusReleased, e.row(t, reqE, rowsE[0].Outpoint).Status)
+	require.Equal(t, store.StatusReleased, e.row(t, req4, rows4[0].Outpoint).Status)
+	e.c.add(Rule2ConfirmGap)
+	e.tick(t) // confirmed
 	for req, want := range map[string]struct{ op, txid string }{
 		reqE: {rowsE[0].Outpoint, evictedTxid},
 		req4: {rows4[0].Outpoint, rule4Txid},
@@ -595,7 +702,7 @@ func TestRule2_SpentRowWithTxidAlertsWithoutDeny(t *testing.T) {
 
 func TestRule2_NilCheckerIsDisabled(t *testing.T) {
 	e := newEnv(t)
-	sw := New(e.st, e.src, nil, nil, e.c.now, nil, reservingTTL)
+	sw := New(e.st, e.src, nil, nil, e.c.now, nil, WithPoolWatch(poolBasket, 0, 60, 1000))
 	who := requester(t)
 	req, fr := e.released(t, who)
 	require.NoError(t, sw.Tick(e.ctx))
@@ -615,15 +722,21 @@ func TestRule2_CASMissDoesNotDeny(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 1, n)
 	require.True(t, e.row(t, req, op).NeedsRecheck)
+	e.chk.set(op, false, nil)
+	e.tick(t) // first spent reading
+	e.c.add(Rule2ConfirmGap)
 
-	// /settle repairs the row while the chain check is in flight; the chain
-	// then (correctly) reports the fuel spent — by the settled tx itself.
-	e.chk.onCheck = func(string) {
+	// /settle repairs the row while the confirming chain check is in flight;
+	// the chain then (correctly) reports the fuel spent — by the settled tx
+	// itself.
+	e.chk.onCheck = func(o string) {
+		if o != op {
+			return // the canary
+		}
 		ok, err := e.st.MarkSettled(e.ctx, op, txid)
 		require.NoError(t, err)
 		require.True(t, ok)
 	}
-	e.chk.set(op, false, nil)
 	e.tick(t)
 
 	r := e.row(t, req, op)
@@ -632,6 +745,110 @@ func TestRule2_CASMissDoesNotDeny(t *testing.T) {
 	require.False(t, e.denied(t, who), "a stale spent verdict must not deny")
 	require.NotContains(t, e.logs.String(), `"alert":"spent_external"`)
 	require.Contains(t, e.logs.String(), "verdict discarded")
+}
+
+// ---------------------------------------------------------------------------
+// rule 2 canary
+
+// No proven pool row to vet the chain service with: rule 2 is skipped for the
+// tick without touching (or even checking) any row.
+func TestRule2_CanarySkipsWhenThePoolIsEmpty(t *testing.T) {
+	e := newEnv(t)
+	req, fr := e.released(t, requester(t))
+	e.chk.set(fr.Outpoint, false, nil)
+	before := e.row(t, req, fr.Outpoint)
+	e.fake.HideBasket()
+	e.c.add(time.Minute)
+	e.tick(t)
+	require.Equal(t, before, e.row(t, req, fr.Outpoint), "not even touched")
+	require.Zero(t, e.chk.calls[fr.Outpoint])
+	require.Contains(t, e.logs.String(), "no proven pool row to vet the chain service")
+	require.NotContains(t, e.logs.String(), AlertChainCheckUntrusted, "an empty pool is not the chain service's fault")
+
+	e.fake.ShowBasket()
+	e.tick(t)
+	require.Equal(t, 1, e.chk.calls[fr.Outpoint], "the next tick with a pool row checks it")
+}
+
+// The chain service fails on the canary, or calls a pool row the wallet
+// lists as spendable spent (e.g. WhatsOnChain "script not found" on the wrong
+// network): alert chain_check_untrusted and skip rule 2 for the tick.
+func TestRule2_CanaryUntrustedSkipsWithAlert(t *testing.T) {
+	for name, res := range map[string]checkResult{
+		"error": {err: errors.New("woc: 500")},
+		"spent": {unspent: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			who := requester(t)
+			req, fr := e.released(t, who)
+			e.chk.set(fr.Outpoint, false, nil)
+			e.chk.set(e.pool.Outpoint, res.unspent, res.err)
+			before := e.row(t, req, fr.Outpoint)
+			for range 3 {
+				e.c.add(Rule2ConfirmGap)
+				e.tick(t)
+			}
+			require.Equal(t, before, e.row(t, req, fr.Outpoint), "no verdict, not even a touch")
+			require.Zero(t, e.chk.calls[fr.Outpoint], "no row is checked on an untrusted tick")
+			require.Empty(t, e.sw.firstSpent)
+			require.False(t, e.denied(t, who))
+			require.Equal(t, 3, strings.Count(e.logs.String(), `"alert":"`+AlertChainCheckUntrusted+`"`))
+
+			// Trust restored: the row is checked again (first reading).
+			e.chk.set(e.pool.Outpoint, true, nil)
+			e.tick(t)
+			require.Equal(t, 1, e.chk.calls[fr.Outpoint])
+			require.Contains(t, e.sw.firstSpent, fr.Outpoint)
+		})
+	}
+}
+
+// A "spent" canary that the wallet itself spent between the listing and the
+// check is consistent, not untrusted: rule 2 is skipped without an alert.
+func TestRule2_CanarySpentByTheWalletMeanwhileIsNoAlert(t *testing.T) {
+	e := newEnv(t)
+	_, fr := e.released(t, requester(t))
+	e.chk.set(fr.Outpoint, true, nil)
+	e.chk.set(e.pool.Outpoint, false, nil)
+	e.chk.onCheck = func(o string) {
+		if o == e.pool.Outpoint {
+			e.fake.SpendExternally(o)
+		}
+	}
+	e.tick(t)
+	require.Zero(t, e.chk.calls[fr.Outpoint])
+	require.NotContains(t, e.logs.String(), AlertChainCheckUntrusted)
+	require.Contains(t, e.logs.String(), "spent by the wallet meanwhile")
+}
+
+// A disabled checker skips rule 2 quietly: no alert, no touch.
+func TestRule2_DisabledCheckerSkipsQuietly(t *testing.T) {
+	e := newEnv(t)
+	sw := New(e.st, e.src, chain.Disabled{}, nil, e.c.now, e.logger(), WithPoolWatch(poolBasket, 0, 60, 1000))
+	req, fr := e.released(t, requester(t))
+	before := e.row(t, req, fr.Outpoint)
+	e.c.add(time.Minute)
+	require.NoError(t, sw.Tick(e.ctx))
+	require.Equal(t, before, e.row(t, req, fr.Outpoint))
+	require.NotContains(t, e.logs.String(), AlertChainCheckUntrusted)
+}
+
+// Without a pool basket rule 2 cannot vet the chain service and never acts.
+func TestRule2_NoPoolWatchNeverActs(t *testing.T) {
+	e := newEnv(t)
+	sw := New(e.st, e.src, e.chk, nil, e.c.now, e.logger())
+	require.Contains(t, e.logs.String(), "rule 2 cannot vet the chain service")
+	req, fr := e.released(t, requester(t))
+	e.chk.set(fr.Outpoint, false, nil)
+	for range 3 {
+		e.c.add(Rule2ConfirmGap)
+		require.NoError(t, sw.Tick(e.ctx))
+	}
+	r := e.row(t, req, fr.Outpoint)
+	require.Equal(t, store.StatusReleased, r.Status)
+	require.True(t, r.NeedsRecheck)
+	require.Zero(t, e.chk.calls[fr.Outpoint])
 }
 
 // ---------------------------------------------------------------------------
@@ -856,6 +1073,128 @@ func TestRule4_ObservationsAreForgottenWhenTheTxLeavesScope(t *testing.T) {
 	require.True(t, ok)
 	e.tick(t)
 	require.NotContains(t, e.sw.firstUnspent, txid)
+}
+
+// ---------------------------------------------------------------------------
+// §4.8 pool watch
+
+// watched rebuilds the sweeper with a pool target of 10 (low water 6 at
+// 60 %) and D=1000, so the balance floor is 20·1000·10 = 200000.
+func (e *env) watched() {
+	e.sw = New(e.st, e.src, e.chk, e.ov, e.c.now, e.logger(), WithPoolWatch(poolBasket, 10, 60, 1000))
+}
+
+func (e *env) alerts(name string) int { return strings.Count(e.logs.String(), `"alert":"`+name+`"`) }
+
+func TestPoolWatch_LowWater(t *testing.T) {
+	e := newEnv(t)
+	e.watched()
+	e.fake.Balance = 1_000_000
+	e.tick(t) // 1 proven row < 6
+	require.Equal(t, 1, e.alerts(AlertLowWater))
+	require.Contains(t, e.logs.String(), `"available":1`)
+	require.Contains(t, e.logs.String(), `"lowWater":6`)
+
+	for range 5 {
+		e.fake.AddFuel(t, 1000)
+	}
+	e.tick(t) // 6 rows: at the mark, not below it
+	require.Equal(t, 1, e.alerts(AlertLowWater))
+	require.Zero(t, e.alerts(AlertIssuerBalanceLow))
+}
+
+func TestPoolWatch_IssuerBalanceLow(t *testing.T) {
+	e := newEnv(t)
+	e.watched()
+	for range 9 {
+		e.fake.AddFuel(t, 1000) // 10 rows: no low-water noise
+	}
+	e.fake.Balance = 199_999
+	e.tick(t)
+	require.Equal(t, 1, e.alerts(AlertIssuerBalanceLow))
+	require.Contains(t, e.logs.String(), `"floor":200000`)
+
+	e.fake.Balance = 200_000
+	e.tick(t)
+	require.Equal(t, 1, e.alerts(AlertIssuerBalanceLow), "at the floor is not below it")
+	require.Zero(t, e.alerts(AlertLowWater))
+}
+
+// The pool may shrink by as many rows as the keeper claimed since the last
+// tick (every claim detaches its row at claim time); any drop beyond that
+// left the pool some other way.
+func TestPoolWatch_PoolDrainUnexplained(t *testing.T) {
+	e := newEnv(t)
+	e.watched()
+	e.fake.Balance = 1_000_000
+	var pool []fuel.Row
+	for range 9 {
+		pool = append(pool, e.fake.AddFuel(t, 1000))
+	}
+	e.tick(t) // first snapshot: nothing to compare with
+	require.Zero(t, e.alerts(AlertPoolDrainUnexplained))
+
+	// Two pool rows claimed and detached, as the drafter does: explained.
+	for i, r := range pool[:2] {
+		ok, err := e.st.Claim(e.ctx, store.Candidate{Outpoint: r.Outpoint, Satoshis: r.Satoshis, FuelScript: hex.EncodeToString(r.LockingScript),
+			FuelBeef: hex.EncodeToString(r.Beef), DerivationPrefix: r.DerivationPrefix, DerivationSuffix: r.DerivationSuffix},
+			"req-watch", requester(t), assetID, i, reservingTTL)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.NoError(t, e.fake.Detach(e.ctx, r.Outpoint))
+	}
+	e.tick(t)
+	require.Zero(t, e.alerts(AlertPoolDrainUnexplained), "a drop of 2 with 2 claims is explained")
+
+	// One more claimed, but three gone: two left the pool unexplained.
+	ok, err := e.st.Claim(e.ctx, store.Candidate{Outpoint: pool[2].Outpoint, Satoshis: 1000, FuelScript: "00", FuelBeef: "00",
+		DerivationPrefix: "p", DerivationSuffix: "s"}, "req-watch-2", requester(t), assetID, 0, reservingTTL)
+	require.NoError(t, err)
+	require.True(t, ok)
+	for _, r := range pool[2:5] {
+		require.NoError(t, e.fake.Detach(e.ctx, r.Outpoint))
+	}
+	e.tick(t)
+	require.Equal(t, 1, e.alerts(AlertPoolDrainUnexplained))
+	require.Contains(t, e.logs.String(), `"drop":3`)
+	require.Contains(t, e.logs.String(), `"claimed":1`)
+
+	// The whole basket vanishes from the listing.
+	e.fake.HideBasket()
+	e.tick(t)
+	require.Equal(t, 2, e.alerts(AlertPoolDrainUnexplained))
+	e.tick(t)
+	require.Equal(t, 2, e.alerts(AlertPoolDrainUnexplained), "an empty pool that stays empty is not a new drain")
+	require.Positive(t, e.alerts(AlertLowWater))
+}
+
+// A failed read skips only the alerts that need it and is reported; the
+// drain check then compares against the last good snapshot.
+func TestPoolWatch_FailedReadsSkipOnlyTheirAlerts(t *testing.T) {
+	e := newEnv(t)
+	e.watched()
+	for range 9 {
+		e.fake.AddFuel(t, 1000)
+	}
+	e.tick(t) // snapshot: 10 available
+
+	e.fake.FailNextList(errors.New("wallet down")) // the pool watch's listing (rule 2 has nothing pending)
+	err := e.sw.Tick(e.ctx)
+	require.ErrorContains(t, err, "sweeper poolwatch:")
+	require.ErrorContains(t, err, "wallet down")
+	require.Equal(t, 2, e.alerts(AlertIssuerBalanceLow), "the balance alert still ran (balance 0)")
+	require.Zero(t, e.alerts(AlertLowWater), "no listing, no low-water verdict")
+
+	e.fake.HideBasket()
+	e.tick(t)
+	require.Equal(t, 1, e.alerts(AlertPoolDrainUnexplained), "compared with the last good snapshot")
+}
+
+func TestBalanceFloorSaturates(t *testing.T) {
+	require.Equal(t, uint64(400_000), balanceFloor(200, 100))
+	require.Zero(t, balanceFloor(0, 100))
+	require.Zero(t, balanceFloor(200, 0))
+	require.Equal(t, uint64(math.MaxUint64), balanceFloor(math.MaxUint64/10, 1))
 }
 
 // ---------------------------------------------------------------------------

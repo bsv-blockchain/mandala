@@ -34,7 +34,7 @@ func TestFakeUnlockerSignsItsOwnFuel(t *testing.T) {
 	issuerPriv, _ := ec.NewPrivateKey()
 	f := NewFake(issuerPriv)
 	row := f.AddFuel(t, 200)
-	rows, err := f.ListProven(context.Background(), "fuel", 10)
+	rows, err := f.ListProven(context.Background(), "fuel", 10, 0)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	require.Equal(t, row.Outpoint, rows[0].Outpoint)

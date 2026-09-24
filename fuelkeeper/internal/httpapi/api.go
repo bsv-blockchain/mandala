@@ -3,17 +3,18 @@
 // fuel pairs, apply the reservation state machine at submit time, settle a
 // broadcast tx, watch pool health and manage the deny list.
 //
-// Every route except GET /health requires the shared secret X-Fuel-Key,
-// compared to Deps.APIKey with crypto/subtle.ConstantTimeCompare so a wrong
-// guess costs no more time than a right one. A missing or wrong key is
-// answered 401 ERR_UNAUTHORIZED before the body is even read.
+// Every route except GET /health and GET /livez requires the shared secret
+// header X-Fuel-Key, compared to Deps.APIKey with
+// crypto/subtle.ConstantTimeCompare so a wrong guess costs no more time than a
+// right one. A missing or wrong key is answered 401 ERR_UNAUTHORIZED before
+// the body is even read.
 //
 // This package owns no business logic: /draft delegates to a Drafter
 // (internal/draft), /consume and /release to the reservation Store
-// (internal/store), /settle to a Settler the caller supplies (Task 8's
-// internal/settle, kept out of this package's import graph behind a small
-// interface so the two can be implemented independently), and /health reads
-// Store.Counts plus the fuel Source. Every handler's job is shape validation,
+// (internal/store), /settle to a Settler the caller supplies (internal/settle
+// behind a small interface; only its ErrInvalid sentinel is imported), and
+// /health reads Store.Counts plus the fuel Source, cached for healthCacheTTL.
+// /livez does no I/O at all. Every handler's job is shape validation,
 // status-code mapping and JSON framing only.
 package httpapi
 
@@ -22,14 +23,20 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/sirdeggen/mandala/fuelkeeper/internal/config"
 	"github.com/sirdeggen/mandala/fuelkeeper/internal/draft"
 	"github.com/sirdeggen/mandala/fuelkeeper/internal/fuel"
+	"github.com/sirdeggen/mandala/fuelkeeper/internal/settle"
 	"github.com/sirdeggen/mandala/fuelkeeper/internal/store"
 )
 
@@ -38,6 +45,31 @@ const maxBodyBytes = 1 << 20
 
 // requestTimeout bounds every request end to end.
 const requestTimeout = 15 * time.Second
+
+// healthCacheTTL is how long /health reuses a pool listing and the store
+// counts: a probe every second costs one wallet listing per 10 s.
+const healthCacheTTL = 10 * time.Second
+
+// healthListLimit is the pool listing size /health counts.
+const healthListLimit = 10000
+
+// alertSettleInvalid is logged (attribute alert=settle_invalid) when /settle
+// is refused as permanently invalid.
+const alertSettleInvalid = "settle_invalid"
+
+// txidRe is the only txid form the keeper stores and matches on (the overlay
+// sends lowercase hex).
+var txidRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// validTxid reports whether s is 64 lowercase hex characters.
+func validTxid(s string) bool { return txidRe.MatchString(s) }
+
+// validOutpoint reports whether s is the canonical "<64 lowercase hex>.<vout>"
+// form the keeper stores (a vout that fits uint32, no sign or leading zero).
+func validOutpoint(s string) bool {
+	op, err := transaction.OutpointFromString(s)
+	return err == nil && op.String() == s
+}
 
 // timeoutBody is the body http.TimeoutHandler sends if a handler overruns
 // requestTimeout. It is written directly (TimeoutHandler does not run our
@@ -64,12 +96,27 @@ type Deps struct {
 	// Timeout overrides requestTimeout (15s) when > 0. Tests use this to force
 	// http.TimeoutHandler's timeout path without a real 15s wait.
 	Timeout time.Duration
+	// Now is the /health cache clock; nil means time.Now.
+	Now func() time.Time
 }
 
 // server holds the wired dependencies for the route handlers.
 type server struct {
 	deps Deps
 	log  *slog.Logger
+	now  func() time.Time
+
+	// /health cache: the pool listing and the store counts, each reused for
+	// healthCacheTTL after a successful read (a failed read is not cached,
+	// so the next probe retries). The lock is never held across I/O.
+	healthMu    sync.Mutex
+	listAt      time.Time
+	available   int
+	countsAt    time.Time
+	counts      map[store.Status]int
+	recheck     int
+	unsettled   int
+	deniedCount int
 }
 
 // New returns the overlay-facing HTTP handler (spec §3.1, §4.5, §4.6, §4.8).
@@ -87,7 +134,11 @@ func New(deps Deps) http.Handler {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	s := &server{deps: deps, log: log}
+	now := deps.Now
+	if now == nil {
+		now = time.Now
+	}
+	s := &server{deps: deps, log: log, now: now}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /draft", s.guard(s.handleDraft))
@@ -95,6 +146,7 @@ func New(deps Deps) http.Handler {
 	mux.HandleFunc("POST /release", s.guard(s.handleRelease))
 	mux.HandleFunc("POST /settle", s.guard(s.handleSettle))
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /livez", handleLivez)
 	mux.HandleFunc("DELETE /deny/{requester}", s.guard(s.handleDeny))
 
 	timeout := deps.Timeout
@@ -262,10 +314,18 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "ERR_SHAPE", false, "txid and a non-empty pairs array are required")
 		return
 	}
+	if !validTxid(req.Txid) {
+		writeErr(w, http.StatusBadRequest, "ERR_SHAPE", false, "txid must be 64 lowercase hex characters")
+		return
+	}
 	items := make([]store.ConsumeItem, len(req.Pairs))
 	for i, p := range req.Pairs {
 		if p.Outpoint == "" || p.RequestID == "" {
 			writeErr(w, http.StatusBadRequest, "ERR_SHAPE", false, "every pair needs outpoint and requestId")
+			return
+		}
+		if !validOutpoint(p.Outpoint) {
+			writeErr(w, http.StatusBadRequest, "ERR_SHAPE", false, "every outpoint must be <64 lowercase hex txid>.<vout>")
 			return
 		}
 		items[i] = store.ConsumeItem{Outpoint: p.Outpoint, RequestID: p.RequestID}
@@ -325,6 +385,16 @@ func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "ERR_SHAPE", false, "eviction release needs both txid and outpoints")
 			return
 		}
+		if !validTxid(req.Txid) {
+			writeErr(w, http.StatusBadRequest, "ERR_SHAPE", false, "txid must be 64 lowercase hex characters")
+			return
+		}
+		for _, op := range req.Outpoints {
+			if !validOutpoint(op) {
+				writeErr(w, http.StatusBadRequest, "ERR_SHAPE", false, "every outpoint must be <64 lowercase hex txid>.<vout>")
+				return
+			}
+		}
 		affected, err := s.deps.Store.ReleaseEvicted(r.Context(), req.Txid, req.Outpoints)
 		if err != nil {
 			s.log.Error("httpapi: release store error", "err", err, "txid", req.Txid)
@@ -356,12 +426,23 @@ func (s *server) handleSettle(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "ERR_SHAPE", false, "txid and atomicBeef are required")
 		return
 	}
+	if !validTxid(req.Txid) {
+		writeErr(w, http.StatusBadRequest, "ERR_SHAPE", false, "txid must be 64 lowercase hex characters")
+		return
+	}
 	beef, err := hex.DecodeString(req.AtomicBeef)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "ERR_SHAPE", false, "atomicBeef must be hex")
 		return
 	}
 	settled, err := s.deps.Settler.Settle(r.Context(), req.Txid, beef)
+	if errors.Is(err, settle.ErrInvalid) {
+		// Permanent: the same request can never settle. Nothing was
+		// credited; an operator has to look at the tx and its rows.
+		s.log.Error("httpapi: settle refused as invalid", "alert", alertSettleInvalid, "err", err, "txid", req.Txid)
+		writeErr(w, http.StatusBadRequest, "ERR_SETTLE_INVALID", false, err.Error())
+		return
+	}
 	if err != nil {
 		s.log.Error("httpapi: settle error", "err", err, "txid", req.Txid)
 		writeErr(w, http.StatusServiceUnavailable, "ERR_UNAVAILABLE", true, "settle temporarily unavailable")
@@ -371,7 +452,7 @@ func (s *server) handleSettle(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /health (spec §4.8) — no X-Fuel-Key required.
+// GET /health (spec §4.8) — no X-Fuel-Key required; cached (healthCacheTTL).
 
 type healthPool struct {
 	Available         int `json:"available"`
@@ -396,24 +477,24 @@ type healthResp struct {
 
 // handleHealth never fails the request over a wallet or listing error: it
 // degrades to null/zero fields and reports the failure in errors, so a
-// flaky wallet call cannot take the health probe itself down.
+// flaky wallet call cannot take the health probe itself down. The pool
+// listing and the store counts come from a healthCacheTTL cache (see
+// poolAvailable, storeCounts); the balance is read on every call.
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var errs []string
 
-	counts, recheckPending, consumedUnsettled, denied, err := s.deps.Store.Counts(ctx)
+	counts, recheckPending, consumedUnsettled, denied, err := s.storeCounts(ctx)
 	if err != nil {
 		s.log.Error("httpapi: health store counts", "err", err)
 		errs = append(errs, "store counts: "+err.Error())
 		counts = map[store.Status]int{}
 	}
 
-	available := 0
-	if rows, err := s.deps.Source.ListProven(ctx, s.deps.Cfg.PoolBasket, 10000); err != nil {
+	available, err := s.poolAvailable(ctx)
+	if err != nil {
 		s.log.Error("httpapi: health list proven", "err", err)
 		errs = append(errs, "list proven fuel: "+err.Error())
-	} else {
-		available = len(rows)
 	}
 
 	var issuerBsvSats *uint64
@@ -443,6 +524,57 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Errors:        errs,
 	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+// fresh reports whether a cache entry read at at is still usable.
+func (s *server) fresh(at time.Time) bool {
+	return !at.IsZero() && s.now().Sub(at) < healthCacheTTL
+}
+
+// poolAvailable is the proven pool size (every proven row, any value),
+// cached for healthCacheTTL after a successful listing.
+func (s *server) poolAvailable(ctx context.Context) (int, error) {
+	s.healthMu.Lock()
+	if s.fresh(s.listAt) {
+		n := s.available
+		s.healthMu.Unlock()
+		return n, nil
+	}
+	s.healthMu.Unlock()
+	rows, err := s.deps.Source.ListProven(ctx, s.deps.Cfg.PoolBasket, healthListLimit, 0)
+	if err != nil {
+		return 0, err
+	}
+	s.healthMu.Lock()
+	s.available, s.listAt = len(rows), s.now()
+	s.healthMu.Unlock()
+	return len(rows), nil
+}
+
+// storeCounts is Store.Counts, cached for healthCacheTTL after a success.
+func (s *server) storeCounts(ctx context.Context) (map[store.Status]int, int, int, int, error) {
+	s.healthMu.Lock()
+	if s.fresh(s.countsAt) {
+		c, rc, un, dn := s.counts, s.recheck, s.unsettled, s.deniedCount
+		s.healthMu.Unlock()
+		return c, rc, un, dn, nil
+	}
+	s.healthMu.Unlock()
+	c, rc, un, dn, err := s.deps.Store.Counts(ctx)
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	s.healthMu.Lock()
+	s.counts, s.recheck, s.unsettled, s.deniedCount, s.countsAt = c, rc, un, dn, s.now()
+	s.healthMu.Unlock()
+	return c, rc, un, dn, nil
+}
+
+// ---------------------------------------------------------------------------
+// GET /livez — no X-Fuel-Key, no I/O: the process is up and serving HTTP.
+
+func handleLivez(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // ---------------------------------------------------------------------------

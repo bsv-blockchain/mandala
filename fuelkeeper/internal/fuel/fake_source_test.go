@@ -103,48 +103,62 @@ func TestFakeListProvenOrderMaxAndHooks(t *testing.T) {
 	require.Less(t, a.OutputID, b.OutputID)
 	require.Less(t, b.OutputID, c.OutputID)
 
-	rows, err := f.ListProven(ctx, "fuel", 10)
+	rows, err := f.ListProven(ctx, "fuel", 10, 0)
 	require.NoError(t, err)
 	require.Equal(t, []string{c.Outpoint, b.Outpoint, a.Outpoint}, outpoints(rows))
 
-	rows, err = f.ListProven(ctx, "fuel", 2)
+	rows, err = f.ListProven(ctx, "fuel", 2, 0)
 	require.NoError(t, err)
 	require.Equal(t, []string{c.Outpoint, b.Outpoint}, outpoints(rows))
 
-	rows, err = f.ListProven(ctx, "fuel", 0)
+	rows, err = f.ListProven(ctx, "fuel", 0, 0)
+	require.NoError(t, err)
+	require.Empty(t, rows)
+
+	// minSats drops smaller rows before the truncation: a max of 1 still
+	// reaches the one row worth enough, however many newer small rows exist.
+	rows, err = f.ListProven(ctx, "fuel", 10, 200)
+	require.NoError(t, err)
+	require.Equal(t, []string{c.Outpoint, b.Outpoint}, outpoints(rows))
+	rows, err = f.ListProven(ctx, "fuel", 1, 250)
+	require.NoError(t, err)
+	require.Equal(t, []string{c.Outpoint}, outpoints(rows))
+	rows, err = f.ListProven(ctx, "fuel", 10, 301)
 	require.NoError(t, err)
 	require.Empty(t, rows)
 
 	// Returned rows are copies.
-	rows, _ = f.ListProven(ctx, "fuel", 1)
+	rows, _ = f.ListProven(ctx, "fuel", 1, 0)
 	rows[0].Beef[0] ^= 0xff
 	require.Equal(t, c.Beef, f.Row(c.Outpoint).Beef)
 	require.Equal(t, Row{}, f.Row("nope"))
 
+	calls := f.ListProvenCalls()
 	boom := errors.New("boom")
 	f.FailNextList(boom)
-	_, err = f.ListProven(ctx, "fuel", 10)
+	_, err = f.ListProven(ctx, "fuel", 10, 0)
 	require.ErrorIs(t, err, boom)
-	rows, err = f.ListProven(ctx, "fuel", 10)
+	rows, err = f.ListProven(ctx, "fuel", 10, 0)
 	require.NoError(t, err)
 	require.Len(t, rows, 3)
+	require.Equal(t, calls+2, f.ListProvenCalls(), "every call is counted, failed ones included")
 
 	f.HideBasket()
-	rows, err = f.ListProven(ctx, "fuel", 10)
+	rows, err = f.ListProven(ctx, "fuel", 10, 0)
 	require.NoError(t, err)
 	require.Empty(t, rows)
 	f.ShowBasket()
-	rows, _ = f.ListProven(ctx, "fuel", 10)
+	rows, _ = f.ListProven(ctx, "fuel", 10, 0)
 	require.Len(t, rows, 3)
 
 	// Detach: one injected failure leaves the row in the basket.
 	f.FailNextDetach(boom)
 	require.ErrorIs(t, f.Detach(ctx, c.Outpoint), boom)
-	rows, _ = f.ListProven(ctx, "fuel", 10)
+	rows, _ = f.ListProven(ctx, "fuel", 10, 0)
 	require.Len(t, rows, 3)
 	require.NoError(t, f.Detach(ctx, c.Outpoint))
 	require.NoError(t, f.Detach(ctx, c.Outpoint), "detach is idempotent")
-	rows, _ = f.ListProven(ctx, "fuel", 10)
+	rows, _ = f.ListProven(ctx, "fuel", 10, 0)
 	require.Equal(t, []string{b.Outpoint, a.Outpoint}, outpoints(rows))
 	ok, err := f.StillSpendable(ctx, c.Outpoint)
 	require.NoError(t, err)
@@ -158,7 +172,7 @@ func TestFakeListProvenOrderMaxAndHooks(t *testing.T) {
 
 	// External spend drops the row from the listing.
 	f.SpendExternally(a.Outpoint)
-	rows, _ = f.ListProven(ctx, "fuel", 10)
+	rows, _ = f.ListProven(ctx, "fuel", 10, 0)
 	require.Empty(t, rows)
 
 	require.Error(t, f.Detach(ctx, "00"))

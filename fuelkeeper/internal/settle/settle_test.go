@@ -46,7 +46,7 @@ func newEnv(t *testing.T) *env {
 	priv, err := ec.NewPrivateKey()
 	require.NoError(t, err)
 	src := fuel.NewFake(priv)
-	return &env{ctx: context.Background(), st: st, src: src, c: c, s: New(st, src, c.now)}
+	return &env{ctx: context.Background(), st: st, src: src, c: c, s: New(st, src)}
 }
 
 func newRequester(t *testing.T) string {
@@ -327,7 +327,7 @@ func TestSettle_RefusesMismatchedInput(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			n, err := e.s.Settle(e.ctx, tc.txid, tc.beef)
-			require.Error(t, err)
+			require.ErrorIs(t, err, ErrInvalid, "a request that can never succeed is permanent")
 			require.Zero(t, n)
 		})
 	}
@@ -348,6 +348,7 @@ func TestSettle_RefusesTxWhoseFeeOutputDiffers(t *testing.T) {
 
 	n, err := e.s.Settle(e.ctx, txid, atomicOf(t, bad))
 	require.ErrorContains(t, err, "not the fee output")
+	require.ErrorIs(t, err, ErrInvalid)
 	require.Zero(t, n)
 	require.Empty(t, e.src.Internalized, "a mismatch internalizes nothing, not even the intact pair")
 	rows, _ := e.st.ByTxid(e.ctx, txid)
@@ -364,6 +365,7 @@ func TestSettle_RefusesTxWhoseFeeOutputDiffers(t *testing.T) {
 		store.ConsumeItem{Outpoint: q[1].fuel.Outpoint, RequestID: "req1"})
 	_, err = e2.s.Settle(e2.ctx, half.TxID().String(), atomicOf(t, half))
 	require.ErrorContains(t, err, "does not spend fuel")
+	require.ErrorIs(t, err, ErrInvalid)
 	require.Empty(t, e2.src.Internalized)
 }
 
@@ -377,6 +379,7 @@ func TestSettle_InternalizeErrorLeavesRowsUnsettled(t *testing.T) {
 
 	n, err := e.s.Settle(e.ctx, txid, atomicOf(t, tx))
 	require.ErrorContains(t, err, "storage down")
+	require.NotErrorIs(t, err, ErrInvalid, "a wallet failure is transient")
 	require.Zero(t, n)
 	rows, _ := e.st.ByTxid(e.ctx, txid)
 	require.Equal(t, store.StatusConsumed, rows[0].Status)
@@ -405,6 +408,7 @@ func TestSettle_PartialFailureSettlesTheRestOnRetry(t *testing.T) {
 
 	n, err := e.s.Settle(e.ctx, txid, atomic)
 	require.ErrorIs(t, err, boom)
+	require.NotErrorIs(t, err, ErrInvalid)
 	require.ErrorContains(t, err, p[1].fuel.Outpoint)
 	require.Equal(t, 1, n, "row 1 was internalized before row 2 failed")
 	require.Len(t, e.src.Internalized, 2)
@@ -433,4 +437,21 @@ func TestSettle_PartialFailureSettlesTheRestOnRetry(t *testing.T) {
 		require.Equal(t, atomic, args.Tx)
 	}
 	require.EqualValues(t, 1, e.src.Internalized[3].Outputs[0].OutputIndex, "row 2's fee output")
+}
+
+// A store failure is transient (503 upstream), never ErrInvalid, even for a
+// well-formed request.
+func TestSettle_StoreErrorIsNotInvalid(t *testing.T) {
+	e := newEnv(t)
+	p := e.draft(t, "req1", newRequester(t), 0, 1)
+	tx := buildTx(t, p)
+	txid := tx.TxID().String()
+	e.consume(t, txid, store.ConsumeItem{Outpoint: p[0].fuel.Outpoint, RequestID: "req1"})
+	require.NoError(t, e.st.Close())
+
+	n, err := e.s.Settle(e.ctx, txid, atomicOf(t, tx))
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrInvalid)
+	require.Zero(t, n)
+	require.Empty(t, e.src.Internalized)
 }

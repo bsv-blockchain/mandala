@@ -113,7 +113,7 @@ func run() int {
 
 	// Read-only in-process provider on the same DB: the toolbox HTTP client's
 	// FindOutputsAuth is a stub at v0.186.3. Never Migrate it (infra did).
-	svcCfg, chainCheck := servicesConfig(cfg, scfg.Services)
+	svcCfg, chainCheck, chainOff := servicesConfig(cfg, scfg.Services)
 	svc := services.New(logger, svcCfg)
 	reader, err := storage.NewGORMProvider(scfg.BSVNetwork, svc, append(infra.GORMProviderOptionsFromConfig(&scfg), storage.WithLogger(logger))...)
 	if err != nil {
@@ -143,10 +143,15 @@ func run() int {
 	defer func() { _ = st.Close() }()
 
 	var checker chain.Checker = chain.Disabled{}
-	if chainCheck {
+	switch {
+	case chainCheck:
 		checker = chain.NewServicesChecker(svc)
-	} else {
-		logger.Warn("chain check disabled: set FK_WOC_API_KEY (and keep wallet_services.whats_on_chain enabled) for sweeper rule 2")
+	case !chainCheckNetwork(cfg.Network):
+		// Even with FK_WOC_API_KEY set: every answer would be "spent".
+		logger.Error("chain check disabled on this network; sweeper rule 2 never acts: released rows awaiting a chain recheck stay pending (no spent_external, no deny)",
+			"network", cfg.Network, "reason", chainOff)
+	default:
+		logger.Warn("chain check disabled; sweeper rule 2 never acts: released rows awaiting a chain recheck stay pending", "reason", chainOff)
 	}
 
 	// (3) Pool keeper: validates its config eagerly.
@@ -160,10 +165,11 @@ func run() int {
 		return fail("request verifier", err)
 	}
 	drafter := draft.New(cfg, st, src, verifier, time.Now).WithLogger(logger)
-	settler := settle.New(st, src, time.Now)
+	settler := settle.New(st, src)
 	overlay := sweeper.NewHTTPOverlayClient(cfg.OverlayURL, cfg.OverlayAdminToken,
 		&http.Client{Timeout: overlayTimeout}, sweeper.WithFuelKey(cfg.APIKey))
-	sw := sweeper.New(st, src, checker, overlay, time.Now, logger, cfg.ReservingTTLSeconds)
+	sw := sweeper.New(st, src, checker, overlay, time.Now, logger,
+		sweeper.WithPoolWatch(cfg.PoolBasket, cfg.PoolTarget, cfg.LowWaterPercent, cfg.Denomination))
 
 	// (4) Mandala API.
 	api := &http.Server{

@@ -117,6 +117,44 @@ func (s *verifyFailSource) StillSpendable(ctx context.Context, op string) (bool,
 	return s.Fake.StillSpendable(ctx, op)
 }
 
+// badDerivationSource wraps the Fake so the listing reports a wrong
+// derivation suffix for one outpoint: the drafter's signature over that row
+// cannot unlock its script, which only the self-verification catches.
+type badDerivationSource struct {
+	*fuel.Fake
+	bad string
+}
+
+func (s *badDerivationSource) ListProven(ctx context.Context, basket string, max int, minSats uint64) ([]fuel.Row, error) {
+	rows, err := s.Fake.ListProven(ctx, basket, max, minSats)
+	for i := range rows {
+		if rows[i].Outpoint == s.bad {
+			rows[i].DerivationSuffix = "AAAAAAAAAAAAAAAAAAAAAA=="
+		}
+	}
+	return rows, err
+}
+
+// relistSource wraps the Fake so the listing also carries extra (first, as
+// the newest row), as if a detached row were back in the pool basket (a
+// detach that did not stick, or the planned relink task).
+type relistSource struct {
+	*fuel.Fake
+	extra fuel.Row
+}
+
+func (s *relistSource) ListProven(ctx context.Context, basket string, max int, minSats uint64) ([]fuel.Row, error) {
+	rows, err := s.Fake.ListProven(ctx, basket, max, minSats)
+	if err != nil {
+		return nil, err
+	}
+	rows = append([]fuel.Row{s.extra}, rows...)
+	if len(rows) > max {
+		rows = rows[:max]
+	}
+	return rows, nil
+}
+
 func newRequester(t *testing.T) (*sdk.ProtoWallet, string) {
 	t.Helper()
 	reqPriv, err := ec.NewPrivateKey()
@@ -321,7 +359,7 @@ func TestDraft_TooLargeAndNoFuel(t *testing.T) {
 
 func TestDraft_FunderRaceDropsAndReplaces(t *testing.T) {
 	h := newHarness(t, 3)
-	rows, _ := h.src.ListProven(context.Background(), "fuel", 10)
+	rows, _ := h.src.ListProven(context.Background(), "fuel", 10, 0)
 	h.src.SpendAfterDetach(rows[0].Outpoint) // the storage funder allocates it between detach and verify
 	res, ref, err := h.d.Draft(context.Background(), h.request(t, 1, 3, 1))
 	require.NoError(t, err)
@@ -335,23 +373,57 @@ func TestDraft_FunderRaceDropsAndReplaces(t *testing.T) {
 	require.Equal(t, store.StatusDropped, statuses[rows[0].Outpoint])
 }
 
-func TestDraft_RedraftsReleasedRowWithStoredBeef(t *testing.T) {
-	h := newHarness(t, 1)
-	res, ref, _ := h.d.Draft(context.Background(), h.request(t, 1, 3, 1))
+// A fuel output that reached `reserved` is never issued again (spec §13
+// rev 3): its earlier holder keeps a valid SINGLE|ANYONECANPAY signature and
+// could break a new holder's transaction with it. A released, rechecked-
+// unspent row is skipped by the next draft, and with no other row in the pool
+// the draft is refused — even when the released row shows up in the listing
+// again, because Claim loses on any outpoint the table already holds.
+func TestDraft_NeverReissuesAReleasedRow(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, 2)
+	res, ref, err := h.d.Draft(ctx, h.request(t, 1, 3, 1))
+	require.NoError(t, err)
 	require.Nil(t, ref)
-	_, _ = h.st.ReleaseRequest(context.Background(), res.RequestID)
-	ok, err := h.st.SetRechecked(context.Background(), res.Pairs[0].FuelOutpoint, true)
+	first := res.Pairs[0].FuelOutpoint
+	n, err := h.st.ReleaseRequest(ctx, res.RequestID)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+	ok, err := h.st.SetRechecked(ctx, first, true)
 	require.NoError(t, err)
 	require.True(t, ok)
-	h.src.HideBasket() // basket listing now returns nothing for the detached row
-	res2, ref, err := h.d.Draft(context.Background(), h.request(t, 1, 3, 2))
+
+	res2, ref, err := h.d.Draft(ctx, h.request(t, 1, 3, 2))
 	require.NoError(t, err)
 	require.Nil(t, ref)
-	require.Equal(t, res.Pairs[0].FuelOutpoint, res2.Pairs[0].FuelOutpoint)
-	require.Equal(t, res.FuelBeef, res2.FuelBeef)
-	// Same requester and same keyID (fee-<outpoint>) ⇒ the issuer-side fee key,
-	// and so the fee script, is identical across re-drafts of the outpoint.
-	require.Equal(t, res.Pairs[0].FeeScript, res2.Pairs[0].FeeScript)
+	require.NotEqual(t, first, res2.Pairs[0].FuelOutpoint, "a released row is never re-drafted")
+	st := h.statuses(t, res.RequestID)
+	require.Equal(t, map[string]store.Status{first: store.StatusReleased}, st, "the released row stays with its last holder")
+
+	// Only the released row in the pool, listed again: refused.
+	h1 := newHarness(t, 1)
+	res, ref, err = h1.d.Draft(ctx, h1.request(t, 1, 3, 1))
+	require.NoError(t, err)
+	require.Nil(t, ref)
+	only := res.Pairs[0].FuelOutpoint
+	_, err = h1.st.ReleaseRequest(ctx, res.RequestID)
+	require.NoError(t, err)
+	ok, err = h1.st.SetRechecked(ctx, only, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	h1.useSource(&relistSource{Fake: h1.src, extra: h1.src.Row(only)})
+
+	res2, ref, err = h1.d.Draft(ctx, h1.request(t, 1, 3, 2))
+	require.NoError(t, err)
+	require.Nil(t, res2)
+	require.Equal(t, CodeUnavailable, ref.Code)
+	wire(t, ref)
+	require.Empty(t, h1.statuses(t, hex.EncodeToString(append(make([]byte, 31), 2))), "the refused draft holds nothing")
+	rows, err := h1.st.ByRequest(ctx, res.RequestID)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, store.StatusReleased, rows[0].Status)
+	require.False(t, rows[0].NeedsRecheck)
 }
 
 func TestDraft_NonceReuseIsAuth(t *testing.T) {
@@ -411,7 +483,7 @@ func TestDraft_SkipsUnusableAndLeavesUnverifiedToSweeper(t *testing.T) {
 	h := newHarness(t, 2)
 	ctx := context.Background()
 	small := h.src.AddFuel(t, h.cfg.Denomination-1) // highest id: listed first
-	rows, _ := h.src.ListProven(ctx, "fuel", 10)
+	rows, _ := h.src.ListProven(ctx, "fuel", 10, 0)
 	require.Equal(t, small.Outpoint, rows[0].Outpoint)
 	h.src.FailNextDetach(errors.New("storage blip")) // hits rows[1], the first claimed
 
@@ -431,28 +503,37 @@ func TestDraft_SkipsUnusableAndLeavesUnverifiedToSweeper(t *testing.T) {
 	require.Equal(t, store.StatusReserved, statuses[rows[2].Outpoint])
 }
 
+// The drafter lists only rows worth at least D (R4.1): newer under-
+// denominated rows, however many, cannot crowd the usable fuel out of the
+// k·4-row listing window.
+func TestDraft_SmallRowsDoNotCrowdOutFuel(t *testing.T) {
+	h := newHarness(t, 1) // the one usable row has the lowest id
+	ctx := context.Background()
+	good, _ := h.src.ListProven(ctx, "fuel", 1, 0)
+	for range 10 {
+		h.src.AddFuel(t, h.cfg.Denomination-1)
+	}
+	newest, _ := h.src.ListProven(ctx, "fuel", 4, 0)
+	require.NotContains(t, newest, good[0], "without the floor the window holds only small rows")
+
+	res, ref, err := h.d.Draft(ctx, h.request(t, 1, 3, 1)) // k=1: a 4-row window
+	require.NoError(t, err)
+	require.Nil(t, ref)
+	require.Equal(t, good[0].Outpoint, res.Pairs[0].FuelOutpoint)
+}
+
 // The drafter verifies its own signatures before handing a draft out. A row
-// whose stored derivation does not unlock its script is dropped (so it cannot
-// poison every later draft) and the request fails with an infrastructure error.
+// whose derivation does not unlock its script is dropped (so it can never be
+// claimed again and poison later drafts) and the request fails with an
+// infrastructure error.
 func TestDraft_SelfVerifyDropsMismatchedRow(t *testing.T) {
 	h := newHarness(t, 2)
 	ctx := context.Background()
-	rows, _ := h.src.ListProven(ctx, "fuel", 10)
-	bad := rows[1]
-	c := store.Candidate{Outpoint: bad.Outpoint, Satoshis: bad.Satoshis, FuelScript: hex.EncodeToString(bad.LockingScript),
-		FuelBeef: hex.EncodeToString(bad.Beef), DerivationPrefix: bad.DerivationPrefix, DerivationSuffix: "AAAAAAAAAAAAAAAAAAAAAA=="}
-	ok, err := h.st.Claim(ctx, c, "seed", h.reqHex, asset, 0, 60)
-	require.NoError(t, err)
-	require.True(t, ok)
-	_, err = h.st.Commit(ctx, "seed", []store.CommitPair{{Outpoint: bad.Outpoint, FeeScript: "00", KeyID: "k", FeeAmount: "1"}}, 600)
-	require.NoError(t, err)
-	_, err = h.st.ReleaseRequest(ctx, "seed")
-	require.NoError(t, err)
-	ok, err = h.st.SetRechecked(ctx, bad.Outpoint, true)
-	require.NoError(t, err)
-	require.True(t, ok)
+	rows, _ := h.src.ListProven(ctx, "fuel", 10, 0)
+	bad := rows[0] // highest id: listed and claimed first
+	h.useSource(&badDerivationSource{Fake: h.src, bad: bad.Outpoint})
 
-	res, ref, err := h.d.Draft(ctx, h.request(t, 1, 3, 1)) // released candidates go first
+	res, ref, err := h.d.Draft(ctx, h.request(t, 1, 3, 1))
 	require.Error(t, err)
 	require.Nil(t, ref)
 	require.Nil(t, res)
@@ -465,7 +546,7 @@ func TestDraft_SelfVerifyDropsMismatchedRow(t *testing.T) {
 	res, ref, err = h.d.Draft(ctx, h.request(t, 1, 3, 2))
 	require.NoError(t, err)
 	require.Nil(t, ref)
-	require.Equal(t, rows[0].Outpoint, res.Pairs[0].FuelOutpoint)
+	require.Equal(t, rows[1].Outpoint, res.Pairs[0].FuelOutpoint)
 }
 
 // A StillSpendable error is never an answer: the row is left reserving for
@@ -474,7 +555,7 @@ func TestDraft_SelfVerifyDropsMismatchedRow(t *testing.T) {
 func TestDraft_VerifyErrorLeavesRowReserving(t *testing.T) {
 	h := newHarness(t, 2)
 	ctx := context.Background()
-	rows, _ := h.src.ListProven(ctx, "fuel", 10)
+	rows, _ := h.src.ListProven(ctx, "fuel", 10, 0)
 	h.useSource(&verifyFailSource{Fake: h.src, fail: map[string]error{rows[0].Outpoint: errors.New("storage reader: 0 rows")}})
 
 	res, ref, err := h.d.Draft(ctx, h.request(t, 1, 3, 1)) // k=1
@@ -496,7 +577,7 @@ func TestDraft_VerifyErrorLeavesRowReserving(t *testing.T) {
 func TestDraft_ShortWithVerifyErrorLeavesEveryRowReserving(t *testing.T) {
 	h := newHarness(t, 2)
 	ctx := context.Background()
-	rows, _ := h.src.ListProven(ctx, "fuel", 10)
+	rows, _ := h.src.ListProven(ctx, "fuel", 10, 0)
 	h.useSource(&verifyFailSource{Fake: h.src, fail: map[string]error{rows[0].Outpoint: errors.New("storage reader: 0 rows")}})
 
 	res, ref, err := h.d.Draft(ctx, h.request(t, 8, 10, 1)) // k=2, one verifiable row
@@ -520,28 +601,17 @@ func TestDraft_ShortWithVerifyErrorLeavesEveryRowReserving(t *testing.T) {
 func TestDraft_DropFailureLeavesRequestToSweeper(t *testing.T) {
 	h := newHarness(t, 2)
 	ctx := context.Background()
-	rows, _ := h.src.ListProven(ctx, "fuel", 10)
-	bad := rows[1]
-	c := store.Candidate{Outpoint: bad.Outpoint, Satoshis: bad.Satoshis, FuelScript: hex.EncodeToString(bad.LockingScript),
-		FuelBeef: hex.EncodeToString(bad.Beef), DerivationPrefix: bad.DerivationPrefix, DerivationSuffix: "AAAAAAAAAAAAAAAAAAAAAA=="}
-	ok, err := h.st.Claim(ctx, c, "seed", h.reqHex, asset, 0, 60)
-	require.NoError(t, err)
-	require.True(t, ok)
-	_, err = h.st.Commit(ctx, "seed", []store.CommitPair{{Outpoint: bad.Outpoint, FeeScript: "00", KeyID: "k", FeeAmount: "1"}}, 600)
-	require.NoError(t, err)
-	_, err = h.st.ReleaseRequest(ctx, "seed")
-	require.NoError(t, err)
-	ok, err = h.st.SetRechecked(ctx, bad.Outpoint, true)
-	require.NoError(t, err)
-	require.True(t, ok)
+	rows, _ := h.src.ListProven(ctx, "fuel", 10, 0)
+	bad := rows[0]
+	h.useSource(&badDerivationSource{Fake: h.src, bad: bad.Outpoint})
 	h.injectDropFailure(t)
 
-	res, ref, err := h.d.Draft(ctx, h.request(t, 8, 10, 1)) // k=2: the bad released row + rows[0]
+	res, ref, err := h.d.Draft(ctx, h.request(t, 8, 10, 1)) // k=2: the bad row + rows[1]
 	require.Error(t, err)
 	require.Nil(t, ref)
 	require.Nil(t, res)
 	st := h.statuses(t, hex.EncodeToString(append(make([]byte, 31), 1)))
-	require.Equal(t, map[string]store.Status{bad.Outpoint: store.StatusReserving, rows[0].Outpoint: store.StatusReserving}, st,
+	require.Equal(t, map[string]store.Status{bad.Outpoint: store.StatusReserving, rows[1].Outpoint: store.StatusReserving}, st,
 		"the undroppable row and the verified survivor both stay reserving for rule 0")
 }
 

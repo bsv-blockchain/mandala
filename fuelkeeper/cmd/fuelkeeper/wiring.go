@@ -132,11 +132,15 @@ func connectWallet(ctx context.Context, cfg config.Config, priv *ec.PrivateKey, 
 // keeper: the throughput strategy must be on (FanOutFuel and pool funding
 // need it), and network, baskets, fan-out width and denomination must match
 // the keeper's, or every fan-out is rejected by the server and the pool
-// never fills.
+// never fills. Metrics must be off: the keeper's read-only provider would
+// register a second set of the same gauges in this process.
 func checkStorageConfig(cfg config.Config, scfg *infra.Config) error {
 	var errs []error
 	if scfg.BSVNetwork != cfg.Network {
 		errs = append(errs, fmt.Errorf("storage bsv_network %q != FK_NETWORK %q", scfg.BSVNetwork, cfg.Network))
+	}
+	if scfg.Observability.Metrics.Enabled {
+		errs = append(errs, errors.New("storage observability.metrics.enabled must be false: the keeper's in-process read-only provider would register duplicate metric gauges"))
 	}
 	um := scfg.UTXOManagement
 	if !um.Enabled() {
@@ -183,19 +187,34 @@ func storagePortMismatch(storageURL string, port uint) (string, bool) {
 	return u.Port(), true
 }
 
+// chainCheckNetwork reports whether sweeper rule 2 may use the WhatsOnChain
+// UTXO lookup on network. Only main and test have their own WhatsOnChain
+// index: go-wallet-toolbox v0.186.3 sends ttn/tstn lookups to the public
+// testnet endpoint, which has never seen their outputs and answers "script
+// not found", i.e. (false, nil) — indistinguishable from "spent".
+func chainCheckNetwork(n defs.BSVNetwork) bool {
+	return n == defs.NetworkMainnet || n == defs.NetworkTestnet
+}
+
 // servicesConfig derives the toolbox services config for the read-only
 // provider and the chain checker from the storage server's. Chaintracks is
 // off: neither needs headers, and a second embedded chaintracks would share
-// the server's storage path. The chain check needs FK_WOC_API_KEY and a
-// WhatsOnChain service the storage config enables (tstn has none).
-func servicesConfig(cfg config.Config, base defs.WalletServices) (svc defs.WalletServices, chainCheck bool) {
+// the server's storage path. The chain check needs a network with its own
+// WhatsOnChain index (chainCheckNetwork), FK_WOC_API_KEY and a WhatsOnChain
+// service the storage config enables; off reports why it is off ("" when on).
+func servicesConfig(cfg config.Config, base defs.WalletServices) (svc defs.WalletServices, chainCheck bool, off string) {
 	svc = base
 	svc.ChaintracksClient.Enabled = false
-	if cfg.WoCAPIKey == "" || !svc.WhatsOnChain.Enabled {
-		return svc, false
+	switch {
+	case !chainCheckNetwork(cfg.Network):
+		return svc, false, fmt.Sprintf("FK_NETWORK %q has no WhatsOnChain index of its own (lookups would hit public testnet and report every fuel output spent)", cfg.Network)
+	case cfg.WoCAPIKey == "":
+		return svc, false, "FK_WOC_API_KEY is not set"
+	case !svc.WhatsOnChain.Enabled:
+		return svc, false, "the storage config disables wallet_services.whats_on_chain"
 	}
 	svc.WhatsOnChain.APIKey = cfg.WoCAPIKey
-	return svc, true
+	return svc, true, ""
 }
 
 // outputLister is the one wallet call the self-check needs.
@@ -205,7 +224,7 @@ type outputLister interface {
 
 // provenLister is the one fuel.Source call the self-check needs.
 type provenLister interface {
-	ListProven(ctx context.Context, basket string, max int) ([]fuel.Row, error)
+	ListProven(ctx context.Context, basket string, max int, minSats uint64) ([]fuel.Row, error)
 }
 
 // errReaderBlind is the fatal self-check verdict.
@@ -233,7 +252,7 @@ func selfCheck(ctx context.Context, w outputLister, src provenLister, reader fue
 		logger.Info("self-check: pool basket is empty; the keeper will mint", "basket", basket)
 		return nil
 	}
-	rows, err := src.ListProven(ctx, basket, 1)
+	rows, err := src.ListProven(ctx, basket, 1, 0)
 	if err != nil {
 		logger.Warn("self-check: ListProven failed; skipped", "basket", basket, "err", err)
 		return nil

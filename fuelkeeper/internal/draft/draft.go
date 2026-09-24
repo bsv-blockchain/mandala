@@ -300,20 +300,22 @@ func (d *Drafter) Draft(ctx context.Context, req Request) (*Response, *Refusal, 
 }
 
 // reserve picks, claims, detaches and verifies up to k fuel outputs (§4.3
-// steps 4–7): released rows with needs_recheck=0 first (oldest first), then
-// the pool basket's proven rows (high-id end). It stops at k survivors or
-// after K_MAX·2 claims. unresolved reports that some claimed row is neither a
-// survivor nor dropped (its state could not be observed) and so must be left
-// to sweeper rule 0; with unresolved=false every reserving row of the
-// request is a survivor.
+// steps 4–7) from the pool basket's proven rows worth at least D (high-id
+// end). Released rows are never candidates (spec §13 rev 3): a row that
+// reached `reserved` left a valid fuel signature with its earlier holder, so
+// it is never issued again, and Claim refuses any outpoint the table already
+// holds. It stops at k survivors or after K_MAX·2 claims. unresolved reports
+// that some claimed row is neither a survivor nor dropped (its state could not
+// be observed) and so must be left to sweeper rule 0; with unresolved=false
+// every reserving row of the request is a survivor.
 func (d *Drafter) reserve(ctx context.Context, requestID, requester, assetID string, k int) (survivors []store.Candidate, unresolved bool, err error) {
 	tried := map[string]bool{}
 	claims, budget := 0, d.cfg.KMax*2
 	done := func() bool { return len(survivors) >= k || claims >= budget }
 
-	// take runs one candidate through claim → check → detach → verify. A
+	// take runs one candidate through check → claim → detach → verify. A
 	// returned error aborts the reservation.
-	take := func(c store.Candidate, fromStore bool) error {
+	take := func(c store.Candidate) error {
 		if tried[c.Outpoint] {
 			return nil
 		}
@@ -321,11 +323,10 @@ func (d *Drafter) reserve(ctx context.Context, requestID, requester, assetID str
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		checkErr := d.checkCandidate(c)
-		if checkErr != nil && !fromStore {
+		if err := d.checkCandidate(c); err != nil {
 			// Unusable basket row: leave it in the basket (the toolbox may
 			// still spend it as change) and never mark it in our table.
-			d.log.Warn("fuel draft: skipping unusable basket row", "outpoint", c.Outpoint, "reason", checkErr)
+			d.log.Warn("fuel draft: skipping unusable basket row", "outpoint", c.Outpoint, "reason", err)
 			return nil
 		}
 		ok, err := d.st.Claim(ctx, c, requestID, requester, assetID, len(survivors), d.cfg.ReservingTTLSeconds)
@@ -334,14 +335,9 @@ func (d *Drafter) reserve(ctx context.Context, requestID, requester, assetID str
 			return fmt.Errorf("draft: claim %s: %w", c.Outpoint, err)
 		}
 		if !ok {
-			return nil // another holder has it
+			return nil // another request holds it, or it was issued before
 		}
 		claims++
-		if checkErr != nil {
-			// A stored row with unusable data: drop it so it stops heading
-			// every released-candidates listing. It is already detached.
-			return d.dropClaimed(ctx, c.Outpoint, requestID, checkErr, &unresolved)
-		}
 		if err := d.src.Detach(ctx, c.Outpoint); err != nil {
 			unresolved = true
 			if ctx.Err() != nil {
@@ -366,23 +362,8 @@ func (d *Drafter) reserve(ctx context.Context, requestID, requester, assetID str
 		return nil
 	}
 
-	released, err := d.st.ReleasedCandidates(ctx, k*2)
-	if err != nil {
-		return survivors, unresolved, fmt.Errorf("draft: released candidates: %w", err)
-	}
-	for _, c := range released {
-		if done() {
-			return survivors, unresolved, nil
-		}
-		if err := take(c, true); err != nil {
-			return survivors, unresolved, err
-		}
-	}
-	if done() {
-		return survivors, unresolved, nil
-	}
 	want := k * 4
-	rows, err := d.src.ListProven(ctx, d.cfg.PoolBasket, want)
+	rows, err := d.src.ListProven(ctx, d.cfg.PoolBasket, want, d.cfg.Denomination)
 	if err != nil {
 		return survivors, unresolved, fmt.Errorf("draft: list fuel: %w", err)
 	}
@@ -398,7 +379,7 @@ func (d *Drafter) reserve(ctx context.Context, requestID, requester, assetID str
 		}
 		c := store.Candidate{Outpoint: r.Outpoint, Satoshis: r.Satoshis, FuelScript: hex.EncodeToString(r.LockingScript),
 			FuelBeef: hex.EncodeToString(r.Beef), DerivationPrefix: r.DerivationPrefix, DerivationSuffix: r.DerivationSuffix}
-		if err := take(c, false); err != nil {
+		if err := take(c); err != nil {
 			return survivors, unresolved, err
 		}
 	}

@@ -6,7 +6,10 @@
 // tx) and leaves already-settled rows as they are; an unknown txid is a
 // no-op. Nothing is internalized unless every row of the txid matches the
 // transaction: the subject txid, an input spending the row's fuel outpoint,
-// and the committed fee script at the paired output index.
+// and the committed fee script at the paired output index. A request that can
+// never succeed (malformed txid or BEEF, a BEEF that does not carry the txid,
+// a transaction that does not match its rows) fails with ErrInvalid; every
+// other failure is transient and worth a retry.
 package settle
 
 import (
@@ -15,9 +18,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
-	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
@@ -34,22 +37,29 @@ const Basket = "mandala-tokens"
 // txidRe is the only txid form stored rows carry (the overlay lowercases).
 var txidRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// ErrInvalid wraps every permanent settle failure: a txid that is not 64
+// lowercase hex, BEEF bytes that do not parse, a BEEF whose subject or
+// content is not the txid, a transaction that does not spend a row's fuel
+// outpoint, or a paired output that is not the committed fee script. The same
+// request can never succeed, so the API answers 400 and alerts instead of
+// inviting a retry.
+var ErrInvalid = errors.New("settle: invalid request")
+
+func invalid(format string, a ...any) error {
+	return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, a...))
+}
+
 // Settler runs §4.6. Safe for concurrent use: two settles of one txid both
-// internalize (the toolbox merges) and the row CAS converges.
+// internalize (the toolbox merges) and the row CAS converges. settled_at is
+// stamped by the store's own clock.
 type Settler struct {
 	st  *store.Store
 	src fuel.Source
-	// now is kept for the constructor contract; settled_at is stamped by
-	// the store's own clock.
-	now func() time.Time
 }
 
-// New returns a Settler. A nil now means time.Now.
-func New(st *store.Store, src fuel.Source, now func() time.Time) *Settler {
-	if now == nil {
-		now = time.Now
-	}
-	return &Settler{st: st, src: src, now: now}
+// New returns a Settler.
+func New(st *store.Store, src fuel.Source) *Settler {
+	return &Settler{st: st, src: src}
 }
 
 // customInstructions is the token output bookkeeping the issuer wallet needs
@@ -74,7 +84,7 @@ type plan struct {
 // BEEF (re-framed as AtomicBEEF for txid). An unknown txid returns (0, nil).
 func (s *Settler) Settle(ctx context.Context, txid string, beefBytes []byte) (int, error) {
 	if !txidRe.MatchString(txid) {
-		return 0, fmt.Errorf("settle: txid %q is not 64 lowercase hex", txid)
+		return 0, invalid("txid %q is not 64 lowercase hex", txid)
 	}
 	atomic, tx, err := atomicBeef(txid, beefBytes)
 	if err != nil {
@@ -96,7 +106,7 @@ func (s *Settler) Settle(ctx context.Context, txid string, beefBytes []byte) (in
 		}
 		vout, err := feeOutputIndex(tx, r)
 		if err != nil {
-			return 0, fmt.Errorf("settle %s: %w", txid, err)
+			return 0, fmt.Errorf("settle %s: %w", txid, err) // ErrInvalid for a mismatch
 		}
 		plans = append(plans, plan{row: r, vout: vout})
 	}
@@ -134,8 +144,10 @@ func (s *Settler) Settle(ctx context.Context, txid string, beefBytes []byte) (in
 			if _, err := s.st.MarkSettled(ctx, r.Outpoint, txid); err != nil {
 				return n, fmt.Errorf("settle %s: mark settled: %w", r.Outpoint, err)
 			}
-			// A CAS miss means the row was re-claimed (txid reset) since it
-			// was read; the fee is still real and is credited above.
+			// A row carrying this txid only ever moves between consumed,
+			// released and spent_external (no re-drafting, spec §13 rev 3),
+			// all of which MarkSettled matches, so a CAS miss is not
+			// expected; the fee is real and is credited above either way.
 		}
 		n++
 	}
@@ -148,7 +160,7 @@ func (s *Settler) Settle(ctx context.Context, txid string, beefBytes []byte) (in
 func atomicBeef(txid string, beefBytes []byte) ([]byte, *transaction.Transaction, error) {
 	h, err := chainhash.NewHashFromHex(txid)
 	if err != nil {
-		return nil, nil, fmt.Errorf("settle: txid: %w", err)
+		return nil, nil, invalid("txid: %v", err)
 	}
 	var (
 		b      *transaction.Beef
@@ -158,25 +170,25 @@ func atomicBeef(txid string, beefBytes []byte) ([]byte, *transaction.Transaction
 		var subject *chainhash.Hash
 		b, subject, err = transaction.NewBeefFromAtomicBytes(beefBytes)
 		if err != nil {
-			return nil, nil, fmt.Errorf("settle: atomic beef: %w", err)
+			return nil, nil, invalid("atomic beef: %v", err)
 		}
 		if !subject.IsEqual(h) {
-			return nil, nil, fmt.Errorf("settle: atomic beef subject %s is not %s", subject, txid)
+			return nil, nil, invalid("atomic beef subject %s is not %s", subject, txid)
 		}
 		atomic = beefBytes
 	} else {
 		b, err = transaction.NewBeefFromBytes(beefBytes)
 		if err != nil {
-			return nil, nil, fmt.Errorf("settle: beef: %w", err)
+			return nil, nil, invalid("beef: %v", err)
 		}
 		atomic, err = b.AtomicBytes(h)
 		if err != nil {
-			return nil, nil, fmt.Errorf("settle: atomic: %w", err)
+			return nil, nil, invalid("atomic: %v", err)
 		}
 	}
 	tx := b.FindTransactionByHash(h)
 	if tx == nil {
-		return nil, nil, fmt.Errorf("settle: beef does not carry transaction %s", txid)
+		return nil, nil, invalid("beef does not carry transaction %s", txid)
 	}
 	return atomic, tx, nil
 }
@@ -199,13 +211,13 @@ func feeOutputIndex(tx *transaction.Transaction, r store.Reservation) (uint32, e
 		}
 	}
 	if vin < 0 {
-		return 0, fmt.Errorf("transaction does not spend fuel %s", r.Outpoint)
+		return 0, invalid("transaction does not spend fuel %s", r.Outpoint)
 	}
 	if vin >= len(tx.Outputs) || tx.Outputs[vin].LockingScript == nil {
-		return 0, fmt.Errorf("fuel %s at input %d has no paired output", r.Outpoint, vin)
+		return 0, invalid("fuel %s at input %d has no paired output", r.Outpoint, vin)
 	}
 	if !bytes.Equal(*tx.Outputs[vin].LockingScript, fee) {
-		return 0, fmt.Errorf("output %d is not the fee output committed for %s", vin, r.Outpoint)
+		return 0, invalid("output %d is not the fee output committed for %s", vin, r.Outpoint)
 	}
 	return uint32(vin), nil
 }

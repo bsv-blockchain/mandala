@@ -141,7 +141,7 @@ func TestSelectProven(t *testing.T) {
 		rows = append(rows, tr)
 	}
 
-	out, skipped := selectProven(rows, inBasket, beef, self)
+	out, skipped := selectProven(rows, inBasket, beef, self, 0)
 	require.Equal(t, []string{selfSender.Outpoint, accepted.Outpoint}, outpoints(out))
 	require.Equal(t, 3, skipped, "txid-only, unproven and absent rows lack proof material")
 
@@ -156,7 +156,17 @@ func TestSelectProven(t *testing.T) {
 	require.NotNil(t, src.MerklePath)
 
 	// No BEEF at all: every otherwise-eligible row is skipped for proof.
-	out, skipped = selectProven(rows, inBasket, nil, self)
+	out, skipped = selectProven(rows, inBasket, nil, self, 0)
 	require.Empty(t, out)
 	require.Equal(t, 5, skipped)
+
+	// minSats: accepted (100 sat) is dropped, selfSender (110 sat) kept; a
+	// row under minSats is not counted as skipped for proof even when its
+	// proof is missing (txid-only 150, unproven 160, absent 170 are above).
+	out, skipped = selectProven(rows, inBasket, beef, self, 105)
+	require.Equal(t, []string{selfSender.Outpoint}, outpoints(out))
+	require.Equal(t, 3, skipped)
+	out, skipped = selectProven(rows, inBasket, beef, self, 155)
+	require.Empty(t, out)
+	require.Equal(t, 2, skipped, "only unproven (160) and absent (170) are worth enough to count")
 }

@@ -28,11 +28,12 @@ type Fake struct {
 	kd   *sdk.KeyDeriver
 	pw   *sdk.ProtoWallet
 
-	rows    map[string]*fakeRow
-	nextID  uint
-	hidden  bool
-	listErr error
-	detErr  error
+	rows      map[string]*fakeRow
+	nextID    uint
+	hidden    bool
+	listErr   error
+	detErr    error
+	listCalls int
 	// intFailIn counts down Internalize calls to the one that returns
 	// intFailErr (see FailNthInternalize); 0 means no pending failure.
 	intFailIn  int
@@ -182,11 +183,13 @@ func (f *Fake) ShowBasket() {
 // IdentityKeyHex is the fake wallet's identity public key.
 func (f *Fake) IdentityKeyHex() string { return f.kd.IdentityKeyHex() }
 
-// ListProven returns in-basket, spendable, unspent rows sorted OutputID desc.
-// The basket name is not modelled: every AddFuel row is in "the" basket.
-func (f *Fake) ListProven(_ context.Context, _ string, max int) ([]Row, error) {
+// ListProven returns in-basket, spendable, unspent rows of at least minSats
+// sorted OutputID desc. The basket name is not modelled: every AddFuel row is
+// in "the" basket. Every call is counted (ListProvenCalls).
+func (f *Fake) ListProven(_ context.Context, _ string, max int, minSats uint64) ([]Row, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.listCalls++
 	if err := f.listErr; err != nil {
 		f.listErr = nil
 		return nil, err
@@ -196,7 +199,7 @@ func (f *Fake) ListProven(_ context.Context, _ string, max int) ([]Row, error) {
 	}
 	var out []Row
 	for _, fr := range f.rows {
-		if fr.inBasket && fr.spendable && fr.spentBy == "" {
+		if fr.inBasket && fr.spendable && fr.spentBy == "" && fr.row.Satoshis >= minSats {
 			out = append(out, cloneRow(fr.row))
 		}
 	}
@@ -205,6 +208,14 @@ func (f *Fake) ListProven(_ context.Context, _ string, max int) ([]Row, error) {
 		out = out[:max]
 	}
 	return out, nil
+}
+
+// ListProvenCalls is the number of ListProven calls so far (failed ones
+// included).
+func (f *Fake) ListProvenCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listCalls
 }
 
 // Detach takes the row out of the basket; idempotent.

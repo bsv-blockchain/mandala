@@ -47,7 +47,11 @@ func TestSQLiteDSNApplied(t *testing.T) {
 	require.Equal(t, 5000, busy)
 }
 
-func TestReclaimResetsPreviousHolder(t *testing.T) {
+// A released row is never issued again (spec §13 rev 3, §4.5: no
+// `released → reserving`): its earlier holder still holds a valid fuel
+// signature. Claim loses on every known outpoint, whatever its state, and
+// leaves the row exactly as it was; the last holder's late submit still works.
+func TestClaimNeverReissuesAnIssuedRow(t *testing.T) {
 	for _, e := range openAll(t) {
 		t.Run(e.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -69,28 +73,54 @@ func TestReclaimResetsPreviousHolder(t *testing.T) {
 			ok, err = s.SetRechecked(ctx, "aa.0", true)
 			require.NoError(t, err)
 			require.True(t, ok)
+			before, _ := s.ByRequest(ctx, "req1")
+			require.Len(t, before, 1)
+			require.Equal(t, StatusReleased, before[0].Status)
+			require.False(t, before[0].NeedsRecheck)
 
 			e.c.t = e.c.t.Add(time.Hour)
 			c := cand("aa.0")
 			c.FuelBeef, c.DerivationPrefix = "ffff", "other"
 			ok, err = s.Claim(ctx, c, "req2", "02bb", "asset.1", 3, 60)
-			require.NoError(t, err)
+			require.NoError(t, err, "a lost claim is a refusal, never an error")
+			require.False(t, ok, "a released row with needs_recheck=0 is never re-drafted")
+			after, _ := s.ByRequest(ctx, "req1")
+			require.Equal(t, before, after, "the lost claim changed nothing (holder, txid, settled_at, updated_at)")
+			none, _ := s.ByRequest(ctx, "req2")
+			require.Empty(t, none)
+
+			// Every other state loses too: reserving (released by rule 0 with
+			// needs_recheck=0), dropped, spent_external.
+			for i, op := range []string{"bb.0", "bb.1", "bb.2"} {
+				ok, _ := s.Claim(ctx, cand(op), "req3", "02cc", "asset.0", i, 60)
+				require.True(t, ok)
+			}
+			require.NoError(t, s.Drop(ctx, "bb.1", "req3"))
+			ok, _ = s.ReleaseReservingOutpoint(ctx, "bb.0", "req3", false)
 			require.True(t, ok)
-			rows, _ := s.ByRequest(ctx, "req2")
+			_, err = s.Commit(ctx, "req3", []CommitPair{{Outpoint: "bb.2"}}, 600)
+			require.NoError(t, err)
+			n, _ = s.ReleaseRequest(ctx, "req3")
+			require.EqualValues(t, 1, n)
+			ok, _ = s.SetRechecked(ctx, "bb.2", false)
+			require.True(t, ok)
+			for _, op := range []string{"bb.0", "bb.1", "bb.2"} {
+				ok, err := s.Claim(ctx, cand(op), "req4", "02dd", "asset.0", 0, 60)
+				require.NoError(t, err)
+				require.False(t, ok, op)
+			}
+			none, _ = s.ByRequest(ctx, "req4")
+			require.Empty(t, none)
+
+			// The late-submit rule is unchanged: the last holder may still
+			// consume its released, rechecked row.
+			ref, err = s.Consume(ctx, "tx9", []ConsumeItem{{"aa.0", "req1"}})
+			require.NoError(t, err)
+			require.Nil(t, ref)
+			rows, _ := s.ByTxid(ctx, "tx9")
 			require.Len(t, rows, 1)
-			r := rows[0]
-			require.Equal(t, StatusReserving, r.Status)
-			require.Equal(t, "02bb", r.Requester)
-			require.Equal(t, "asset.1", r.AssetID)
-			require.Equal(t, 3, r.PairIndex)
-			require.Empty(t, r.Txid)
-			require.Empty(t, r.FeeScript+r.KeyID+r.FeeAmount)
-			require.Nil(t, r.SettledAt, "a stale settled_at would hide the next consume from the sweeper")
-			require.False(t, r.NeedsRecheck)
-			require.Equal(t, "0100beef", r.FuelBeef, "stored BEEF kept on the update path")
-			require.Equal(t, "p", r.DerivationPrefix)
-			require.Equal(t, e.c.t.Unix(), r.CreatedAt, "re-claim counts toward quotas")
-			require.Equal(t, e.c.t.Unix()+60, r.ExpiresAt)
+			require.Equal(t, StatusConsumed, rows[0].Status)
+			require.Nil(t, rows[0].SettledAt, "consume clears the old settled_at")
 		})
 	}
 }
@@ -325,24 +355,26 @@ func TestReleaseReservingOutpoint(t *testing.T) {
 			require.NoError(t, err)
 			require.False(t, ok, "second call misses: row is no longer reserving")
 
-			// ABA: the released row is re-claimed by a newer request; a stale
-			// rule-0 verdict for req1 must not release req2's reservation.
+			// No ABA: the released row cannot be re-claimed by a newer
+			// request (§13 rev 3), so a stale rule-0 verdict for req1 finds
+			// the row exactly as req1's release left it.
 			ok, err = s.Claim(ctx, cand("aa.0"), "req2", "02bb", "asset.0", 0, 60)
 			require.NoError(t, err)
-			require.True(t, ok)
+			require.False(t, ok, "a released row is never re-claimed")
 			ok, err = s.ReleaseReservingOutpoint(ctx, "aa.0", "req1", false)
 			require.NoError(t, err)
 			require.False(t, ok)
 			rows, _ = s.ByRequest(ctx, "req2")
-			require.Equal(t, StatusReserving, rows[0].Status)
+			require.Empty(t, rows)
 
 			ok, err = s.ReleaseReservingOutpoint(ctx, "aa.1", "req1", true)
 			require.NoError(t, err)
 			require.True(t, ok)
 			rows, _ = s.ByRequest(ctx, "req1")
-			require.Len(t, rows, 1)
-			require.Equal(t, "aa.1", rows[0].Outpoint)
-			require.True(t, rows[0].NeedsRecheck)
+			require.Len(t, rows, 2, "req1 still owns both rows: nothing was re-claimed")
+			require.Equal(t, "aa.1", rows[1].Outpoint)
+			require.Equal(t, StatusReleased, rows[1].Status)
+			require.True(t, rows[1].NeedsRecheck)
 		})
 	}
 }

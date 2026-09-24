@@ -35,8 +35,10 @@ type Row struct {
 type Source interface {
 	IdentityKeyHex() string
 	// ListProven returns at most max rows that are in basket, spendable,
-	// unspent and belong to a completed (proven) tx, sorted OutputID desc.
-	ListProven(ctx context.Context, basket string, max int) ([]Row, error)
+	// unspent, worth at least minSats and belong to a completed (proven) tx,
+	// sorted OutputID desc. Rows under minSats are dropped before the sort
+	// and the truncation, so they never crowd usable fuel out of a listing.
+	ListProven(ctx context.Context, basket string, max int, minSats uint64) ([]Row, error)
 	// Detach removes the output from every basket (RelinquishOutput with
 	// basket "") so the toolbox never selects it as change. It stays
 	// spendable; Detach is idempotent.

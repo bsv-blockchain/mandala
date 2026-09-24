@@ -6,11 +6,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,10 +24,21 @@ import (
 	"github.com/sirdeggen/mandala/fuelkeeper/internal/config"
 	"github.com/sirdeggen/mandala/fuelkeeper/internal/draft"
 	"github.com/sirdeggen/mandala/fuelkeeper/internal/fuel"
+	"github.com/sirdeggen/mandala/fuelkeeper/internal/settle"
 	"github.com/sirdeggen/mandala/fuelkeeper/internal/store"
 )
 
 const testAsset = "abababababababababababababababababababababababababababababababab.0"
+
+// Canonical txids and outpoints: the API refuses any other shape (ERR_SHAPE).
+var (
+	txid1 = strings.Repeat("a1", 32)
+	txid2 = strings.Repeat("a2", 32)
+	txid3 = strings.Repeat("a3", 32)
+	txid4 = strings.Repeat("a4", 32)
+)
+
+func outpoint(b string, vout int) string { return strings.Repeat(b, 32) + "." + strconv.Itoa(vout) }
 
 // ---------------------------------------------------------------------------
 // stubs
@@ -49,6 +64,7 @@ type stubSettler struct {
 	err      error
 	lastTxid string
 	lastBeef []byte
+	calls    int
 	sleep    time.Duration // > 0: Settle blocks this long before returning
 }
 
@@ -56,8 +72,27 @@ func (s *stubSettler) Settle(_ context.Context, txid string, beef []byte) (int, 
 	if s.sleep > 0 {
 		time.Sleep(s.sleep)
 	}
+	s.calls++
 	s.lastTxid, s.lastBeef = txid, beef
 	return s.settled, s.err
+}
+
+// clock is a settable /health cache clock.
+type clock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *clock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *clock) add(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
 }
 
 // balanceErrSource overrides *fuel.Fake's BalanceSats to fail, so /health's
@@ -82,6 +117,7 @@ type harness struct {
 	drafter *stubDrafter
 	settler *stubSettler
 	apiKey  string
+	clock   *clock
 }
 
 func newHarness(t *testing.T) *harness {
@@ -110,10 +146,11 @@ func newHarness(t *testing.T) *harness {
 	h := &harness{
 		t: t, st: st, src: src, cfg: cfg,
 		drafter: &stubDrafter{}, settler: &stubSettler{}, apiKey: cfg.APIKey,
+		clock: &clock{t: now},
 	}
 	h.handler = New(Deps{
 		APIKey: cfg.APIKey, Drafter: h.drafter, Store: st, Settler: h.settler,
-		Source: src, Cfg: cfg, Logger: nil,
+		Source: src, Cfg: cfg, Logger: nil, Now: h.clock.now,
 	})
 	return h
 }
@@ -258,11 +295,12 @@ func TestDraft_ResponseHasExactSpecFieldNames(t *testing.T) {
 
 func TestConsume(t *testing.T) {
 	h := newHarness(t)
-	const outpoint, requestID, requester = "deadbeef00.0", "req-consume-1", "requester-1"
+	const requestID, requester = "req-consume-1", "requester-1"
+	outpoint := outpoint("de", 0)
 	h.seedReserved(outpoint, requestID, requester)
 
 	t.Run("ok", func(t *testing.T) {
-		body := map[string]any{"txid": "tx1", "pairs": []map[string]any{{"outpoint": outpoint, "requestId": requestID}}}
+		body := map[string]any{"txid": txid1, "pairs": []map[string]any{{"outpoint": outpoint, "requestId": requestID}}}
 		rec := h.do("POST", "/consume", body, h.apiKey)
 		require.Equal(t, 200, rec.Code)
 		m := decodeMap(t, rec)
@@ -272,7 +310,7 @@ func TestConsume(t *testing.T) {
 	})
 
 	t.Run("refused: consumed by another txid", func(t *testing.T) {
-		body := map[string]any{"txid": "tx2", "pairs": []map[string]any{{"outpoint": outpoint, "requestId": requestID}}}
+		body := map[string]any{"txid": txid2, "pairs": []map[string]any{{"outpoint": outpoint, "requestId": requestID}}}
 		rec := h.do("POST", "/consume", body, h.apiKey)
 		require.Equal(t, 200, rec.Code)
 		m := decodeMap(t, rec)
@@ -289,14 +327,14 @@ func TestConsume(t *testing.T) {
 	})
 
 	t.Run("malformed: empty pairs", func(t *testing.T) {
-		body := map[string]any{"txid": "tx3", "pairs": []map[string]any{}}
+		body := map[string]any{"txid": txid3, "pairs": []map[string]any{}}
 		rec := h.do("POST", "/consume", body, h.apiKey)
 		require.Equal(t, 400, rec.Code)
 		require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
 	})
 
 	t.Run("malformed: empty field in pair", func(t *testing.T) {
-		body := map[string]any{"txid": "tx4", "pairs": []map[string]any{{"outpoint": "", "requestId": requestID}}}
+		body := map[string]any{"txid": txid4, "pairs": []map[string]any{{"outpoint": "", "requestId": requestID}}}
 		rec := h.do("POST", "/consume", body, h.apiKey)
 		require.Equal(t, 400, rec.Code)
 		require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
@@ -306,7 +344,7 @@ func TestConsume(t *testing.T) {
 func TestConsume_StoreErrorMapsTo503(t *testing.T) {
 	h := newHarness(t)
 	require.NoError(t, h.st.Close())
-	body := map[string]any{"txid": "tx1", "pairs": []map[string]any{{"outpoint": "op", "requestId": "r1"}}}
+	body := map[string]any{"txid": txid1, "pairs": []map[string]any{{"outpoint": outpoint("de", 0), "requestId": "r1"}}}
 	rec := h.do("POST", "/consume", body, h.apiKey)
 	require.Equal(t, 503, rec.Code)
 	require.Equal(t, "ERR_UNAVAILABLE", decodeMap(t, rec)["code"])
@@ -327,12 +365,13 @@ func TestRelease_ByRequestID(t *testing.T) {
 
 func TestRelease_ByEviction(t *testing.T) {
 	h := newHarness(t)
-	const outpoint, requestID = "op-release-2.0", "req-release-2"
+	const requestID = "req-release-2"
+	outpoint := outpoint("ef", 2)
 	h.seedReserved(outpoint, requestID, "requester-2")
-	_, err := h.st.Consume(context.Background(), "tx-evict", []store.ConsumeItem{{Outpoint: outpoint, RequestID: requestID}})
+	_, err := h.st.Consume(context.Background(), txid1, []store.ConsumeItem{{Outpoint: outpoint, RequestID: requestID}})
 	require.NoError(t, err)
 
-	rec := h.do("POST", "/release", map[string]any{"txid": "tx-evict", "outpoints": []string{outpoint}}, h.apiKey)
+	rec := h.do("POST", "/release", map[string]any{"txid": txid1, "outpoints": []string{outpoint}}, h.apiKey)
 	require.Equal(t, 200, rec.Code)
 	m := decodeMap(t, rec)
 	require.Equal(t, true, m["ok"])
@@ -368,27 +407,51 @@ func TestSettle_PassesDecodedHexToSettler(t *testing.T) {
 	h := newHarness(t)
 	h.settler.settled = 2
 	beefHex := hex.EncodeToString([]byte{0xde, 0xad, 0xbe, 0xef})
-	rec := h.do("POST", "/settle", map[string]any{"txid": "tx1", "atomicBeef": beefHex}, h.apiKey)
+	rec := h.do("POST", "/settle", map[string]any{"txid": txid1, "atomicBeef": beefHex}, h.apiKey)
 	require.Equal(t, 200, rec.Code)
 	m := decodeMap(t, rec)
 	require.Equal(t, float64(2), m["settled"])
-	require.Equal(t, "tx1", h.settler.lastTxid)
+	require.Equal(t, txid1, h.settler.lastTxid)
 	require.Equal(t, []byte{0xde, 0xad, 0xbe, 0xef}, h.settler.lastBeef)
 }
 
 func TestSettle_BadHexIs400Shape(t *testing.T) {
 	h := newHarness(t)
-	rec := h.do("POST", "/settle", map[string]any{"txid": "tx1", "atomicBeef": "not-hex"}, h.apiKey)
+	rec := h.do("POST", "/settle", map[string]any{"txid": txid1, "atomicBeef": "not-hex"}, h.apiKey)
 	require.Equal(t, 400, rec.Code)
 	require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
+	require.Zero(t, h.settler.calls)
 }
 
 func TestSettle_SettlerErrorMapsTo503(t *testing.T) {
 	h := newHarness(t)
 	h.settler.err = errors.New("settle failed")
-	rec := h.do("POST", "/settle", map[string]any{"txid": "tx1", "atomicBeef": "aa"}, h.apiKey)
+	rec := h.do("POST", "/settle", map[string]any{"txid": txid1, "atomicBeef": "aa"}, h.apiKey)
 	require.Equal(t, 503, rec.Code)
-	require.Equal(t, "ERR_UNAVAILABLE", decodeMap(t, rec)["code"])
+	m := decodeMap(t, rec)
+	require.Equal(t, "ERR_UNAVAILABLE", m["code"])
+	require.Equal(t, true, m["retryable"])
+}
+
+// A permanent settle failure (settle.ErrInvalid) is a final 400 with an
+// alert, never a 503 the overlay would retry forever.
+func TestSettle_InvalidMapsTo400Final(t *testing.T) {
+	h := newHarness(t)
+	var logs bytes.Buffer
+	h.handler = New(Deps{
+		APIKey: h.apiKey, Drafter: h.drafter, Store: h.st, Settler: h.settler,
+		Source: h.src, Cfg: h.cfg, Logger: slog.New(slog.NewJSONHandler(&logs, nil)), Now: h.clock.now,
+	})
+	h.settler.err = fmt.Errorf("settle %s: %w", txid1, fmt.Errorf("%w: transaction does not spend fuel x", settle.ErrInvalid))
+	rec := h.do("POST", "/settle", map[string]any{"txid": txid1, "atomicBeef": "aa"}, h.apiKey)
+	require.Equal(t, 400, rec.Code)
+	m := decodeMap(t, rec)
+	require.Equal(t, "error", m["status"])
+	require.Equal(t, "ERR_SETTLE_INVALID", m["code"])
+	require.Equal(t, false, m["retryable"])
+	require.Contains(t, m["description"], "does not spend fuel")
+	require.Contains(t, logs.String(), `"alert":"settle_invalid"`)
+	require.Contains(t, logs.String(), `"level":"ERROR"`)
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +508,112 @@ func TestHealth_ListProvenFailureDegradesTo200(t *testing.T) {
 	errs, ok := m["errors"].([]any)
 	require.True(t, ok)
 	require.NotEmpty(t, errs)
+}
+
+// ---------------------------------------------------------------------------
+// shape validation (txid, outpoints)
+
+// Every txid the overlay sends is 64 lowercase hex and every outpoint is the
+// canonical "<txid>.<vout>"; anything else is a 400 ERR_SHAPE that never
+// reaches the store or the settler.
+func TestShape_TxidAndOutpointsAreValidated(t *testing.T) {
+	h := newHarness(t)
+	require.NoError(t, h.st.Close()) // any request that reached the store would answer 503
+	good := outpoint("cd", 1)
+	badTxids := map[string]string{
+		"short": txid1[:62], "long": txid1 + "00", "uppercase": strings.ToUpper(txid1), "not hex": strings.Repeat("zz", 32),
+	}
+	badOutpoints := map[string]string{
+		"no vout": strings.Repeat("cd", 32), "uppercase": strings.ToUpper(strings.Repeat("cd", 32)) + ".1",
+		"short txid": "deadbeef.0", "leading zero": strings.Repeat("cd", 32) + ".01", "negative": strings.Repeat("cd", 32) + ".-1",
+		"vout overflow": strings.Repeat("cd", 32) + ".4294967296", "separator": strings.Repeat("cd", 32) + ":1",
+	}
+	expect400 := func(t *testing.T, path string, body any) {
+		t.Helper()
+		rec := h.do("POST", path, body, h.apiKey)
+		require.Equal(t, 400, rec.Code, "%s %v", path, body)
+		m := decodeMap(t, rec)
+		require.Equal(t, "ERR_SHAPE", m["code"])
+		require.Equal(t, false, m["retryable"])
+	}
+	for name, txid := range badTxids {
+		t.Run("txid "+name, func(t *testing.T) {
+			expect400(t, "/consume", map[string]any{"txid": txid, "pairs": []map[string]any{{"outpoint": good, "requestId": "r1"}}})
+			expect400(t, "/release", map[string]any{"txid": txid, "outpoints": []string{good}})
+			expect400(t, "/settle", map[string]any{"txid": txid, "atomicBeef": "aa"})
+		})
+	}
+	for name, op := range badOutpoints {
+		t.Run("outpoint "+name, func(t *testing.T) {
+			expect400(t, "/consume", map[string]any{"txid": txid1, "pairs": []map[string]any{
+				{"outpoint": good, "requestId": "r1"}, {"outpoint": op, "requestId": "r1"}}})
+			expect400(t, "/release", map[string]any{"txid": txid1, "outpoints": []string{good, op}})
+		})
+	}
+	require.Zero(t, h.settler.calls)
+
+	// The canonical shapes pass validation (and reach the closed store).
+	rec := h.do("POST", "/consume", map[string]any{"txid": txid1, "pairs": []map[string]any{{"outpoint": good, "requestId": "r1"}}}, h.apiKey)
+	require.Equal(t, 503, rec.Code)
+	rec = h.do("POST", "/release", map[string]any{"txid": txid1, "outpoints": []string{outpoint("cd", 4294967295)}}, h.apiKey)
+	require.Equal(t, 503, rec.Code)
+}
+
+// ---------------------------------------------------------------------------
+// /health cache and /livez
+
+// /health reuses its pool listing and store counts for 10 s: a probe loop
+// costs one wallet listing per window, not one per probe.
+func TestHealth_CachesListingAndCountsFor10s(t *testing.T) {
+	h := newHarness(t)
+	h.src.AddFuel(t, h.cfg.Denomination)
+	get := func() map[string]any {
+		t.Helper()
+		rec := h.do("GET", "/health", nil, "")
+		require.Equal(t, 200, rec.Code)
+		return decodeMap(t, rec)
+	}
+	require.Equal(t, float64(1), get()["provenFuel"])
+	require.Equal(t, 1, h.src.ListProvenCalls())
+
+	h.src.AddFuel(t, h.cfg.Denomination)
+	h.seedReserved(outpoint("be", 0), "req-cache", "requester-cache")
+	h.clock.add(healthCacheTTL - time.Second)
+	m := get()
+	require.Equal(t, 1, h.src.ListProvenCalls(), "the second call within 10 s hits the cache")
+	require.Equal(t, float64(1), m["provenFuel"], "cached listing")
+	require.Equal(t, float64(0), m["pool"].(map[string]any)["reserved"], "cached counts")
+
+	h.clock.add(time.Second)
+	m = get()
+	require.Equal(t, 2, h.src.ListProvenCalls(), "refreshed after 10 s")
+	require.Equal(t, float64(2), m["provenFuel"])
+	require.Equal(t, float64(1), m["pool"].(map[string]any)["reserved"])
+}
+
+// A failed listing is not cached: the next probe retries at once.
+func TestHealth_FailedListingIsNotCached(t *testing.T) {
+	h := newHarness(t)
+	h.src.AddFuel(t, h.cfg.Denomination)
+	h.src.FailNextList(errors.New("list failed"))
+	rec := h.do("GET", "/health", nil, "")
+	require.Contains(t, decodeMap(t, rec), "errors")
+	rec = h.do("GET", "/health", nil, "")
+	m := decodeMap(t, rec)
+	require.NotContains(t, m, "errors")
+	require.Equal(t, float64(1), m["provenFuel"])
+	require.Equal(t, 2, h.src.ListProvenCalls())
+}
+
+// /livez answers without any I/O: no key, no store, no wallet.
+func TestLivez_NoIOAndNoKey(t *testing.T) {
+	h := newHarness(t)
+	require.NoError(t, h.st.Close())
+	h.src.FailNextList(errors.New("wallet down"))
+	rec := h.do("GET", "/livez", nil, "")
+	require.Equal(t, 200, rec.Code)
+	require.Equal(t, map[string]any{"ok": true}, decodeMap(t, rec))
+	require.Zero(t, h.src.ListProvenCalls())
 }
 
 // ---------------------------------------------------------------------------
@@ -543,7 +712,7 @@ func TestTimeout_ResponseCarriesJSONContentType(t *testing.T) {
 		APIKey: h.apiKey, Drafter: h.drafter, Store: h.st, Settler: slow,
 		Source: h.src, Cfg: h.cfg, Logger: nil, Timeout: 5 * time.Millisecond,
 	})
-	req := httptest.NewRequest("POST", "/settle", bytes.NewReader([]byte(`{"txid":"tx1","atomicBeef":"aa"}`)))
+	req := httptest.NewRequest("POST", "/settle", bytes.NewReader([]byte(`{"txid":"`+txid1+`","atomicBeef":"aa"}`)))
 	req.Header.Set("X-Fuel-Key", h.apiKey)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)

@@ -414,8 +414,10 @@ func (s *Store) BeginRequest(ctx context.Context, nonce, requester string, ts in
 // ---------------------------------------------------------------------------
 // §4.3 steps 4-10: candidates, claim, drop, release, commit
 
-// ReleasedCandidates lists re-draftable rows: released with needs_recheck=0,
-// oldest first.
+// ReleasedCandidates lists released rows with needs_recheck=0, oldest first.
+// The drafter no longer calls it (spec §13 rev 3: a fuel output that reached
+// `reserved` is never issued again, and Claim refuses every known outpoint);
+// it is kept for the planned relink task and for inspection.
 func (s *Store) ReleasedCandidates(ctx context.Context, limit int) ([]Candidate, error) {
 	if limit <= 0 { // Postgres rejects a negative LIMIT; SQLite reads it as "all"
 		return nil, nil
@@ -432,29 +434,24 @@ func (s *Store) ReleasedCandidates(ctx context.Context, limit int) ([]Candidate,
 	return out, nil
 }
 
-// claimSQL is one statement for both claim paths. A new outpoint is inserted
-// as reserving. An existing row is taken only when it is released with
-// needs_recheck=0 (the DO UPDATE ... WHERE); in every other state the WHERE
-// fails and both engines report 0 rows affected. On the update path
-// fuel_script/satoshis/fuel_beef/derivation_* keep the stored values (the row
-// already holds the proven BEEF from its first claim; a released row is no
-// longer in the toolbox basket). Everything owned by the previous holder is
-// reset: txid, fee_*, settled_at, needs_recheck. created_at is set to the claim
-// time so the pair counts toward the new requester's daily and the global
-// per-minute quota (otherwise re-drafted rows would be invisible to both).
+// claimSQL inserts a new outpoint as reserving. An outpoint the table already
+// holds, in any state, is never taken again (ON CONFLICT DO NOTHING: 0 rows
+// affected on both engines): every row was issued to a request once, and a
+// row that reached `reserved` left a valid SINGLE|ANYONECANPAY signature with
+// its holder, who could break a new holder's transaction by spending the
+// same fuel and get the new holder denied (spec §13 rev 3, §4.5: no
+// `released → reserving`). A released row stays released; only its last
+// holder's late submit may still consume it (Consume).
 const claimSQL = `INSERT INTO fuel_reservations
   (outpoint, satoshis, fuel_script, fuel_beef, derivation_prefix, derivation_suffix,
    request_id, requester, asset_id, pair_index, status, needs_recheck, expires_at, created_at, updated_at)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserving', 0, ?, ?, ?)
-  ON CONFLICT(outpoint) DO UPDATE SET status='reserving', request_id=excluded.request_id,
-    requester=excluded.requester, asset_id=excluded.asset_id, pair_index=excluded.pair_index,
-    expires_at=excluded.expires_at, created_at=excluded.created_at, updated_at=excluded.updated_at,
-    txid=NULL, fee_script=NULL, key_id=NULL, fee_amount=NULL, settled_at=NULL, needs_recheck=0
-  WHERE fuel_reservations.status='released' AND fuel_reservations.needs_recheck=0`
+  ON CONFLICT(outpoint) DO NOTHING`
 
 // Claim atomically takes c for requestID (§4.3 step 5): true when this call
-// now holds the row as reserving, false when another holder has it (or it is
-// dropped/spent_external/awaiting recheck). Committed on its own.
+// inserted the row as reserving, false when the outpoint is already in the
+// table (held by another request, or issued before in any state). Committed
+// on its own.
 func (s *Store) Claim(ctx context.Context, c Candidate, requestID, requester, assetID string, pairIndex int, reservingTTL int64) (bool, error) {
 	if c.Outpoint == "" || requestID == "" || requester == "" {
 		return false, errors.New("store: Claim needs outpoint, requestID and requester")
@@ -489,10 +486,10 @@ func (s *Store) ReleaseReserving(ctx context.Context, requestID string, needsRec
 
 // ReleaseReservingOutpoint is sweeper rule 0 for one row: reserving →
 // released with the given needs_recheck flag. The CAS carries the holding
-// request as well as the status, so a row that its drafter released and a
-// newer request re-claimed after the sweeper listed it is never touched
-// (request ids are nonces and never repeat). True only when this call made
-// the transition.
+// request as well as the status, so a row that moved on after the sweeper
+// listed it (its drafter committed or released it) is never touched, and the
+// check stays exact even if an outpoint were ever re-claimed (request ids are
+// nonces and never repeat). True only when this call made the transition.
 func (s *Store) ReleaseReservingOutpoint(ctx context.Context, outpoint, requestID string, needsRecheck bool) (bool, error) {
 	if outpoint == "" || requestID == "" {
 		return false, errors.New("store: ReleaseReservingOutpoint needs outpoint and requestID")
@@ -575,8 +572,8 @@ func decideConsume(st rowState, txid, requestID string) (write bool, reason stri
 		}
 		return false, ReasonReservedByOther
 	case StatusReleased:
-		// Late submit of a released row that has not been re-drafted: only its
-		// last holder, and only once the chain recheck cleared it.
+		// Late submit of a released row (never re-drafted, §13 rev 3): only
+		// its last holder, and only once the chain recheck cleared it.
 		if !st.needsRecheck && st.requestID == requestID {
 			return true, ""
 		}
