@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,13 +29,17 @@ const testAsset = "ababababababababababababababababababababababababababababababa
 // stubs
 
 type stubDrafter struct {
-	resp    *draft.Response
-	ref     *draft.Refusal
-	err     error
-	lastReq draft.Request
+	resp     *draft.Response
+	ref      *draft.Refusal
+	err      error
+	lastReq  draft.Request
+	panicMsg string // non-empty: Draft panics instead of returning
 }
 
 func (d *stubDrafter) Draft(_ context.Context, req draft.Request) (*draft.Response, *draft.Refusal, error) {
+	if d.panicMsg != "" {
+		panic(d.panicMsg)
+	}
 	d.lastReq = req
 	return d.resp, d.ref, d.err
 }
@@ -44,9 +49,13 @@ type stubSettler struct {
 	err      error
 	lastTxid string
 	lastBeef []byte
+	sleep    time.Duration // > 0: Settle blocks this long before returning
 }
 
 func (s *stubSettler) Settle(_ context.Context, txid string, beef []byte) (int, error) {
+	if s.sleep > 0 {
+		time.Sleep(s.sleep)
+	}
 	s.lastTxid, s.lastBeef = txid, beef
 	return s.settled, s.err
 }
@@ -441,24 +450,105 @@ func TestHealth_ListProvenFailureDegradesTo200(t *testing.T) {
 // ---------------------------------------------------------------------------
 // DELETE /deny/{requester}
 
+// requesterHex is a 66-hex-char (compressed-DER-shaped) requester key used
+// wherever a test needs a value that passes handleDeny's shape check.
+const requesterHex = "02abababababababababababababababababababababababababababababababab"
+
 func TestDeny_RemovedAfterStoreDenyAndLowercases(t *testing.T) {
 	h := newHarness(t)
-	require.NoError(t, h.st.Deny(context.Background(), "abcd1234", "reason", "op"))
+	require.NoError(t, h.st.Deny(context.Background(), requesterHex, "reason", "op"))
 
-	rec := h.do("DELETE", "/deny/ABCD1234", nil, h.apiKey)
+	rec := h.do("DELETE", "/deny/"+strings.ToUpper(requesterHex), nil, h.apiKey)
 	require.Equal(t, 200, rec.Code)
 	require.Equal(t, true, decodeMap(t, rec)["removed"])
 
 	// Idempotent: the second delete finds nothing left to remove.
-	rec2 := h.do("DELETE", "/deny/abcd1234", nil, h.apiKey)
+	rec2 := h.do("DELETE", "/deny/"+requesterHex, nil, h.apiKey)
 	require.Equal(t, 200, rec2.Code)
 	require.Equal(t, false, decodeMap(t, rec2)["removed"])
+}
+
+func TestDeny_MalformedPathIs400ShapeWithoutTouchingStore(t *testing.T) {
+	h := newHarness(t)
+	rec := h.do("DELETE", "/deny/not-hex-and-way-too-short", nil, h.apiKey)
+	require.Equal(t, 400, rec.Code)
+	require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
+	// The store was never touched: closing it does not change the outcome.
+	require.NoError(t, h.st.Close())
+	rec2 := h.do("DELETE", "/deny/not-hex-and-way-too-short", nil, h.apiKey)
+	require.Equal(t, 400, rec2.Code)
 }
 
 func TestDeny_StoreErrorMapsTo503(t *testing.T) {
 	h := newHarness(t)
 	require.NoError(t, h.st.Close())
-	rec := h.do("DELETE", "/deny/abc", nil, h.apiKey)
+	rec := h.do("DELETE", "/deny/"+requesterHex, nil, h.apiKey)
 	require.Equal(t, 503, rec.Code)
 	require.Equal(t, "ERR_UNAVAILABLE", decodeMap(t, rec)["code"])
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1 regressions
+
+// TestGuard_EmptyAPIKeyAlwaysRefuses pins the critical fix: a Deps.APIKey of
+// "" (a misconfigured keeper) must never be treated as "any key matches".
+// subtle.ConstantTimeCompare("", "") == 1, so the guard must special-case the
+// empty-key configuration before delegating to it.
+func TestGuard_EmptyAPIKeyAlwaysRefuses(t *testing.T) {
+	h := newHarness(t)
+	handler := New(Deps{
+		APIKey: "", Drafter: h.drafter, Store: h.st, Settler: h.settler,
+		Source: h.src, Cfg: h.cfg, Logger: nil,
+	})
+	body := map[string]any{"txid": "tx1", "pairs": []map[string]any{{"outpoint": "op", "requestId": "r1"}}}
+	b, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	for _, key := range []string{"", "anything"} {
+		req := httptest.NewRequest("POST", "/consume", bytes.NewReader(b))
+		if key != "" {
+			req.Header.Set("X-Fuel-Key", key)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusUnauthorized, rec.Code, "key=%q", key)
+		require.Equal(t, "ERR_UNAUTHORIZED", decodeMap(t, rec)["code"], "key=%q", key)
+	}
+}
+
+// TestRecover_HandlerPanicIsAnsweredAsJSON500 pins the panic-recovery fix.
+// Without server.recover sitting inside http.TimeoutHandler, a handler panic
+// is caught by TimeoutHandler only to be re-panicked synchronously in the
+// caller's goroutine (go1.27 net/http/server.go), which would fail this test
+// with an unrecovered panic instead of producing a response.
+func TestRecover_HandlerPanicIsAnsweredAsJSON500(t *testing.T) {
+	h := newHarness(t)
+	h.drafter.panicMsg = "boom"
+	rec := h.do("POST", "/draft", draft.Request{AssetID: testAsset}, h.apiKey)
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	m := decodeMap(t, rec)
+	require.Equal(t, "error", m["status"])
+	require.Equal(t, "ERR_INTERNAL", m["code"])
+	require.Equal(t, true, m["retryable"])
+}
+
+// TestTimeout_ResponseCarriesJSONContentType pins the Content-Type fix: the
+// 503 http.TimeoutHandler writes when a handler overruns its deadline must
+// still carry Content-Type: application/json (decodeMap asserts this on
+// every call), not just the routes that reply through writeJSON.
+func TestTimeout_ResponseCarriesJSONContentType(t *testing.T) {
+	h := newHarness(t)
+	slow := &stubSettler{sleep: 50 * time.Millisecond}
+	handler := New(Deps{
+		APIKey: h.apiKey, Drafter: h.drafter, Store: h.st, Settler: slow,
+		Source: h.src, Cfg: h.cfg, Logger: nil, Timeout: 5 * time.Millisecond,
+	})
+	req := httptest.NewRequest("POST", "/settle", bytes.NewReader([]byte(`{"txid":"tx1","atomicBeef":"aa"}`)))
+	req.Header.Set("X-Fuel-Key", h.apiKey)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	m := decodeMap(t, rec) // asserts Content-Type: application/json
+	require.Equal(t, "ERR_TIMEOUT", m["code"])
 }

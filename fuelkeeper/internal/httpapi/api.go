@@ -60,6 +60,10 @@ type Deps struct {
 	Source fuel.Source
 	Cfg    config.Config
 	Logger *slog.Logger
+
+	// Timeout overrides requestTimeout (15s) when > 0. Tests use this to force
+	// http.TimeoutHandler's timeout path without a real 15s wait.
+	Timeout time.Duration
 }
 
 // server holds the wired dependencies for the route handlers.
@@ -69,6 +73,15 @@ type server struct {
 }
 
 // New returns the overlay-facing HTTP handler (spec §3.1, §4.5, §4.6, §4.8).
+//
+// Layering, outermost first: jsonContentType pre-sets Content-Type on the
+// real ResponseWriter (http.TimeoutHandler's own timeout path writes to that
+// same ResponseWriter directly and copies no headers onto it, so this is the
+// only way a timeout response carries Content-Type); http.TimeoutHandler
+// bounds request latency and reinstates any panic that survives the next
+// layer; server.recover catches a handler panic before it reaches
+// TimeoutHandler (which would otherwise re-panic synchronously in the
+// caller's goroutine); the mux dispatches by method and path.
 func New(deps Deps) http.Handler {
 	log := deps.Logger
 	if log == nil {
@@ -84,14 +97,80 @@ func New(deps Deps) http.Handler {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("DELETE /deny/{requester}", s.guard(s.handleDeny))
 
-	return http.TimeoutHandler(mux, requestTimeout, timeoutBody)
+	timeout := deps.Timeout
+	if timeout <= 0 {
+		timeout = requestTimeout
+	}
+
+	var handler http.Handler = s.recover(mux)
+	handler = http.TimeoutHandler(handler, timeout, timeoutBody)
+	handler = jsonContentType{next: handler}
+	return handler
 }
 
-// guard requires header X-Fuel-Key to equal Deps.APIKey, in constant time.
+// jsonContentType pre-sets Content-Type on the outer ResponseWriter before
+// control ever reaches http.TimeoutHandler. http.TimeoutHandler gives the
+// inner handler chain its own, separate header buffer and only merges it
+// into the real ResponseWriter's headers on the success path; on the timeout
+// path it writes StatusServiceUnavailable straight to the real
+// ResponseWriter with no merge, so a header set only inside the inner chain
+// (e.g. by writeJSON) never reaches a timed-out response. Setting it here,
+// before that split happens, makes it survive either path.
+type jsonContentType struct {
+	next http.Handler
+}
+
+func (j jsonContentType) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	j.next.ServeHTTP(w, r)
+}
+
+// trackingWriter records whether a response has already started, so a
+// recovered panic knows whether it is still safe to write its own response.
+type trackingWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (t *trackingWriter) WriteHeader(code int) {
+	t.wroteHeader = true
+	t.ResponseWriter.WriteHeader(code)
+}
+
+func (t *trackingWriter) Write(b []byte) (int, error) {
+	t.wroteHeader = true
+	return t.ResponseWriter.Write(b)
+}
+
+// recover catches a panic from next, logs it, and — only if nothing was
+// written to the response yet — answers 500 ERR_INTERNAL. This must run
+// inside (i.e. be wrapped by) http.TimeoutHandler: TimeoutHandler recovers a
+// panic from its inner handler only to re-panic it synchronously in the
+// caller's goroutine, which would crash the process (or fail the calling
+// test) instead of producing an HTTP response.
+func (s *server) recover(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tw := &trackingWriter{ResponseWriter: w}
+		defer func() {
+			if rec := recover(); rec != nil {
+				s.log.Error("httpapi: recovered panic", "panic", rec, "method", r.Method, "path", r.URL.Path)
+				if !tw.wroteHeader {
+					writeErr(tw, http.StatusInternalServerError, "ERR_INTERNAL", true, "internal error")
+				}
+			}
+		}()
+		next.ServeHTTP(tw, r)
+	})
+}
+
+// guard requires header X-Fuel-Key to equal Deps.APIKey, in constant time. An
+// empty configured key always refuses: two empty byte slices compare equal
+// under ConstantTimeCompare, which would otherwise accept every request when
+// the keeper is misconfigured with no key at all.
 func (s *server) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		got := r.Header.Get("X-Fuel-Key")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.deps.APIKey)) != 1 {
+		if s.deps.APIKey == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.deps.APIKey)) != 1 {
 			writeErr(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", false, "missing or invalid X-Fuel-Key")
 			return
 		}
@@ -373,11 +452,27 @@ type denyResp struct {
 	Removed bool `json:"removed"`
 }
 
+// validRequesterHex reports whether s is 66 lowercase-or-mixed hex chars: the
+// shape of a compressed DER public key (auth.ParseRequester's parse
+// boundary), which is what the drafter's requester keys always are.
+func validRequesterHex(s string) bool {
+	if len(s) != 66 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
 // handleDeny lowercases the path value before Undeny: the drafter keys the
 // deny list by the requester's canonical lowercase compressed-DER hex, and an
-// operator-pasted key may carry any case.
+// operator-pasted key may carry any case. A value that cannot be that shape
+// is refused before it ever reaches the store.
 func (s *server) handleDeny(w http.ResponseWriter, r *http.Request) {
 	requester := strings.ToLower(r.PathValue("requester"))
+	if !validRequesterHex(requester) {
+		writeErr(w, http.StatusBadRequest, "ERR_SHAPE", false, "requester must be 66 hex chars")
+		return
+	}
 	removed, err := s.deps.Store.Undeny(r.Context(), requester)
 	if err != nil {
 		s.log.Error("httpapi: deny store error", "err", err, "requester", requester)
