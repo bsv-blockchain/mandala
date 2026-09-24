@@ -1,8 +1,9 @@
 name: Build and Push Docker Images
 
-# Publishes both deployable images to GHCR on every v* tag (and on demand):
+# Publishes deployable images to GHCR on every v* tag (and on demand):
 #   ghcr.io/<owner>/mandala-overlay-go  — overlay-go/Dockerfile
 #   ghcr.io/<owner>/mandala-app         — app/Dockerfile (repo-root context)
+#   ghcr.io/<owner>/mandala-fuelkeeper  — fuelkeeper/Dockerfile
 # The console bakes its VITE_* config in at build time. Override the defaults
 # below with repository variables of the same name (Settings → Variables).
 
@@ -31,6 +32,9 @@ jobs:
           - image: mandala-app
             context: .
             dockerfile: app/Dockerfile
+          - image: mandala-fuelkeeper
+            context: fuelkeeper
+            dockerfile: fuelkeeper/Dockerfile
 
     steps:
       - name: Checkout

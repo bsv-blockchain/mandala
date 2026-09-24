@@ -304,3 +304,117 @@ db.mandalaAdminHistory.find({
 
 For any hit, delete the row and rebuild that asset's state — a register row
 keyed under a foreign `assetId` is a forged prior (spec §12 P5).
+
+## fuelKeeper local run (P2)
+
+New Go module `fuelkeeper/` (spec `docs/design/2026-09-22-mandala-token-fee-design.md`
+§4, P2 done 2026-09-23). One binary: an in-process go-wallet-toolbox storage
+server, an issuer wallet client over loopback, the pool keeper, the fuel HTTP
+API (`X-Fuel-Key` guarded, `/health` excepted), and the sweeper. Not wired
+into the TS/Go overlays yet (P3) — this section is for running fuelKeeper on
+its own to exercise the draft/consume/settle/sweep flow directly.
+
+### Env
+
+Required:
+
+```bash
+export ISSUER_ROOT_KEY=<32-byte hex — the issuer's wallet root key, SSM in prod>
+export FK_API_KEY=<random string, at least 32 chars>
+export FK_NETWORK=test
+export FK_STORAGE_CONFIG=./fuelkeeper-infra.yaml   # path to the yaml below
+export FUEL_ASSET_IDS=                             # comma list of "<64 hex>.<vout>" genesis outpoints, or empty = nothing eligible yet
+```
+
+A few you would plausibly change for a local run (defaults shown; full surface
+is in `fuelkeeper/internal/config/config.go`):
+
+```bash
+export FK_API_PORT=8090                # must be >= 1025
+export FK_STORAGE_URL=http://127.0.0.1:8100   # must match the infra yaml's http.port
+export FK_DB_DRIVER=sqlite             # or postgres
+export FK_DB_DSN=fuelkeeper.sqlite     # fuelKeeper's own reservation-table DB, separate from the storage DB below
+export FUEL_D=200                      # must equal the infra yaml's denomination_satoshis
+export FK_FANOUT_OUTPUTS_PER_TX=20     # must equal the infra yaml's fanout_outputs_per_tx — the keeper exits 1 on mismatch at startup
+# export FK_WOC_API_KEY=...            # optional; without it the sweeper's chain check (rule 2) is disabled and needs_recheck rows stay pending
+```
+
+### Minimal infra yaml (`fuelkeeper-infra.yaml`)
+
+Modeled on `go-wallet-toolbox/infra-config-docker-throughput-tstn.yaml`'s key
+names, trimmed to what a local sqlite run needs (generate your own
+`server_private_key`, e.g. `openssl rand -hex 32` — do not reuse any key
+committed elsewhere in this repo or in go-wallet-toolbox's example configs):
+
+```yaml
+name: fuelkeeper-local
+server_private_key: "<32-byte hex, generated locally>"
+
+bsv_network: test
+
+db:
+  engine: sqlite
+  sqlite:
+    connection_string: ./fuelkeeper-storage.sqlite
+
+http:
+  port: 8100
+
+fee_model:
+  type: sat/kb
+  value: 100
+
+utxo_management:
+  strategy: throughput
+  throughput:
+    denomination_satoshis: 200
+    pool_basket: fuel
+    reserve_basket: reserve
+    fanout_outputs_per_tx: 20
+    fanout_max_txs_per_round: 5
+    top_up:
+      enabled: true
+
+observability:
+  metrics:
+    enabled: false   # required: a second metrics provider in the same process would register duplicate gauges
+
+monitor:
+  enabled: true
+```
+
+Fields left out (logging, change_basket, tracing, commission, …) fall back to
+go-wallet-toolbox's own defaults; see `pkg/defs` there for the full schema.
+`denomination_satoshis`, `pool_basket`/`reserve_basket`,
+`fanout_outputs_per_tx` and `bsv_network` here MUST agree with `FUEL_D` /
+`FK_POOL_BASKET` / `FK_RESERVE_BASKET` / `FK_FANOUT_OUTPUTS_PER_TX` /
+`FK_NETWORK` above — the keeper reads fuel rows through its own read-only
+in-process storage provider built from this same config, on the same DB, so a
+mismatch is a silent split-brain rather than a clean error (except the
+fan-out count, which the keeper does check at startup).
+
+### Run
+
+```bash
+cd fuelkeeper && GOTOOLCHAIN=auto go run ./cmd/fuelkeeper
+```
+
+Check it came up:
+
+```bash
+curl http://127.0.0.1:8090/health
+```
+
+**The issuer wallet must be funded before the keeper can mint fuel.** Send
+BSV to the issuer wallet's receiving address via the storage server (the
+console / any go-wallet-toolbox client pointed at `FK_STORAGE_URL` with
+`ISSUER_ROOT_KEY`) — `/health`'s `issuerBsvSats` stays at 0 and the pool
+stays empty until this happens, and every `/draft` call fails
+`ERR_FUEL_UNAVAILABLE` (no proven fuel) until the keeper's first fan-out
+round confirms.
+
+### Tests
+
+```bash
+cd fuelkeeper && GOTOOLCHAIN=auto go test ./... -count=1
+```

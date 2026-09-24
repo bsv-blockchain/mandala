@@ -944,7 +944,8 @@ their phase.
   verification (`anyone`), claim/detach/verify/sign/commit draft flow with a
   go-sdk verification test (skeleton extended by a token tx must verify),
   reservation CAS + batch consume + sweeper tests (SQLite and Postgres),
-  routes, deny list, Dockerfile, `/health`.
+  routes, deny list, Dockerfile, `/health`. — done 2026-09-23, commits
+  fba6799…2d982f7 plus follow-up fixes
 - **P3 — overlays.** TS: routes (draft/release/info/resettle), `withFuelGuard`
   with intent write, settle hook + dupe path + sweeper, verdict row,
   recognizer/nonce collections, `putAdmitted` `fuel` field; Go: the same;
@@ -1004,3 +1005,68 @@ code before adoption):
 - §10, §7.2 step 4: privacy claims corrected; lib-side shuffle of payer outputs.
 - §2 (post-P1 merge with PR #11): eviction rebuilds the TS fee-rate row from surviving history; parity with Go's fold-based rebuild restored.
 - §2 (2026-09-23, rebuild-first eviction): both engines rebuild each touched asset's state and fee rate from its history EXCLUDING the evicted txid's rows, and delete those rows only afterwards, so a 503 retry after a failed rebuild re-runs the whole sequence and converges.
+
+Revision 3 (2026-09-23, P2 implementation):
+
+- Toolchain: fuelKeeper builds against `go-wallet-toolbox v0.186.3` (go 1.27.0,
+  go-sdk v1.5.1) — the published tag, not the local branch the spec's line
+  numbers came from; four `replace` directives (adds `k8s.io/kube-openapi`).
+- §4.4: `fuel_reservations` gains `fuel_beef`, `derivation_prefix`,
+  `derivation_suffix`, `pair_index` (why: re-drafted `released` rows are no
+  longer in the basket; `/settle` needs the fee vout).
+- §4.5: `POST /consume` body is `{ txid, pairs: [{ outpoint, requestId }] }` —
+  the keeper needs the request the overlay matched to enforce "reserved by
+  another request"; a `released, needs_recheck=0` row is consumable only by
+  its last holder's `requestId`.
+- §1.3: `satDeficit(k)` is floored at 0 when `n > m + k`.
+- §4.3 step 1: the keeper also checks the overlay-supplied `issuerIdentityKey`
+  equals its own identity (else `ERR_FUEL_INELIGIBLE`).
+- §4.7 rule 2: `IsUtxo` is provided only by WhatsOnChain in go-wallet-toolbox;
+  without `FK_WOC_API_KEY` the check is disabled and `needs_recheck` rows stay
+  pending (never released) — P5 must provision a key or an alternative
+  checker for tstn.
+- §4.7 rule 4: the "two unspent observations ≥ 10 min apart" memory is
+  in-process; a restart only delays that release.
+- §4.1/§4.2: the toolbox HTTP storage client's `FindOutputsAuth` is a stub at
+  v0.186.3 (no server route), so the keeper reads fuel rows through a
+  read-only in-process `*storage.Provider` built from `infra.Server.Config` on
+  the same DB; wallet operations stay on the HTTP wallet.
+- §4.2 (operator consequence of the above): the infra yaml and the keeper env
+  must agree on `strategy: throughput`, `denomination_satoshis` = `FUEL_D`,
+  `pool_basket`/`reserve_basket`, and `fanout_outputs_per_tx` =
+  `FK_FANOUT_OUTPUTS_PER_TX` (toolbox default 100 vs keeper default 20 — the
+  keeper exits 1 on a mismatch at startup), and `bsv_network` = `FK_NETWORK`;
+  keep `observability.metrics.enabled: false` (a second provider would
+  register duplicate gauges); prefer Postgres for both the storage engine and
+  `FK_DB_*` in production. The storage HTTP server binds all interfaces
+  (toolbox behaviour) — it is BRC-103-authenticated and is what the issuer
+  console connects to (D6), so P5 must expose it only through the cluster
+  Service, never a public ingress.
+- §4.3: the drafter runs a candidate pre-check (amount ≥ `D`, source proven by
+  BEEF) and self-verifies every signed fuel input with the script interpreter
+  before a draft is issued; a Detach/verify *error* (as opposed to a
+  definitive "not spendable" result) leaves the row `reserving` for sweeper
+  rule 0 to resolve rather than dropping it immediately; requester identity
+  keys are canonicalised to lowercase throughout (deny list, quotas,
+  reservation rows). With the shipped defaults (`K_MAX=4, N_MAX=20, M_MAX=10`)
+  `ERR_FUEL_TOO_LARGE` cannot actually fire — every in-bounds request sizes to
+  `k ≤ 3`.
+- §4.6: `/settle` credits the fee at the index of whichever input actually
+  spends the fuel outpoint, not the draft's original vin (a payer may reorder
+  whole pairs), after verifying the settling tx spends every fuel outpoint
+  under the reservation and that each paired output byte-equals the committed
+  fee script.
+- §4.4: `created_at` is the time of the current claim (re-claims count toward
+  `DailyPairs`/`PairsPerMinute`); `settled_at` is cleared on claim and
+  consume.
+- §4.3 step 2 / §10: quotas are soft under concurrent drafts from one
+  requester (rows are created after the check) — spec-owner follow-up: count
+  recent `fuel_requests` as outstanding.
+- §4.7 rule 2: a requester is denied only when the `released → spent_external`
+  CAS actually matched AND the row carries no consuming `txid`; rows released
+  by eviction (§4.5) or by rule 4 keep their `txid`, so a later `spent_external`
+  finding on one of those gets the alert but no denial (a concurrent `/settle`
+  repair wins). Rule 4's own release additionally skips rows that already
+  carry `settled_at`. The "two unspent observations ≥ 10 min apart" memory
+  behind the 404 branch is in-process (already noted above re: restarts).
+- §12: P2 marked done with the commit range.
