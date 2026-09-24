@@ -945,7 +945,7 @@ their phase.
   go-sdk verification test (skeleton extended by a token tx must verify),
   reservation CAS + batch consume + sweeper tests (SQLite and Postgres),
   routes, deny list, Dockerfile, `/health`. — done 2026-09-23, commits
-  fba6799…2d982f7 plus follow-up fixes
+  fba6799…38d156f (incl. review fix rounds)
 - **P3 — overlays.** TS: routes (draft/release/info/resettle), `withFuelGuard`
   with intent write, settle hook + dupe path + sweeper, verdict row,
   recognizer/nonce collections, `putAdmitted` `fuel` field; Go: the same;
@@ -1041,7 +1041,14 @@ Revision 3 (2026-09-23, P2 implementation):
   `FK_DB_*` in production. The storage HTTP server binds all interfaces
   (toolbox behaviour) — it is BRC-103-authenticated and is what the issuer
   console connects to (D6), so P5 must expose it only through the cluster
-  Service, never a public ingress.
+  Service plus a NetworkPolicy limiting ingress to the console and the
+  keeper's own pod, never a public ingress — with `request_price: 0` any
+  BRC-103 identity that reaches the port can register a user and use it as
+  free wallet storage.
+- §4.5/§4.7: an eviction `release(outpoints, txid)` releases the tx's rows
+  even when they are settled (the fee output is on a tx the network rejected);
+  sweeper rule 4 only ever sees unsettled rows and additionally guards
+  `settled_at IS NULL` on its release.
 - §4.3: the drafter runs a candidate pre-check (amount ≥ `D`, source proven by
   BEEF) and self-verifies every signed fuel input with the script interpreter
   before a draft is issued; a Detach/verify *error* (as opposed to a
