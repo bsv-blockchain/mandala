@@ -1060,7 +1060,7 @@ git commit -m "feat(fuelkeeper): request verification with the anyone key (§3.1
   func (s *Store) ExpiredReserving(ctx) ([]Reservation, error)
   func (s *Store) ExpireReserved(ctx) (int64, error)                              // reserved past expires_at → released, needs_recheck=1
   func (s *Store) RecheckPending(ctx, limit int) ([]Reservation, error)          // released, needs_recheck=1
-  func (s *Store) SetRechecked(ctx, outpoint string, unspent bool) error         // → needs_recheck=0 | spent_external
+  func (s *Store) SetRechecked(ctx, outpoint string, unspent bool) (bool, error) // → needs_recheck=0 | spent_external; true iff the CAS matched
   func (s *Store) UnsettledConsumed(ctx, olderThan time.Duration) ([]Reservation, error)
   func (s *Store) ReleaseByRule4(ctx, txid string) (int64, error)                 // consumed(txid) → released, needs_recheck=1
   // deny list + health
@@ -1375,7 +1375,7 @@ Rules for `store.go`:
 - `ExpiredReserving`: `SELECT … WHERE status='reserving' AND expires_at < ?`.
 - `ExpireReserved`: `UPDATE … SET status='released', needs_recheck=1, updated_at=? WHERE status='reserved' AND expires_at < ?`.
 - `RecheckPending`: `… WHERE status='released' AND needs_recheck=1 ORDER BY updated_at LIMIT ?`.
-- `SetRechecked(outpoint, unspent)`: unspent → `needs_recheck=0`; spent → `status='spent_external', needs_recheck=0`; both `WHERE status='released' AND needs_recheck=1`.
+- `SetRechecked(outpoint, unspent) (bool, error)`: unspent → `needs_recheck=0`; spent → `status='spent_external', needs_recheck=0`; both `WHERE status='released' AND needs_recheck=1`; returns `RowsAffected()==1`.
 - `UnsettledConsumed(olderThan)`: `… WHERE status='consumed' AND settled_at IS NULL AND updated_at < ?`.
 - `BeginRequest`: one transaction. SQLite: the `_txlock=immediate` DSN makes `BEGIN` an immediate lock, so nothing else is needed; Postgres: first statement `SELECT pg_advisory_xact_lock(hashtext(?))` with the requester. Then: `INSERT INTO fuel_requests … ON CONFLICT(nonce) DO NOTHING` → RowsAffected 0 → `VerdictNonceUsed` (rollback); `SELECT COUNT(DISTINCT request_id) FROM fuel_reservations WHERE requester=? AND status='reserved' AND expires_at>?` ≥ MaxOutstanding → `VerdictQuota`; `SELECT COUNT(*) FROM fuel_reservations WHERE requester=? AND created_at>?` (24 h) ≥ DailyPairs → `VerdictQuota`; `SELECT COUNT(*) FROM fuel_reservations WHERE created_at>?` (60 s) ≥ PairsPerMinute → `VerdictUnavailable`. Any non-ok verdict rolls back (the nonce row is not kept). Commit on ok.
 - `Counts`: `SELECT status, COUNT(*) … GROUP BY status`, plus the three scalar counts.
@@ -2108,7 +2108,7 @@ Cover, with a fake `Checker` (map outpoint→(unspent bool, err)) and a fake `Ov
 
 - rule 0: `reserving` past TTL, detach+verify ok → `released, needs_recheck=0`; verify fails → `dropped`.
 - rule 1: `reserved` past `expires_at` → `released, needs_recheck=1`.
-- rule 2: recheck rows: unspent → `needs_recheck=0`; spent → `spent_external` and requester denied; checker error → unchanged and not denied.
+- rule 2: recheck rows: unspent → `needs_recheck=0`; spent → `spent_external` and the requester denied **only when `SetRechecked` reports `true`** (the CAS can miss when `/settle` concurrently repaired the row to `consumed` — then no denial, no alert); checker error → unchanged and not denied.
 - rule 3: `consumed` unsettled older than 5 min → only a log line (assert nothing changed).
 - rule 4: `consumed` unsettled older than 30 min: overlay 200 → unchanged + `Resettle` called once; 410 → released needs_recheck=1; 400 with `finalReject` → released; 404 with checker unspent on two ticks ≥ 10 min apart → released on the second tick, not the first; 5xx → unchanged, no `Resettle`.
 
@@ -2259,7 +2259,8 @@ func connectWallet(ctx context.Context, cfg config.Config, priv *ec.PrivateKey, 
 
 1. `cfg := config.Load(os.Getenv)`; `logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))`.
 2. `srv, err := infra.NewServer(ctx, infra.WithConfigFile(cfg.StorageConf), infra.WithEnvPrefix("FK_STORAGE"), infra.WithLogger(logger))`; `go func(){ if err := srv.ListenAndServe(ctx); err != nil { logger.Error(...); cancel() } }()`; `defer srv.Cleanup()`.
-3. `priv, _ := ec.PrivateKeyFromHex(cfg.IssuerRootKeyHex)`; `w, sc, err := connectWallet(...)`; `defer w.Close()`; `kd := sdk.NewKeyDeriver(priv)`; `src := fuel.NewWalletSource(w, sc, kd)`.
+3. `priv, _ := ec.PrivateKeyFromHex(cfg.IssuerRootKeyHex)`; `w, _, err := connectWallet(...)`; `defer w.Close()`; `kd := sdk.NewKeyDeriver(priv)`.
+   **Read-only storage provider (ruling 2026-09-23, Task 6 review):** the toolbox HTTP client's `FindOutputsAuth` is a stub at v0.186.3, so reads come from an in-process provider on the same DB: `scfg := srv.Config` (exported field of `*infra.Server`); `svc := services.New(logger, scfg.Services)`; `reader, err := storage.NewGORMProvider(scfg.BSVNetwork, svc, append(infra.GORMProviderOptionsFromConfig(&scfg), storage.WithLogger(logger))...)`; `u, err := reader.FindOrInsertUser(ctx, kd.IdentityKeyHex())` → `userID := u.User.UserID` (check the response field names in `pkg/wdk`); `src := fuel.NewWalletSource(w, reader, kd, userID, logger)`. Do NOT call `Migrate` on the reader (infra already did). Startup self-check: `ListOutputs(basket=PoolBasket, limit 1)` non-empty but `src.ListProven(ctx, PoolBasket, 1)` empty AND the basket's single output belongs to a completed tx → log Error and exit 1 ("storage reader sees no fuel rows: check DB config/user"). If the wallet option `wallet.WithAutoKnownTxids(false)` exists at v0.186.3 (grep `pkg/wallet/wallet_opts` or `wallet.With` functions), pass it to `NewWithStorageFactory` so basket listings keep full BEEF instead of txid-only entries.
 4. `keeper, err := fuelkeeper.New(w, keeperConfig(cfg), logger)`; `go keeper.Run(ctx)`.
 5. `st, err := store.Open(cfg.DBDriver, cfg.DBDSN, time.Now)`.
 6. `checker`: if `cfg.WoCAPIKey != ""` → `svcCfg := infra.Defaults().Services; svcCfg.Chain = cfg.Network;` set the WhatsOnChain API key field on `svcCfg.WhatsOnChain` (grep `type WhatsOnChain struct` in `pkg/defs/services.go` for the field name and an `Enabled` flag; set both) → `chain.NewServicesChecker(services.New(logger, svcCfg))`; else `chain.Disabled{}` with a startup warning naming `FK_WOC_API_KEY`.
@@ -2299,6 +2300,10 @@ git commit -m "feat(fuelkeeper): process wiring — infra storage, issuer wallet
   - §4.3 step 1: the keeper also checks the overlay-supplied `issuerIdentityKey` equals its own identity (else `ERR_FUEL_INELIGIBLE`).
   - §4.7 rule 2: `IsUtxo` is provided only by WhatsOnChain in go-wallet-toolbox; without `FK_WOC_API_KEY` the check is disabled and `needs_recheck` rows stay pending (never released) — P5 must provision a key or an alternative checker for tstn.
   - §4.7 rule 4: the "two unspent observations ≥ 10 min apart" memory is in-process; a restart only delays that release.
+  - §4.1/§4.2: the toolbox HTTP storage client's `FindOutputsAuth` is a stub at v0.186.3 (no server route), so the keeper reads fuel rows through a read-only in-process `*storage.Provider` built from `infra.Server.Config` on the same DB; wallet operations stay on the HTTP wallet.
+  - §4.4: `created_at` is the time of the current claim (re-claims count toward `DailyPairs`/`PairsPerMinute`); `settled_at` is cleared on claim and consume.
+  - §4.3 step 2 / §10: quotas are soft under concurrent drafts from one requester (rows are created after the check) — spec-owner follow-up: count recent `fuel_requests` as outstanding.
+  - §4.7 rule 2: a requester is denied only when the `released → spent_external` CAS actually matched (a concurrent `/settle` repair wins).
   - §12: P2 marked done with the commit range.
 - [ ] **Step 2: runbook.md — add "fuelKeeper local run (P2)"**: env block, minimal infra yaml (sqlite engine, `http.port: 8100`, `fee_model 100`, `utxo_management` throughput with `denomination_satoshis: 200`, `pool_basket: fuel`, `reserve_basket: reserve`, `bsv_network: test`), the `go run` command with `GOTOOLCHAIN=auto`, the curl for `/health`, and the note that the wallet must be funded before the keeper mints.
 - [ ] **Step 3: docker-publish.yml** — add `- image: mandala-fuelkeeper, context: fuelkeeper, dockerfile: fuelkeeper/Dockerfile` to the matrix, mirroring the `mandala-overlay-go` entry, and update the header comment.
