@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,7 +105,21 @@ func TestCheckStorageConfig(t *testing.T) {
 	require.ErrorContains(t, err, "FK_NETWORK")
 	require.ErrorContains(t, err, "FUEL_D 200")
 	require.ErrorContains(t, err, "FK_POOL_BASKET")
-	require.ErrorContains(t, err, "FK_FANOUT_OUTPUTS_PER_TX 20")
+	require.ErrorContains(t, err, "utxo_management.throughput.fanout_outputs_per_tx 100 != FK_FANOUT_OUTPUTS_PER_TX 20")
+
+	s = throughputInfra()
+	s.UTXOManagement.Throughput.ReserveBasket = "other-reserve"
+	err = checkStorageConfig(keeperCfg(), &s)
+	require.ErrorContains(t, err, "utxo_management.throughput.reserve_basket")
+	require.ErrorContains(t, err, "FK_RESERVE_BASKET")
+	require.NotContains(t, err.Error(), "FUEL_D", "only the reserve basket differs")
+
+	s = throughputInfra()
+	s.UTXOManagement.Throughput.DenominationSatoshis = 0 // derive...
+	s.UTXOManagement.Throughput.ExpectedTxSizeBytes = 0  // ...from an empty shape
+	s.UTXOManagement.Throughput.ExpectedOutputSatoshis = 0
+	err = checkStorageConfig(keeperCfg(), &s)
+	require.ErrorContains(t, err, "denomination: derived denomination is zero")
 }
 
 func TestStoragePortMismatch(t *testing.T) {
@@ -150,28 +166,30 @@ func (f fakeLister) ListOutputs(context.Context, sdk.ListOutputsArgs, string) (*
 	return &sdk.ListOutputsResult{TotalOutputs: uint32(len(f.outs)), Outputs: f.outs}, nil
 }
 
-type fakeProven struct{ rows []fuel.Row }
+type fakeProven struct {
+	rows []fuel.Row
+	err  error
+}
 
-func (f fakeProven) ListProven(context.Context, string, int) ([]fuel.Row, error) { return f.rows, nil }
+func (f fakeProven) ListProven(context.Context, string, int) ([]fuel.Row, error) {
+	return f.rows, f.err
+}
 
 // fakeReader answers the self-check's two lookups: any row (no TxStatus
-// filter) and completed rows (TxStatus filter).
+// filter; err) and completed rows (TxStatus filter; errCompleted).
 type fakeReader struct {
-	any, completed wdk.TableOutputs
-	err            error
+	any, completed    wdk.TableOutputs
+	err, errCompleted error
 }
 
 func (f fakeReader) FindOutputsAuth(_ context.Context, a wdk.AuthID, args wdk.FindOutputsArgs) (wdk.TableOutputs, error) {
-	if f.err != nil {
-		return nil, f.err
-	}
 	if a.UserID == nil || args.TxID == nil || args.Vout == nil {
 		return nil, errors.New("bad lookup")
 	}
 	if len(args.TxStatus) > 0 {
-		return f.completed, nil
+		return f.completed, f.errCompleted
 	}
-	return f.any, nil
+	return f.any, f.err
 }
 
 func TestSelfCheck(t *testing.T) {
@@ -201,6 +219,8 @@ func TestSelfCheck(t *testing.T) {
 		{name: "completed usable row but no proven fuel", lister: listed, reader: fakeReader{any: wdk.TableOutputs{row}, completed: wdk.TableOutputs{row}}, fatal: true},
 		{name: "completed non-change row tolerated", lister: listed, reader: fakeReader{any: wdk.TableOutputs{notChange}, completed: wdk.TableOutputs{notChange}}},
 		{name: "reader error tolerated", lister: listed, reader: fakeReader{err: errors.New("db down")}},
+		{name: "ListProven error tolerated", lister: listed, proven: fakeProven{err: errors.New("beef")}},
+		{name: "tx-status lookup error tolerated", lister: listed, reader: fakeReader{any: wdk.TableOutputs{row}, errCompleted: errors.New("db down")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -213,4 +233,47 @@ func TestSelfCheck(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClassifyStartup(t *testing.T) {
+	live := context.Background()
+	signalled, stop := context.WithCancel(context.Background())
+	stop()
+	dead, kill := context.WithCancelCause(context.Background())
+	kill(errors.New("storage server stopped: bind: address already in use"))
+	wrapped := fmt.Errorf("gave up after 3 attempts: %w", errors.Join(context.Canceled, errors.New("dial refused")))
+
+	cases := []struct {
+		name        string
+		sig, root   context.Context
+		err         error
+		want        startupVerdict
+		wantExitOne bool
+	}{
+		{"plain failure", live, live, errors.New("bad yaml"), verdictFailed, true},
+		{"signal cancels a step", signalled, live, wrapped, verdictSignal, false},
+		{"signal with nil err", signalled, live, nil, verdictSignal, false},
+		{"signal does not mask a real error", signalled, live, errors.New("bad yaml"), verdictFailed, true},
+		{"storage death is the cause, not a signal", live, dead, wrapped, verdictRootCause, true},
+		{"storage death wins over a signal", signalled, dead, wrapped, verdictRootCause, true},
+		{"cancellation without a signal is a failure", live, live, context.Canceled, verdictFailed, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyStartup(tc.sig, tc.root, tc.err)
+			require.Equal(t, tc.want, got)
+			require.Equal(t, tc.wantExitOne, got.exitCode() == 1)
+		})
+	}
+}
+
+func TestWaitTimeout(t *testing.T) {
+	var wg sync.WaitGroup
+	require.True(t, waitTimeout(&wg, time.Second), "nothing to wait for")
+
+	release := make(chan struct{})
+	wg.Go(func() { <-release })
+	require.False(t, waitTimeout(&wg, 20*time.Millisecond), "a stuck worker times out")
+	close(release)
+	require.True(t, waitTimeout(&wg, time.Second))
 }

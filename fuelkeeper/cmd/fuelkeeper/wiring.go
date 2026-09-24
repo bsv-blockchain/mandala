@@ -25,6 +25,9 @@ import (
 // originator is the BRC-100 originator the process presents to its wallet.
 const originator = "fuelkeeper"
 
+// walletAttemptTimeout bounds one connectWallet attempt (build + Balance).
+const walletAttemptTimeout = 30 * time.Second
+
 // keeperConfig maps the process config onto the toolbox pool keeper. The
 // chunk fee headroom follows fuelkeeper.FromThroughput: max(1000, 8*D).
 func keeperConfig(c config.Config) fuelkeeper.Config {
@@ -90,7 +93,8 @@ func retryWithBackoff(ctx context.Context, window, initial, maxDelay time.Durati
 
 // connectWallet builds the issuer wallet over the loopback storage server
 // and waits (up to 2 min) until a Balance round trip succeeds, i.e. the
-// server listens and the BRC-103 handshake completes. AutoKnownTxids is off
+// server listens and the BRC-103 handshake completes. Each attempt is capped
+// at walletAttemptTimeout. AutoKnownTxids is off
 // so basket listings carry full BEEF (fuel.ListProven needs each fuel tx's
 // own BUMP; a txid-only entry makes the row unusable).
 func connectWallet(ctx context.Context, cfg config.Config, priv *ec.PrivateKey, logger *slog.Logger) (*wallet.Wallet, error) {
@@ -106,7 +110,10 @@ func connectWallet(ctx context.Context, cfg config.Config, priv *ec.PrivateKey, 
 		if err != nil {
 			return err
 		}
-		if _, err = nw.Balance(ctx); err != nil {
+		// A hung handshake must not outlive the retry window.
+		actx, acancel := context.WithTimeout(ctx, walletAttemptTimeout)
+		defer acancel()
+		if _, err = nw.Balance(actx); err != nil {
 			nw.Close()
 			return err
 		}
@@ -137,20 +144,20 @@ func checkStorageConfig(cfg config.Config, scfg *infra.Config) error {
 		return errors.Join(errs...)
 	}
 	if um.Throughput.PoolBasket != cfg.PoolBasket {
-		errs = append(errs, fmt.Errorf("storage pool_basket %q != FK_POOL_BASKET %q", um.Throughput.PoolBasket, cfg.PoolBasket))
+		errs = append(errs, fmt.Errorf("storage utxo_management.throughput.pool_basket %q != FK_POOL_BASKET %q", um.Throughput.PoolBasket, cfg.PoolBasket))
 	}
 	if um.Throughput.ReserveBasket != cfg.ReserveBasket {
-		errs = append(errs, fmt.Errorf("storage reserve_basket %q != FK_RESERVE_BASKET %q", um.Throughput.ReserveBasket, cfg.ReserveBasket))
+		errs = append(errs, fmt.Errorf("storage utxo_management.throughput.reserve_basket %q != FK_RESERVE_BASKET %q", um.Throughput.ReserveBasket, cfg.ReserveBasket))
 	}
 	// The server bounds leaf counts by, and sizes the minimum chunk from, its
 	// own fanout_outputs_per_tx; the keeper sizes both from its own.
 	if um.Throughput.FanoutOutputsPerTx != cfg.FanoutOutputsPerTx {
-		errs = append(errs, fmt.Errorf("storage fanout_outputs_per_tx %d != FK_FANOUT_OUTPUTS_PER_TX %d", um.Throughput.FanoutOutputsPerTx, cfg.FanoutOutputsPerTx))
+		errs = append(errs, fmt.Errorf("storage utxo_management.throughput.fanout_outputs_per_tx %d != FK_FANOUT_OUTPUTS_PER_TX %d", um.Throughput.FanoutOutputsPerTx, cfg.FanoutOutputsPerTx))
 	}
 	d, err := um.Throughput.Denomination(scfg.FeeModel, scfg.Commission)
 	switch {
 	case err != nil:
-		errs = append(errs, fmt.Errorf("storage denomination: %w", err))
+		errs = append(errs, fmt.Errorf("storage utxo_management.throughput denomination: %w", err))
 	case d != cfg.Denomination:
 		errs = append(errs, fmt.Errorf("storage resolved denomination %d != FUEL_D %d (set utxo_management.throughput.denomination_satoshis)", d, cfg.Denomination))
 	}
@@ -203,6 +210,11 @@ type provenLister interface {
 
 // errReaderBlind is the fatal self-check verdict.
 var errReaderBlind = errors.New("storage reader sees no fuel rows: check DB config/user")
+
+// errReaderOtherDB is fatal: FindOrInsertUser on the reader created the
+// wallet's user, which the wallet's own handshake had already created on the
+// storage server's DB.
+var errReaderOtherDB = errors.New("storage reader is on a different database than the wallet")
 
 // selfCheck verifies the read-only provider sees what the wallet sees. It
 // returns errReaderBlind (wrapped) only on a definitive mismatch: the pool
