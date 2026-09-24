@@ -13,6 +13,7 @@ import (
 	sighash "github.com/bsv-blockchain/go-sdk/transaction/sighash"
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 	"github.com/bsv-blockchain/go-wallet-toolbox/pkg/brc29"
+	"github.com/bsv-blockchain/go-wallet-toolbox/pkg/wdk"
 
 	"github.com/sirdeggen/mandala/fuelkeeper/internal/token"
 )
@@ -41,6 +42,8 @@ type Source interface {
 	// spendable; Detach is idempotent.
 	Detach(ctx context.Context, outpoint string) error
 	// StillSpendable reports spendable && spent_by IS NULL for the output.
+	// An unknown (or ambiguous) output is an error, never "spent": a caller
+	// must not drop fuel it cannot see.
 	StillSpendable(ctx context.Context, outpoint string) (bool, error)
 	// FeePubKeyHash is the issuer-side fee key hash for requester (spec §1.2).
 	FeePubKeyHash(ctx context.Context, keyID string, requester *ec.PublicKey) ([]byte, error)
@@ -49,6 +52,14 @@ type Source interface {
 	Unlocker(prefix, suffix string) (transaction.UnlockingScriptTemplate, error)
 	Internalize(ctx context.Context, args sdk.InternalizeActionArgs) error
 	BalanceSats(ctx context.Context) (uint64, error)
+}
+
+// OutputsReader is the row-level storage view (tx status, spent_by, change)
+// the BRC-100 surface does not expose. In production it is the in-process
+// *storage.Provider: the toolbox HTTP storage client's FindOutputsAuth is a
+// stub that always returns no rows (go-wallet-toolbox v0.186.3).
+type OutputsReader interface {
+	FindOutputsAuth(ctx context.Context, auth wdk.AuthID, filters wdk.FindOutputsArgs) (wdk.TableOutputs, error)
 }
 
 // FuelSigHash is the sighash every fuel input is signed with (0xC3): the
