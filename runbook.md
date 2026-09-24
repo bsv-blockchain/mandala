@@ -419,7 +419,8 @@ curl http://127.0.0.1:8090/health
 ```
 
 In the container image (`fuelkeeper/Dockerfile`, distroless `nonroot`) the
-working directory is `/data`: mount the PVC there.
+working directory is `/data`: mount the PVC there and set `securityContext.fsGroup: 65532`
+(the distroless `nonroot` uid/gid) so the volume is writable.
 
 **The issuer wallet must be funded before the keeper can mint fuel.** Send
 BSV to the issuer wallet's receiving address via the storage server (the

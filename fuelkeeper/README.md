@@ -114,7 +114,9 @@ minutes and gives up).
 `Dockerfile` builds a CGO binary onto `gcr.io/distroless/base-debian12:nonroot`
 and runs it as `nonroot` with working directory `/data`. Mount the persistent
 volume at `/data`: the `FK_DB_DSN` default (`fuelkeeper.sqlite`) and any
-relative sqlite `connection_string` in the infra yaml resolve there. Point
+relative sqlite `connection_string` in the infra yaml resolve there. The
+image's user is uid/gid 65532, so the pod spec needs `securityContext.fsGroup: 65532`
+(or a pre-chowned volume) for `/data` to be writable. Point
 Kubernetes liveness at `/livez` and readiness at `/health`.
 
 ## Single replica

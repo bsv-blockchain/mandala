@@ -394,6 +394,13 @@ func (s *Sweeper) rule2(ctx context.Context) error {
 			log.Error("sweeper: fuel released after its tx was consumed (eviction or rule 4) is spent on chain; "+
 				"the tx most likely mined anyway, so the requester is not denied; /settle repairs the row",
 				"alert", AlertSpentExternal, "firstReading", first.UTC().Format(time.RFC3339))
+		case r.FeeScript == "":
+			// The draft never reached Commit (a short draft's survivors or a
+			// rule-0 release): no signed skeleton was ever handed out, so the
+			// requester cannot have spent this fuel. Two "spent" readings here
+			// mean the wallet's own funder or an operator moved it.
+			log.Error("sweeper: fuel released before any draft was issued is spent on chain; not attributable to the requester",
+				"alert", AlertSpentExternal, "firstReading", first.UTC().Format(time.RFC3339))
 		default:
 			log.Error("sweeper: released fuel was spent outside the keeper", "alert", AlertSpentExternal,
 				"firstReading", first.UTC().Format(time.RFC3339))

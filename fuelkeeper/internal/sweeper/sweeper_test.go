@@ -700,6 +700,34 @@ func TestRule2_SpentRowWithTxidAlertsWithoutDeny(t *testing.T) {
 	require.True(t, ok, "/settle repairs the spent_external row")
 }
 
+func TestRule2_UncommittedRowNeverDenies(t *testing.T) {
+	e := newEnv(t)
+	who := requester(t)
+	fr := e.src.AddFuel(t, 200)
+	reqID := "req-uncommitted"
+	ok, err := e.st.Claim(e.ctx, store.Candidate{Outpoint: fr.Outpoint, Satoshis: fr.Satoshis, FuelScript: hex.EncodeToString(fr.LockingScript), FuelBeef: hex.EncodeToString(fr.Beef), DerivationPrefix: fr.DerivationPrefix, DerivationSuffix: fr.DerivationSuffix}, reqID, who, assetID, 0, 60)
+	require.NoError(t, err)
+	require.True(t, ok)
+	n, err := e.st.ReleaseReserving(e.ctx, reqID, true) // short draft: survivors released unsigned
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+	require.NoError(t, e.src.Detach(e.ctx, fr.Outpoint)) // as the drafter does before verifying
+	canary := e.src.AddFuel(t, 200)                      // a healthy pool row so the canary passes
+	e.chk.set(canary.Outpoint, true, nil)
+	e.chk.set(fr.Outpoint, false, nil)
+
+	e.c.add(time.Minute)
+	e.tick(t) // first reading
+	e.c.add(Rule2ConfirmGap + time.Second)
+	e.tick(t) // confirmed
+	r := e.row(t, reqID, fr.Outpoint)
+	require.Equal(t, store.StatusSpentExternal, r.Status)
+	require.Empty(t, r.FeeScript, "never committed")
+	require.False(t, e.denied(t, who), "no signed draft was ever issued: the requester cannot be blamed")
+	require.Contains(t, e.logs.String(), `"alert":"spent_external"`)
+	require.Contains(t, e.logs.String(), "before any draft was issued")
+}
+
 func TestRule2_NilCheckerIsDisabled(t *testing.T) {
 	e := newEnv(t)
 	sw := New(e.st, e.src, nil, nil, e.c.now, nil, WithPoolWatch(poolBasket, 0, 60, 1000))
