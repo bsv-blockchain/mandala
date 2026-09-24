@@ -387,3 +387,50 @@ func TestSettle_InternalizeErrorLeavesRowsUnsettled(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 }
+
+// A failure part-way through: the rows before the failing internalize are
+// credited and marked, the failing row and the ones after it are not, and
+// the overlay's retry settles the rest without touching what already landed.
+func TestSettle_PartialFailureSettlesTheRestOnRetry(t *testing.T) {
+	e := newEnv(t)
+	p := e.draft(t, "req1", newRequester(t), 0, 2)
+	tx := buildTx(t, p)
+	txid := tx.TxID().String()
+	e.consume(t, txid,
+		store.ConsumeItem{Outpoint: p[0].fuel.Outpoint, RequestID: "req1"},
+		store.ConsumeItem{Outpoint: p[1].fuel.Outpoint, RequestID: "req1"})
+	atomic := atomicOf(t, tx)
+	boom := errors.New("storage down on the second output")
+	e.src.FailNthInternalize(2, boom)
+
+	n, err := e.s.Settle(e.ctx, txid, atomic)
+	require.ErrorIs(t, err, boom)
+	require.ErrorContains(t, err, p[1].fuel.Outpoint)
+	require.Equal(t, 1, n, "row 1 was internalized before row 2 failed")
+	require.Len(t, e.src.Internalized, 2)
+	rows, err := e.st.ByTxid(e.ctx, txid)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	require.Equal(t, p[0].fuel.Outpoint, rows[0].Outpoint)
+	require.Equal(t, store.StatusConsumed, rows[0].Status)
+	require.NotNil(t, rows[0].SettledAt, "row 1 is settled")
+	firstSettledAt := *rows[0].SettledAt
+	require.Equal(t, store.StatusConsumed, rows[1].Status)
+	require.Nil(t, rows[1].SettledAt, "row 2 is still unsettled: the sweeper and the overlay still see it")
+
+	e.c.t = e.c.t.Add(time.Minute)
+	n, err = e.s.Settle(e.ctx, txid, atomic)
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+	require.Len(t, e.src.Internalized, 4, "the retry re-internalizes row 1 (known-tx merge) and row 2")
+	rows, err = e.st.ByTxid(e.ctx, txid)
+	require.NoError(t, err)
+	require.NotNil(t, rows[0].SettledAt)
+	require.Equal(t, firstSettledAt, *rows[0].SettledAt, "row 1 keeps its original settled_at")
+	require.NotNil(t, rows[1].SettledAt, "row 2 settled on the retry")
+	require.Equal(t, e.c.t.Unix(), *rows[1].SettledAt)
+	for _, args := range e.src.Internalized[2:] {
+		require.Equal(t, atomic, args.Tx)
+	}
+	require.EqualValues(t, 1, e.src.Internalized[3].Outputs[0].OutputIndex, "row 2's fee output")
+}

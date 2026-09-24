@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"log/slog"
@@ -198,16 +199,17 @@ func (l *logBuf) String() string {
 // environment
 
 type env struct {
-	ctx   context.Context
-	st    *store.Store
-	fake  *fuel.Fake
-	src   *flakySource
-	c     *clock
-	chk   *fakeChecker
-	ov    *fakeOverlay
-	logs  *logBuf
-	sw    *Sweeper
-	reqNo int
+	ctx    context.Context
+	st     *store.Store
+	dbPath string
+	fake   *fuel.Fake
+	src    *flakySource
+	c      *clock
+	chk    *fakeChecker
+	ov     *fakeOverlay
+	logs   *logBuf
+	sw     *Sweeper
+	reqNo  int
 }
 
 func newEnv(t *testing.T) *env { return newEnvWith(t, true) }
@@ -215,13 +217,14 @@ func newEnv(t *testing.T) *env { return newEnvWith(t, true) }
 func newEnvWith(t *testing.T, withOverlay bool) *env {
 	t.Helper()
 	c := &clock{t: time.Unix(1_758_700_000, 0)}
-	st, err := store.Open(store.DriverSQLite, filepath.Join(t.TempDir(), "fk.sqlite"), c.now)
+	dbPath := filepath.Join(t.TempDir(), "fk.sqlite")
+	st, err := store.Open(store.DriverSQLite, dbPath, c.now)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	priv, err := ec.NewPrivateKey()
 	require.NoError(t, err)
 	fake := fuel.NewFake(priv)
-	e := &env{ctx: context.Background(), st: st, fake: fake, src: &flakySource{Fake: fake}, c: c,
+	e := &env{ctx: context.Background(), st: st, dbPath: dbPath, fake: fake, src: &flakySource{Fake: fake}, c: c,
 		chk: newFakeChecker(), ov: newFakeOverlay(), logs: &logBuf{}}
 	var ov OverlayClient
 	if withOverlay {
@@ -319,6 +322,18 @@ func (e *env) row(t *testing.T, reqID, op string) store.Reservation {
 	}
 	t.Fatalf("no row %s under %s", op, reqID)
 	return store.Reservation{}
+}
+
+// sqlExec runs stmt over a second connection to the store's SQLite file.
+// Tests use it for fault injection: a trigger that fails one kind of write
+// while every other store call keeps working.
+func (e *env) sqlExec(t *testing.T, stmt string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", "file:"+e.dbPath+"?_busy_timeout=5000")
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	_, err = db.Exec(stmt)
+	require.NoError(t, err)
 }
 
 func (e *env) tick(t *testing.T) {
@@ -481,6 +496,7 @@ func TestRule2_SpentMarksSpentExternalAndDenies(t *testing.T) {
 	r := e.row(t, req, fr.Outpoint)
 	require.Equal(t, store.StatusSpentExternal, r.Status)
 	require.False(t, r.NeedsRecheck)
+	require.Empty(t, r.Txid, "a draft released unconsumed: only such rows deny")
 	require.True(t, e.denied(t, who))
 	require.False(t, e.denied(t, bystander))
 	require.Contains(t, e.logs.String(), `"alert":"spent_external"`)
@@ -495,9 +511,86 @@ func TestRule2_CheckerErrorLeavesRowAndNeverDenies(t *testing.T) {
 	e.c.add(time.Minute)
 	e.tick(t)
 	e.tick(t)
-	require.Equal(t, before, e.row(t, req, fr.Outpoint), "row unchanged, including updated_at")
+	after := e.row(t, req, fr.Outpoint)
+	require.Equal(t, e.c.now().Unix(), after.UpdatedAt, "only moved to the back of the recheck queue")
+	after.UpdatedAt = before.UpdatedAt
+	require.Equal(t, before, after, "otherwise unchanged: still released, needs_recheck=1")
 	require.False(t, e.denied(t, who))
 	require.Contains(t, e.logs.String(), "rows stay pending")
+}
+
+// A row whose chain check keeps failing goes to the back of the queue on
+// every failure, so it cannot starve the rows behind it (rule 2 checks at
+// most recheckBatch rows per tick; lowered to 1 here).
+func TestRule2_FailingRowDoesNotStarveTheQueue(t *testing.T) {
+	e := newEnv(t)
+	e.sw.recheckBatch = 1
+	reqA, a := e.released(t, requester(t)) // oldest: head of the queue
+	e.c.add(time.Second)
+	reqB, b := e.released(t, requester(t))
+	e.chk.set(a.Outpoint, false, errors.New("woc: 429"))
+	e.chk.set(b.Outpoint, true, nil)
+	e.c.add(time.Minute)
+
+	e.tick(t)
+	require.Equal(t, 1, e.chk.calls[a.Outpoint])
+	require.Zero(t, e.chk.calls[b.Outpoint], "a batch of one checks only the head")
+	e.tick(t)
+	require.Equal(t, 1, e.chk.calls[a.Outpoint], "the failing row moved to the back")
+	require.Equal(t, 1, e.chk.calls[b.Outpoint], "the row behind it is reached on the next tick")
+	rb := e.row(t, reqB, b.Outpoint)
+	require.Equal(t, store.StatusReleased, rb.Status)
+	require.False(t, rb.NeedsRecheck, "cleared: claimable again")
+	ra := e.row(t, reqA, a.Outpoint)
+	require.Equal(t, store.StatusReleased, ra.Status)
+	require.True(t, ra.NeedsRecheck, "the failing row stays pending")
+}
+
+// A released row that carries a txid came from an eviction or a rule-4
+// release after its tx was consumed, so a chain spend is most likely that tx
+// having mined anyway. The row goes spent_external with an alert (a /settle
+// still repairs it) but its requester is never denied.
+func TestRule2_SpentRowWithTxidAlertsWithoutDeny(t *testing.T) {
+	e := newEnv(t)
+	evictedBy, rule4By := requester(t), requester(t)
+
+	evictedTxid := randTxid(t)
+	reqE, rowsE := e.consumed(t, evictedBy, evictedTxid, 1)
+	n, err := e.st.ReleaseEvicted(e.ctx, evictedTxid, []string{rowsE[0].Outpoint})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+
+	rule4Txid := randTxid(t)
+	req4, rows4 := e.consumed(t, rule4By, rule4Txid, 1)
+	e.ov.set(rule4Txid, http.StatusGone, false, nil)
+	e.pastRule4(t)
+	e.tick(t) // rule 4 releases rule4Txid's row; the evicted row's check has no answer yet
+	r := e.row(t, req4, rows4[0].Outpoint)
+	require.Equal(t, store.StatusReleased, r.Status)
+	require.True(t, r.NeedsRecheck)
+	require.Equal(t, rule4Txid, r.Txid)
+	require.NotContains(t, e.logs.String(), `"alert":"spent_external"`)
+
+	e.chk.set(rowsE[0].Outpoint, false, nil)
+	e.chk.set(rows4[0].Outpoint, false, nil)
+	e.tick(t)
+	for req, want := range map[string]struct{ op, txid string }{
+		reqE: {rowsE[0].Outpoint, evictedTxid},
+		req4: {rows4[0].Outpoint, rule4Txid},
+	} {
+		r := e.row(t, req, want.op)
+		require.Equal(t, store.StatusSpentExternal, r.Status, want.op)
+		require.False(t, r.NeedsRecheck, want.op)
+		require.Equal(t, want.txid, r.Txid, "txid kept for a /settle repair")
+	}
+	require.False(t, e.denied(t, evictedBy), "the evicted tx most likely mined: never denied")
+	require.False(t, e.denied(t, rule4By), "the rule-4 released tx most likely mined: never denied")
+	require.Contains(t, e.logs.String(), `"alert":"spent_external"`)
+	require.Contains(t, e.logs.String(), "requester is not denied")
+
+	ok, err := e.st.MarkSettled(e.ctx, rowsE[0].Outpoint, evictedTxid)
+	require.NoError(t, err)
+	require.True(t, ok, "/settle repairs the spent_external row")
 }
 
 func TestRule2_NilCheckerIsDisabled(t *testing.T) {
@@ -768,7 +861,61 @@ func TestRule4_ObservationsAreForgottenWhenTheTxLeavesScope(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Tick / Run
 
+// A failing rule is reported and the tick moves on: the rules after it still
+// run in the same tick. Rules 0 and 2 are made to fail by SQLite triggers on
+// their own writes (Drop, SetRechecked); rules 1, 3 and 4 are untouched.
 func TestTickContinuesPastAFailingRule(t *testing.T) {
+	e := newEnv(t)
+	// rule 0: an expired reservation that is no longer spendable → Drop.
+	req0, rows0 := e.claim(t, requester(t), 1)
+	e.fake.SpendExternally(rows0[0].Outpoint)
+	// rule 1: an expired draft.
+	req1, _ := e.draft(t, requester(t), 1)
+	// rule 2: a released row whose unspent verdict is written by SetRechecked.
+	req2, row2 := e.released(t, requester(t))
+	e.chk.set(row2.Outpoint, true, nil)
+	// rule 4: an unsettled consumed tx the overlay reports evicted.
+	txid := randTxid(t)
+	req4, _ := e.consumed(t, requester(t), txid, 1)
+	e.ov.set(txid, http.StatusGone, false, nil)
+	e.pastRule4(t) // also expires the reservation and the draft
+
+	e.sqlExec(t, `CREATE TRIGGER inject_drop_failure BEFORE UPDATE OF status ON fuel_reservations
+  WHEN NEW.status='dropped' BEGIN SELECT RAISE(ABORT, 'injected drop failure'); END`)
+	e.sqlExec(t, `CREATE TRIGGER inject_recheck_failure BEFORE UPDATE OF needs_recheck ON fuel_reservations
+  WHEN OLD.status='released' AND OLD.needs_recheck=1 AND NEW.needs_recheck=0
+  BEGIN SELECT RAISE(ABORT, 'injected recheck failure'); END`)
+
+	err := e.sw.Tick(e.ctx)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "sweeper rule0:")
+	require.ErrorContains(t, err, "injected drop failure")
+	require.ErrorContains(t, err, "sweeper rule2:")
+	require.ErrorContains(t, err, "injected recheck failure")
+	for _, ok := range []string{"rule1", "rule3", "rule4"} {
+		require.NotContains(t, err.Error(), "sweeper "+ok+":", "only the failing rules are reported")
+	}
+	// The failed writes changed nothing...
+	require.Equal(t, store.StatusReserving, e.rows(t, req0)[0].Status)
+	r2 := e.row(t, req2, row2.Outpoint)
+	require.Equal(t, store.StatusReleased, r2.Status)
+	require.True(t, r2.NeedsRecheck)
+	// ...and the rules after each failure still ran in the same tick.
+	require.Equal(t, store.StatusReleased, e.rows(t, req1)[0].Status, "rule 1 ran after rule 0 failed")
+	require.Equal(t, 1, e.ov.askedCount(txid), "rule 4 asked the overlay after rule 2 failed")
+	require.Equal(t, store.StatusReleased, e.rows(t, req4)[0].Status, "rule 4 acted on the overlay's answer")
+
+	// Once the faults clear, the next tick completes the failed rules.
+	e.sqlExec(t, `DROP TRIGGER inject_drop_failure`)
+	e.sqlExec(t, `DROP TRIGGER inject_recheck_failure`)
+	e.tick(t)
+	require.Equal(t, store.StatusDropped, e.rows(t, req0)[0].Status)
+	require.False(t, e.row(t, req2, row2.Outpoint).NeedsRecheck)
+}
+
+// A cancelled context fails every rule; each failure is reported, nothing
+// changes, and the next tick does the work.
+func TestTickReportsEveryFailedRule(t *testing.T) {
 	e := newEnv(t)
 	req, _ := e.draft(t, requester(t), 1)
 	e.c.add((draftTTL + 1) * time.Second)
@@ -776,6 +923,10 @@ func TestTickContinuesPastAFailingRule(t *testing.T) {
 	cancel()
 	err := e.sw.Tick(ctx)
 	require.Error(t, err, "every rule sees the cancelled context")
+	for _, rule := range []string{"rule0", "rule1", "rule2", "rule3", "rule4"} {
+		require.ErrorContains(t, err, "sweeper "+rule+":")
+	}
+	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, store.StatusReserved, e.rows(t, req)[0].Status)
 	e.tick(t)
 	require.Equal(t, store.StatusReleased, e.rows(t, req)[0].Status)

@@ -48,25 +48,39 @@ func TestHTTPOverlay_AdmissionStatus(t *testing.T) {
 		status    int
 		body      string
 		wantFinal bool
+		wantErr   bool // no usable answer: the sweeper does nothing this tick
 	}{
-		"admitted":            {200, `{"txid":"` + txid + `","outputsToAdmit":[0]}`, false},
-		"evicted":             {410, `{"status":"error","code":"ERR_EVICTED","retryable":false,"description":"x"}`, true},
-		"final refusal":       {400, `{"status":"error","code":"ERR_TOPIC_REJECTED","retryable":false,"description":"x"}`, true},
-		"shape is not final":  {400, `{"status":"error","code":"ERR_SHAPE","retryable":false,"description":"x"}`, false},
-		"retryable 400":       {400, `{"status":"error","code":"ERR_X","retryable":true}`, false},
-		"400 without flag":    {400, `{"status":"error","code":"ERR_X"}`, false},
-		"400 not json":        {400, `nope`, false},
-		"not found":           {404, `{"status":"error","message":"no admission on record for ` + txid + `"}`, false},
-		"unavailable":         {503, `{"status":"error","code":"ERR_UNAVAILABLE","retryable":false}`, false},
-		"unauthorized is 4xx": {401, `{"status":"error","code":"ERR_UNAUTHORIZED","retryable":false}`, true},
-		"empty 404 body":      {404, ``, false},
+		"admitted": {200, `{"txid":"` + txid + `","outputsToAdmit":[0]}`, false, false},
+		// 410 is acted on by its status; only a 400 is ever a final refusal.
+		"evicted":                    {410, `{"status":"error","code":"ERR_EVICTED","retryable":false,"description":"x"}`, false, false},
+		"final refusal":              {400, `{"status":"error","code":"ERR_TOPIC_REJECTED","retryable":false,"description":"x"}`, true, false},
+		"shape is not final":         {400, `{"status":"error","code":"ERR_SHAPE","retryable":false,"description":"x"}`, false, false},
+		"retryable 400":              {400, `{"status":"error","code":"ERR_X","retryable":true}`, false, false},
+		"400 without flag":           {400, `{"status":"error","code":"ERR_X"}`, false, false},
+		"400 without code":           {400, `{"status":"error","retryable":false}`, false, false},
+		"400 not the overlay shape":  {400, `{"code":"ERR_X","retryable":false}`, false, false},
+		"400 not json":               {400, `nope`, false, false},
+		"unavailable":                {503, `{"status":"error","code":"ERR_UNAVAILABLE","retryable":false}`, false, false},
+		"401 is never final":         {401, `{"status":"error","code":"ERR_UNAUTHORIZED","retryable":false}`, false, false},
+		"403 is never final":         {403, `{"status":"error","code":"ERR_FORBIDDEN","retryable":false}`, false, false},
+		"409 is never final":         {409, `{"status":"error","code":"ERR_X","retryable":false}`, false, false},
+		"404 overlay no-record json": {404, `{"status":"error","message":"no admission on record for ` + txid + `"}`, false, false},
+		"404 html from a proxy":      {404, `<html><body><h1>404 Not Found</h1></body></html>`, false, true},
+		"404 plain text":             {404, `404 page not found`, false, true},
+		"404 unmounted route":        {404, `{"status":"error","code":"ERR_ROUTE_NOT_FOUND","description":"Route not found."}`, false, true},
+		"404 other json":             {404, `{"message":"Not Found"}`, false, true},
+		"empty 404 body":             {404, ``, false, true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			srv, seen := overlayServer(t, tc.status, tc.body)
 			c := NewHTTPOverlayClient(srv.URL+"/", "tok", nil)
 			code, final, err := c.AdmissionStatus(context.Background(), txid)
-			require.NoError(t, err)
-			require.Equal(t, tc.status, code)
+			if tc.wantErr {
+				require.Error(t, err, "a 404 that is not the overlay's answer is no answer")
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.status, code)
+			}
 			require.Equal(t, tc.wantFinal, final)
 			reqs := seen()
 			require.Len(t, reqs, 1)

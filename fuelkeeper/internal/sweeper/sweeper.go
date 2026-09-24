@@ -6,14 +6,19 @@
 //	   error → left reserving for the next tick (never drop unseen fuel).
 //	1  reserved past expires_at → released(needs_recheck=1).
 //	2  released(needs_recheck=1) → chain check: unspent → needs_recheck=0;
-//	   spent → spent_external + deny the last requester, only when that CAS
-//	   actually moved the row; checker error → unchanged.
+//	   spent → spent_external + alert, and deny the last requester only when
+//	   that CAS actually moved the row and the row carries no txid (a row
+//	   with a txid came from an eviction or a rule-4 release: its consumed tx
+//	   most likely mined anyway, so nobody is denied); checker error → the row
+//	   only moves to the back of the queue (updated_at bumped).
 //	3  consumed, unsettled > 5 min → log only (the overlay owns settle
 //	   retries).
 //	4  consumed, unsettled > 30 min → ask the overlay's admission record:
 //	   200 → never release, alert, POST /fuel/resettle; 410 or a final 400 →
-//	   released(needs_recheck=1); 404 → released(needs_recheck=1) only after
-//	   two unspent chain observations ≥ 10 min apart; anything else → nothing.
+//	   released(needs_recheck=1) (settled rows never); the overlay's own 404
+//	   "no admission on record" → released(needs_recheck=1) only after two
+//	   unspent chain observations ≥ 10 min apart; anything else (including a
+//	   404 that is not the overlay's answer) → nothing.
 //
 // Every transition is a store CAS, so a tick racing /consume, /settle or a
 // draft converges: whichever write lands first wins and the other misses.
@@ -70,8 +75,10 @@ var txidRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // OverlayClient is the overlay surface rule 4 needs.
 type OverlayClient interface {
 	// AdmissionStatus is GET /admin/admission/{txid}: the HTTP status, and
-	// for a 4xx whether its body is a final refusal (retryable:false). err
-	// is set only when no HTTP answer arrived (transport error, timeout).
+	// for a 400 whether its body is a final refusal (retryable:false; never
+	// set for any other status). err is set when no usable answer arrived: a
+	// transport error, a timeout, or a 404 that is not the overlay's own
+	// "no admission on record" body (a proxy, a route not mounted).
 	AdmissionStatus(ctx context.Context, txid string) (code int, finalReject bool, err error)
 	// Resettle is POST /fuel/resettle {txid}; non-2xx is an error.
 	Resettle(ctx context.Context, txid string) error
@@ -86,6 +93,7 @@ type Sweeper struct {
 	now          func() time.Time
 	logger       *slog.Logger
 	reservingTTL int64
+	recheckBatch int // rule 2's rows per tick (recheckBatch; tests lower it)
 
 	mu sync.Mutex // serializes Tick and guards firstUnspent
 	// firstUnspent is rule 4's first 404+unspent observation per txid. It is
@@ -114,7 +122,7 @@ func New(st *store.Store, src fuel.Source, checker chain.Checker, overlay Overla
 	}
 	return &Sweeper{
 		st: st, src: src, checker: checker, overlay: overlay, now: now, logger: logger,
-		reservingTTL: reservingTTL, firstUnspent: map[string]time.Time{},
+		reservingTTL: reservingTTL, recheckBatch: recheckBatch, firstUnspent: map[string]time.Time{},
 	}
 }
 
@@ -232,10 +240,16 @@ func (s *Sweeper) rule1(ctx context.Context) error {
 }
 
 // rule2: released, needs_recheck=1 → chain check. A checker error is never
-// an answer; a spent verdict denies the requester only when the CAS moved
-// the row (a concurrent /settle repair wins the race and nobody is denied).
+// an answer: the row is only touched to the back of the queue, so a row whose
+// check keeps failing cannot starve the rows behind it. A spent verdict moves
+// the row to spent_external; the requester is denied only when that CAS
+// moved the row (a concurrent /settle repair wins the race and nobody is
+// denied) and the row carries no txid. A txid means the row was released by
+// an eviction or by rule 4 after the requester's tx was consumed: the chain
+// spend is most likely that very tx having mined anyway, so the keeper
+// alerts (a /settle repairs the row) but does not punish the requester.
 func (s *Sweeper) rule2(ctx context.Context) error {
-	rows, err := s.st.RecheckPending(ctx, recheckBatch)
+	rows, err := s.st.RecheckPending(ctx, s.recheckBatch)
 	if err != nil {
 		return err
 	}
@@ -255,6 +269,9 @@ func (s *Sweeper) rule2(ctx context.Context) error {
 			if firstFail == nil {
 				firstFail = err
 			}
+			if terr := s.st.TouchRecheck(ctx, r.Outpoint); terr != nil {
+				errs = append(errs, fmt.Errorf("touch %s: %w", r.Outpoint, terr))
+			}
 			continue
 		}
 		moved, err := s.st.SetRechecked(ctx, r.Outpoint, unspent)
@@ -268,6 +285,10 @@ func (s *Sweeper) rule2(ctx context.Context) error {
 			log.Info("sweeper: row moved on during the chain check; verdict discarded", "unspent", unspent)
 		case unspent:
 			log.Info("sweeper: released fuel is unspent on chain; claimable again")
+		case r.Txid != "":
+			log.Error("sweeper: fuel released after its tx was consumed (eviction or rule 4) is spent on chain; "+
+				"the tx most likely mined anyway, so the requester is not denied; /settle repairs the row",
+				"alert", AlertSpentExternal)
 		default:
 			log.Error("sweeper: released fuel was spent outside the keeper", "alert", AlertSpentExternal)
 			if err := s.deny(ctx, r); err != nil {
@@ -277,7 +298,7 @@ func (s *Sweeper) rule2(ctx context.Context) error {
 		}
 	}
 	if failed > 0 {
-		s.logger.Warn("sweeper: chain check failed; rows stay pending", "rule", 2, "rows", failed, "err", firstFail)
+		s.logger.Warn("sweeper: chain check failed; rows stay pending (moved to the back of the queue)", "rule", 2, "rows", failed, "err", firstFail)
 	}
 	return errors.Join(errs...)
 }

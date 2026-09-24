@@ -162,8 +162,10 @@ func TestFakeListProvenOrderMaxAndHooks(t *testing.T) {
 	require.Empty(t, rows)
 
 	require.Error(t, f.Detach(ctx, "00"))
+	// An unknown outpoint is an error (fail closed, as WalletSource), never
+	// a definitive "not spendable" a caller could drop fuel on.
 	ok, err = f.StillSpendable(ctx, "unknown")
-	require.NoError(t, err)
+	require.ErrorIs(t, err, errUnknownOutpoint)
 	require.False(t, ok)
 }
 
@@ -181,6 +183,15 @@ func TestFakeInternalizeAndBalance(t *testing.T) {
 	require.Error(t, f.Internalize(ctx, args))
 	require.Len(t, f.Internalized, 2)
 	require.Equal(t, "sweep change", f.Internalized[0].Description)
+
+	// FailNthInternalize: only the n-th call from now fails, once.
+	f.InternalizeErr = nil
+	boom := errors.New("boom")
+	f.FailNthInternalize(2, boom)
+	require.NoError(t, f.Internalize(ctx, args))
+	require.ErrorIs(t, f.Internalize(ctx, args), boom)
+	require.NoError(t, f.Internalize(ctx, args))
+	require.Len(t, f.Internalized, 5, "the failing call is still recorded")
 }
 
 func outpoints(rows []Row) []string {

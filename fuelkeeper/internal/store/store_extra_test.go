@@ -346,3 +346,91 @@ func TestReleaseReservingOutpoint(t *testing.T) {
 		})
 	}
 }
+
+func TestReleaseByRule4SkipsSettledRows(t *testing.T) {
+	for _, e := range openAll(t) {
+		t.Run(e.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := e.s
+			_, err := s.ReleaseByRule4(ctx, "")
+			require.Error(t, err)
+			for i, op := range []string{"aa.0", "aa.1"} {
+				ok, err := s.Claim(ctx, cand(op), "req1", "02aa", "asset.0", i, 60)
+				require.NoError(t, err)
+				require.True(t, ok)
+			}
+			_, err = s.Commit(ctx, "req1", []CommitPair{{Outpoint: "aa.0"}, {Outpoint: "aa.1"}}, 600)
+			require.NoError(t, err)
+			ref, err := s.Consume(ctx, "tx1", []ConsumeItem{{"aa.0", "req1"}, {"aa.1", "req1"}})
+			require.NoError(t, err)
+			require.Nil(t, ref)
+			ok, err := s.MarkSettled(ctx, "aa.0", "tx1")
+			require.NoError(t, err)
+			require.True(t, ok)
+			settled, _ := s.ByTxid(ctx, "tx1")
+			require.NotNil(t, settled[0].SettledAt)
+
+			e.c.t = e.c.t.Add(time.Minute)
+			n, err := s.ReleaseByRule4(ctx, "tx1")
+			require.NoError(t, err)
+			require.EqualValues(t, 1, n, "only the unsettled row is released")
+			rows, _ := s.ByTxid(ctx, "tx1")
+			require.Len(t, rows, 2)
+			require.Equal(t, settled[0], rows[0], "the settled row is untouched, including updated_at")
+			require.Equal(t, StatusReleased, rows[1].Status)
+			require.True(t, rows[1].NeedsRecheck)
+			require.Equal(t, "tx1", rows[1].Txid, "txid kept for a /settle repair")
+
+			n, err = s.ReleaseByRule4(ctx, "tx1")
+			require.NoError(t, err)
+			require.Zero(t, n)
+		})
+	}
+}
+
+func TestTouchRecheckRotatesThePendingQueue(t *testing.T) {
+	for _, e := range openAll(t) {
+		t.Run(e.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := e.s
+			require.Error(t, s.TouchRecheck(ctx, ""))
+			for i, op := range []string{"aa.0", "aa.1", "aa.2"} {
+				ok, err := s.Claim(ctx, cand(op), "req1", "02aa", "asset.0", i, 60)
+				require.NoError(t, err)
+				require.True(t, ok)
+			}
+			_, err := s.Commit(ctx, "req1", []CommitPair{{Outpoint: "aa.0"}, {Outpoint: "aa.1"}, {Outpoint: "aa.2"}}, 600)
+			require.NoError(t, err)
+			n, err := s.ReleaseRequest(ctx, "req1")
+			require.NoError(t, err)
+			require.EqualValues(t, 3, n)
+			ok, err := s.SetRechecked(ctx, "aa.2", true) // released, needs_recheck=0: not pending
+			require.NoError(t, err)
+			require.True(t, ok)
+			pend, err := s.RecheckPending(ctx, 1)
+			require.NoError(t, err)
+			require.Equal(t, "aa.0", pend[0].Outpoint, "oldest (then outpoint) first")
+			before, _ := s.ByRequest(ctx, "req1")
+
+			e.c.t = e.c.t.Add(time.Second)
+			require.NoError(t, s.TouchRecheck(ctx, "aa.0"))
+			pend, err = s.RecheckPending(ctx, 1)
+			require.NoError(t, err)
+			require.Equal(t, "aa.1", pend[0].Outpoint, "a touched row goes to the back of the queue")
+			after, _ := s.ByRequest(ctx, "req1")
+			require.Equal(t, e.c.t.Unix(), after[0].UpdatedAt)
+			touched := after[0]
+			touched.UpdatedAt = before[0].UpdatedAt
+			require.Equal(t, before[0], touched, "only updated_at changes")
+			require.Equal(t, StatusReleased, after[0].Status)
+			require.True(t, after[0].NeedsRecheck)
+
+			// CAS: a row not awaiting a recheck is never touched.
+			e.c.t = e.c.t.Add(time.Second)
+			require.NoError(t, s.TouchRecheck(ctx, "aa.2"))
+			require.NoError(t, s.TouchRecheck(ctx, "zz.9"))
+			again, _ := s.ByRequest(ctx, "req1")
+			require.Equal(t, after[2], again[2], "released, needs_recheck=0 is left alone")
+		})
+	}
+}

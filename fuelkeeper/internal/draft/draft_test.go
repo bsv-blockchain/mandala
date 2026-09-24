@@ -2,9 +2,11 @@ package draft
 
 import (
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +33,8 @@ type harness struct {
 	d      *Drafter
 	src    *fuel.Fake
 	st     *store.Store
+	dbPath string
+	v      *auth.Verifier
 	cfg    config.Config
 	now    time.Time
 	issuer *ec.PrivateKey
@@ -59,13 +63,58 @@ func newHarness(t *testing.T, fuelRows int, env ...string) *harness {
 	for i := 0; i < fuelRows; i++ {
 		h.src.AddFuel(t, cfg.Denomination)
 	}
-	h.st, err = store.Open("sqlite", filepath.Join(t.TempDir(), "fk.sqlite"), func() time.Time { return h.now })
+	h.dbPath = filepath.Join(t.TempDir(), "fk.sqlite")
+	h.st, err = store.Open("sqlite", h.dbPath, func() time.Time { return h.now })
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = h.st.Close() })
-	v, _ := auth.NewVerifier(func() time.Time { return h.now })
-	h.d = New(cfg, h.st, h.src, v, func() time.Time { return h.now })
+	h.v, _ = auth.NewVerifier(func() time.Time { return h.now })
+	h.d = New(cfg, h.st, h.src, h.v, func() time.Time { return h.now })
 	h.reqPW, h.reqHex = newRequester(t)
 	return h
+}
+
+// useSource rebuilds the drafter over src (a wrapper around h.src).
+func (h *harness) useSource(src fuel.Source) {
+	h.d = New(h.cfg, h.st, src, h.v, func() time.Time { return h.now })
+}
+
+// statuses maps each of requestID's rows to its status.
+func (h *harness) statuses(t *testing.T, requestID string) map[string]store.Status {
+	t.Helper()
+	rows, err := h.st.ByRequest(context.Background(), requestID)
+	require.NoError(t, err)
+	out := map[string]store.Status{}
+	for _, r := range rows {
+		out[r.Outpoint] = r.Status
+	}
+	return out
+}
+
+// injectDropFailure makes every write to status 'dropped' fail inside SQLite
+// (a trigger created over a second connection to the store's file), so Drop
+// errors while every other store call keeps working.
+func (h *harness) injectDropFailure(t *testing.T) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", "file:"+h.dbPath+"?_busy_timeout=5000")
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	_, err = db.Exec(`CREATE TRIGGER inject_drop_failure BEFORE UPDATE OF status ON fuel_reservations
+  WHEN NEW.status='dropped' BEGIN SELECT RAISE(ABORT, 'injected drop failure'); END`)
+	require.NoError(t, err)
+}
+
+// verifyFailSource wraps the Fake with a StillSpendable error for chosen
+// outpoints, which the Fake cannot produce for a row it knows.
+type verifyFailSource struct {
+	*fuel.Fake
+	fail map[string]error
+}
+
+func (s *verifyFailSource) StillSpendable(ctx context.Context, op string) (bool, error) {
+	if err, ok := s.fail[op]; ok {
+		return false, err
+	}
+	return s.Fake.StillSpendable(ctx, op)
 }
 
 func newRequester(t *testing.T) (*sdk.ProtoWallet, string) {
@@ -158,6 +207,12 @@ func TestDraft_SkeletonSurvivesExtension(t *testing.T) {
 	require.Nil(t, ref)
 	require.Equal(t, 2, res.K)
 	tx, _ := transaction.NewTransactionFromHex(res.DraftTx)
+	// The keeper's fuel signatures as handed out, to compare after tx.Sign().
+	fuelUnlocks := make([][]byte, len(res.Pairs))
+	for i := range res.Pairs {
+		require.NotNil(t, tx.Inputs[i].UnlockingScript)
+		fuelUnlocks[i] = slices.Clone([]byte(*tx.Inputs[i].UnlockingScript))
+	}
 	prev := make([]*transaction.TransactionOutput, 2)
 	for i, p := range res.Pairs {
 		row := h.src.Row(p.FuelOutpoint)
@@ -174,6 +229,10 @@ func TestDraft_SkeletonSurvivesExtension(t *testing.T) {
 	tx.AddOutput(&transaction.TransactionOutput{Satoshis: 1, LockingScript: payerLock})
 	tx.AddOutput(&transaction.TransactionOutput{Satoshis: 1, LockingScript: payerLock})
 	require.NoError(t, tx.Sign()) // signs only inputs with a template (the payer input)
+	for i := range res.Pairs {
+		require.NotNil(t, tx.Inputs[i].UnlockingScript)
+		require.Equal(t, fuelUnlocks[i], []byte(*tx.Inputs[i].UnlockingScript), "tx.Sign() must leave fuel input %d's unlocking script byte-identical", i)
+	}
 
 	for i := range res.Pairs {
 		require.NoError(t, interpreter.NewEngine().Execute(interpreter.WithTx(tx, i, prev[i]), interpreter.WithForkID(), interpreter.WithAfterGenesis()), "fuel input %d must verify after extension", i)
@@ -407,6 +466,83 @@ func TestDraft_SelfVerifyDropsMismatchedRow(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, ref)
 	require.Equal(t, rows[0].Outpoint, res.Pairs[0].FuelOutpoint)
+}
+
+// A StillSpendable error is never an answer: the row is left reserving for
+// sweeper rule 0 (never dropped) and the draft carries on with the next
+// candidate.
+func TestDraft_VerifyErrorLeavesRowReserving(t *testing.T) {
+	h := newHarness(t, 2)
+	ctx := context.Background()
+	rows, _ := h.src.ListProven(ctx, "fuel", 10)
+	h.useSource(&verifyFailSource{Fake: h.src, fail: map[string]error{rows[0].Outpoint: errors.New("storage reader: 0 rows")}})
+
+	res, ref, err := h.d.Draft(ctx, h.request(t, 1, 3, 1)) // k=1
+	require.NoError(t, err)
+	require.Nil(t, ref)
+	require.Equal(t, rows[1].Outpoint, res.Pairs[0].FuelOutpoint)
+	st := h.statuses(t, res.RequestID)
+	require.Len(t, st, 2)
+	require.Equal(t, store.StatusReserving, st[rows[0].Outpoint], "left for sweeper rule 0, never dropped")
+	require.Equal(t, store.StatusReserved, st[rows[1].Outpoint])
+}
+
+// Short of k with an unverified row: no blanket release. Releasing would
+// also move the unverified row to released, and a later chain recheck could
+// deny an innocent requester (§4.7 rule 2), so every reserving row of the
+// request — the verified survivor included — is left untouched for rule 0.
+// (Contrast TestDraft_ShortReleasesSurvivorsForRecheck, where every row
+// verified and the survivors are released.)
+func TestDraft_ShortWithVerifyErrorLeavesEveryRowReserving(t *testing.T) {
+	h := newHarness(t, 2)
+	ctx := context.Background()
+	rows, _ := h.src.ListProven(ctx, "fuel", 10)
+	h.useSource(&verifyFailSource{Fake: h.src, fail: map[string]error{rows[0].Outpoint: errors.New("storage reader: 0 rows")}})
+
+	res, ref, err := h.d.Draft(ctx, h.request(t, 8, 10, 1)) // k=2, one verifiable row
+	require.NoError(t, err)
+	require.Nil(t, res)
+	require.Equal(t, "ERR_FUEL_UNAVAILABLE", ref.Code)
+	wire(t, ref)
+	all, err := h.st.ByRequest(ctx, hex.EncodeToString(append(make([]byte, 31), 1)))
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+	for _, r := range all {
+		require.Equal(t, store.StatusReserving, r.Status, r.Outpoint)
+		require.False(t, r.NeedsRecheck, r.Outpoint)
+	}
+}
+
+// A failed drop of a row that failed self-verification leaves that row
+// reserving, so the request is unresolved exactly as for a Detach or
+// StillSpendable error: no blanket release (it would release the row the drop
+// could not reach), and every reserving row waits for sweeper rule 0.
+func TestDraft_DropFailureLeavesRequestToSweeper(t *testing.T) {
+	h := newHarness(t, 2)
+	ctx := context.Background()
+	rows, _ := h.src.ListProven(ctx, "fuel", 10)
+	bad := rows[1]
+	c := store.Candidate{Outpoint: bad.Outpoint, Satoshis: bad.Satoshis, FuelScript: hex.EncodeToString(bad.LockingScript),
+		FuelBeef: hex.EncodeToString(bad.Beef), DerivationPrefix: bad.DerivationPrefix, DerivationSuffix: "AAAAAAAAAAAAAAAAAAAAAA=="}
+	ok, err := h.st.Claim(ctx, c, "seed", h.reqHex, asset, 0, 60)
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, err = h.st.Commit(ctx, "seed", []store.CommitPair{{Outpoint: bad.Outpoint, FeeScript: "00", KeyID: "k", FeeAmount: "1"}}, 600)
+	require.NoError(t, err)
+	_, err = h.st.ReleaseRequest(ctx, "seed")
+	require.NoError(t, err)
+	ok, err = h.st.SetRechecked(ctx, bad.Outpoint, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	h.injectDropFailure(t)
+
+	res, ref, err := h.d.Draft(ctx, h.request(t, 8, 10, 1)) // k=2: the bad released row + rows[0]
+	require.Error(t, err)
+	require.Nil(t, ref)
+	require.Nil(t, res)
+	st := h.statuses(t, hex.EncodeToString(append(make([]byte, 31), 1)))
+	require.Equal(t, map[string]store.Status{bad.Outpoint: store.StatusReserving, rows[0].Outpoint: store.StatusReserving}, st,
+		"the undroppable row and the verified survivor both stay reserving for rule 0")
 }
 
 // Concurrent drafts (double click, many tabs, many requesters) never hand the

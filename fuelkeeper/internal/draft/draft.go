@@ -11,8 +11,8 @@
 //     stored data is unusable, or our own signature over it does not verify);
 //   - left `reserving` for sweeper rule 0 (§4.7), which re-runs detach+verify
 //     per row: any row whose state the keeper could not observe (a storage
-//     error, a cancelled request). Such rows are never dropped — the keeper
-//     must not drop fuel it cannot see.
+//     error, a cancelled request) or whose drop write failed. Such rows are
+//     never dropped here — the keeper must not drop fuel it cannot see.
 //
 // The blanket ReleaseReserving(requestID, needs_recheck=1) is issued only
 // while every reserving row of the request is a verified survivor. Releasing
@@ -262,7 +262,12 @@ func (d *Drafter) Draft(ctx context.Context, req Request) (*Response, *Refusal, 
 	}
 	if len(bad) > 0 {
 		for _, op := range bad {
-			d.drop(ctx, op, req.Nonce)
+			if derr := d.drop(ctx, op, req.Nonce); derr != nil {
+				// The row is still reserving and unverified-as-dropped: leave
+				// the whole request to sweeper rule 0, exactly as for a
+				// Detach/StillSpendable error (no blanket release).
+				unresolved = true
+			}
 		}
 		release()
 		return nil, nil, fmt.Errorf("draft: %d signed fuel input(s) failed self-verification", len(bad))
@@ -557,12 +562,15 @@ func (d *Drafter) releaseReserving(ctx context.Context, requestID string) {
 	}
 }
 
-// drop is the best-effort reserving → dropped for a row found unusable after
-// reservation.
-func (d *Drafter) drop(ctx context.Context, outpoint, requestID string) {
+// drop moves a row found unusable after reservation reserving → dropped. On
+// failure the row stays reserving and the error is returned so the caller
+// marks the request unresolved (sweeper rule 0 then re-runs detach+verify).
+func (d *Drafter) drop(ctx context.Context, outpoint, requestID string) error {
 	cctx, cancel := cleanupCtx(ctx)
 	defer cancel()
 	if err := d.st.Drop(cctx, outpoint, requestID); err != nil {
-		d.log.Warn("fuel draft: drop failed", "outpoint", outpoint, "requestId", requestID, "err", err)
+		d.log.Warn("fuel draft: drop failed; row left reserving for sweeper rule 0", "outpoint", outpoint, "requestId", requestID, "err", err)
+		return fmt.Errorf("draft: drop %s: %w", outpoint, err)
 	}
+	return nil
 }

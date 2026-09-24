@@ -84,8 +84,11 @@ func (v *Verifier) Verify(ctx context.Context, requesterHex, keyID, sigHex strin
 	if err != nil {
 		return fmt.Errorf("%w: sig not DER", ErrShape)
 	}
-	d := v.now().Unix() - ts
-	if d > int64(v.window/time.Second) || -d > int64(v.window/time.Second) {
+	// Compare ts against the window bounds instead of negating now-ts: an
+	// adversarial ts (e.g. now+math.MinInt64) makes that difference wrap to
+	// math.MinInt64, whose negation is itself, and slips through.
+	now, w := v.now().Unix(), int64(v.window/time.Second)
+	if ts < now-w || ts > now+w {
 		return fmt.Errorf("%w: ts outside window", ErrShape)
 	}
 	res, err := v.pw.VerifySignature(ctx, sdk.VerifySignatureArgs{

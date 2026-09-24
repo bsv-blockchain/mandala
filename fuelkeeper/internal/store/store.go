@@ -715,14 +715,15 @@ func (s *Store) ReleaseEvicted(ctx context.Context, txid string, outpoints []str
 	return total, nil
 }
 
-// ReleaseByRule4 is sweeper rule 4 with overlay proof: every consumed(txid)
-// row → released, needs_recheck=1.
+// ReleaseByRule4 is sweeper rule 4 with overlay proof: every unsettled
+// consumed(txid) row → released, needs_recheck=1. A settled row is never
+// released: its fee is already credited, so the tx it belongs to is real.
 func (s *Store) ReleaseByRule4(ctx context.Context, txid string) (int64, error) {
 	if txid == "" {
 		return 0, errors.New("store: ReleaseByRule4 needs txid")
 	}
 	return s.exec(ctx, `UPDATE fuel_reservations SET status='released', needs_recheck=1, updated_at=?
-  WHERE txid=? AND status='consumed'`, s.unix(), txid)
+  WHERE txid=? AND status='consumed' AND settled_at IS NULL`, s.unix(), txid)
 }
 
 // ByTxid returns every row whose txid is txid, by pair index.
@@ -793,6 +794,19 @@ func (s *Store) SetRechecked(ctx context.Context, outpoint string, unspent bool)
 		return false, err
 	}
 	return n == 1, nil
+}
+
+// TouchRecheck moves a released, needs_recheck=1 row to the back of the
+// RecheckPending queue (updated_at = now) without changing anything else, so
+// a row whose chain check keeps failing cannot starve the rows behind it.
+// CAS on released, needs_recheck=1: a row that moved on is left alone.
+func (s *Store) TouchRecheck(ctx context.Context, outpoint string) error {
+	if outpoint == "" {
+		return errors.New("store: TouchRecheck needs outpoint")
+	}
+	_, err := s.exec(ctx, `UPDATE fuel_reservations SET updated_at=?
+  WHERE outpoint=? AND status='released' AND needs_recheck=1`, s.unix(), outpoint)
+	return err
 }
 
 // UnsettledConsumed lists consumed rows without settled_at whose last update

@@ -33,6 +33,10 @@ type Fake struct {
 	hidden  bool
 	listErr error
 	detErr  error
+	// intFailIn counts down Internalize calls to the one that returns
+	// intFailErr (see FailNthInternalize); 0 means no pending failure.
+	intFailIn  int
+	intFailErr error
 
 	// Internalized records every Internalize call's args, in order.
 	Internalized []sdk.InternalizeActionArgs
@@ -224,13 +228,15 @@ func (f *Fake) Detach(_ context.Context, outpoint string) error {
 	return nil
 }
 
-// StillSpendable reports spendable && unspent; unknown outpoints are false.
+// StillSpendable reports spendable && unspent. An unknown outpoint is an
+// error, never "spent" (the Source contract WalletSource implements): a
+// caller must not drop fuel it cannot see.
 func (f *Fake) StillSpendable(_ context.Context, outpoint string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	fr, ok := f.rows[outpoint]
 	if !ok {
-		return false, nil
+		return false, fmt.Errorf("still spendable %s: %w", outpoint, errUnknownOutpoint)
 	}
 	return fr.spendable && fr.spentBy == "", nil
 }
@@ -245,11 +251,29 @@ func (f *Fake) Unlocker(prefix, suffix string) (transaction.UnlockingScriptTempl
 	return unlocker(f.IdentityKeyHex(), prefix, suffix, f.kd)
 }
 
-// Internalize records args and returns InternalizeErr.
+// FailNthInternalize makes the n-th Internalize call from now (n ≥ 1) return
+// err, once; the calls before it and after it behave normally. The failing
+// call's args are still recorded.
+func (f *Fake) FailNthInternalize(n int, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.intFailIn, f.intFailErr = n, err
+}
+
+// Internalize records args and returns InternalizeErr (or the one-shot
+// FailNthInternalize error when its call comes up).
 func (f *Fake) Internalize(_ context.Context, args sdk.InternalizeActionArgs) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Internalized = append(f.Internalized, args)
+	if f.intFailIn > 0 {
+		f.intFailIn--
+		if f.intFailIn == 0 {
+			err := f.intFailErr
+			f.intFailErr = nil
+			return err
+		}
+	}
 	return f.InternalizeErr
 }
 

@@ -23,6 +23,17 @@ const maxOverlayBody = 64 << 10
 // a final refusal of the tx.
 const codeShape = "ERR_SHAPE"
 
+// noRecordPrefix starts the message of the overlay's own 404 for a txid it
+// has no admission for — {"status":"error","message":"no admission on record
+// for <txid>"}, verbatim on both stacks (overlay/src/admissionRoute.ts,
+// overlay-go/internal/httpapi/admin.go). It carries no code; overlay-go's
+// unknown-route 404 does ({"status":"error","code":"ERR_ROUTE_NOT_FOUND"}),
+// so the message, not a code, is what identifies a real "no record".
+const noRecordPrefix = "no admission on record for "
+
+// maxErrSnippet caps how much of an unusable body goes into an error.
+const maxErrSnippet = 256
+
 // HTTPOption configures NewHTTPOverlayClient.
 type HTTPOption func(*httpOverlayClient)
 
@@ -92,25 +103,48 @@ func (c *httpOverlayClient) do(ctx context.Context, method, path string, body []
 	return resp.StatusCode, b, nil
 }
 
-// AdmissionStatus is GET {base}/admin/admission/{txid}. For a 4xx, finalReject
-// is true when the JSON body says "retryable": false (and is not a request
-// shape error). Transport failures and timeouts return err.
+// AdmissionStatus is GET {base}/admin/admission/{txid}.
+//
+// finalReject is true only for a 400 whose body is the overlay's JSON error
+// with a code, "retryable": false, and a code other than ERR_SHAPE; no other
+// status is ever final (a 401/403 is the keeper's credentials, not the tx).
+//
+// A 404 is returned as a status only when its body is the overlay's own
+// "no admission on record" answer. Any other 404 (a proxy's HTML page, an
+// unmounted route, an empty body) says nothing about the tx and returns err,
+// like a transport failure or timeout: nothing happens this tick.
 func (c *httpOverlayClient) AdmissionStatus(ctx context.Context, txid string) (int, bool, error) {
 	code, body, err := c.do(ctx, http.MethodGet, "/admin/admission/"+url.PathEscape(txid), nil, false)
 	if err != nil {
 		return 0, false, err
 	}
-	final := false
-	if code >= 400 && code < 500 {
-		var v struct {
-			Code      string `json:"code"`
-			Retryable *bool  `json:"retryable"`
-		}
-		if json.Unmarshal(body, &v) == nil && v.Retryable != nil && !*v.Retryable && v.Code != codeShape {
-			final = true
-		}
+	var v struct {
+		Status    string `json:"status"`
+		Code      string `json:"code"`
+		Message   string `json:"message"`
+		Retryable *bool  `json:"retryable"`
 	}
-	return code, final, nil
+	isJSON := json.Unmarshal(body, &v) == nil
+	switch code {
+	case http.StatusBadRequest:
+		final := isJSON && v.Status == "error" && v.Code != "" && v.Code != codeShape && v.Retryable != nil && !*v.Retryable
+		return code, final, nil
+	case http.StatusNotFound:
+		if isJSON && v.Status == "error" && strings.HasPrefix(v.Message, noRecordPrefix) {
+			return code, false, nil
+		}
+		return code, false, fmt.Errorf("overlay admission %s: HTTP 404 is not the overlay's no-record answer (proxy or unmounted route?): %q",
+			txid, snippet(body))
+	default:
+		return code, false, nil
+	}
+}
+
+func snippet(b []byte) string {
+	if len(b) > maxErrSnippet {
+		b = b[:maxErrSnippet]
+	}
+	return string(b)
 }
 
 // Resettle is POST {base}/fuel/resettle {"txid": txid}; non-2xx is an error.
@@ -124,11 +158,7 @@ func (c *httpOverlayClient) Resettle(ctx context.Context, txid string) error {
 		return err
 	}
 	if code < 200 || code > 299 {
-		snippet := string(resp)
-		if len(snippet) > 256 {
-			snippet = snippet[:256]
-		}
-		return fmt.Errorf("overlay resettle %s: HTTP %d: %s", txid, code, snippet)
+		return fmt.Errorf("overlay resettle %s: HTTP %d: %s", txid, code, snippet(resp))
 	}
 	return nil
 }
