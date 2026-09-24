@@ -487,6 +487,24 @@ func (s *Store) ReleaseReserving(ctx context.Context, requestID string, needsRec
   WHERE request_id=? AND status='reserving'`, b2i(needsRecheck), s.unix(), requestID)
 }
 
+// ReleaseReservingOutpoint is sweeper rule 0 for one row: reserving →
+// released with the given needs_recheck flag. The CAS carries the holding
+// request as well as the status, so a row that its drafter released and a
+// newer request re-claimed after the sweeper listed it is never touched
+// (request ids are nonces and never repeat). True only when this call made
+// the transition.
+func (s *Store) ReleaseReservingOutpoint(ctx context.Context, outpoint, requestID string, needsRecheck bool) (bool, error) {
+	if outpoint == "" || requestID == "" {
+		return false, errors.New("store: ReleaseReservingOutpoint needs outpoint and requestID")
+	}
+	n, err := s.exec(ctx, `UPDATE fuel_reservations SET status='released', needs_recheck=?, updated_at=?
+  WHERE outpoint=? AND request_id=? AND status='reserving'`, b2i(needsRecheck), s.unix(), outpoint, requestID)
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 // Commit moves every pair reserving → reserved for requestID in one
 // transaction (§4.3 step 10). If any row misses the CAS, nothing changes and
 // ErrCommitConflict is returned.

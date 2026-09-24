@@ -290,3 +290,59 @@ func TestInputGuards(t *testing.T) {
 	rows, _ := s.ByRequest(ctx, "req1")
 	require.Equal(t, StatusReserved, rows[0].Status, "a rejected batch changes nothing")
 }
+
+func TestReleaseReservingOutpoint(t *testing.T) {
+	for _, e := range openAll(t) {
+		t.Run(e.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := e.s
+			_, err := s.ReleaseReservingOutpoint(ctx, "", "req1", false)
+			require.Error(t, err)
+			_, err = s.ReleaseReservingOutpoint(ctx, "aa.0", "", false)
+			require.Error(t, err)
+
+			for i, op := range []string{"aa.0", "aa.1"} {
+				ok, err := s.Claim(ctx, cand(op), "req1", "02aa", "asset.0", i, 60)
+				require.NoError(t, err)
+				require.True(t, ok)
+			}
+			e.c.t = e.c.t.Add(61 * time.Second)
+
+			ok, err := s.ReleaseReservingOutpoint(ctx, "aa.0", "req-other", false)
+			require.NoError(t, err)
+			require.False(t, ok, "CAS carries the holding request")
+
+			ok, err = s.ReleaseReservingOutpoint(ctx, "aa.0", "req1", false)
+			require.NoError(t, err)
+			require.True(t, ok)
+			rows, _ := s.ByRequest(ctx, "req1")
+			require.Equal(t, StatusReleased, rows[0].Status)
+			require.False(t, rows[0].NeedsRecheck)
+			require.Equal(t, e.c.t.Unix(), rows[0].UpdatedAt)
+			require.Equal(t, StatusReserving, rows[1].Status, "only the named outpoint moves")
+
+			ok, err = s.ReleaseReservingOutpoint(ctx, "aa.0", "req1", false)
+			require.NoError(t, err)
+			require.False(t, ok, "second call misses: row is no longer reserving")
+
+			// ABA: the released row is re-claimed by a newer request; a stale
+			// rule-0 verdict for req1 must not release req2's reservation.
+			ok, err = s.Claim(ctx, cand("aa.0"), "req2", "02bb", "asset.0", 0, 60)
+			require.NoError(t, err)
+			require.True(t, ok)
+			ok, err = s.ReleaseReservingOutpoint(ctx, "aa.0", "req1", false)
+			require.NoError(t, err)
+			require.False(t, ok)
+			rows, _ = s.ByRequest(ctx, "req2")
+			require.Equal(t, StatusReserving, rows[0].Status)
+
+			ok, err = s.ReleaseReservingOutpoint(ctx, "aa.1", "req1", true)
+			require.NoError(t, err)
+			require.True(t, ok)
+			rows, _ = s.ByRequest(ctx, "req1")
+			require.Len(t, rows, 1)
+			require.Equal(t, "aa.1", rows[0].Outpoint)
+			require.True(t, rows[0].NeedsRecheck)
+		})
+	}
+}
