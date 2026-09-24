@@ -1,0 +1,464 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"testing"
+	"time"
+
+	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/stretchr/testify/require"
+
+	"github.com/sirdeggen/mandala/fuelkeeper/internal/config"
+	"github.com/sirdeggen/mandala/fuelkeeper/internal/draft"
+	"github.com/sirdeggen/mandala/fuelkeeper/internal/fuel"
+	"github.com/sirdeggen/mandala/fuelkeeper/internal/store"
+)
+
+const testAsset = "abababababababababababababababababababababababababababababababab.0"
+
+// ---------------------------------------------------------------------------
+// stubs
+
+type stubDrafter struct {
+	resp    *draft.Response
+	ref     *draft.Refusal
+	err     error
+	lastReq draft.Request
+}
+
+func (d *stubDrafter) Draft(_ context.Context, req draft.Request) (*draft.Response, *draft.Refusal, error) {
+	d.lastReq = req
+	return d.resp, d.ref, d.err
+}
+
+type stubSettler struct {
+	settled  int
+	err      error
+	lastTxid string
+	lastBeef []byte
+}
+
+func (s *stubSettler) Settle(_ context.Context, txid string, beef []byte) (int, error) {
+	s.lastTxid, s.lastBeef = txid, beef
+	return s.settled, s.err
+}
+
+// balanceErrSource overrides *fuel.Fake's BalanceSats to fail, so /health's
+// wallet-failure degrade path can be exercised without teaching the shared
+// Fake about balance failures.
+type balanceErrSource struct {
+	*fuel.Fake
+	err error
+}
+
+func (b *balanceErrSource) BalanceSats(context.Context) (uint64, error) { return 0, b.err }
+
+// ---------------------------------------------------------------------------
+// harness
+
+type harness struct {
+	t       *testing.T
+	handler http.Handler
+	st      *store.Store
+	src     *fuel.Fake
+	cfg     config.Config
+	drafter *stubDrafter
+	settler *stubSettler
+	apiKey  string
+}
+
+func newHarness(t *testing.T) *harness {
+	t.Helper()
+	vars := map[string]string{
+		"ISSUER_ROOT_KEY":      "dc745c57de627a6d3a3ca549e0f9fb6b8f779108a1fe6fe290cc4df3461125d6",
+		"FK_API_KEY":           "0123456789abcdef0123456789abcdef",
+		"FK_STORAGE_CONFIG":    "x",
+		"FK_NETWORK":           "test",
+		"FUEL_ASSET_IDS":       testAsset,
+		"FK_POOL_TARGET":       "100",
+		"FK_LOW_WATER_PERCENT": "60",
+	}
+	cfg, err := config.Load(func(k string) string { return vars[k] })
+	require.NoError(t, err)
+
+	issuer, err := ec.PrivateKeyFromHex(cfg.IssuerRootKeyHex)
+	require.NoError(t, err)
+	src := fuel.NewFake(issuer)
+
+	now := time.Unix(1_758_500_000, 0)
+	st, err := store.Open("sqlite", filepath.Join(t.TempDir(), "fk.sqlite"), func() time.Time { return now })
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	h := &harness{
+		t: t, st: st, src: src, cfg: cfg,
+		drafter: &stubDrafter{}, settler: &stubSettler{}, apiKey: cfg.APIKey,
+	}
+	h.handler = New(Deps{
+		APIKey: cfg.APIKey, Drafter: h.drafter, Store: st, Settler: h.settler,
+		Source: src, Cfg: cfg, Logger: nil,
+	})
+	return h
+}
+
+// seedReserved claims and commits a single-pair reservation directly against
+// the store, as if a prior /draft had run, so /consume and /release have
+// something real to act on.
+func (h *harness) seedReserved(outpoint, requestID, requester string) {
+	h.t.Helper()
+	ctx := context.Background()
+	cand := store.Candidate{Outpoint: outpoint, Satoshis: 200, FuelScript: "aa", FuelBeef: "bb", DerivationPrefix: "p", DerivationSuffix: "s"}
+	ok, err := h.st.Claim(ctx, cand, requestID, requester, testAsset, 0, 60)
+	require.NoError(h.t, err)
+	require.True(h.t, ok)
+	_, err = h.st.Commit(ctx, requestID, []store.CommitPair{{Outpoint: outpoint, FeeScript: "cc", KeyID: "kid", FeeAmount: "20"}}, 600)
+	require.NoError(h.t, err)
+}
+
+func (h *harness) do(method, path string, body any, key string) *httptest.ResponseRecorder {
+	h.t.Helper()
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		require.NoError(h.t, err)
+		reader = bytes.NewReader(b)
+	}
+	req := httptest.NewRequest(method, path, reader)
+	if key != "" {
+		req.Header.Set("X-Fuel-Key", key)
+	}
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func decodeMap(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &m), "body: %s", rec.Body.String())
+	return m
+}
+
+// ---------------------------------------------------------------------------
+// X-Fuel-Key guard
+
+func TestGuard_RequiresKeyOnEveryRouteExceptHealth(t *testing.T) {
+	h := newHarness(t)
+	cases := []struct {
+		method, path string
+		body         any
+	}{
+		{"POST", "/draft", draft.Request{}},
+		{"POST", "/consume", map[string]any{}},
+		{"POST", "/release", map[string]any{}},
+		{"POST", "/settle", map[string]any{}},
+		{"DELETE", "/deny/abc", nil},
+	}
+	for _, c := range cases {
+		for _, key := range []string{"", "wrong-key-that-is-not-the-real-one"} {
+			rec := h.do(c.method, c.path, c.body, key)
+			require.Equal(t, http.StatusUnauthorized, rec.Code, "%s %s key=%q", c.method, c.path, key)
+			m := decodeMap(t, rec)
+			require.Equal(t, "error", m["status"])
+			require.Equal(t, "ERR_UNAUTHORIZED", m["code"])
+			require.Equal(t, false, m["retryable"])
+		}
+	}
+}
+
+func TestHealth_NoKeyRequired(t *testing.T) {
+	h := newHarness(t)
+	rec := h.do("GET", "/health", nil, "")
+	require.Equal(t, http.StatusOK, rec.Code)
+}
+
+// ---------------------------------------------------------------------------
+// POST /draft
+
+func TestDraft_RefusalMapsStatusAndBody(t *testing.T) {
+	h := newHarness(t)
+	h.drafter.ref = &draft.Refusal{Code: "ERR_FUEL_QUOTA", HTTP: 429, Retryable: true, Description: "quota exceeded"}
+	rec := h.do("POST", "/draft", draft.Request{AssetID: testAsset}, h.apiKey)
+	require.Equal(t, 429, rec.Code)
+	m := decodeMap(t, rec)
+	require.Equal(t, "error", m["status"])
+	require.Equal(t, "ERR_FUEL_QUOTA", m["code"])
+	require.Equal(t, true, m["retryable"])
+	require.Equal(t, "quota exceeded", m["description"])
+	require.Equal(t, testAsset, h.drafter.lastReq.AssetID)
+}
+
+func TestDraft_InfraErrorMapsTo503(t *testing.T) {
+	h := newHarness(t)
+	h.drafter.err = errors.New("boom")
+	rec := h.do("POST", "/draft", draft.Request{AssetID: testAsset}, h.apiKey)
+	require.Equal(t, 503, rec.Code)
+	m := decodeMap(t, rec)
+	require.Equal(t, "ERR_FUEL_UNAVAILABLE", m["code"])
+	require.Equal(t, true, m["retryable"])
+}
+
+func TestDraft_MalformedBodyIs400Shape(t *testing.T) {
+	h := newHarness(t)
+	req := httptest.NewRequest("POST", "/draft", bytes.NewReader([]byte("not json")))
+	req.Header.Set("X-Fuel-Key", h.apiKey)
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	require.Equal(t, 400, rec.Code)
+	require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
+}
+
+func TestDraft_ResponseHasExactSpecFieldNames(t *testing.T) {
+	h := newHarness(t)
+	h.drafter.resp = &draft.Response{
+		RequestID: "req1", AssetID: testAsset, K: 1, FeePerPair: "20", ExpiresAt: 123,
+		DraftTx: "aa", FuelBeef: "bb",
+		Pairs: []draft.Pair{{
+			Vin: 0, Vout: 0, FuelOutpoint: "txid.0", FuelSatoshis: 200,
+			KeyID: "fee-txid.0", Counterparty: "cp", FeeScript: "cc", FeeAmount: "20",
+		}},
+	}
+	rec := h.do("POST", "/draft", draft.Request{AssetID: testAsset}, h.apiKey)
+	require.Equal(t, 200, rec.Code)
+	m := decodeMap(t, rec)
+	for _, k := range []string{"requestId", "assetId", "k", "feePerPair", "expiresAt", "draftTx", "fuelBeef", "pairs"} {
+		require.Contains(t, m, k)
+	}
+	require.Equal(t, "req1", m["requestId"])
+	pairs, ok := m["pairs"].([]any)
+	require.True(t, ok)
+	require.Len(t, pairs, 1)
+	p, ok := pairs[0].(map[string]any)
+	require.True(t, ok)
+	for _, k := range []string{"vin", "vout", "fuelOutpoint", "fuelSatoshis", "keyID", "counterparty", "feeScript", "feeAmount"} {
+		require.Contains(t, p, k)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /consume
+
+func TestConsume(t *testing.T) {
+	h := newHarness(t)
+	const outpoint, requestID, requester = "deadbeef00.0", "req-consume-1", "requester-1"
+	h.seedReserved(outpoint, requestID, requester)
+
+	t.Run("ok", func(t *testing.T) {
+		body := map[string]any{"txid": "tx1", "pairs": []map[string]any{{"outpoint": outpoint, "requestId": requestID}}}
+		rec := h.do("POST", "/consume", body, h.apiKey)
+		require.Equal(t, 200, rec.Code)
+		m := decodeMap(t, rec)
+		require.Equal(t, true, m["ok"])
+		require.NotContains(t, m, "outpoint")
+		require.NotContains(t, m, "reason")
+	})
+
+	t.Run("refused: consumed by another txid", func(t *testing.T) {
+		body := map[string]any{"txid": "tx2", "pairs": []map[string]any{{"outpoint": outpoint, "requestId": requestID}}}
+		rec := h.do("POST", "/consume", body, h.apiKey)
+		require.Equal(t, 200, rec.Code)
+		m := decodeMap(t, rec)
+		require.Equal(t, false, m["ok"])
+		require.Equal(t, outpoint, m["outpoint"])
+		require.Equal(t, "consumed by another txid", m["reason"])
+	})
+
+	t.Run("malformed: missing txid", func(t *testing.T) {
+		body := map[string]any{"pairs": []map[string]any{{"outpoint": outpoint, "requestId": requestID}}}
+		rec := h.do("POST", "/consume", body, h.apiKey)
+		require.Equal(t, 400, rec.Code)
+		require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
+	})
+
+	t.Run("malformed: empty pairs", func(t *testing.T) {
+		body := map[string]any{"txid": "tx3", "pairs": []map[string]any{}}
+		rec := h.do("POST", "/consume", body, h.apiKey)
+		require.Equal(t, 400, rec.Code)
+		require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
+	})
+
+	t.Run("malformed: empty field in pair", func(t *testing.T) {
+		body := map[string]any{"txid": "tx4", "pairs": []map[string]any{{"outpoint": "", "requestId": requestID}}}
+		rec := h.do("POST", "/consume", body, h.apiKey)
+		require.Equal(t, 400, rec.Code)
+		require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
+	})
+}
+
+func TestConsume_StoreErrorMapsTo503(t *testing.T) {
+	h := newHarness(t)
+	require.NoError(t, h.st.Close())
+	body := map[string]any{"txid": "tx1", "pairs": []map[string]any{{"outpoint": "op", "requestId": "r1"}}}
+	rec := h.do("POST", "/consume", body, h.apiKey)
+	require.Equal(t, 503, rec.Code)
+	require.Equal(t, "ERR_UNAVAILABLE", decodeMap(t, rec)["code"])
+}
+
+// ---------------------------------------------------------------------------
+// POST /release
+
+func TestRelease_ByRequestID(t *testing.T) {
+	h := newHarness(t)
+	h.seedReserved("op-release-1.0", "req-release-1", "requester-1")
+	rec := h.do("POST", "/release", map[string]any{"requestId": "req-release-1"}, h.apiKey)
+	require.Equal(t, 200, rec.Code)
+	m := decodeMap(t, rec)
+	require.Equal(t, true, m["ok"])
+	require.Equal(t, float64(1), m["affected"])
+}
+
+func TestRelease_ByEviction(t *testing.T) {
+	h := newHarness(t)
+	const outpoint, requestID = "op-release-2.0", "req-release-2"
+	h.seedReserved(outpoint, requestID, "requester-2")
+	_, err := h.st.Consume(context.Background(), "tx-evict", []store.ConsumeItem{{Outpoint: outpoint, RequestID: requestID}})
+	require.NoError(t, err)
+
+	rec := h.do("POST", "/release", map[string]any{"txid": "tx-evict", "outpoints": []string{outpoint}}, h.apiKey)
+	require.Equal(t, 200, rec.Code)
+	m := decodeMap(t, rec)
+	require.Equal(t, true, m["ok"])
+	require.Equal(t, float64(1), m["affected"])
+}
+
+func TestRelease_NeitherFormIs400Shape(t *testing.T) {
+	h := newHarness(t)
+	rec := h.do("POST", "/release", map[string]any{}, h.apiKey)
+	require.Equal(t, 400, rec.Code)
+	require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
+}
+
+func TestRelease_BothFormsIs400Shape(t *testing.T) {
+	h := newHarness(t)
+	body := map[string]any{"requestId": "r1", "txid": "t1", "outpoints": []string{"op"}}
+	rec := h.do("POST", "/release", body, h.apiKey)
+	require.Equal(t, 400, rec.Code)
+	require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
+}
+
+func TestRelease_PartialEvictionIs400Shape(t *testing.T) {
+	h := newHarness(t)
+	rec := h.do("POST", "/release", map[string]any{"txid": "t1"}, h.apiKey)
+	require.Equal(t, 400, rec.Code)
+	require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
+}
+
+// ---------------------------------------------------------------------------
+// POST /settle
+
+func TestSettle_PassesDecodedHexToSettler(t *testing.T) {
+	h := newHarness(t)
+	h.settler.settled = 2
+	beefHex := hex.EncodeToString([]byte{0xde, 0xad, 0xbe, 0xef})
+	rec := h.do("POST", "/settle", map[string]any{"txid": "tx1", "atomicBeef": beefHex}, h.apiKey)
+	require.Equal(t, 200, rec.Code)
+	m := decodeMap(t, rec)
+	require.Equal(t, float64(2), m["settled"])
+	require.Equal(t, "tx1", h.settler.lastTxid)
+	require.Equal(t, []byte{0xde, 0xad, 0xbe, 0xef}, h.settler.lastBeef)
+}
+
+func TestSettle_BadHexIs400Shape(t *testing.T) {
+	h := newHarness(t)
+	rec := h.do("POST", "/settle", map[string]any{"txid": "tx1", "atomicBeef": "not-hex"}, h.apiKey)
+	require.Equal(t, 400, rec.Code)
+	require.Equal(t, "ERR_SHAPE", decodeMap(t, rec)["code"])
+}
+
+func TestSettle_SettlerErrorMapsTo503(t *testing.T) {
+	h := newHarness(t)
+	h.settler.err = errors.New("settle failed")
+	rec := h.do("POST", "/settle", map[string]any{"txid": "tx1", "atomicBeef": "aa"}, h.apiKey)
+	require.Equal(t, 503, rec.Code)
+	require.Equal(t, "ERR_UNAVAILABLE", decodeMap(t, rec)["code"])
+}
+
+// ---------------------------------------------------------------------------
+// GET /health
+
+func TestHealth_ShapeAndLowWaterArithmetic(t *testing.T) {
+	h := newHarness(t)
+	h.src.AddFuel(t, h.cfg.Denomination)
+	h.src.AddFuel(t, h.cfg.Denomination)
+	h.src.Balance = 12345
+
+	rec := h.do("GET", "/health", nil, "")
+	require.Equal(t, 200, rec.Code)
+	m := decodeMap(t, rec)
+
+	pool, ok := m["pool"].(map[string]any)
+	require.True(t, ok)
+	for _, k := range []string{"available", "reserving", "reserved", "consumedUnsettled", "released", "recheckPending", "dropped", "spentExternal"} {
+		require.Contains(t, pool, k)
+	}
+	require.Equal(t, float64(2), pool["available"])
+	require.Equal(t, float64(2), m["provenFuel"])
+	require.Equal(t, float64(12345), m["issuerBsvSats"])
+	require.Equal(t, float64(h.cfg.PoolTarget*h.cfg.LowWaterPercent/100), m["lowWater"])
+	require.Equal(t, float64(h.cfg.Denomination), m["denomination"])
+	require.Equal(t, float64(0), m["denied"])
+	require.NotContains(t, m, "errors")
+}
+
+func TestHealth_WalletFailureDegradesTo200(t *testing.T) {
+	h := newHarness(t)
+	bad := &balanceErrSource{Fake: h.src, err: errors.New("wallet down")}
+	handler := New(Deps{
+		APIKey: h.apiKey, Drafter: h.drafter, Store: h.st, Settler: h.settler,
+		Source: bad, Cfg: h.cfg, Logger: nil,
+	})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest("GET", "/health", nil))
+	require.Equal(t, 200, rec.Code)
+	m := decodeMap(t, rec)
+	require.Nil(t, m["issuerBsvSats"])
+	errs, ok := m["errors"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, errs)
+}
+
+func TestHealth_ListProvenFailureDegradesTo200(t *testing.T) {
+	h := newHarness(t)
+	h.src.FailNextList(errors.New("list failed"))
+	rec := h.do("GET", "/health", nil, "")
+	require.Equal(t, 200, rec.Code)
+	m := decodeMap(t, rec)
+	require.Equal(t, float64(0), m["provenFuel"])
+	errs, ok := m["errors"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, errs)
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /deny/{requester}
+
+func TestDeny_RemovedAfterStoreDenyAndLowercases(t *testing.T) {
+	h := newHarness(t)
+	require.NoError(t, h.st.Deny(context.Background(), "abcd1234", "reason", "op"))
+
+	rec := h.do("DELETE", "/deny/ABCD1234", nil, h.apiKey)
+	require.Equal(t, 200, rec.Code)
+	require.Equal(t, true, decodeMap(t, rec)["removed"])
+
+	// Idempotent: the second delete finds nothing left to remove.
+	rec2 := h.do("DELETE", "/deny/abcd1234", nil, h.apiKey)
+	require.Equal(t, 200, rec2.Code)
+	require.Equal(t, false, decodeMap(t, rec2)["removed"])
+}
+
+func TestDeny_StoreErrorMapsTo503(t *testing.T) {
+	h := newHarness(t)
+	require.NoError(t, h.st.Close())
+	rec := h.do("DELETE", "/deny/abc", nil, h.apiKey)
+	require.Equal(t, 503, rec.Code)
+	require.Equal(t, "ERR_UNAVAILABLE", decodeMap(t, rec)["code"])
+}
