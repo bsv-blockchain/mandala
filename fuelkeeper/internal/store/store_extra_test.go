@@ -66,7 +66,9 @@ func TestReclaimResetsPreviousHolder(t *testing.T) {
 			ok, err = s.Claim(ctx, cand("aa.0"), "req2", "02bb", "asset.1", 3, 60)
 			require.NoError(t, err)
 			require.False(t, ok, "released awaiting recheck is not claimable")
-			require.NoError(t, s.SetRechecked(ctx, "aa.0", true))
+			ok, err = s.SetRechecked(ctx, "aa.0", true)
+			require.NoError(t, err)
+			require.True(t, ok)
 
 			e.c.t = e.c.t.Add(time.Hour)
 			c := cand("aa.0")
@@ -120,7 +122,9 @@ func TestConsumeEdgeCases(t *testing.T) {
 			require.EqualValues(t, 2, n)
 			ref, _ = s.Consume(ctx, "tx1", []ConsumeItem{{"aa.0", "req1"}})
 			require.Equal(t, "unknown", ref.Reason, "released awaiting recheck is not consumable")
-			require.NoError(t, s.SetRechecked(ctx, "aa.0", true))
+			ok, err := s.SetRechecked(ctx, "aa.0", true)
+			require.NoError(t, err)
+			require.True(t, ok)
 			ref, _ = s.Consume(ctx, "tx1", []ConsumeItem{{"aa.0", "someone-else"}})
 			require.Equal(t, "unknown", ref.Reason, "late submit only for the last holder")
 		})
@@ -174,52 +178,115 @@ func TestConcurrentCASHasOneWinner(t *testing.T) {
 			ctx := context.Background()
 			s := e.s
 			const n = 16
+			type claimResult struct {
+				req string
+				ok  bool
+				err error
+			}
+			claims := make(chan claimResult, n)
 			var wg sync.WaitGroup
-			wins := make(chan string, n)
 			for i := 0; i < n; i++ {
 				wg.Add(1)
 				go func(i int) {
 					defer wg.Done()
 					req := "req" + string(rune('a'+i))
 					ok, err := s.Claim(ctx, cand("aa.0"), req, "02aa", "asset.0", 0, 60)
-					if err == nil && ok {
-						wins <- req
-					}
+					claims <- claimResult{req, ok, err}
 				}(i)
 			}
 			wg.Wait()
-			close(wins)
+			close(claims)
 			var winners []string
-			for w := range wins {
-				winners = append(winners, w)
+			for c := range claims {
+				require.NoError(t, c.err, "a losing claim must be refused, never errored")
+				if c.ok {
+					winners = append(winners, c.req)
+				}
 			}
 			require.Len(t, winners, 1)
 			_, err := s.Commit(ctx, winners[0], []CommitPair{{Outpoint: "aa.0"}}, 600)
 			require.NoError(t, err)
 
-			oks := make(chan string, n)
+			type consumeResult struct {
+				txid string
+				ref  *ConsumeRefusal
+				err  error
+			}
+			consumes := make(chan consumeResult, n)
 			for i := 0; i < n; i++ {
 				wg.Add(1)
 				go func(i int) {
 					defer wg.Done()
 					txid := "tx" + string(rune('a'+i))
 					ref, err := s.Consume(ctx, txid, []ConsumeItem{{"aa.0", winners[0]}})
-					if err == nil && ref == nil {
-						oks <- txid
-					} else if err == nil && ref.Reason != "consumed by another txid" {
-						oks <- "bad reason " + ref.Reason
-					}
+					consumes <- consumeResult{txid, ref, err}
 				}(i)
 			}
 			wg.Wait()
-			close(oks)
+			close(consumes)
 			var consumed []string
-			for o := range oks {
-				consumed = append(consumed, o)
+			for c := range consumes {
+				require.NoError(t, c.err, "a losing consume must be refused, never errored")
+				if c.ref == nil {
+					consumed = append(consumed, c.txid)
+					continue
+				}
+				require.Equal(t, &ConsumeRefusal{Outpoint: "aa.0", Reason: "consumed by another txid"}, c.ref)
 			}
 			require.Len(t, consumed, 1)
 			rows, _ := s.ByTxid(ctx, consumed[0])
 			require.Len(t, rows, 1)
 		})
 	}
+}
+
+func TestSetRecheckedMissesMovedRow(t *testing.T) {
+	for _, e := range openAll(t) {
+		t.Run(e.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := e.s
+			ok, _ := s.Claim(ctx, cand("aa.0"), "req1", "02aa", "asset.0", 0, 60)
+			require.True(t, ok)
+			_, err := s.Commit(ctx, "req1", []CommitPair{{Outpoint: "aa.0"}}, 600)
+			require.NoError(t, err)
+			ref, _ := s.Consume(ctx, "tx1", []ConsumeItem{{"aa.0", "req1"}})
+			require.Nil(t, ref)
+			before, _ := s.ByTxid(ctx, "tx1")
+			require.Len(t, before, 1)
+
+			e.c.t = e.c.t.Add(time.Minute)
+			for _, unspent := range []bool{false, true} {
+				ok, err := s.SetRechecked(ctx, "aa.0", unspent)
+				require.NoError(t, err)
+				require.False(t, ok, "no transition on a consumed row (unspent=%v)", unspent)
+			}
+			after, _ := s.ByTxid(ctx, "tx1")
+			require.Equal(t, before, after, "row unchanged, including updated_at")
+		})
+	}
+}
+
+func TestInputGuards(t *testing.T) {
+	s := openAll(t)[0].s
+	ctx := context.Background()
+	_, err := s.Claim(ctx, cand(""), "req1", "02aa", "asset.0", 0, 60)
+	require.Error(t, err)
+	_, err = s.Claim(ctx, cand("aa.0"), "req1", "", "asset.0", 0, 60)
+	require.Error(t, err)
+	_, err = s.Claim(ctx, cand("aa.0"), "", "02aa", "asset.0", 0, 60)
+	require.Error(t, err)
+
+	ok, err := s.Claim(ctx, cand("aa.0"), "req1", "02aa", "asset.0", 0, 60)
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, err = s.Commit(ctx, "req1", []CommitPair{{Outpoint: "aa.0"}}, 600)
+	require.NoError(t, err)
+	ref, err := s.Consume(ctx, "tx1", []ConsumeItem{{"aa.0", "req1"}, {"", "req1"}})
+	require.Error(t, err)
+	require.Nil(t, ref)
+	ref, err = s.Consume(ctx, "tx1", []ConsumeItem{{"aa.0", ""}})
+	require.Error(t, err)
+	require.Nil(t, ref)
+	rows, _ := s.ByRequest(ctx, "req1")
+	require.Equal(t, StatusReserved, rows[0].Status, "a rejected batch changes nothing")
 }

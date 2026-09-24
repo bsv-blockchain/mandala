@@ -456,8 +456,8 @@ const claimSQL = `INSERT INTO fuel_reservations
 // now holds the row as reserving, false when another holder has it (or it is
 // dropped/spent_external/awaiting recheck). Committed on its own.
 func (s *Store) Claim(ctx context.Context, c Candidate, requestID, requester, assetID string, pairIndex int, reservingTTL int64) (bool, error) {
-	if c.Outpoint == "" || requestID == "" {
-		return false, errors.New("store: Claim needs outpoint and requestID")
+	if c.Outpoint == "" || requestID == "" || requester == "" {
+		return false, errors.New("store: Claim needs outpoint, requestID and requester")
 	}
 	sats, err := satsToDB(c.Satoshis)
 	if err != nil {
@@ -583,6 +583,11 @@ func (s *Store) Consume(ctx context.Context, txid string, items []ConsumeItem) (
 	}
 	if len(items) == 0 {
 		return nil, nil
+	}
+	for i, it := range items {
+		if it.Outpoint == "" || it.RequestID == "" {
+			return nil, fmt.Errorf("store: Consume item %d needs outpoint and requestID", i)
+		}
 	}
 	now := s.unix()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -755,16 +760,21 @@ func (s *Store) RecheckPending(ctx context.Context, limit int) ([]Reservation, e
 
 // SetRechecked records a rule-2 verdict: unspent → needs_recheck=0 (claimable
 // again); spent → spent_external (terminal). CAS on released,
-// needs_recheck=1; a miss is a no-op.
-func (s *Store) SetRechecked(ctx context.Context, outpoint string, unspent bool) error {
+// needs_recheck=1. The bool is true only when this call made the transition;
+// false means the row moved on meanwhile (e.g. /settle repaired it to
+// consumed), so the caller must not deny the requester on a stale verdict.
+func (s *Store) SetRechecked(ctx context.Context, outpoint string, unspent bool) (bool, error) {
 	query := `UPDATE fuel_reservations SET status='spent_external', needs_recheck=0, updated_at=?
   WHERE outpoint=? AND status='released' AND needs_recheck=1`
 	if unspent {
 		query = `UPDATE fuel_reservations SET needs_recheck=0, updated_at=?
   WHERE outpoint=? AND status='released' AND needs_recheck=1`
 	}
-	_, err := s.exec(ctx, query, s.unix(), outpoint)
-	return err
+	n, err := s.exec(ctx, query, s.unix(), outpoint)
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // UnsettledConsumed lists consumed rows without settled_at whose last update
