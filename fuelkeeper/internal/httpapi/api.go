@@ -53,7 +53,7 @@ type Deps struct {
 	Drafter interface {
 		Draft(ctx context.Context, req draft.Request) (*draft.Response, *draft.Refusal, error)
 	}
-	Store *store.Store
+	Store   *store.Store
 	Settler interface {
 		Settle(ctx context.Context, txid string, beef []byte) (int, error)
 	}
