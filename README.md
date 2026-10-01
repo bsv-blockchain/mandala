@@ -55,10 +55,11 @@ npm install
 npm run gen-key
 ```
 
-npm 12 and later skip dependency install scripts, so the `sqlite3` native
-binding may not be built. If `node -e "require('sqlite3')"` fails, run
-`npm rebuild sqlite3 --foreground-scripts` (see `runbook.md` if that still
-leaves it missing).
+npm 12 and later skip dependency install scripts unless `package.json`
+approves them. `overlay/package.json` approves the `sqlite3` install script
+(`allowScripts`), so `npm install` builds its native binding; check with
+`node -e "require('sqlite3')"`. A `sqlite3` version bump needs a fresh approval
+(see `runbook.md`).
 
 This prints:
 ```
