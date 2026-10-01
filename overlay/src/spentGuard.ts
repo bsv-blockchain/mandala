@@ -25,7 +25,7 @@
  * the same way.
  *
  * The guard's own read is LATER than the engine's previousCoins query (every
- * outer wrapper runs in between), and FIX E's `unmarkSpent` is a bare UPDATE
+ * outer wrapper runs in between), and FIX E's `unmarkSpent` is an UPDATE
  * outside the engine's submission lock. So a coin can flip spent → live in that
  * gap: missing from previousCoins, yet live to the guard. Delegating then hands
  * the manager a token spend with no previous coins — a persisted, final

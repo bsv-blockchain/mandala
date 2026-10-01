@@ -18,7 +18,7 @@ import { admissionHandler } from './admissionRoute.js'
 import { SubmitSideChannel, withVerdictCapture, type AdmissionTokenRow } from './submitSideChannel.js'
 import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
 import { withSpentInputGuard, knexSpentInputStore, type SpentInputStore } from './spentGuard.js'
-import { mountArcIngest } from './eviction.js'
+import { mountArcIngest, knexEvictionCoins } from './eviction.js'
 import { replayAssetState, type ReplayStorage } from './pinnedReducer.js'
 import { withAdminChainAnchor } from './adminChainGuard.js'
 import { assetAuthHeadHandler, assetAuthBeefHandler, withFrozenRowFlags, type AdminHistoryRowLite } from './assetAuth.js'
@@ -70,11 +70,10 @@ const main = async (): Promise<void> => {
   // broadcaster.
   const ARCADE_URL = process.env.ARCADE_URL
   // FIX E, second half: eviction restores spent inputs, so an unauthenticated
-  // /arc-ingest lets anyone strand or resurrect a coin. The pinned
-  // OverlayExpress route checks the callback token only WHEN IT IS NON-EMPTY,
-  // so an unset token means no auth at all. This repo mounts its own route
-  // ahead of it (see mountArcIngest below) and refuses to mount a working one
-  // without a token.
+  // /arc-ingest lets anyone strand or resurrect a coin. The token is mandatory
+  // whenever ARCADE_URL is set: overlay-express 2.7.3's start() refuses Arcade
+  // without one, and this repo's own route (see mountArcIngest below) 401s
+  // every request if the token is ever empty.
   const ARCADE_CALLBACK_TOKEN = process.env.ARCADE_CALLBACK_TOKEN ?? ''
   if (ARCADE_URL != null && ARCADE_URL !== '') {
     server.configureArcade(ARCADE_URL, { apiKey: process.env.ARCADE_API_KEY })
@@ -366,21 +365,20 @@ const main = async (): Promise<void> => {
   await server.configureEngine(false)
 
   // FIX E. Mounted BEFORE server.start(), which is where OverlayExpress
-  // registers its own /arc-ingest, so this route matches first. With an empty
-  // ARCADE_CALLBACK_TOKEN a blocking stub is mounted instead: the pinned route
-  // (which mounts unauthenticated when the token is unset) is shadowed, the
-  // error is logged, and the server still serves everything else.
+  // registers its own /arc-ingest, so this route matches first: the pinned
+  // route evicts without restoring inputs. The callback token is mandatory
+  // whenever ARCADE_URL is set (start() refuses Arcade without one).
   //
   // Gated on the same condition the pinned route uses — with no provider
   // configured it never mounts /arc-ingest at all, so there is nothing to
-  // shadow and nothing to warn about (the local demo has no Arcade).
+  // shadow (the local demo has no Arcade).
   if (ARCADE_URL != null && ARCADE_URL !== '') {
     mountArcIngest(server.app as any, {
       callbackToken: ARCADE_CALLBACK_TOKEN,
       store: admissionStore,
-      unmarkSpent: async (txid, outputIndex) => {
-        await server.knex!('outputs').where({ txid, outputIndex, topic: TOKEN_TOPIC }).update('spent', false)
-      },
+      // unmarkSpent only while the evicted tx still holds the coin (or a
+      // legacy NULL spentBy); isUnspent fails closed on an unreadable row.
+      ...knexEvictionCoins(server.knex!, TOKEN_TOPIC),
       restoreTokenRow: async (row) => {
         await sharedStorage.storeToken({
           txid: row.txid,
@@ -412,10 +410,12 @@ const main = async (): Promise<void> => {
       purgeAdminHistory: async (txid) => {
         await adminHistoryCol.deleteMany({ txid })
       },
-      ingestProof: async (txid, merklePathHex, blockHeight) => {
+      // No block height: the engine takes it from the proof, and throws when
+      // a forwarded one differs from it.
+      ingestProof: async (txid, merklePathHex) => {
         await (server.engine as unknown as {
-          handleNewMerkleProof: (t: string, p: MerklePath, h?: number) => Promise<unknown>
-        }).handleNewMerkleProof(txid, MerklePath.fromHex(merklePathHex), blockHeight)
+          handleNewMerkleProof: (t: string, p: MerklePath) => Promise<unknown>
+        }).handleNewMerkleProof(txid, MerklePath.fromHex(merklePathHex))
       }
     })
   }
