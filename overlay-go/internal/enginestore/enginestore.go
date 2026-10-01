@@ -1,6 +1,6 @@
 // Package enginestore is the in-repo Mongo implementation of
-// go-overlay-services v1.3.2's engine.Storage (Task 12, amended: the
-// b-open-io/overlay storage does not implement the v1.3.2 interface at any
+// go-overlay-services v1.3.7's engine.Storage (Task 12, amended: the
+// b-open-io/overlay storage does not implement the v1.3.7 interface at any
 // published tag, so the spec fallback governs and we own the storage layer).
 //
 // Design (brief-pinned): outputs live in `engineOutputs` (unique index
@@ -32,7 +32,7 @@ import (
 // compensation/eviction methods below — UnmarkSpentBySpendTxid,
 // FindOutputsByTxid, DeleteOutputsByTxid, DeleteAppliedTransactionsByTxid —
 // which are deliberately NOT part of go-overlay-services' engine.Storage:
-// they exist to undo/evict what the pinned v1.3.2 engine cannot.
+// they exist to undo/evict what the pinned v1.3.7 engine cannot.
 type Store struct {
 	outputs      *mongo.Collection
 	applied      *mongo.Collection
@@ -548,8 +548,9 @@ func (s *Store) AdmittedOutputIndexes(ctx context.Context, topic, txid string) (
 // UnmarkSpentBySpendTxid reverses MarkUTXOsAsSpent for every output document
 // whose spendTxid matches: spent flips back to false and spendTxid is
 // cleared, across all topics. It is NOT part of engine.Storage — it exists
-// because go-overlay-services v1.3.2's Submit marks inputs spent BEFORE
-// broadcasting and never unwinds on broadcast failure; the HTTP layer calls
+// because go-overlay-services v1.3.7's Submit marks inputs spent BEFORE
+// broadcasting and never unwinds on broadcast failure (ErrorOnBroadcastFailure
+// is still unread); the HTTP layer calls
 // this (via wiring's compensation closure) to restore the engine-side spend
 // state. Returns the number of documents modified (0 when nothing matched —
 // re-running the compensation is a harmless no-op).

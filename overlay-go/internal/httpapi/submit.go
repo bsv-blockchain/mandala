@@ -56,10 +56,12 @@ var _ AdmissionRecorder = (*mandala.Store)(nil)
 type AppliedAdmissionProof func(ctx context.Context, txid string) (applied bool, outputsToAdmit []uint32, err error)
 
 // PrepareSubmitCompensation is the Arcade-path compensation seam for the
-// pinned go-overlay-services v1.3.2 engine's submit ordering (validate →
+// pinned go-overlay-services v1.3.7 engine's submit ordering (validate →
 // mark inputs spent + notify OutputSpent → broadcast → fold): a failed
 // broadcast aborts Submit AFTER the inputs were marked spent and the mandala
-// projections destroyed, and the engine never unwinds that. The handler
+// projections destroyed, and the engine never unwinds that (still present in
+// v1.3.7: Submit marks spends before broadcast; ErrorOnBroadcastFailure
+// unread). The handler
 // calls prepare BEFORE Engine.Submit (it must snapshot the restorable state
 // while it still exists); the returned compensate closure is invoked only
 // when Submit fails with a broadcast-classified error

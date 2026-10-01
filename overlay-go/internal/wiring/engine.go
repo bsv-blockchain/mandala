@@ -78,9 +78,11 @@ type App struct {
 	ArcadeEnabled       bool
 	ArcadeCallbackToken string
 
-	// PrepareSubmitCompensation compensates for the pinned v1.3.2 engine's
+	// PrepareSubmitCompensation compensates for the pinned v1.3.7 engine's
 	// submit ordering (inputs marked spent + mandala projections destroyed
-	// BEFORE broadcast; a failed broadcast aborts without unwinding). The
+	// BEFORE broadcast; a failed broadcast aborts without unwinding — still
+	// present in v1.3.7: Submit marks spends before broadcast;
+	// ErrorOnBroadcastFailure unread). The
 	// submit handler calls it with the raw BEEF before Engine.Submit; the
 	// returned closure — run only on a broadcast-classified Submit error —
 	// unmarks the engine-side spends (UnmarkSpentBySpendTxid) and restores
@@ -360,7 +362,7 @@ func prepareSubmitCompensation(store *mandala.Store, es *enginestore.Store) func
 		spendTxid := txid.String()
 		return func(ctx context.Context) error {
 			// A duplicate resubmit of an already-committed tx can reach this
-			// closure too: go-overlay-services v1.3.2's per-topic dupe gate
+			// closure too: go-overlay-services v1.3.7's per-topic dupe gate
 			// lets a resubmit past validation, and a broadcast failure on
 			// THAT attempt is classified the same as a genuine one. But a
 			// genuine broadcast failure can never have an applied-transaction

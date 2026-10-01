@@ -1,6 +1,6 @@
 package enginestore
 
-// Task 12 tests: in-repo Mongo implementation of go-overlay-services v1.3.2
+// Task 12 tests: in-repo Mongo implementation of go-overlay-services v1.3.7
 // engine.Storage. Every test exercises the storage exactly the way
 // engine.go's call sites do (positional FindOutputs, nil-on-missing
 // FindOutput, LoadAncillaryBeef merge, ReconcileMerkleRoot state moves).
@@ -1047,5 +1047,19 @@ func TestNewAbortsWhenAnIndexCannotBeCreated(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "engineOutputs") {
 		t.Fatalf("error must name the collection that failed, got: %v", err)
+	}
+}
+
+// go-overlay-services v1.3.7 switches Submit to the broadcast-first admission
+// path when the storage exposes AdmissionStorage(). Our compensation seam and
+// EvictTx assume the default path, so the store must not advertise it.
+func TestStoreDoesNotAdvertiseAdmissionStorage(t *testing.T) {
+	db := testDB(t)
+	es, err := New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if engine.GetAdmissionStorage(es) != nil {
+		t.Fatal("enginestore.Store must not implement admission storage (wiring/engine.go compensation assumes the default Submit path)")
 	}
 }

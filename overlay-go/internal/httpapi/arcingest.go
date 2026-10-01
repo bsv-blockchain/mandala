@@ -34,7 +34,7 @@ type EvictionOutcome = mandala.EvictionOutcome
 // Arcade txStatus — the Go stand-in for the TS /arc-ingest route's
 // Engine.evictAppliedTransaction (which deletes the tx's outputs and
 // notifies each lookup service via OutputEvicted). go-overlay-services
-// v1.3.2's engine exposes no eviction API, so wiring.Build assembles the
+// v1.3.7's engine exposes no eviction API, so wiring.Build assembles the
 // equivalent from the concrete enginestore + ls_mandala and threads it here.
 type EvictTx func(ctx context.Context, txid string) (EvictionOutcome, error)
 
