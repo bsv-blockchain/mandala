@@ -159,6 +159,15 @@ describe('index.ts — boot configuration for overlay-express 2.7.3', () => {
     expect(CODE).toMatch(/\(server\.engine as unknown as \{ advertiser\?: unknown \}\)\.advertiser = undefined/)
   })
 
+  it('maps non-terminal Arcade 2xx statuses to success on the engine broadcaster, after the engine exists', () => {
+    const names = ['await server.configureEngine(false)', 'withArcadeStatusParity(engineBroadcaster)', 'await server.start()']
+    for (const n of names) expect(CODE).toContain(n)
+    expect(orderOf(CODE, names)).toEqual(names)
+    expect(CODE).toMatch(/\(server\.engine as unknown as \{ broadcaster\?: /)
+    // No broadcaster (local demo, no Arcade) is left alone, not an error.
+    expect(CODE).toContain('if (engineBroadcaster != null) withArcadeStatusParity(engineBroadcaster)')
+  })
+
   it('mounts /arc-ingest only with Arcade, using the validated token', () => {
     const mount = CODE.slice(CODE.indexOf('mountArcIngest('))
     expect(CODE).toMatch(/if \(cfg\.arcade != null\) \{\s*\n\s*mountArcIngest\(/)

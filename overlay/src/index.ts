@@ -25,6 +25,7 @@ import { assetAuthHeadHandler, assetAuthBeefHandler, withFrozenRowFlags, type Ad
 import { withFeeRateFold, withFeeRate, rebuildFeeRateFromHistory, type FeeRateStore, type FeeRateRow, type FeeRateHistoryEntry } from './feeRates.js'
 import { adminAuth, adminCors, parseAdminCorsOrigins, warnIfAdminAuthDisabled } from './adminAuth.js'
 import { readBootConfig } from './bootConfig.js'
+import { withArcadeStatusParity } from './arcadeParity.js'
 import {
   RegistryStore, RegistryTopicManager, createRegistryLookup,
   registryScreening, REGISTRY_TOPIC, REGISTRY_LOOKUP
@@ -373,6 +374,15 @@ const main = async (): Promise<void> => {
   // the engine's submission lock. start() only inits it when it is a
   // WalletAdvertiser, so clearing it is safe.
   ;(server.engine as unknown as { advertiser?: unknown }).advertiser = undefined
+
+  // Go parity: overlay-go accepts every non-terminal 2xx Arcade status, but
+  // overlay-express 2.7.3 refuses the ones outside its success set (Arcade
+  // echoes SEEN_MULTIPLE_NODES / PENDING_RETRY / ... on a re-submit), failing a
+  // re-broadcast the Go overlay admits. Mandala configures Arcade only (never
+  // an ARC key), so the engine's broadcaster is the ArcadeProvider itself
+  // rather than a ProviderChainBroadcaster, and its result is the provider's.
+  const engineBroadcaster = (server.engine as unknown as { broadcaster?: { broadcast: (tx: any) => Promise<any> } }).broadcaster
+  if (engineBroadcaster != null) withArcadeStatusParity(engineBroadcaster)
 
   // FIX E. Mounted BEFORE server.start(), which is where OverlayExpress
   // registers its own /arc-ingest, so this route matches first: the pinned
