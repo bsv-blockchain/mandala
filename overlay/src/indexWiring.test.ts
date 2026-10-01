@@ -15,14 +15,19 @@
  * and it is paired below with a behavioural test of the same order over the real
  * guards.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest'
 import { readFileSync } from 'node:fs'
+import type { Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import OverlayExpress from '@bsv/overlay-express'
+import { initialDoubleSlashCompatibility } from '@bsv/overlay-express/security/edgePolicy.ts'
 import { Transaction, UnlockingScript, P2PKH, PrivateKey, ProtoWallet, Hash, Utils } from '@bsv/sdk'
 import { MandalaToken } from '@bsv/templates'
 import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
 import { withSpentInputGuard, type SpentInputStore } from './spentGuard.js'
 import { withAdminChainAnchor, type AdminChainStore } from './adminChainGuard.js'
 import { classifyManagerReason } from './submitVerdict.js'
+import { wrapSubmitJson, normalizeDoubleSlash, signAdmissionV2Sync } from './admission.js'
 
 const SOURCE = readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
 
@@ -158,6 +163,73 @@ describe('index.ts — boot configuration for overlay-express 2.7.3', () => {
     const mount = CODE.slice(CODE.indexOf('mountArcIngest('))
     expect(CODE).toMatch(/if \(cfg\.arcade != null\) \{\s*\n\s*mountArcIngest\(/)
     expect(mount).toContain('callbackToken: cfg.arcade.callbackToken')
+  })
+})
+
+// overlay-express 2.7.3 installs its '//' collapse and the upstream /submit
+// route inside start(), AFTER everything index.ts registers. Express routing
+// is case-insensitive and non-strict, so an exact path check, or a mount the
+// router does not share with upstream, lets '/Submit', '/submit/' or '//submit'
+// reach the upstream route with no σ_I and no admission record.
+describe('index.ts — the /submit wrapper shares the upstream route matcher', () => {
+  const MOUNT = "server.app.post('/submit', wrapSubmitJson("
+  const NORMALIZER = 'server.app.use(normalizeDoubleSlash)'
+
+  it('mounts the wrapper with app.post on /submit, never app.use', () => {
+    expect(CODE).toContain(MOUNT)
+    expect(CODE).not.toMatch(/\.use\(\s*wrapSubmitJson/)
+  })
+
+  it('collapses a leading // first, before any route of ours, the /submit wrapper included', () => {
+    expect(CODE).toContain(NORMALIZER)
+    expect(CODE.search(/server\.app\b/)).toBe(CODE.indexOf(NORMALIZER))
+    expect(orderOf(CODE, [NORMALIZER, MOUNT])).toEqual([NORMALIZER, MOUNT])
+  })
+
+  describe('over real Express routing (the app OverlayExpress builds)', () => {
+    const overlayPriv = PrivateKey.fromRandom()
+    const tx = new Transaction()
+    tx.addInput({ sourceTXID: '3d'.repeat(32), sourceOutputIndex: 0, unlockingScript: new UnlockingScript() })
+    tx.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(overlayPriv.toAddress()) })
+    const expected = signAdmissionV2Sync(overlayPriv, tx.id('hex'), [0]).admissionSignature
+    let http: Server | undefined
+    let base = ''
+
+    beforeAll(async () => {
+      vi.spyOn(console, 'log').mockImplementation(() => {})
+      const { app } = new OverlayExpress('wiring', PrivateKey.fromRandom().toHex(), 'overlay.example.com')
+      // index.ts's mount…
+      app.use(normalizeDoubleSlash)
+      app.post('/submit', wrapSubmitJson({ priv: overlayPriv }) as any)
+      // …then what start() installs later: upstream's own '//' collapse and
+      // its /submit route (here reading the body bodyParser.raw would have).
+      app.use(initialDoubleSlashCompatibility)
+      app.post('/submit', async (req: any, res: any) => {
+        const chunks: Buffer[] = []
+        for await (const c of req) chunks.push(c as Buffer)
+        req.body = Buffer.concat(chunks)
+        res.status(200).json({ tm_mandala: { outputsToAdmit: [0], coinsToRetain: [] } })
+      })
+      const listening = app.listen(0, '127.0.0.1')
+      http = listening
+      await new Promise<void>(resolve => listening.once('listening', () => resolve()))
+      base = `http://127.0.0.1:${(listening.address() as AddressInfo).port}`
+    })
+    afterAll(async () => {
+      if (http != null) await new Promise<void>(resolve => (http as Server).close(() => resolve()))
+      vi.restoreAllMocks()
+    })
+
+    it.each(['/submit', '/Submit', '/SUBMIT/', '/submit/', '//submit', '///Submit/', '//submit?x=1'])(
+      '%s reaches the upstream route only through σ_I', async path => {
+        const r = await fetch(base + path, {
+          method: 'POST',
+          headers: { 'content-type': 'application/octet-stream', 'x-topics': JSON.stringify(['tm_mandala']) },
+          body: Buffer.from(tx.toBEEF())
+        })
+        expect(r.status).toBe(200)
+        expect((await r.json()).tm_mandala.admissionSignature).toBe(expected)
+      })
   })
 })
 

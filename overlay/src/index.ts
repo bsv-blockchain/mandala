@@ -11,7 +11,7 @@ import { config } from 'dotenv'
 import type { Request, Response } from 'express'
 import { buildActivity, LinkageRowLite } from './activity.js'
 import {
-  wrapSubmitJson, withPersistedVerdict, ensureAdmissionIndexes, TOKEN_TOPIC,
+  wrapSubmitJson, normalizeDoubleSlash, withPersistedVerdict, ensureAdmissionIndexes, TOKEN_TOPIC,
   type AdmissionRecord, type AdmissionStore, type AppliedProof
 } from './admission.js'
 import { admissionHandler } from './admissionRoute.js'
@@ -202,7 +202,13 @@ const main = async (): Promise<void> => {
   // restore snapshot from the same wrapper.
   const submitChannel = new SubmitSideChannel()
 
-  server.app.use(wrapSubmitJson({
+  // Collapse leading '//' before any route of ours matches (2.7.3 normalizes
+  // only later, inside start(), so '//submit' would otherwise bypass σI).
+  server.app.use(normalizeDoubleSlash)
+  // Same matcher as the upstream route (case-insensitive, non-strict), so
+  // '/Submit' and '/submit/' cannot bypass the admission wrapper either.
+  // Its next() runs the edge policy and then the upstream /submit route.
+  server.app.post('/submit', wrapSubmitJson({
     priv: overlayPriv,
     store: admissionStore,
     applied: appliedProof,

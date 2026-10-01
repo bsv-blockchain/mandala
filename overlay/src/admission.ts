@@ -78,7 +78,9 @@ export function txidFromSubmitBody (body: number[], includesOffChain: boolean): 
     let beef = body
     if (includesOffChain) {
       const r = new Utils.Reader(beef)
-      const l = r.readVarIntNum()
+      // Canonical CompactSize only, as the upstream route reads it: a frame it
+      // refuses must not decode here, or its final 400 reads as a 503.
+      const l = r.readVarIntNumStrict(false)
       beef = r.read(l)
     }
     return Transaction.fromBEEF(beef).id('hex')
@@ -130,7 +132,7 @@ export const payloadHashOfBody = (body: number[], includesOffChain: boolean): st
   if (!includesOffChain) return EMPTY_PAYLOAD_HASH
   try {
     const r = new Utils.Reader(body)
-    const beefLength = r.readVarIntNum()
+    const beefLength = r.readVarIntNumStrict(false)
     r.read(beefLength)
     return payloadHashOfValues(r.read())
   } catch {
@@ -380,7 +382,7 @@ export interface SubmitWrapDeps {
 export const FINALIZE_FAILED =
   'the admission was not recorded; the transaction may already be applied — retry to collect its signature'
 
-interface ReqLike { path: string, method: string, body: unknown, headers: Record<string, unknown> }
+interface ReqLike { body: unknown, headers: Record<string, unknown> }
 interface ResLike { json: (b: unknown) => unknown, status?: (code: number) => unknown }
 
 const bytesOf = (raw: unknown): number[] =>
@@ -391,8 +393,25 @@ const bytesOf = (raw: unknown): number[] =>
 const nowIso = (): string => new Date().toISOString()
 
 /**
- * Wraps POST /submit. Installed with `app.use` BEFORE `configureEngine`, so it
- * is on the stack ahead of the route OverlayExpress registers in `start()`.
+ * Collapses a leading run of slashes to one (`//submit` → `/submit`), exactly
+ * as overlay-express 2.7.3's `initialDoubleSlashCompatibility` does. Upstream
+ * installs that inside `start()`, AFTER every route this repo registers, so
+ * without this a `//submit` misses our /submit route, is collapsed later, and
+ * reaches the upstream route with no σ_I and no admission record. index.ts
+ * mounts it first, so it covers our `/admin/*` and `/arc-ingest` routes too.
+ */
+export const normalizeDoubleSlash = (req: { url: string }, _res: unknown, next: () => void): void => {
+  if (req.url.startsWith('//')) req.url = req.url.replace(/^\/{2,}/, '/')
+  next()
+}
+
+/**
+ * Wraps POST /submit. Mounted with `app.post('/submit', …)` BEFORE
+ * `configureEngine`, so it is on the stack ahead of the route OverlayExpress
+ * registers in `start()`, and it matches exactly what that route matches
+ * (Express routing is case-insensitive and non-strict: `/Submit`, `/submit/`).
+ * It does no path check of its own — the route is the gate — and its `next()`
+ * runs overlay-express's edge policy and then the upstream route.
  *
  * `req.body` is read LAZILY, inside the response interceptor: OverlayExpress
  * installs its `bodyParser.raw` at the top of `start()`, i.e. AFTER everything
@@ -409,10 +428,6 @@ const nowIso = (): string => new Date().toISOString()
  */
 export function wrapSubmitJson (deps: SubmitWrapDeps) {
   return (req: ReqLike, res: ResLike, next: () => void): void => {
-    if (req.path !== '/submit' || req.method !== 'POST') {
-      next()
-      return
-    }
     const origJson = res.json.bind(res)
 
     const send = (status: number, body: unknown): void => {
@@ -431,6 +446,14 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
     const scope = newSubmitScope()
 
     res.json = (body: unknown) => {
+      // overlay-express 2.7.3 edge policy answers synchronously from inside
+      // next() (concurrency cap, body limits). ERR_SERVER_BUSY is transient and
+      // must reach the client as the contract's retryable 503, never a 400.
+      const edge = body as { status?: unknown, code?: unknown, description?: unknown } | null
+      if (edge?.status === 'error' && edge.code === 'ERR_SERVER_BUSY') {
+        send(503, errorBody('ERR_UNAVAILABLE', typeof edge.description === 'string' ? edge.description : 'overlay at capacity'))
+        return res
+      }
       void (async () => {
         const txid = txidFromSubmitBody(bytesOf(req.body), includesOffChain())
         try {
@@ -447,7 +470,6 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
       })()
       return res
     }
-    runInSubmitScope(scope, () => { next() })
 
     /**
      * `refusingTopic` is the topic whose OWN manager produced `reason` — not
@@ -514,11 +536,12 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
       if (txid == null) {
         // Nothing to key on. If the engine also failed, this is framing or
         // payload — a request-level 400 that still carries the full body shape.
+        // The upstream route's catch-all says `message`; the edge policy's
+        // body-limit and invalid-body answers say `description`.
         if (isErrorBody) {
-          const message = (body as { message?: unknown }).message
-          send(400, requestErrorBody(
-            typeof message === 'string' && message !== '' ? message : requestProblem() ?? 'malformed submission'
-          ))
+          const { message, description } = body as { message?: unknown, description?: unknown }
+          const said = [message, description].find((t): t is string => typeof t === 'string' && t !== '')
+          send(400, requestErrorBody(said ?? requestProblem() ?? 'malformed submission'))
           return
         }
         origJson(body)
@@ -690,6 +713,11 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
         console.warn(`[mandala] could not finalize the pending admission record for ${id}:`, e)
       }
     }
+
+    // LAST, after every helper above is initialized: the edge policy can answer
+    // synchronously from inside next(), and that answer runs the res.json
+    // override — which reaches `settle` and everything it calls — at once.
+    runInSubmitScope(scope, () => { next() })
   }
 }
 

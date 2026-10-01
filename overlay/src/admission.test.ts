@@ -1,15 +1,15 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { Hash, P2PKH, PrivateKey, Signature, Transaction, UnlockingScript, Utils } from '@bsv/sdk'
 import {
   admissionDigestV2, admissionMessageV2, outputSetString, signAdmissionV2Sync,
   attachAdmissionSignaturesSync, wrapSubmitJson, finalVerdictOf, EVICTED_DESCRIPTION,
   withPersistedVerdict, payloadHashOfValues, payloadHashOfBody, EMPTY_PAYLOAD_HASH,
-  ensureAdmissionIndexes, FINALIZE_FAILED,
+  ensureAdmissionIndexes, FINALIZE_FAILED, txidFromSubmitBody,
   type AdmissionAdmitted, type AdmissionRefusal, type AdmissionRecord, type AdmissionStore,
   type AppliedProof, type Steak
 } from './admission.js'
 import { SubmitSideChannel, withVerdictCapture } from './submitSideChannel.js'
-import { InputSpentError, FinalVerdictError, InfraError, isInfraError } from './submitVerdict.js'
+import { InputSpentError, FinalVerdictError, InfraError, isInfraError, errorBody, requestErrorBody } from './submitVerdict.js'
 
 const priv = PrivateKey.fromRandom()
 
@@ -130,6 +130,18 @@ const applied = (opts: { applied?: string[], outputs?: Record<string, number[]> 
   storedOutputs: async (txid) => opts.outputs?.[txid] ?? []
 })
 
+/** The harness's fake Express `res`: records the status and the first body sent. */
+const fakeRes = (): { res: any, sent: Promise<Captured> } => {
+  let statusCode = 200
+  let resolveSend: (c: Captured) => void = () => {}
+  const sent = new Promise<Captured>(r => { resolveSend = r })
+  const res: any = {
+    status (n: number) { statusCode = n; return res },
+    json (b: unknown) { resolveSend({ status: statusCode, body: b }); return res }
+  }
+  return { res, sent }
+}
+
 // A real /submit always carries X-Topics (the pinned route throws without it),
 // so the harness does too — its absence is itself a request-level 400 now.
 const harness = (
@@ -141,13 +153,7 @@ const harness = (
   tx.addInput({ sourceTXID: seed.toString(16).padStart(2, '0').repeat(32), sourceOutputIndex: 0, unlockingScript: new UnlockingScript() })
   tx.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(priv.toAddress()) })
 
-  let statusCode = 200
-  let resolveSend: (c: Captured) => void = () => {}
-  const sent = new Promise<Captured>(r => { resolveSend = r })
-  const res: any = {
-    status (n: number) { statusCode = n; return res },
-    json (b: unknown) { resolveSend({ status: statusCode, body: b }); return res }
-  }
+  const { res, sent } = fakeRes()
   let resolveNext: () => void = () => {}
   const nexted = new Promise<'next'>(r => { resolveNext = () => r('next') })
   const req = { path: '/submit', method: 'POST', body: tx.toBEEF(), headers }
@@ -238,10 +244,24 @@ describe('/submit success — STEAK + σ_I, record awaited before the response',
     expect(store.admitted).toHaveLength(0)
   })
 
-  it('passes non-/submit requests straight through', () => {
-    let called = false
-    wrapSubmitJson({ priv })({ path: '/lookup', method: 'POST', body: [], headers: {} } as any, { json: () => {} } as any, () => { called = true })
-    expect(called).toBe(true)
+  // The route it is mounted on (`app.post('/submit', …)`, the upstream route's
+  // own matcher) is the only gate. Express matches case-insensitively and
+  // non-strictly, so a '/Submit/' the router hands to the upstream route must
+  // reach σ_I as well — an exact `req.path` check here used to wave it through
+  // unsigned and unrecorded.
+  it('does not second-guess the router: a /Submit/ spelling is signed and recorded too', async () => {
+    const store = memStore()
+    const tx = new Transaction()
+    tx.addInput({ sourceTXID: '5c'.repeat(32), sourceOutputIndex: 0, unlockingScript: new UnlockingScript() })
+    tx.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(priv.toAddress()) })
+    const { res, sent } = fakeRes()
+    const req = { path: '/Submit/', method: 'POST', body: tx.toBEEF(), headers: { 'x-topics': JSON.stringify(['tm_mandala']) } }
+    wrapSubmitJson({ priv, store })(req as any, res, () => {})
+    res.json({ tm_mandala: { outputsToAdmit: [0], coinsToRetain: [] } })
+    const { status, body } = await sent
+    expect(status).toBe(200)
+    expect(body.tm_mandala.admissionSignature).toBe(signAdmissionV2Sync(priv, tx.id('hex'), [0]).admissionSignature)
+    expect(store.admitted).toHaveLength(1)
   })
 })
 
@@ -888,6 +908,115 @@ describe('§9.7 — concurrent submits of one txid each get their own verdict', 
     // …and the refusal is stamped with the payload that actually earned it.
     expect(store.refusals).toHaveLength(1)
     expect(store.refusals[0].refusedPayloadHash).toBe(payloadHashOfValues(REFUSED))
+  })
+})
+
+// ───────────── overlay-express 2.7.3 edge policy, inside next() ─────────────
+
+/**
+ * Drives the wrapper with a `next()` that answers in the upstream chain's
+ * place. overlay-express 2.7.3 mounts its edge policy (concurrency cap, body
+ * parsers and their error handler) inside `start()`, i.e. AFTER our /submit
+ * route and before its own, so those answers arrive from INSIDE next(),
+ * synchronously, and before any body has been parsed.
+ */
+const answeredInsideNext = (
+  deps: Parameters<typeof wrapSubmitJson>[0],
+  req: { body?: unknown, headers: Record<string, unknown> },
+  answer: (res: any) => void
+): Promise<Captured> => {
+  const { res, sent } = fakeRes()
+  wrapSubmitJson(deps)({ path: '/submit', method: 'POST', ...req } as any, res, () => { answer(res) })
+  return sent
+}
+
+const TOPICS = { 'x-topics': JSON.stringify(['tm_mandala']) }
+
+describe('/submit — an edge-policy answer from inside next() (overlay-express 2.7.3)', () => {
+  afterEach(() => { vi.restoreAllMocks() })
+
+  // The concurrency cap: res.setHeader('Retry-After','1'); res.status(503).json(…).
+  // A busy server is transient by definition; as anything but the contract's
+  // retryable 503 the wallet would record a final refusal and release inputs
+  // that are still good.
+  it('ERR_SERVER_BUSY reaches the client as the retryable 503 ERR_UNAVAILABLE, with no fault logged', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const store = memStore()
+    const { status, body } = await answeredInsideNext({ priv, store, channel: new SubmitSideChannel() }, { headers: TOPICS }, res => {
+      res.status(503).json({ status: 'error', code: 'ERR_SERVER_BUSY', description: 'busy' })
+    })
+    expect(status).toBe(503)
+    expect(body).toEqual(errorBody('ERR_UNAVAILABLE', 'busy'))
+    expect(body.retryable).toBe(true)
+    expect(store.refusals).toHaveLength(0)
+    // The wrapper used to call next() before `settle` was initialized, so a
+    // synchronous answer hit the TDZ and was logged and passed through raw.
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('a busy answer without a usable description still says what happened', async () => {
+    const { status, body } = await answeredInsideNext({ priv }, { headers: TOPICS }, res => {
+      res.status(503).json({ status: 'error', code: 'ERR_SERVER_BUSY' })
+    })
+    expect(status).toBe(503)
+    expect(body).toEqual(errorBody('ERR_UNAVAILABLE', 'overlay at capacity'))
+  })
+
+  // bodyParserErrorHandler: req.body is never set, so there is no txid to key on.
+  it.each([
+    [413, 'ERR_BODY_TOO_LARGE', 'The request body exceeds the endpoint limit.'],
+    [400, 'ERR_INVALID_BODY', 'The request body is invalid.']
+  ])('a %i %s from the body parser is a final 400 ERR_SHAPE, never persisted', async (edgeStatus, code, description) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const store = memStore()
+    const { status, body } = await answeredInsideNext({ priv, store, channel: new SubmitSideChannel() }, { headers: TOPICS }, res => {
+      res.status(edgeStatus).json({ status: 'error', code, description })
+    })
+    expect(status).toBe(400)
+    expect(body).toEqual(requestErrorBody(description))
+    expect(body.retryable).toBe(false)
+    expect(store.refusals).toHaveLength(0)
+    expect(warn).not.toHaveBeenCalled()
+  })
+})
+
+// ────────── off-chain framing: canonical CompactSize only, as upstream ──────────
+
+describe('/submit — off-chain framing is read with the strict CompactSize reader', () => {
+  const PAYLOAD = Utils.toArray('{"outputs":[{"index":0}]}', 'utf8')
+  const tx = new Transaction()
+  tx.addInput({ sourceTXID: '7e'.repeat(32), sourceOutputIndex: 0, unlockingScript: new UnlockingScript() })
+  tx.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(priv.toAddress()) })
+  const beef = tx.toBEEF()
+  const canonical = [beef.length, ...beef, ...PAYLOAD]
+  // The same length in the 3-byte 0xfd form — legal only for values >= 0xfd.
+  const nonCanonical = [0xfd, beef.length & 0xff, beef.length >> 8, ...beef, ...PAYLOAD]
+
+  it('frames a BEEF short enough that the 0xfd form is non-canonical', () => {
+    expect(beef.length).toBeLessThan(0xfd)
+  })
+
+  it('txidFromSubmitBody refuses a non-canonical length prefix', () => {
+    expect(txidFromSubmitBody(canonical, true)).toBe(tx.id('hex'))
+    expect(txidFromSubmitBody(nonCanonical, true)).toBeNull()
+  })
+
+  it('payloadHashOfBody treats a non-canonical length prefix as unframeable', () => {
+    expect(payloadHashOfBody(canonical, true)).toBe(payloadHashOfValues(PAYLOAD))
+    expect(payloadHashOfBody(nonCanonical, true)).toBe(EMPTY_PAYLOAD_HASH)
+  })
+
+  // Upstream's route reads the prefix with readVarIntNumStrict(false) and
+  // answers its masked 400. With a lenient mirror the wrapper decoded a txid
+  // the route never did, found no request problem, and turned that final 400
+  // into a retryable 503 — a client would retry the same bytes forever.
+  it('/submit keeps upstream\'s refusal a final 400 ERR_SHAPE, not a retryable 503', async () => {
+    const req = { body: Buffer.from(nonCanonical), headers: { ...TOPICS, 'x-includes-off-chain-values': 'true' } }
+    const { status, body } = await answeredInsideNext({ priv, store: memStore(), channel: new SubmitSideChannel() }, req, res => {
+      setImmediate(() => { res.status(400).json({ status: 'error', message: 'Request could not be processed' }) })
+    })
+    expect(status).toBe(400)
+    expect(body).toEqual(requestErrorBody('Request could not be processed'))
   })
 })
 
