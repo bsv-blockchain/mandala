@@ -26,6 +26,22 @@
 - Commits end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - Local npm 12 skips install scripts (`allow-scripts`). After any `npm install`/`npm ci` run `node -e "require('sqlite3')"`. If that fails, run `npm rebuild sqlite3 --foreground-scripts` and re-check.
 
+## Execution notes
+
+- Tasks run **strictly in order** in one working tree: 1–7 all touch `overlay/src/index.ts`, and 8/9 share the branch.
+- Implementer model tiers:
+  - opus for Tasks 2, 3, 5, 11;
+  - sonnet for 1, 4, 6, 7, 8, 9, 10;
+  - opus for every reviewer.
+- Implementers must **verify, not assume**:
+  1. Task 2: `package-lock.json` resolves `@bsv/overlay-topics` 1.6.0 and `@bsv/templates` 1.9.0.
+  2. Task 4: `configureEngineParams` accepts a partial `{throwOnBroadcastFailure: true}`. If it does not, pass exactly what upstream `infra/overlay-server/src/index.ts:260-264` passes, minus the advertiser.
+  3. Task 5: `admission.test.ts` pass-through-for-other-paths cases are updated, not deleted, and σI-attachment assertions are kept.
+  4. Task 6: `server.engine.broadcaster` is the provider instance (or the chain's inner provider).
+  5. Task 7: `close()` tolerates an instance that never listened (read `closeResources`). Otherwise wrap it in try/catch and still exit 1.
+  6. Task 10: grep bsv-wallet (read-only, excluding `.claude/worktrees`) for `is being spent by another submission` before writing amendment 11.1. If it matches, add a line that TS clients now see a generic retryable 503.
+  7. Task 11 Step 3 includes a well-formed submit that reaches the engine (e.g. a 1-output BEEF on `tm_mandala` that the manager refuses), proving the `/submit` route falls through to upstream.
+
 ## Review Focus
 
 1. **Double-spend after the bump.** The second spend of a coin must still get `400 ERR_INPUT_SPENT {spendTxid}`, never `ERR_CONSERVATION`. The engine now drops spent coins from `previousCoins`. Pinned in Task 1 (harness), fixed in Task 2.
@@ -198,6 +214,10 @@ describe('real engine + spent-input guard', () => {
     const rb = await h.submit(b)
     expect(rb.refusal).toBeInstanceOf(InputSpentError)
     expect((rb.refusal as InputSpentError).spendTxid).toBe(a.id('hex'))
+    // The refused spend must not re-mark the coin: still spent by A.
+    const row = await h.knex('outputs').where({ txid: h.root.id('hex'), outputIndex: 0 }).first()
+    expect(Boolean(row.spent)).toBe(true)
+    expect(row.spentBy ?? a.id('hex')).toBe(a.id('hex')) // spentBy absent on 2.2.0, set on 2.6.2
   })
 })
 ```
