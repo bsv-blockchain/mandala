@@ -10,7 +10,7 @@ import { MandalaToken, ADMIN_PROTOCOL } from '@bsv/templates'
 import { ProtoWallet, PrivateKey, Hash, Utils, Transaction, UnlockingScript, WalletProtocol } from '@bsv/sdk'
 import { withVerdictCapture, SubmitSideChannel } from './submitSideChannel.js'
 import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
-import { withSpentInputGuard, EVICTED_HEAL_DESCRIPTION, type SpentInputStore } from './spentGuard.js'
+import { withSpentInputGuard, EVICTED_HEAL_DESCRIPTION, MOVED_DESCRIPTION, type SpentInputStore } from './spentGuard.js'
 import { admissionResponse } from './admissionRoute.js'
 import {
   withPersistedVerdict, wrapSubmitJson, signAdmissionV2Sync, EVICTED_DESCRIPTION, payloadHashOfValues,
@@ -160,7 +160,9 @@ const framedBody = (beef: number[], payload: number[]): Buffer => {
  * isolation these tests are here to pin.
  */
 const submitThrough = async (
-  tm: any, deps: Parameters<typeof wrapSubmitJson>[0], beef: number[], payload: number[]
+  tm: any, deps: Parameters<typeof wrapSubmitJson>[0], beef: number[], payload: number[],
+  // The engine's previousCoins — [0] is the one input listed as a live topic coin.
+  previousCoins: number[] = [0]
 ): Promise<{ status: number, body: any }> => {
   let statusCode = 200
   let resolveSend: (c: { status: number, body: any }) => void = () => {}
@@ -180,7 +182,7 @@ const submitThrough = async (
       // empty STEAK entry and the route answers 200.
       let steak: Record<string, unknown>
       try {
-        steak = { tm_mandala: await tm.identifyAdmissibleOutputs(beef, [0], payload) }
+        steak = { tm_mandala: await tm.identifyAdmissibleOutputs(beef, previousCoins, payload) }
       } catch {
         steak = { tm_mandala: { outputsToAdmit: [], coinsToRetain: [] } }
       }
@@ -365,6 +367,34 @@ describe('§9.2 — an evicted competitor frees the coin for the loser', () => {
     expect(store.rows[txid]).toBeUndefined()
 
     const admitted = await submitThrough(tm, { priv, store, channel }, beef, payload)
+    expect(admitted.status).toBe(200)
+    expect(admitted.body.tm_mandala.outputsToAdmit).toEqual([0])
+    expect(admitted.body.tm_mandala.admissionSignature).toBe(signAdmissionV2Sync(priv, txid, [0]).admissionSignature)
+  })
+
+  // The same rescue, losing the race: the engine queried previousCoins while
+  // the competitor still held the coin (so it is not listed), and the
+  // eviction's unmarkSpent landed before the guard read it (so it reads live).
+  // The pinned manager would answer a token spend with no previous coins with
+  // a FINAL ERR_CONSERVATION — persisted, outranking every rescue resubmit.
+  it('a coin un-spent between the engine\'s previousCoins query and the guard is 503 with nothing persisted, then admitted', async () => {
+    const channel = new SubmitSideChannel()
+    const store = memStore()
+    const tm = stack(channel, store, liveInputs)
+    const { beef, payload, txid, sourceOutpoint } = await spend()
+
+    const raced = await submitThrough(tm, { priv, store, channel }, beef, payload, [])
+    expect(raced.status).toBe(503)
+    expect(raced.body).toEqual({
+      status: 'error',
+      code: 'ERR_UNAVAILABLE',
+      retryable: true,
+      description: MOVED_DESCRIPTION(sourceOutpoint),
+      message: MOVED_DESCRIPTION(sourceOutpoint)
+    })
+    expect(store.rows[txid]).toBeUndefined()
+
+    const admitted = await submitThrough(tm, { priv, store, channel }, beef, payload, [0])
     expect(admitted.status).toBe(200)
     expect(admitted.body.tm_mandala.outputsToAdmit).toEqual([0])
     expect(admitted.body.tm_mandala.admissionSignature).toBe(signAdmissionV2Sync(priv, txid, [0]).admissionSignature)

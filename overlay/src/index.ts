@@ -296,7 +296,9 @@ const main = async (): Promise<void> => {
   //                            output with no verified linkage.
   //   withSpentInputGuard    — FIX L: refuse a conflicting second spend of
   //                            ANY input (the engine omits spent coins from
-  //                            previousCoins), healing stale self/evicted spends.
+  //                            previousCoins), healing stale self/evicted spends;
+  //                            a live input previousCoins does not list (un-spent
+  //                            after the engine's query) is a retryable 503.
   //   withAdminChainAnchor   — admin actions must be anchored to the asset's
   //                            chain of spends.
   //   MandalaTopicManager    — the pinned rules.

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createHarness, HARNESS_TOPIC, type Harness } from './testkit/engineHarness.js'
-import { knexSpentInputStore } from './spentGuard.js'
+import { knexSpentInputStore, MOVED_DESCRIPTION } from './spentGuard.js'
 import { InputSpentError, InfraError, isInfraError } from './submitVerdict.js'
 
 describe('real engine + spent-input guard', () => {
@@ -80,6 +80,59 @@ describe('real engine + spent-input guard', () => {
     expect(r2.refusal).toBeUndefined()
     expect(JSON.stringify(r2.steak)).toContain('"outputsToAdmit":[0]')
     const row = await h.knex('outputs').where({ txid: h.root.id('hex'), outputIndex: 0 }).first()
+    expect(row.spentBy).toBe(b.id('hex'))
+  })
+
+  // The §9.2/§7 rescue race. The engine builds previousCoins with
+  // findOutput(…, topic, false) BEFORE the wrapper stack runs; FIX E's
+  // /arc-ingest unmarkSpent is a bare UPDATE outside Engine.submit's lock. A
+  // coin un-spent in between is missing from previousCoins yet reads live to
+  // the guard — and the pinned manager would then persist a final
+  // ERR_CONSERVATION against a valid rescue resubmit. The guard refuses it
+  // retryably instead, and the resubmit converges.
+  it('a coin un-spent by eviction between the engine\'s previousCoins query and the guard is a retryable InfraError, then the rescue resubmit is admitted', async () => {
+    const evicted = new Set<string>()
+    h = await createHarness({ wasEvicted: async (t) => evicted.has(t) })
+    await h.submit(h.root)
+    const a = await h.spend(900)
+    const b = await h.spend(800)
+    expect((await h.submit(a)).refusal).toBeUndefined()
+    const root = h.root.id('hex')
+
+    const storage = h.storage as any
+    const realFind = storage.findOutput.bind(storage)
+    let raced = 0
+    let engineSaw: unknown = 'not queried'
+    storage.findOutput = async (...args: any[]) => {
+      const out = await realFind(...args)
+      const [txid, outputIndex, topic, spent] = args
+      // spent === false is unique to the engine's previousCoins query.
+      if (raced === 0 && txid === root && outputIndex === 0 && topic === HARNESS_TOPIC && spent === false) {
+        raced++
+        engineSaw = out
+        // The eviction lands now: index.ts unmarkSpent, verbatim shape (spentBy left stale).
+        evicted.add(a.id('hex'))
+        await h.knex('outputs').where({ txid: root, outputIndex: 0, topic: HARNESS_TOPIC }).update('spent', false)
+      }
+      return out
+    }
+    const r1 = await h.submit(b)
+    storage.findOutput = realFind
+
+    // Premise: the engine queried while A still held the coin, so left it out.
+    expect(raced).toBe(1)
+    expect(engineSaw).toBeNull()
+    expect(r1.refusal).toBeInstanceOf(InfraError)
+    expect(r1.refusal).not.toBeInstanceOf(InputSpentError)
+    expect((r1.refusal as Error).message).toBe(MOVED_DESCRIPTION(`${root}.0`))
+    expect(await h.knex('outputs').where({ txid: b.id('hex') })).toHaveLength(0)
+
+    // The rescue resubmit: the engine now lists the coin, and B is admitted.
+    const r2 = await h.submit(b)
+    expect(r2.refusal).toBeUndefined()
+    expect(JSON.stringify(r2.steak)).toContain('"outputsToAdmit":[0]')
+    const row = await h.knex('outputs').where({ txid: root, outputIndex: 0, topic: HARNESS_TOPIC }).first()
+    expect(Boolean(row.spent)).toBe(true)
     expect(row.spentBy).toBe(b.id('hex'))
   })
 })

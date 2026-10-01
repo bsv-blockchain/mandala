@@ -23,6 +23,14 @@
  * restore is never told ERR_INPUT_SPENT for a spend that no longer exists. A
  * coin left spent by an interrupted attempt of the SAME transaction is healed
  * the same way.
+ *
+ * The guard's own read is LATER than the engine's previousCoins query (every
+ * outer wrapper runs in between), and FIX E's `unmarkSpent` is a bare UPDATE
+ * outside the engine's submission lock. So a coin can flip spent → live in that
+ * gap: missing from previousCoins, yet live to the guard. Delegating then hands
+ * the manager a token spend with no previous coins — a persisted, final
+ * ERR_CONSERVATION against exactly the rescue resubmit §7 protects. A live row
+ * the engine did not list is therefore refused retryably (InfraError → 503).
  */
 import { Transaction } from '@bsv/sdk'
 import type { TopicManager } from '@bsv/overlay'
@@ -59,6 +67,8 @@ export const SELF_HEAL_DESCRIPTION = (outpoint: string): string =>
   `input ${outpoint} was left marked spent by an interrupted attempt of this transaction; released, retry`
 export const EVICTED_HEAL_DESCRIPTION = (outpoint: string, competitor: string): string =>
   `input ${outpoint} was still marked spent by evicted transaction ${competitor}; released, retry`
+export const MOVED_DESCRIPTION = (outpoint: string): string =>
+  `input ${outpoint} was released while this submission was being evaluated; retry`
 
 /** The spending transaction id behind a `consumedBy` entry list. */
 export const spendTxidOf = (consumedBy: ConsumedByEntry[]): string | null => {
@@ -80,13 +90,21 @@ const outpointOf = (inp: { sourceTXID?: string, sourceTransaction?: Transaction,
  * The first input of `tx` that a different, still-admitted transaction has
  * already spent — or null when every input is live.
  *
- * Every input, not `previousCoins`: since @bsv/overlay 2.6 the engine omits
- * spent coins from previousCoins, so the double spend would otherwise surface
- * as the manager's conservation reject (a persisted final ERR_CONSERVATION).
+ * Every input, not only `previousCoins` (the engine's input indices it found
+ * as live topic coins): since @bsv/overlay 2.6 the engine omits spent coins
+ * from previousCoins, so the double spend would otherwise surface as the
+ * manager's conservation reject (a persisted final ERR_CONSERVATION).
  * An input with no row on this topic (a fee input, a coin never admitted, or
  * one an eviction deleted) is not a conflict this guard can prove.
  * `spendTxid` is '' when the competitor cannot be named (the coin is still
  * spent, so the submission is still refused).
+ *
+ * A LIVE row whose input index is not in `previousCoins` was un-spent after the
+ * engine's query (an eviction's unmarkSpent racing this submission): the
+ * manager is about to judge the spend without that coin, so it is refused
+ * retryably (InfraError → 503, never persisted) and the resubmit, which the
+ * engine will see with the coin listed, converges. `previousCoins` that is not
+ * an array lists nothing, so it fails CLOSED the same way.
  *
  * Two stale-spend cases are healed, then refused retryably (InfraError → 503),
  * because the engine already built previousCoins without the coin:
@@ -101,15 +119,21 @@ const outpointOf = (inp: { sourceTXID?: string, sourceTransaction?: Transaction,
  */
 export const conflictingSpend = async (
   tx: Transaction,
+  previousCoins: readonly number[],
   store: SpentInputStore
 ): Promise<{ outpoint: string, spendTxid: string } | null> => {
   const self = tx.id('hex')
-  for (const inp of tx.inputs) {
+  const listed = new Set<number>(Array.isArray(previousCoins) ? previousCoins : [])
+  for (const [inputIndex, inp] of tx.inputs.entries()) {
     const { txid, vout } = outpointOf(inp)
     if (txid === '') continue
     const state = await infra('the engine output store', async () => await store.spendStateOf(txid, vout))
-    if (state == null || !state.spent) continue
+    if (state == null) continue
     const outpoint = `${txid}.${vout}`
+    if (!state.spent) {
+      if (!listed.has(inputIndex)) throw new InfraError(MOVED_DESCRIPTION(outpoint))
+      continue
+    }
     const competitor = state.spentBy ?? spendTxidOf(state.consumedBy)
     if (competitor === self) {
       await infra('the engine output store', async () => await store.releaseSpend(txid, vout, self))
@@ -130,7 +154,7 @@ export const withSpentInputGuard = (inner: TopicManager, store: SpentInputStore)
     ...inner,
     identifyAdmissibleOutputs: async (beef: number[], previousCoins: number[], offChainValues?: number[]) => {
       const tx = Transaction.fromBEEF(beef)
-      const hit = await conflictingSpend(tx, store)
+      const hit = await conflictingSpend(tx, previousCoins, store)
       if (hit != null) throw new InputSpentError(hit.outpoint, hit.spendTxid)
       return await (inner.identifyAdmissibleOutputs as (
         b: number[], p: number[], o?: number[]

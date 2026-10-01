@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { Transaction, UnlockingScript, P2PKH, PrivateKey } from '@bsv/sdk'
 import {
   conflictingSpend, withSpentInputGuard, spendTxidOf, knexSpentInputStore,
-  SELF_HEAL_DESCRIPTION, EVICTED_HEAL_DESCRIPTION,
+  SELF_HEAL_DESCRIPTION, EVICTED_HEAL_DESCRIPTION, MOVED_DESCRIPTION,
   type SpentInputStore, type SpendState
 } from './spentGuard.js'
 import { InputSpentError, InfraError, isInfraError, classifyManagerReason } from './submitVerdict.js'
@@ -50,35 +50,63 @@ describe('spendTxidOf', () => {
 describe('conflictingSpend — FIX L (contract §7)', () => {
   it('passes an unspent input', async () => {
     const s = store({ row: LIVE })
-    expect(await conflictingSpend(spendTx(), s)).toBeNull()
+    expect(await conflictingSpend(spendTx(), [0], s)).toBeNull()
     expect(s.released).toEqual([])
+  })
+
+  // The engine queried previousCoins BEFORE the outer wrappers ran; an
+  // eviction's unmarkSpent (outside the engine lock) can flip the coin live in
+  // between. Delegating would let the manager judge the spend without it.
+  it('refuses retryably a LIVE input the engine did not list in previousCoins (un-spent after its query)', async () => {
+    const s = store({ row: LIVE })
+    const err = await conflictingSpend(spendTx(), [], s).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(InfraError)
+    expect(err).not.toBeInstanceOf(InputSpentError)
+    expect((err as Error).message).toBe(MOVED_DESCRIPTION(`${SRC}.0`))
+    expect(s.released).toEqual([])
+  })
+
+  it('a previousCoins that is not an array lists nothing — a live input fails CLOSED, retryably', async () => {
+    const err = await conflictingSpend(spendTx(), undefined as any, store({ row: LIVE })).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(InfraError)
+    expect((err as Error).message).toBe(MOVED_DESCRIPTION(`${SRC}.0`))
+  })
+
+  it('checks previousCoins per input index — only the unlisted live input is named', async () => {
+    const tx = spendTx()
+    const other = 'bb'.repeat(32)
+    tx.addInput({ sourceTXID: other, sourceOutputIndex: 3, unlockingScript: new UnlockingScript() })
+    const err = await conflictingSpend(tx, [0], store({ row: LIVE })).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(InfraError)
+    expect((err as Error).message).toBe(MOVED_DESCRIPTION(`${other}.3`))
+    expect(await conflictingSpend(tx, [0, 1], store({ row: LIVE }))).toBeNull()
   })
 
   it('refuses an input already spent by a different still-admitted tx, naming spentBy', async () => {
     const s = store({ row: { spent: true, spentBy: COMPETITOR, consumedBy: [] } })
-    expect(await conflictingSpend(spendTx(), s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: COMPETITOR })
+    expect(await conflictingSpend(spendTx(), [], s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: COMPETITOR })
     expect(s.released).toEqual([])
   })
 
   it('names the competitor from consumedBy when spentBy is null (legacy rows)', async () => {
     const s = store({ row: { spent: true, spentBy: null, consumedBy: [`${COMPETITOR}.0`] } })
-    expect(await conflictingSpend(spendTx(), s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: COMPETITOR })
+    expect(await conflictingSpend(spendTx(), [], s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: COMPETITOR })
   })
 
   it('prefers spentBy over consumedBy when both name a spender', async () => {
     const other = 'dd'.repeat(32)
     const s = store({ row: { spent: true, spentBy: COMPETITOR, consumedBy: [`${other}.0`] } })
-    expect(await conflictingSpend(spendTx(), s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: COMPETITOR })
+    expect(await conflictingSpend(spendTx(), [], s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: COMPETITOR })
   })
 
   it('treats a missing row as live — an evicted spend deletes the row, and silence is not a conflict', async () => {
-    expect(await conflictingSpend(spendTx(), store({ row: null }))).toBeNull()
+    expect(await conflictingSpend(spendTx(), [], store({ row: null }))).toBeNull()
   })
 
   it('still refuses when the competitor cannot be named (spent, no spentBy, no consumedBy)', async () => {
     // evicted: [''] — an unnamed competitor must never reach the eviction check.
     const s = store({ row: { spent: true, spentBy: null, consumedBy: [] }, evicted: [''] })
-    expect(await conflictingSpend(spendTx(), s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: '' })
+    expect(await conflictingSpend(spendTx(), [], s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: '' })
     expect(s.released).toEqual([])
   })
 
@@ -91,14 +119,15 @@ describe('conflictingSpend — FIX L (contract §7)', () => {
       wasEvicted: async () => false,
       releaseSpend: async () => 1
     }
-    expect(await conflictingSpend(tx, s)).toEqual({ outpoint: `${other}.3`, spendTxid: COMPETITOR })
+    // Input 0 is live and listed; input 1 is spent (so, on >= 2.6, unlisted).
+    expect(await conflictingSpend(tx, [0], s)).toEqual({ outpoint: `${other}.3`, spendTxid: COMPETITOR })
   })
 
   it('self-heals a coin left spent by THIS tx (an interrupted attempt): release, then a retryable InfraError', async () => {
     const tx = spendTx()
     const self = tx.id('hex')
     const s = store({ row: { spent: true, spentBy: self, consumedBy: [] } })
-    const err = await conflictingSpend(tx, s).catch((e: unknown) => e)
+    const err = await conflictingSpend(tx, [], s).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(InfraError)
     expect((err as Error).message).toBe(SELF_HEAL_DESCRIPTION(`${SRC}.0`))
     expect(s.released).toEqual([[SRC, 0, self]])
@@ -108,14 +137,14 @@ describe('conflictingSpend — FIX L (contract §7)', () => {
     const tx = spendTx()
     const self = tx.id('hex')
     const s = store({ row: { spent: true, spentBy: null, consumedBy: [`${self}.0`] } })
-    const err = await conflictingSpend(tx, s).catch((e: unknown) => e)
+    const err = await conflictingSpend(tx, [], s).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(InfraError)
     expect(s.released).toEqual([[SRC, 0, self]])
   })
 
   it('heals a coin still held by an EVICTED competitor: release it, then a retryable InfraError', async () => {
     const s = store({ row: { spent: true, spentBy: COMPETITOR, consumedBy: [] }, evicted: [COMPETITOR] })
-    const err = await conflictingSpend(spendTx(), s).catch((e: unknown) => e)
+    const err = await conflictingSpend(spendTx(), [], s).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(InfraError)
     expect((err as Error).message).toBe(EVICTED_HEAL_DESCRIPTION(`${SRC}.0`, COMPETITOR))
     expect(s.released).toEqual([[SRC, 0, COMPETITOR]])
@@ -128,7 +157,7 @@ describe('conflictingSpend — FIX L (contract §7)', () => {
       wasEvicted: async () => false,
       releaseSpend: async () => { throw new Error('SQLITE_BUSY') }
     }
-    const err = await conflictingSpend(tx, s).catch((e: unknown) => e)
+    const err = await conflictingSpend(tx, [], s).catch((e: unknown) => e)
     expect(isInfraError(err)).toBe(true)
     expect((err as Error).message).not.toBe(SELF_HEAL_DESCRIPTION(`${SRC}.0`))
   })
@@ -167,6 +196,18 @@ describe('withSpentInputGuard', () => {
     const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [], undefined).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(InputSpentError)
     expect((err as InputSpentError).spendTxid).toBe(COMPETITOR)
+    expect(calls.n).toBe(0)
+  })
+
+  it('a live input missing from previousCoins: retryable InfraError, nothing released; inner never runs', async () => {
+    const calls = { n: 0 }
+    const s = store({ row: LIVE })
+    const tm = withSpentInputGuard(inner(calls), s)
+    const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [], undefined).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(InfraError)
+    expect(err).not.toBeInstanceOf(InputSpentError)
+    expect((err as Error).message).toBe(MOVED_DESCRIPTION(`${SRC}.0`))
+    expect(s.released).toEqual([])
     expect(calls.n).toBe(0)
   })
 
