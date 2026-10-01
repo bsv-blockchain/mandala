@@ -10,7 +10,7 @@ import { MandalaToken, ADMIN_PROTOCOL } from '@bsv/templates'
 import { ProtoWallet, PrivateKey, Hash, Utils, Transaction, UnlockingScript, WalletProtocol } from '@bsv/sdk'
 import { withVerdictCapture, SubmitSideChannel } from './submitSideChannel.js'
 import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
-import { withSpentInputGuard, InFlightOutpoints, IN_FLIGHT_DESCRIPTION, type SpentInputStore } from './spentGuard.js'
+import { withSpentInputGuard, EVICTED_HEAL_DESCRIPTION, type SpentInputStore } from './spentGuard.js'
 import { admissionResponse } from './admissionRoute.js'
 import {
   withPersistedVerdict, wrapSubmitJson, signAdmissionV2Sync, EVICTED_DESCRIPTION, payloadHashOfValues,
@@ -53,16 +53,40 @@ const memStore = (rows: Record<string, AdmissionRecord> = {}): AdmissionStore & 
 const noApplied: AppliedProof = { wasApplied: async () => false, storedOutputs: async () => [] }
 
 const liveInputs: SpentInputStore = {
-  spendStateOf: async () => ({ spent: false, consumedBy: [] }),
-  wasEvicted: async () => false
+  spendStateOf: async () => ({ spent: false, spentBy: null, consumedBy: [] }),
+  wasEvicted: async () => false,
+  releaseSpend: async () => 0
+}
+
+/**
+ * The submission's one input, held by `competitor` until a releaseSpend NAMING
+ * that competitor frees it — the engine-row semantics of knexSpentInputStore.
+ */
+const heldBy = (competitor: string, evicted: () => boolean): { inputs: SpentInputStore, released: string[] } => {
+  let spent = true
+  const released: string[] = []
+  return {
+    released,
+    inputs: {
+      spendStateOf: async () => spent
+        ? { spent: true, spentBy: competitor, consumedBy: [{ txid: competitor, outputIndex: 0 }] }
+        : { spent: false, spentBy: null, consumedBy: [] },
+      wasEvicted: async (txid) => txid === competitor && evicted(),
+      releaseSpend: async (txid, outputIndex, spender) => {
+        released.push(`${txid}.${outputIndex}:${spender}`)
+        if (!spent || spender !== competitor) return 0
+        spent = false
+        return 1
+      }
+    }
+  }
 }
 
 /** The stack from index.ts, outermost first — §9.6 order for the inner three. */
 const stack = (
   channel: SubmitSideChannel,
   store: AdmissionStore,
-  inputs: SpentInputStore = liveInputs,
-  inFlight?: InFlightOutpoints
+  inputs: SpentInputStore = liveInputs
 ) =>
   withVerdictCapture(
     withPersistedVerdict(
@@ -75,8 +99,7 @@ const stack = (
             adminProtocolID: ADMIN_PROTOCOL,
             stateStore: { getAssetState: async (id: string) => assetState(id), getTokenRow: async () => null } as any
           }) as any,
-          inputs,
-          inFlight
+          inputs
         ),
         { verifierWallet: overlay as any }
       ),
@@ -225,10 +248,7 @@ describe('composed wrapper stack — index.ts wiring, real pinned manager', () =
     const channel = new SubmitSideChannel()
     const store = memStore()
     const competitor = 'dd'.repeat(32)
-    const tm = stack(channel, store, {
-      spendStateOf: async () => ({ spent: true, consumedBy: [{ txid: competitor, outputIndex: 0 }] }),
-      wasEvicted: async () => false
-    })
+    const tm = stack(channel, store, heldBy(competitor, () => false).inputs)
     const { beef, payload } = await spend()
     const out = await submitThrough(tm, { priv, store, channel }, beef, payload)
     expect(out.status).toBe(400)
@@ -236,14 +256,27 @@ describe('composed wrapper stack — index.ts wiring, real pinned manager', () =
     expect(out.body.spendTxid).toBe(competitor)
   })
 
-  it('a conflicting spend whose competitor was evicted is admitted (contract §7 rescue)', async () => {
+  // The engine (>= 2.6) leaves a spent coin out of previousCoins, so the guard
+  // cannot simply wave an evicted competitor's coin through: it releases the
+  // stale spend and answers retryably, and the retry is admitted (§7 rescue).
+  it('a conflicting spend whose competitor was evicted: 503 heal, then admitted on retry (contract §7 rescue)', async () => {
     const channel = new SubmitSideChannel()
     const store = memStore()
-    const tm = stack(channel, store, {
-      spendStateOf: async () => ({ spent: true, consumedBy: [{ txid: 'dd'.repeat(32), outputIndex: 0 }] }),
-      wasEvicted: async () => true
+    const competitor = 'dd'.repeat(32)
+    const held = heldBy(competitor, () => true)
+    const tm = stack(channel, store, held.inputs)
+    const { beef, payload, txid, sourceOutpoint } = await spend()
+    const healed = await submitThrough(tm, { priv, store, channel }, beef, payload)
+    expect(healed.status).toBe(503)
+    expect(healed.body).toEqual({
+      status: 'error',
+      code: 'ERR_UNAVAILABLE',
+      retryable: true,
+      description: EVICTED_HEAL_DESCRIPTION(sourceOutpoint, competitor),
+      message: EVICTED_HEAL_DESCRIPTION(sourceOutpoint, competitor)
     })
-    const { beef, payload } = await spend()
+    expect(held.released).toEqual([`${sourceOutpoint}:${competitor}`])
+    expect(store.rows[txid]).toBeUndefined()
     const out = await submitThrough(tm, { priv, store, channel }, beef, payload)
     expect(out.status).toBe(200)
     expect(out.body.tm_mandala.outputsToAdmit).toEqual([0])
@@ -302,16 +335,14 @@ describe('§9.1 — a stripped payload cannot poison the txid', () => {
 // ───────── §9.2 + §7 — the eviction rescue survives, because nothing persists ─
 
 describe('§9.2 — an evicted competitor frees the coin for the loser', () => {
-  it('refuses ERR_INPUT_SPENT, persists nothing, then admits the re-submit once the competitor is evicted', async () => {
+  it('refuses ERR_INPUT_SPENT, persists nothing, then heals and admits the re-submit once the competitor is evicted', async () => {
     const channel = new SubmitSideChannel()
     const store = memStore()
     const competitor = 'dd'.repeat(32)
     let competitorEvicted = false
-    const tm = stack(channel, store, {
-      spendStateOf: async () => ({ spent: true, consumedBy: [{ txid: competitor, outputIndex: 0 }] }),
-      wasEvicted: async () => competitorEvicted
-    })
-    const { beef, payload, txid } = await spend()
+    const held = heldBy(competitor, () => competitorEvicted)
+    const tm = stack(channel, store, held.inputs)
+    const { beef, payload, txid, sourceOutpoint } = await spend()
 
     const refused = await submitThrough(tm, { priv, store, channel }, beef, payload)
     expect(refused.status).toBe(400)
@@ -320,69 +351,23 @@ describe('§9.2 — an evicted competitor frees the coin for the loser', () => {
     // The whole point of §9.2: NOTHING is written, so no record can outrank the
     // rescue below.
     expect(store.rows[txid]).toBeUndefined()
+    expect(held.released).toEqual([])
 
     competitorEvicted = true
+
+    // The guard frees the evicted competitor's stale spend and answers
+    // retryably — still nothing persisted that could outrank the rescue.
+    const healed = await submitThrough(tm, { priv, store, channel }, beef, payload)
+    expect(healed.status).toBe(503)
+    expect(healed.body.code).toBe('ERR_UNAVAILABLE')
+    expect(healed.body.retryable).toBe(true)
+    expect(held.released).toEqual([`${sourceOutpoint}:${competitor}`])
+    expect(store.rows[txid]).toBeUndefined()
 
     const admitted = await submitThrough(tm, { priv, store, channel }, beef, payload)
     expect(admitted.status).toBe(200)
     expect(admitted.body.tm_mandala.outputsToAdmit).toEqual([0])
     expect(admitted.body.tm_mandala.admissionSignature).toBe(signAdmissionV2Sync(priv, txid, [0]).admissionSignature)
-  })
-})
-
-// ───────── §9.7 — two concurrent spends of one coin, exactly one winner ──────
-
-describe('§9.7 — the in-flight outpoint set', () => {
-  it('two concurrent conflicting spends produce exactly one 200; the loser gets a retryable 503', async () => {
-    const channel = new SubmitSideChannel()
-    const store = memStore()
-    const inFlight = new InFlightOutpoints()
-    // Committed state says the coin is UNSPENT for both — which it is, until the
-    // winner's spend-mark lands in the engine's PHASE 3, after both have already
-    // been answered. That is the window the in-flight set closes.
-    const tm = stack(channel, store, liveInputs, inFlight)
-    const a = await spend({ keyID: 'outA' })
-    const b = await spend({ keyID: 'outB' })
-    expect(a.txid).not.toBe(b.txid)
-    expect(a.sourceOutpoint).toBe(b.sourceOutpoint) // same coin
-
-    const [ra, rb] = await Promise.all([
-      submitThrough(tm, { priv, store, channel, inFlight }, a.beef, a.payload),
-      submitThrough(tm, { priv, store, channel, inFlight }, b.beef, b.payload)
-    ])
-
-    const statuses = [ra.status, rb.status].sort((x, y) => x - y)
-    expect(statuses).toEqual([200, 503])
-
-    const winner = ra.status === 200 ? ra : rb
-    const loser = ra.status === 200 ? rb : ra
-    expect(winner.body.tm_mandala.admissionSignature).toBeTypeOf('string')
-    expect(loser.body).toEqual({
-      status: 'error',
-      code: 'ERR_UNAVAILABLE',
-      retryable: true,
-      description: IN_FLIGHT_DESCRIPTION(a.sourceOutpoint),
-      message: IN_FLIGHT_DESCRIPTION(a.sourceOutpoint)
-    })
-    // Exactly one σ_I was minted over that coin…
-    expect(Object.values(store.rows).filter(r => r.admissionSignature != null)).toHaveLength(1)
-    // …the 503 was never persisted…
-    expect(Object.values(store.rows).filter(r => r.refusedCode != null)).toHaveLength(0)
-    // …and both requests released their claims when they settled.
-    expect(inFlight.outpoints()).toEqual([])
-  })
-
-  it('a second spend of the coin is fine once the first request has settled', async () => {
-    const channel = new SubmitSideChannel()
-    const store = memStore()
-    const inFlight = new InFlightOutpoints()
-    const tm = stack(channel, store, liveInputs, inFlight)
-    const a = await spend({ keyID: 'outA' })
-    const b = await spend({ keyID: 'outB' })
-    expect((await submitThrough(tm, { priv, store, channel, inFlight }, a.beef, a.payload)).status).toBe(200)
-    // Sequential, not concurrent: the claim is gone, so the committed spend
-    // state (the ordinary guard) is what answers — and here it says unspent.
-    expect((await submitThrough(tm, { priv, store, channel, inFlight }, b.beef, b.payload)).status).toBe(200)
   })
 })
 
@@ -394,7 +379,7 @@ describe('§9.5 — infra faults are never final, end to end', () => {
   it('the spent-input guard: a throwing output store is 503 with no record written', async () => {
     const channel = new SubmitSideChannel()
     const store = memStore()
-    const tm = stack(channel, store, { spendStateOf: boom, wasEvicted: async () => false })
+    const tm = stack(channel, store, { spendStateOf: boom, wasEvicted: async () => false, releaseSpend: async () => 0 })
     const { beef, payload, txid } = await spend()
     const out = await submitThrough(tm, { priv, store, channel }, beef, payload)
     expect(out.status).toBe(503)
@@ -421,7 +406,8 @@ describe('§9.5 — infra faults are never final, end to end', () => {
     // A message the table would read as a final 400 ERR_INPUT_SPENT.
     const tm = stack(channel, store, {
       spendStateOf: async () => { throw new Error('row already spent by the connection pool') },
-      wasEvicted: async () => false
+      wasEvicted: async () => false,
+      releaseSpend: async () => 0
     })
     const { beef, payload } = await spend()
     const out = await submitThrough(tm, { priv, store, channel }, beef, payload)

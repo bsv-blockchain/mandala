@@ -92,11 +92,9 @@ export const TOKEN_TOPIC = 'tm_mandala'
  */
 export interface SubmitScope {
   readonly entries: Map<string, ManagerOutcome>
-  /** Outpoint → when its compare-and-swap mark-spent lost, for THIS request. */
-  readonly conflicts: Map<string, number>
 }
 
-export const newSubmitScope = (): SubmitScope => ({ entries: new Map(), conflicts: new Map() })
+export const newSubmitScope = (): SubmitScope => ({ entries: new Map() })
 
 const scopeStorage = new AsyncLocalStorage<SubmitScope>()
 
@@ -137,9 +135,6 @@ export class SubmitSideChannel {
     for (const [txid, entry] of this.global.entries) {
       if (entry.at < cutoff) this.global.entries.delete(txid)
     }
-    for (const [outpoint, at] of this.global.conflicts) {
-      if (at < cutoff) this.global.conflicts.delete(outpoint)
-    }
   }
 
   private upsert (txid: string, patch: Partial<ManagerOutcome>): void {
@@ -174,29 +169,6 @@ export class SubmitSideChannel {
         ? { code: 'ERR_UNAVAILABLE' as VerdictCode, description: error.message }
         : undefined
     this.upsert(txid, { reason, spendTxid, verdict, topic })
-  }
-
-  /**
-   * FIX L, storage half. Recorded by the compare-and-swap mark-spent when its
-   * UPDATE affects zero rows. Keyed by the COIN's outpoint, not by the spending
-   * txid — `markUTXOAsSpent(txid, outputIndex, topic)` names the coin being
-   * spent, and the spending transaction is not one of its arguments.
-   */
-  noteSpendConflict (outpoint: string): void {
-    this.prune()
-    this.target().conflicts.set(outpoint, this.now())
-  }
-
-  /**
-   * True when any of these outpoints lost a compare-and-swap recently. Scoped
-   * like the verdicts: of two requests racing for one coin the LOSER records the
-   * conflict, so a process-wide map would make the winner 503 on its own rival's
-   * failure.
-   */
-  hadSpendConflict (outpoints: string[], scope?: SubmitScope): boolean {
-    this.prune()
-    const sources = this.sources(scope)
-    return (outpoints ?? []).some(o => sources.some(s => s.conflicts.has(o)))
   }
 
   noteRestore (txid: string, restore: AdmissionRestore): void {

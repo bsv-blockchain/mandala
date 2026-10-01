@@ -17,7 +17,7 @@ import {
 import { admissionHandler } from './admissionRoute.js'
 import { SubmitSideChannel, withVerdictCapture, type AdmissionTokenRow } from './submitSideChannel.js'
 import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
-import { withSpentInputGuard, casMarkUTXOAsSpent, knexSpentInputStore, InFlightOutpoints, type SpentInputStore } from './spentGuard.js'
+import { withSpentInputGuard, knexSpentInputStore, type SpentInputStore } from './spentGuard.js'
 import { mountArcIngest } from './eviction.js'
 import { replayAssetState, type ReplayStorage } from './pinnedReducer.js'
 import { withAdminChainAnchor } from './adminChainGuard.js'
@@ -209,17 +209,11 @@ const main = async (): Promise<void> => {
   // restore snapshot from the same wrapper.
   const submitChannel = new SubmitSideChannel()
 
-  // §9.7 — coins claimed by a submission that has cleared the spent-input guard
-  // but whose spend-mark has not landed yet. A concurrent submit touching one
-  // gets 503 ERR_UNAVAILABLE instead of a second σ_I over the same coin.
-  const inFlight = new InFlightOutpoints()
-
   server.app.use(wrapSubmitJson({
     priv: overlayPriv,
     store: admissionStore,
     applied: appliedProof,
-    channel: submitChannel,
-    inFlight
+    channel: submitChannel
   }) as any)
 
   // The admin chain is anchored repo-locally until the same gate ships in
@@ -271,7 +265,8 @@ const main = async (): Promise<void> => {
   })
 
   // FIX L — the live spend state of an input, and whether the transaction that
-  // spent it has since been evicted (in which case the coin counts as live).
+  // spent it has since been evicted (in which case the guard releases the coin
+  // and the submitter retries).
   const spentInputStore: SpentInputStore = knexSpentInputStore(server.knex!, TOKEN_TOPIC, async (txid) => {
     const rec = await admissionsCol.findOne({ txid }, { projection: { evictedAt: 1 } })
     return rec?.evictedAt != null
@@ -299,8 +294,9 @@ const main = async (): Promise<void> => {
   //   ── §9.6 order starts here ──
   //   withUnlinkedTokenReject— FIX A: reject (never skip) a MandalaToken
   //                            output with no verified linkage.
-  //   withSpentInputGuard    — FIX L: refuse a conflicting second spend, and
-  //                            claim the inputs in `inFlight` (§9.7).
+  //   withSpentInputGuard    — FIX L: refuse a conflicting second spend of
+  //                            ANY input (the engine omits spent coins from
+  //                            previousCoins), healing stale self/evicted spends.
   //   withAdminChainAnchor   — admin actions must be anchored to the asset's
   //                            chain of spends.
   //   MandalaTopicManager    — the pinned rules.
@@ -315,8 +311,7 @@ const main = async (): Promise<void> => {
             adminProtocolID: [2, 'mandala admin'] as [2, string],
             stateStore: sharedStorage
           }) as any, adminChainStore),
-          spentInputStore,
-          inFlight
+          spentInputStore
         ),
         { verifierWallet: mandalaWallet }
       ),
@@ -367,35 +362,6 @@ const main = async (): Promise<void> => {
 
   server.configureEnableGASPSync(false)
   await server.configureEngine(false)
-
-  // FIX L, detecting half. `KnexStorage.markUTXOAsSpent` is an unconditional
-  // UPDATE with no rows-affected check; swapping it for a compare-and-swap on
-  // `spent = false` turns a silent double-mark into a logged conflict. It
-  // cannot refuse the submission from here — the engine calls it inside its own
-  // swallowing try/catch, after the broadcast — which is why the enforcement
-  // point is withSpentInputGuard, above, and this is the race-narrowing half.
-  const engine = server.engine as unknown as { storage: Record<string, unknown> } | undefined
-  if (engine?.storage != null) {
-    engine.storage.markUTXOAsSpent = casMarkUTXOAsSpent({
-      markSpentIfUnspent: async (txid, outputIndex, topic) =>
-        await server.knex!('outputs').where({ txid, outputIndex, topic, spent: false }).update('spent', true),
-      onConflict: (txid, outputIndex, topic) => {
-        console.warn(`[mandala] spend conflict: ${txid}.${outputIndex}@${topic} was already spent (compare-and-swap affected 0 rows)`)
-        // Recorded by the COIN's outpoint — markUTXOAsSpent does not name the
-        // spending transaction. /submit matches it against the restore
-        // snapshot's spentOutpoints and answers 503 (retryable) rather than a
-        // final 400: only the manager's live-token-row guard mints
-        // ERR_INPUT_SPENT, and the retry converges on it.
-        submitChannel.noteSpendConflict(`${txid}.${outputIndex}`)
-      },
-      // §9.7 — the coin's spend state is now committed either way, so the
-      // in-flight claim on it has done its job and the next submit is answered
-      // by the ordinary spent-input guard rather than by a 503.
-      onMarked: (txid, outputIndex) => { inFlight.releaseOutpoint(`${txid}.${outputIndex}`) }
-    })
-  } else {
-    console.error('[mandala] engine storage unavailable — compare-and-swap mark-spent NOT installed (FIX L)')
-  }
 
   // FIX E. Mounted BEFORE server.start(), which is where OverlayExpress
   // registers its own /arc-ingest, so this route matches first. With an empty

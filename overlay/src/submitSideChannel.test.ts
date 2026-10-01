@@ -75,26 +75,6 @@ describe('SubmitSideChannel', () => {
     expect(got?.topic).toBe('tm_mandala_registry')
   })
 
-  it('tracks compare-and-swap spend conflicts by coin outpoint', () => {
-    const ch = new SubmitSideChannel()
-    const coin = 'aa'.repeat(32) + '.0'
-    expect(ch.hadSpendConflict([coin])).toBe(false)
-    ch.noteSpendConflict(coin)
-    expect(ch.hadSpendConflict([coin])).toBe(true)
-    expect(ch.hadSpendConflict(['ff'.repeat(32) + '.1'])).toBe(false)
-    expect(ch.hadSpendConflict([])).toBe(false)
-  })
-
-  it('expires spend conflicts on the same ttl', () => {
-    let now = 1000
-    const ch = new SubmitSideChannel({ ttlMs: 100, now: () => now })
-    const coin = 'aa'.repeat(32) + '.0'
-    ch.noteSpendConflict(coin)
-    expect(ch.hadSpendConflict([coin])).toBe(true)
-    now = 1101
-    expect(ch.hadSpendConflict([coin])).toBe(false)
-  })
-
   it('keys strictly by txid so concurrent submissions do not cross-talk', () => {
     const ch = new SubmitSideChannel()
     ch.noteReject('ab'.repeat(32), new Error('first'))
@@ -279,15 +259,5 @@ describe('SubmitSideChannel — request scopes (§9.7)', () => {
     const ch = new SubmitSideChannel()
     ch.noteReject(A, new Error('conservation violated'))
     expect(ch.take(A, newSubmitScope())?.reason).toBe('conservation violated')
-  })
-
-  it('spend conflicts are scoped too — the LOSER records, so the winner must not see it', () => {
-    const ch = new SubmitSideChannel()
-    const coin = 'aa'.repeat(32) + '.0'
-    const winner = newSubmitScope()
-    const loser = newSubmitScope()
-    runInSubmitScope(loser, () => { ch.noteSpendConflict(coin) })
-    expect(ch.hadSpendConflict([coin], winner)).toBe(false)
-    expect(ch.hadSpendConflict([coin], loser)).toBe(true)
   })
 })

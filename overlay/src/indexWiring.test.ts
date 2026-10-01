@@ -56,13 +56,14 @@ describe('index.ts — tm_mandala guard order (§9.6)', () => {
   })
 
   it('passes every guard the state it gates on', () => {
-    expect(stack).toContain('spentInputStore')
+    expect(stack).toMatch(/withSpentInputGuard\([\s\S]*?\),\s*\n\s*spentInputStore\s*\n\s*\)/)
     // The production store reads the engine's `outputs` table, not a stand-in.
     expect(CODE).toContain('knexSpentInputStore(server.knex!, TOKEN_TOPIC')
     expect(stack).toContain('adminChainStore')
     expect(stack).toContain('admissionStore')
-    // §9.7 — the in-flight claim is the guard's, not the wrapper's, to make.
-    expect(stack).toMatch(/withSpentInputGuard\([\s\S]*?spentInputStore,\s*\n\s*inFlight/)
+    const wrap = CODE.slice(CODE.indexOf('wrapSubmitJson({'), CODE.indexOf('wrapSubmitJson({') + 400)
+    expect(wrap).toContain('channel: submitChannel')
+    expect(wrap).toContain('store: admissionStore')
   })
 
   it('wires the §9.4 provisional record on the token manager only', () => {
@@ -74,15 +75,12 @@ describe('index.ts — tm_mandala guard order (§9.6)', () => {
     expect(registry).not.toContain('withPersistedVerdict')
   })
 
-  it('gives the /submit wrapper the in-flight set so a request releases its claims', () => {
-    const wrap = CODE.slice(CODE.indexOf('wrapSubmitJson({'), CODE.indexOf('wrapSubmitJson({') + 400)
-    expect(wrap).toContain('inFlight')
-    expect(wrap).toContain('channel: submitChannel')
-    expect(wrap).toContain('store: admissionStore')
-  })
-
-  it('releases an in-flight claim from the compare-and-swap (§9.7)', () => {
-    expect(CODE).toMatch(/onMarked:[\s\S]*?inFlight\.releaseOutpoint/)
+  // @bsv/overlay >= 2.6's markUTXOAsSpent is itself a compare-and-swap that
+  // records spentBy (the 4th argument). Replacing it would drop spentBy, and the
+  // spent-input guard's self-heal keys on it.
+  it('leaves the engine\'s own compare-and-swap mark-spent in place', () => {
+    expect(CODE).not.toMatch(/markUTXOAsSpent\s*=/)
+    expect(CODE).not.toContain('inFlight')
   })
 })
 
@@ -174,8 +172,9 @@ describe('§9.6 guard order — first refusal wins, over the real guards', () =>
     }), 'utf8')
 
   const spentInputs = (spent: boolean): SpentInputStore => ({
-    spendStateOf: async () => ({ spent, consumedBy: spent ? [{ txid: 'dd'.repeat(32), outputIndex: 0 }] : [] }),
-    wasEvicted: async () => false
+    spendStateOf: async () => ({ spent, spentBy: spent ? 'dd'.repeat(32) : null, consumedBy: [] }),
+    wasEvicted: async () => false,
+    releaseSpend: async () => 0
   })
 
   /** Anchors nothing, so any admin entry is unanchored. */

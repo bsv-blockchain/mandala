@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import { Transaction, UnlockingScript, P2PKH, PrivateKey } from '@bsv/sdk'
 import {
-  conflictingSpend, withSpentInputGuard, casMarkUTXOAsSpent, spendTxidOf, knexSpentInputStore,
-  InFlightOutpoints, IN_FLIGHT_DESCRIPTION, tokenInputOutpoints,
-  type SpentInputStore, type ConsumedByEntry
+  conflictingSpend, withSpentInputGuard, spendTxidOf, knexSpentInputStore,
+  SELF_HEAL_DESCRIPTION, EVICTED_HEAL_DESCRIPTION,
+  type SpentInputStore, type SpendState
 } from './spentGuard.js'
 import { InputSpentError, InfraError, isInfraError, classifyManagerReason } from './submitVerdict.js'
 
@@ -17,13 +17,21 @@ const spendTx = (): Transaction => {
   return tx
 }
 
+const LIVE: SpendState = { spent: false, spentBy: null, consumedBy: [] }
+
+/** `released` records every releaseSpend(txid, vout, spender) call. */
 const store = (opts: {
-  row?: { spent: boolean, consumedBy: ConsumedByEntry[] } | null
+  row?: SpendState | null
   evicted?: string[]
-}): SpentInputStore => ({
-  spendStateOf: async () => opts.row === undefined ? { spent: false, consumedBy: [] } : opts.row,
-  wasEvicted: async (txid: string) => (opts.evicted ?? []).includes(txid)
-})
+}): SpentInputStore & { released: Array<[string, number, string]> } => {
+  const released: Array<[string, number, string]> = []
+  return {
+    released,
+    spendStateOf: async () => opts.row === undefined ? LIVE : opts.row,
+    wasEvicted: async (txid: string) => (opts.evicted ?? []).includes(txid),
+    releaseSpend: async (txid, outputIndex, spender) => { released.push([txid, outputIndex, spender]); return 1 }
+  }
+}
 
 describe('spendTxidOf', () => {
   it('reads the spending txid out of a consumedBy outpoint string', () => {
@@ -41,45 +49,88 @@ describe('spendTxidOf', () => {
 
 describe('conflictingSpend — FIX L (contract §7)', () => {
   it('passes an unspent input', async () => {
-    expect(await conflictingSpend(spendTx(), [0], store({ row: { spent: false, consumedBy: [] } }))).toBeNull()
+    const s = store({ row: LIVE })
+    expect(await conflictingSpend(spendTx(), s)).toBeNull()
+    expect(s.released).toEqual([])
   })
 
-  it('refuses an input already spent by a different still-admitted tx, naming the competitor', async () => {
-    const hit = await conflictingSpend(spendTx(), [0], store({ row: { spent: true, consumedBy: [`${COMPETITOR}.0`] } }))
-    expect(hit).toEqual({ outpoint: `${SRC}.0`, spendTxid: COMPETITOR })
+  it('refuses an input already spent by a different still-admitted tx, naming spentBy', async () => {
+    const s = store({ row: { spent: true, spentBy: COMPETITOR, consumedBy: [] } })
+    expect(await conflictingSpend(spendTx(), s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: COMPETITOR })
+    expect(s.released).toEqual([])
   })
 
-  it('treats an input spent by a tx whose admission record carries evictedAt as LIVE', async () => {
-    const hit = await conflictingSpend(
-      spendTx(), [0],
-      store({ row: { spent: true, consumedBy: [`${COMPETITOR}.0`] }, evicted: [COMPETITOR] })
-    )
-    expect(hit).toBeNull()
+  it('names the competitor from consumedBy when spentBy is null (legacy rows)', async () => {
+    const s = store({ row: { spent: true, spentBy: null, consumedBy: [`${COMPETITOR}.0`] } })
+    expect(await conflictingSpend(spendTx(), s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: COMPETITOR })
+  })
+
+  it('prefers spentBy over consumedBy when both name a spender', async () => {
+    const other = 'dd'.repeat(32)
+    const s = store({ row: { spent: true, spentBy: COMPETITOR, consumedBy: [`${other}.0`] } })
+    expect(await conflictingSpend(spendTx(), s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: COMPETITOR })
   })
 
   it('treats a missing row as live — an evicted spend deletes the row, and silence is not a conflict', async () => {
-    expect(await conflictingSpend(spendTx(), [0], store({ row: null }))).toBeNull()
+    expect(await conflictingSpend(spendTx(), store({ row: null }))).toBeNull()
   })
 
-  it('still refuses when the competitor cannot be named (spent, no consumedBy)', async () => {
-    const hit = await conflictingSpend(spendTx(), [0], store({ row: { spent: true, consumedBy: [] } }))
-    expect(hit).toEqual({ outpoint: `${SRC}.0`, spendTxid: '' })
+  it('still refuses when the competitor cannot be named (spent, no spentBy, no consumedBy)', async () => {
+    // evicted: [''] — an unnamed competitor must never reach the eviction check.
+    const s = store({ row: { spent: true, spentBy: null, consumedBy: [] }, evicted: [''] })
+    expect(await conflictingSpend(spendTx(), s)).toEqual({ outpoint: `${SRC}.0`, spendTxid: '' })
+    expect(s.released).toEqual([])
   })
 
-  it('does not treat the submitting transaction itself as a competitor', async () => {
+  it('inspects every input, not only the first — the first conflicting one is named', async () => {
+    const tx = spendTx()
+    const other = 'bb'.repeat(32)
+    tx.addInput({ sourceTXID: other, sourceOutputIndex: 3, unlockingScript: new UnlockingScript() })
+    const s: SpentInputStore = {
+      spendStateOf: async (txid) => txid === other ? { spent: true, spentBy: COMPETITOR, consumedBy: [] } : LIVE,
+      wasEvicted: async () => false,
+      releaseSpend: async () => 1
+    }
+    expect(await conflictingSpend(tx, s)).toEqual({ outpoint: `${other}.3`, spendTxid: COMPETITOR })
+  })
+
+  it('self-heals a coin left spent by THIS tx (an interrupted attempt): release, then a retryable InfraError', async () => {
     const tx = spendTx()
     const self = tx.id('hex')
-    expect(await conflictingSpend(tx, [0], store({ row: { spent: true, consumedBy: [`${self}.0`] } }))).toBeNull()
+    const s = store({ row: { spent: true, spentBy: self, consumedBy: [] } })
+    const err = await conflictingSpend(tx, s).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(InfraError)
+    expect((err as Error).message).toBe(SELF_HEAL_DESCRIPTION(`${SRC}.0`))
+    expect(s.released).toEqual([[SRC, 0, self]])
   })
 
-  it('only inspects inputs this topic previously admitted (previousCoins)', async () => {
-    let looked = 0
+  it('self-heals a legacy row whose consumedBy names THIS tx too', async () => {
+    const tx = spendTx()
+    const self = tx.id('hex')
+    const s = store({ row: { spent: true, spentBy: null, consumedBy: [`${self}.0`] } })
+    const err = await conflictingSpend(tx, s).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(InfraError)
+    expect(s.released).toEqual([[SRC, 0, self]])
+  })
+
+  it('heals a coin still held by an EVICTED competitor: release it, then a retryable InfraError', async () => {
+    const s = store({ row: { spent: true, spentBy: COMPETITOR, consumedBy: [] }, evicted: [COMPETITOR] })
+    const err = await conflictingSpend(spendTx(), s).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(InfraError)
+    expect((err as Error).message).toBe(EVICTED_HEAL_DESCRIPTION(`${SRC}.0`, COMPETITOR))
+    expect(s.released).toEqual([[SRC, 0, COMPETITOR]])
+  })
+
+  it('a throwing releaseSpend is an InfraError too — never a verdict', async () => {
+    const tx = spendTx()
     const s: SpentInputStore = {
-      spendStateOf: async () => { looked++; return { spent: false, consumedBy: [] } },
-      wasEvicted: async () => false
+      spendStateOf: async () => ({ spent: true, spentBy: tx.id('hex'), consumedBy: [] }),
+      wasEvicted: async () => false,
+      releaseSpend: async () => { throw new Error('SQLITE_BUSY') }
     }
-    await conflictingSpend(spendTx(), [], s)
-    expect(looked).toBe(0)
+    const err = await conflictingSpend(tx, s).catch((e: unknown) => e)
+    expect(isInfraError(err)).toBe(true)
+    expect((err as Error).message).not.toBe(SELF_HEAL_DESCRIPTION(`${SRC}.0`))
   })
 })
 
@@ -92,7 +143,7 @@ describe('withSpentInputGuard', () => {
 
   it('throws InputSpentError before delegating', async () => {
     const calls = { n: 0 }
-    const tm = withSpentInputGuard(inner(calls), store({ row: { spent: true, consumedBy: [`${COMPETITOR}.0`] } }))
+    const tm = withSpentInputGuard(inner(calls), store({ row: { spent: true, spentBy: COMPETITOR, consumedBy: [] } }))
     const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [0], undefined).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(InputSpentError)
     expect((err as InputSpentError).spendTxid).toBe(COMPETITOR)
@@ -102,46 +153,61 @@ describe('withSpentInputGuard', () => {
 
   it('delegates unchanged when nothing conflicts', async () => {
     const calls = { n: 0 }
-    const tm = withSpentInputGuard(inner(calls), store({ row: { spent: false, consumedBy: [] } }))
+    const tm = withSpentInputGuard(inner(calls), store({ row: LIVE }))
     const res = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [0], undefined)
     expect(res.outputsToAdmit).toEqual([0])
     expect(calls.n).toBe(1)
+  })
+
+  // @bsv/overlay >= 2.6 builds previousCoins with findOutput(…, false), so a
+  // spent coin is never IN previousCoins — the guard must not rely on it.
+  it('inspects every input, even with previousCoins = []', async () => {
+    const calls = { n: 0 }
+    const tm = withSpentInputGuard(inner(calls), store({ row: { spent: true, spentBy: COMPETITOR, consumedBy: [] } }))
+    const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [], undefined).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(InputSpentError)
+    expect((err as InputSpentError).spendTxid).toBe(COMPETITOR)
+    expect(calls.n).toBe(0)
+  })
+
+  it('names a legacy competitor from consumedBy when spentBy is null', async () => {
+    const calls = { n: 0 }
+    const tm = withSpentInputGuard(inner(calls), store({ row: { spent: true, spentBy: null, consumedBy: [`${COMPETITOR}.0`] } }))
+    const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [], undefined).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(InputSpentError)
+    expect((err as InputSpentError).spendTxid).toBe(COMPETITOR)
+    expect(calls.n).toBe(0)
+  })
+
+  it('an evicted competitor: releaseSpend(…, competitor) once and a retryable InfraError; inner never runs', async () => {
+    const calls = { n: 0 }
+    const s = store({ row: { spent: true, spentBy: COMPETITOR, consumedBy: [] }, evicted: [COMPETITOR] })
+    const tm = withSpentInputGuard(inner(calls), s)
+    const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [], undefined).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(InfraError)
+    expect(err).not.toBeInstanceOf(InputSpentError)
+    expect((err as Error).message).toBe(EVICTED_HEAL_DESCRIPTION(`${SRC}.0`, COMPETITOR))
+    expect(s.released).toEqual([[SRC, 0, COMPETITOR]])
+    expect(calls.n).toBe(0)
+  })
+
+  it('spentBy === own txid: releaseSpend(…, self) and a retryable InfraError; inner never runs', async () => {
+    const calls = { n: 0 }
+    const tx = spendTx()
+    const self = tx.id('hex')
+    const s = store({ row: { spent: true, spentBy: self, consumedBy: [] } })
+    const tm = withSpentInputGuard(inner(calls), s)
+    const err = await tm.identifyAdmissibleOutputs(tx.toBEEF(), [], undefined).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(InfraError)
+    expect((err as Error).message).toBe(SELF_HEAL_DESCRIPTION(`${SRC}.0`))
+    expect(s.released).toEqual([[SRC, 0, self]])
+    expect(calls.n).toBe(0)
   })
 
   it('preserves documentation/metadata through the proxy', async () => {
     const tm = withSpentInputGuard(inner({ n: 0 }), store({}))
     expect(await tm.getDocumentation()).toBe('doc')
     expect(await tm.getMetaData?.()).toEqual({ name: 'tm_mandala', shortDescription: 's' })
-  })
-})
-
-describe('casMarkUTXOAsSpent — compare-and-swap on spent=false', () => {
-  it('marks an unspent row and reports no conflict', async () => {
-    const seen: string[] = []
-    const mark = casMarkUTXOAsSpent({
-      markSpentIfUnspent: async (txid, vout, topic) => { seen.push(`${txid}.${vout}@${topic}`); return 1 },
-      onConflict: () => { throw new Error('should not fire') }
-    })
-    await mark(SRC, 0, 'tm_mandala')
-    expect(seen).toEqual([`${SRC}.0@tm_mandala`])
-  })
-
-  it('reports a conflict when the CAS affects zero rows (someone else already spent it)', async () => {
-    const conflicts: string[] = []
-    const mark = casMarkUTXOAsSpent({
-      markSpentIfUnspent: async () => 0,
-      onConflict: (txid, vout, topic) => { conflicts.push(`${txid}.${vout}@${topic}`) }
-    })
-    await mark(SRC, 0, 'tm_mandala')
-    expect(conflicts).toEqual([`${SRC}.0@tm_mandala`])
-  })
-
-  it('never throws out of the engine mutation phase, even if the update fails', async () => {
-    const mark = casMarkUTXOAsSpent({
-      markSpentIfUnspent: async () => { throw new Error('sqlite locked') },
-      onConflict: () => {}
-    })
-    await expect(mark(SRC, 0, 'tm_mandala')).resolves.toBeUndefined()
   })
 })
 
@@ -156,7 +222,8 @@ describe('withSpentInputGuard — a store fault is an InfraError, never a verdic
     const calls = { n: 0 }
     const tm = withSpentInputGuard(inner(calls), {
       spendStateOf: async () => { throw new Error('ECONNREFUSED') },
-      wasEvicted: async () => false
+      wasEvicted: async () => false,
+      releaseSpend: async () => 1
     })
     const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [0], undefined).catch((e: unknown) => e)
     expect(isInfraError(err)).toBe(true)
@@ -167,8 +234,9 @@ describe('withSpentInputGuard — a store fault is an InfraError, never a verdic
 
   it('a throwing wasEvicted is infrastructure too — the §7 rescue cannot be guessed at', async () => {
     const tm = withSpentInputGuard(inner({ n: 0 }), {
-      spendStateOf: async () => ({ spent: true, consumedBy: [{ txid: COMPETITOR, outputIndex: 0 }] }),
-      wasEvicted: async () => { throw new Error('mongo down') }
+      spendStateOf: async () => ({ spent: true, spentBy: COMPETITOR, consumedBy: [] }),
+      wasEvicted: async () => { throw new Error('mongo down') },
+      releaseSpend: async () => 1
     })
     const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [0], undefined).catch((e: unknown) => e)
     expect(isInfraError(err)).toBe(true)
@@ -196,18 +264,33 @@ describe('knexSpentInputStore — decodes the engine row, failing CLOSED on anyt
 
   it('decodes the shapes the engine writes (0/1 or boolean, JSON-string or array consumedBy)', async () => {
     expect(await read(undefined)).toBeNull()
-    expect(await read({ spent: 1, consumedBy: COMPETITOR_ENTRY }))
-      .toEqual({ spent: true, consumedBy: [{ txid: COMPETITOR, outputIndex: 0 }] })
-    expect(await read({ spent: true, consumedBy: [`${COMPETITOR}.0`] }))
-      .toEqual({ spent: true, consumedBy: [`${COMPETITOR}.0`] })
-    expect(await read({ spent: 0, consumedBy: '[]' })).toEqual({ spent: false, consumedBy: [] })
-    expect(await read({ spent: false, consumedBy: [] })).toEqual({ spent: false, consumedBy: [] })
-    expect(await read({ spent: 1n, consumedBy: '[]' })).toEqual({ spent: true, consumedBy: [] })
+    expect(await read({ spent: 1, spentBy: COMPETITOR, consumedBy: COMPETITOR_ENTRY }))
+      .toEqual({ spent: true, spentBy: COMPETITOR, consumedBy: [{ txid: COMPETITOR, outputIndex: 0 }] })
+    expect(await read({ spent: true, spentBy: null, consumedBy: [`${COMPETITOR}.0`] }))
+      .toEqual({ spent: true, spentBy: null, consumedBy: [`${COMPETITOR}.0`] })
+    expect(await read({ spent: 0, spentBy: null, consumedBy: '[]' })).toEqual({ spent: false, spentBy: null, consumedBy: [] })
+    expect(await read({ spent: false, spentBy: null, consumedBy: [] })).toEqual({ spent: false, spentBy: null, consumedBy: [] })
+    expect(await read({ spent: 1n, spentBy: null, consumedBy: '[]' })).toEqual({ spent: true, spentBy: null, consumedBy: [] })
   })
 
   it('a nullable consumedBy is "nothing consumed it" — the same as the engine\'s own parse', async () => {
-    expect(await read({ spent: 0, consumedBy: null })).toEqual({ spent: false, consumedBy: [] })
-    expect(await read({ spent: 0, consumedBy: 'null' })).toEqual({ spent: false, consumedBy: [] })
+    expect(await read({ spent: 0, consumedBy: null })).toEqual({ spent: false, spentBy: null, consumedBy: [] })
+    expect(await read({ spent: 0, consumedBy: 'null' })).toEqual({ spent: false, spentBy: null, consumedBy: [] })
+  })
+
+  it('spentBy: the engine\'s spending txid, lower-cased; null/absent/empty is a legacy row (null)', async () => {
+    expect((await read({ spent: 1, spentBy: COMPETITOR.toUpperCase(), consumedBy: '[]' }))?.spentBy).toBe(COMPETITOR)
+    expect((await read({ spent: 1, spentBy: null, consumedBy: '[]' }))?.spentBy).toBeNull()
+    expect((await read({ spent: 1, consumedBy: '[]' }))?.spentBy).toBeNull()
+    expect((await read({ spent: 1, spentBy: '', consumedBy: '[]' }))?.spentBy).toBeNull()
+  })
+
+  it.each([
+    ['a number', 5],
+    ['a Buffer', Buffer.from('cc', 'hex')],
+    ['a non-txid string', 'not-a-txid']
+  ])('a spentBy that is %s is a fault — never a competitor name, never a legacy null', async (_label, spentBy) => {
+    await expect(read({ spent: 1, spentBy, consumedBy: '[]' })).rejects.toThrow(/spentBy/)
   })
 
   it.each([
@@ -239,7 +322,8 @@ describe('knexSpentInputStore — decodes the engine row, failing CLOSED on anyt
   it.each([
     ['a malformed consumedBy', { spent: 1, consumedBy: 'not json' }],
     ['a non-array consumedBy', { spent: 1, consumedBy: '{}' }],
-    ['an unreadable spent flag', { spent: '1', consumedBy: COMPETITOR_ENTRY }]
+    ['an unreadable spent flag', { spent: '1', consumedBy: COMPETITOR_ENTRY }],
+    ['an unreadable spentBy', { spent: 1, spentBy: 7, consumedBy: COMPETITOR_ENTRY }]
   ])('%s refuses the spend retryably (InfraError), never a final ERR_INPUT_SPENT and never admits', async (_label, row) => {
     const calls = { n: 0 }
     // wasEvicted(true) must not matter: the competitor cannot be named, so the
@@ -248,112 +332,9 @@ describe('knexSpentInputStore — decodes the engine row, failing CLOSED on anyt
       knexSpentInputStore(rowKnex(row), 'tm_x', async () => true))
     const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [0], undefined).catch((e: unknown) => e)
     expect(isInfraError(err)).toBe(true)
+    // The DECODE refused — not a heal attempt the evicted flag would trigger.
+    expect((err as Error).message).toMatch(/outputs\.(consumedBy|spent|spentBy) /)
     expect(err).not.toBeInstanceOf(InputSpentError)
     expect(calls.n).toBe(0)
-  })
-})
-
-// ───────────────── §9.7 — the in-flight outpoint claim ──────────────────────
-
-describe('InFlightOutpoints', () => {
-  const A = `${SRC}.0`
-  const B = `${SRC}.1`
-  const TX1 = '11'.repeat(32)
-  const TX2 = '22'.repeat(32)
-
-  it('lets one transaction claim a coin and refuses the next with an InfraError', () => {
-    const set = new InFlightOutpoints()
-    set.hold(TX1, [A])
-    expect(() => set.hold(TX2, [A])).toThrow(IN_FLIGHT_DESCRIPTION(A))
-    expect(isInfraError(((): unknown => { try { set.hold(TX2, [A]) } catch (e) { return e } })())).toBe(true)
-  })
-
-  it('is idempotent for the same transaction (a retry of its own claim)', () => {
-    const set = new InFlightOutpoints()
-    set.hold(TX1, [A, B])
-    expect(() => set.hold(TX1, [A, B])).not.toThrow()
-  })
-
-  it('claims all-or-nothing, so a refused claim strands nothing', () => {
-    const set = new InFlightOutpoints()
-    set.hold(TX1, [B])
-    expect(() => set.hold(TX2, [A, B])).toThrow()
-    // A was never claimed by TX2, so a third transaction can still take it.
-    expect(() => set.hold('33'.repeat(32), [A])).not.toThrow()
-  })
-
-  it('releases per-outpoint (the compare-and-swap) and wholesale (the request)', () => {
-    const set = new InFlightOutpoints()
-    set.hold(TX1, [A, B])
-    set.releaseOutpoint(A)
-    expect(set.outpoints()).toEqual([B])
-    set.releaseAll(TX1)
-    expect(set.outpoints()).toEqual([])
-    expect(() => set.hold(TX2, [A, B])).not.toThrow()
-  })
-
-  it('releaseAll only frees the named transaction\'s own claims', () => {
-    const set = new InFlightOutpoints()
-    set.hold(TX1, [A])
-    set.hold(TX2, [B])
-    set.releaseAll(TX1)
-    expect(set.outpoints()).toEqual([B])
-  })
-
-  it('expires a claim whose request never released it (a dropped connection)', () => {
-    let now = 1000
-    const set = new InFlightOutpoints(100, () => now)
-    set.hold(TX1, [A])
-    expect(() => set.hold(TX2, [A])).toThrow()
-    now = 1101
-    expect(() => set.hold(TX2, [A])).not.toThrow()
-  })
-
-  it('the guard claims the previously-admitted inputs once the spend check passes', async () => {
-    const set = new InFlightOutpoints()
-    const tm = withSpentInputGuard(
-      { identifyAdmissibleOutputs: async () => ({ outputsToAdmit: [0], coinsToRetain: [] }) } as any,
-      store({}),
-      set
-    )
-    await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [0], undefined)
-    expect(set.outpoints()).toEqual([`${SRC}.0`])
-  })
-
-  it('claims nothing for a submission the manager beneath refuses', async () => {
-    const set = new InFlightOutpoints()
-    const tm = withSpentInputGuard(
-      { identifyAdmissibleOutputs: async () => { throw new Error('conservation violated') } } as any,
-      store({}),
-      set
-    )
-    await expect(tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [0], undefined)).rejects.toThrow()
-    expect(set.outpoints()).toEqual([])
-  })
-
-  it('onMarked fires whether the compare-and-swap won or lost', async () => {
-    const released: string[] = []
-    const won = casMarkUTXOAsSpent({ markSpentIfUnspent: async () => 1, onMarked: (t, v) => released.push(`${t}.${v}`) })
-    await won(SRC, 0, 'tm_mandala')
-    const lost = casMarkUTXOAsSpent({ markSpentIfUnspent: async () => 0, onMarked: (t, v) => released.push(`${t}.${v}`) })
-    await lost(SRC, 1, 'tm_mandala')
-    const threw = casMarkUTXOAsSpent({
-      markSpentIfUnspent: async () => { throw new Error('sqlite locked') },
-      onMarked: (t, v) => released.push(`${t}.${v}`)
-    })
-    await threw(SRC, 2, 'tm_mandala')
-    expect(released).toEqual([`${SRC}.0`, `${SRC}.1`, `${SRC}.2`])
-  })
-})
-
-describe('tokenInputOutpoints', () => {
-  it('names only the inputs the engine resolved into previousCoins', () => {
-    const tx = spendTx()
-    tx.addInput({ sourceTXID: 'bb'.repeat(32), sourceOutputIndex: 3, unlockingScript: new UnlockingScript() })
-    expect(tokenInputOutpoints(tx, [0])).toEqual([`${SRC}.0`])
-    expect(tokenInputOutpoints(tx, [0, 1])).toEqual([`${SRC}.0`, `${'bb'.repeat(32)}.3`])
-    expect(tokenInputOutpoints(tx, [])).toEqual([])
-    // An index the transaction does not have is simply not a coin.
-    expect(tokenInputOutpoints(tx, [9])).toEqual([])
   })
 })

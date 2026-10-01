@@ -2,6 +2,9 @@
   "name": "mandala-overlay",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
@@ -9,19 +12,19 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@bsv/overlay": "^2.2.0",
-    "@bsv/overlay-express": "^2.4.1",
+    "@bsv/overlay": "^2.6.2",
+    "@bsv/overlay-express": "^2.7.3",
     "@bsv/overlay-topics": "^1.6.0",
-    "@bsv/sdk": "^2.1.6",
+    "@bsv/sdk": "^2.8.11",
     "@bsv/templates": "^1.9.0",
     "dotenv": "^17.4.2",
-    "knex": "^3.1.0",
-    "mongodb": "^7.2.0",
+    "knex": "^3.3.0",
+    "mongodb": "^7.5.0",
     "sqlite3": "^5.1.7"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
-    "@types/node": "^20.0.0",
+    "@types/node": "^24.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.9.3",
     "vitest": "^4.1.10"

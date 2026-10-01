@@ -36,7 +36,6 @@ import {
 } from './submitVerdict.js'
 import { TOKEN_TOPIC, newSubmitScope, runInSubmitScope } from './submitSideChannel.js'
 import type { AdmissionPending, AdmissionRestore, SubmitSideChannel } from './submitSideChannel.js'
-import type { InFlightOutpoints } from './spentGuard.js'
 
 export const ADMISSION_PREFIX = 'mandala-admit:'
 export { TOKEN_TOPIC }
@@ -282,10 +281,6 @@ export interface AppliedProof {
 export const EVICTED_DESCRIPTION = (txid: string): string =>
   `transaction ${txid} was admitted and later evicted; its inputs are spendable again`
 
-/** FIX L race backstop (503, retryable) — never the final ERR_INPUT_SPENT. */
-export const SPEND_CONFLICT_DESCRIPTION =
-  'an input of this transaction was marked spent by another transaction while it was being admitted; retry'
-
 export interface FinalVerdict {
   code: VerdictCode
   description: string
@@ -379,8 +374,6 @@ export interface SubmitWrapDeps {
   store?: AdmissionStore
   applied?: AppliedProof
   channel?: SubmitSideChannel
-  /** §9.7 — released here when the request settles (the leak-guard half). */
-  inFlight?: InFlightOutpoints
 }
 
 /** §9.4 — the finalize write failed, so the client must retry (503). */
@@ -450,11 +443,6 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
             console.warn('[mandala] admission post-processing failed:', e)
             origJson(body)
           }
-        } finally {
-          // §9.7 leak-guard: whatever this request still holds is freed when it
-          // ends. The compare-and-swap frees each outpoint earlier, as it marks
-          // it spent; this covers every path that never reaches one.
-          if (txid != null) deps.inFlight?.releaseAll(txid)
         }
       })()
       return res
@@ -576,20 +564,12 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
 
       if (admitted.length > 0) {
         const signed = attachAdmissionSignaturesSync(steak, txid, deps.priv)
-        // FIX L, storage half. A compare-and-swap mark-spent that affected zero
-        // rows means another still-admitted transaction got this coin first.
-        // The engine runs that UPDATE after it has already answered, inside its
-        // own swallowing try/catch, so it can only ever be a RACE BACKSTOP:
-        // 503 (retryable), never a final 400. The authoritative answer is the
-        // manager's own live-token-row guard, which mints 400 ERR_INPUT_SPENT
-        // {spendTxid} on the retry — that is what the client converges on.
-        const spent = outcome?.restore?.spentOutpoints ?? []
-        const conflicted = (): boolean => deps.channel?.hadSpendConflict(spent, scope) === true
-        if (!conflicted()) await persist(txid, signed, admitted, outcome?.restore)
-        if (conflicted()) {
-          send(503, errorBody('ERR_UNAVAILABLE', SPEND_CONFLICT_DESCRIPTION))
-          return
-        }
+        // A spend-mark conflict never reaches here: the engine's own
+        // compare-and-swap mark-spent runs before the STEAK exists and its
+        // failure rejects Engine.submit, which arrives above as an error body
+        // (→ 503 ERR_UNAVAILABLE, retryable). The retry converges on the
+        // spent-input guard's 400 ERR_INPUT_SPENT {spendTxid}.
+        await persist(txid, signed, admitted, outcome?.restore)
         origJson(signed)
         return
       }

@@ -204,38 +204,6 @@ describe('/submit success — STEAK + σ_I, record awaited before the response',
     expect(store.admitted[0].restore?.spentOutpoints).toEqual(['aa'.repeat(32) + '.0'])
   })
 
-  // Parity item 5: the compare-and-swap is a RACE BACKSTOP only.
-  it('a CAS spend-mark conflict answers 503 ERR_UNAVAILABLE, never a final 400', async () => {
-    const store = memStore()
-    const channel = new SubmitSideChannel()
-    const h = harness({ priv, store, channel })
-    const coin = 'aa'.repeat(32) + '.0'
-    channel.noteRestore(h.txid, { spentOutpoints: [coin], tokenRows: [] })
-    channel.noteSpendConflict(coin)
-    await h.nexted
-    h.res.json({ tm_mandala: { outputsToAdmit: [0], coinsToRetain: [0] } })
-    const { status, body } = await h.sent
-    expect(status).toBe(503)
-    expect(body.code).toBe('ERR_UNAVAILABLE')
-    expect(body.retryable).toBe(true)
-    expect(body.message).toBe(body.description)
-    // No admission record, so the dupe path cannot later serve a σ_I for it.
-    expect(store.admitted).toHaveLength(0)
-  })
-
-  it('a CAS conflict on an unrelated coin does not disturb this submission', async () => {
-    const store = memStore()
-    const channel = new SubmitSideChannel()
-    const h = harness({ priv, store, channel })
-    channel.noteRestore(h.txid, { spentOutpoints: ['aa'.repeat(32) + '.0'], tokenRows: [] })
-    channel.noteSpendConflict('ff'.repeat(32) + '.7')
-    await h.nexted
-    h.res.json({ tm_mandala: { outputsToAdmit: [0], coinsToRetain: [0] } })
-    const { status, body } = await h.sent
-    expect(status).toBe(200)
-    expect(body.tm_mandala.admissionSignature).toBeTypeOf('string')
-  })
-
   // §9.4 — this USED to answer 200: the finalize failure was swallowed and the
   // client banked a σ_I the overlay had no record of issuing, so the very next
   // GET /admin/admission/:txid 404'd and an offline verifier walking the
