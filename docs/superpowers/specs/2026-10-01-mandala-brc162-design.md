@@ -70,7 +70,7 @@ OP_DUP OP_HASH160 <push pkh20> OP_EQUALVERIFY OP_CHECKSIG
 - **Token id on the wire:** 32 bytes, deploy txid in natural/internal byte order (spec §Token identification). A 36-byte id is *invalid for Mandala* (no BRC-161 tokens exist here).
 - **Token id string:** `<txid>_0` (64 lowercase hex, display byte order, underscore). Used in every API, store, frame and UI. **Outpoints** stay `<txid>.<vout>`; they get their own helper. The lib's single `outpoint()` helper that served both is split (`tokenIdString` / `outpointString`) so the two can never be confused.
 - **Amount:** minimally encoded script number per spec. The codec decodes the full 0…2^64−1 domain as `bigint`. The Mandala policy cap is in §3.4.
-- **Payload:** optional per spec. When present it must be a strict DAG-CBOR map (§3.5) to carry Mandala attributes. A non-map or non-strict payload carries no attributes. On a deploy or a committed authority output that makes the transaction fail Mandala policy (§5.3); on any other output it is ignored.
+- **Payload:** optional per spec. When present it must be a strict DAG-CBOR map (§3.5) to carry Mandala attributes. A non-map or non-strict payload carries no attributes. On a deploy or a committed authority output that makes the transaction fail Mandala policy (§4.3); on any other output it is ignored.
 
 ### 3.2 Roles (authority supply only)
 
@@ -83,7 +83,7 @@ OP_DUP OP_HASH160 <push pkh20> OP_EQUALVERIFY OP_CHECKSIG
 - A deploy with amount > 0 (fixed supply) is refused by Mandala policy (D1).
 - The issuer is the deploy output's linked identity, never a payload field.
 - `sym`, `dec` follow the spec's display fields. `label` and `feeRatePerKb` are Mandala keys (the spec ignores unknown keys). `feeRatePerKb` keeps the meaning shipped in token-fee P0/P1.
-- `dec` outside 0–18 or a non-text `sym`/`label` makes the deploy fail Mandala policy (§5.3). The spec says malformed display fields do not invalidate a deploy; Mandala refuses them pre-broadcast so a stablecoin never ships with broken metadata.
+- `dec` outside 0–18 or a non-text `sym`/`label` makes the deploy fail Mandala policy (§4.3). The spec says malformed display fields do not invalidate a deploy; Mandala refuses them pre-broadcast so a stablecoin never ships with broken metadata.
 
 ### 3.3 Admin action details
 
@@ -166,7 +166,7 @@ Identity checks, kept separate from layer A as the maintainer asked:
 
 Everything below fails with `ERR_AUTHORITY` unless noted:
 
-1. **Trusted identities (D4).** Every deploy and authority output's linked identity, and its linkage `prover`, is in the trusted-issuer set.
+1. **Trusted identities (D4).** Every deploy and authority output's linked identity, and its linkage `prover`, is in the trusted-issuer set (→ `ERR_UNTRUSTED`, retryable, never persisted, §6.3).
 2. **Deploy signature (§5.3).** A deploy needs a valid issuer `deploySig` over its txid.
 3. **No fixed supply.** A deploy with amount > 0 is refused.
 4. **Continuity (D8).** For each token T with ≥1 authority input, the tx creates ≥1 authority output of T.
@@ -192,7 +192,13 @@ Repo-local pre-checks (conflicting spend, fuel when P3 lands) → layer A → B 
 
 Overlay configuration `MANDALA_ISSUER_KEYS`: a JSON array of compressed identity public keys (TS env and Go env, same parsing; empty → boot fails when Mandala is enabled).
 
-The overlay no longer holds any issuer private key. `MANDALA_ADMIN_PRIVATE_KEY` and the commitment-keyed key derivation are deleted. The verifier key (`MANDALA_VERIFIER_PRIVATE_KEY`, linkage decryption) and the server identity key (σI) stay.
+The overlay no longer holds any issuer private key, and the commitment-keyed admin derivation is deleted. (Today both engines use `SERVER_PRIVATE_KEY` for σI, linkage decryption *and* admin derivation, so the overlay was implicitly the issuer. `MANDALA_ISSUER_KEYS` makes the set explicit.)
+
+**Single overlay key (documented divergence from upstream).** Upstream `securityConfig` requires independent server, verifier and admin keys. Mandala keeps one overlay identity key (`SERVER_PRIVATE_KEY`) for both σI signing and linkage decryption, because lib and wallet reveal linkage to, and verify σI against, the one configured overlay key per chain (stablecoin-mobile decision 6). P0 adopts upstream's parsing style but not the three-key split. Upstream's `MANDALA_ADMIN_PRIVATE_KEY` / `MANDALA_VERIFIER_PRIVATE_KEY` are not used.
+
+### 5.1a Key derivation for all token outputs
+
+Every token output (deploy, authority, value) derives under `FT_PROTOCOL` `[2,'mandala token']` with a per-output unique keyID. Authority and deploy outputs lock to the issuer itself (`counterparty` = issuer identity key hex, never the literal `'self'`). Blinded recipient outputs keep the pkh-only path. One protocol for all roles means `lib/src/unlock.ts` (`walletMandalaUnlock`, which hard-codes `FT_PROTOCOL`) stays unchanged and signs every role. `ADMIN_PROTOCOL` and `REGISTRY_PROTOCOL` are deleted. Registry outputs also use `FT_PROTOCOL`; the topic, not the key, separates them.
 
 ### 5.2 Why linkage identity is enough for authority outputs
 
@@ -237,10 +243,19 @@ Supersedes v2. Unchanged from v2: §1 admission digest, §3 `GET /admin/admissio
 - Token id `<txid>_0` everywhere: routes, query keys, MessageBox body (`assetId` field renamed `tokenId`), bundles, journals, SQLite.
 - Outpoints stay `<txid>.<vout>`.
 
+### 6.2a COVER walk (replaces v2 §8 / FIX K wording)
+
+The `cover()` walk follows every input whose source output decodes as a valid BRC-162 token output of the bundle's `tokenId`, in **either role (value or authority)**. Issue/reissue/redeem txs spend authority inputs, and σI covers every admitted output of a tx. Non-token inputs (fees) are not walked.
+
 ### 6.3 Verdicts
 
 - Topic managers throw `MandalaReject { code, reason }`. The repo-local side channel captures the object and the verdict uses `.code` directly. The substring `REASON_TABLE` is deleted on both engines.
-- Codes: v2 set plus **`ERR_AUTHORITY`** (400, final, persisted): untrusted identity, missing or invalid deploy signature, continuity break, duplicate commitment, fixed-supply deploy.
+- Codes: v2 set plus two new codes. Content-deterministic refusals are final; refusals that depend on operator configuration are not, so that a config change can lift them (same principle as `ERR_INPUT_SPENT` / `ERR_MEMBERSHIP`).
+
+| code | HTTP | retryable | persisted | when |
+|---|---|---|---|---|
+| `ERR_AUTHORITY` | 400 | false | yes | missing or invalid `deploySig`, continuity break, duplicate commitment, fixed-supply deploy, authority output without an admitted authority input |
+| `ERR_UNTRUSTED` | 409 | true | **never** | a deploy/authority output identity or linkage prover is not in `MANDALA_ISSUER_KEYS` |
 - Reason strings are pinned in the conformance vectors and byte-identical TS ≡ Go. The v2 §6 string becomes `output <idx>: token output with no verified linkage`.
 
 ### 6.4 Guard order (replaces v2 §9.6)
@@ -341,6 +356,7 @@ The §7 bumps and adoptions, done as separate commits with full suites green, be
   - Delete the old mandala sources and tests.
 - **`infra/overlay-server`:** Mandala wiring → `MANDALA_ISSUER_KEYS`, registry topic; docs, README, release notes, `pnpm docs:facts`.
 - **Conformance vectors generator** (§8.3).
+- **Supersedes open PRs** bsv-blockchain/ts-stack#535 (1.7.3 unlinked-token reject) and bsv-blockchain/ts-stack#584 (reducer export). Both touch files this PR deletes. Whether to close or merge-then-rebase them is the maintainer's call.
 - Until publish, mandala consumes the packages as packed tarballs (`file:` to a vendored `.tgz`, like the wallet does with the lib).
 
 ### P2 — TS overlay
