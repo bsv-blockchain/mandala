@@ -16,6 +16,7 @@ import (
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/arcade"
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/wiring"
 )
 
 // tokenTopic is the one topic σ_I speaks for. A registry-only admission
@@ -144,6 +145,18 @@ func submitHandler(s Submitter, prepare PrepareSubmitCompensation, signer Admiss
 			if handled, err := serveKnownVerdict(c, ctx, txid, payloadHash, signer, rec, proof); handled {
 				return err
 			}
+		}
+
+		// Script-rules parity with TS (wiring.CheckChronicleSighashRule): a
+		// version-1 tx carrying a SIGHASH_CHRONICLE signature is refused 503
+		// ERR_UNAVAILABLE, as the TS engine's Transaction.verify throw is.
+		// It runs for every submit (TS verifies regardless of topic), AFTER the
+		// known-verdict path (a tx this node already admitted still resolves
+		// idempotently from its record) and BEFORE any snapshot, provisional
+		// record or Submit, so a refusal leaves no state behind. Never
+		// persisted: like every dependency fault it is not the tx's verdict.
+		if cerr := wiring.CheckChronicleSighashRule(beef); cerr != nil {
+			return verdictResponse(c, verdictUnavailable, cerr.Error(), "")
 		}
 
 		// Snapshot restorable state BEFORE Submit: the engine's OutputSpent
