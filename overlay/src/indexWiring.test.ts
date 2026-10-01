@@ -242,6 +242,45 @@ describe('index.ts — the /submit wrapper shares the upstream route matcher', (
   })
 })
 
+// A signal must drain through OverlayExpress.close() (HTTP server, timers,
+// knex, Mongo) rather than kill the process mid-write, and close() can only
+// release the clients it owns — so the repo must not open a second Mongo client
+// that nothing closes.
+describe('index.ts — graceful lifecycle on OverlayExpress.close()', () => {
+  it('opens no Mongo client of its own: the lookup db is the one configureMongo built', () => {
+    expect(CODE).not.toMatch(/\bMongoClient\b/)
+    expect(CODE).not.toMatch(/from 'mongodb'/)
+    // Directly after configureMongo, the db OverlayExpress named `${name}_lookup_services`.
+    expect(CODE).toMatch(/await server\.configureMongo\(cfg\.mongoUrl\)\s*\n\s*const lookupDb = server\.mongoDb!\s*\n/)
+    expect(CODE).toContain('new MandalaStorageManager(lookupDb)')
+    expect(CODE.match(/const lookupDb\b/g)).toHaveLength(1)
+  })
+
+  it('captures the server for close() right after constructing it', () => {
+    expect(CODE).toMatch(/let overlay: OverlayExpress \| undefined/)
+    expect(CODE).toMatch(/new OverlayExpress\([^)]*\)\s*\n\s*overlay = server\s*\n/)
+    expect(CODE).toContain('await overlay?.close()')
+  })
+
+  it('drains on SIGTERM and SIGINT once each, through the idempotent shutdown', () => {
+    expect(CODE).toContain("createShutdown({ close, exit: (code) => process.exit(code), log, deadlineMs: 25_000 })")
+    expect(CODE).toContain("process.once('SIGTERM', () => { void onSignal('SIGTERM') })")
+    expect(CODE).toContain("process.once('SIGINT', () => { void onSignal('SIGINT') })")
+  })
+
+  it('a failed startup always exits 1, whether or not the cleanup close succeeds', () => {
+    expect(CODE).toContain('createShutdown({ close, exit: () => process.exit(1), log, deadlineMs: 10_000 })')
+    expect(CODE).toContain("main().catch((e) => { console.error(e); void onStartupFailure('startup-failure') })")
+    // The only direct exits are the two shutdown instances above.
+    expect(CODE.match(/process\.exit\(/g)).toHaveLength(2)
+  })
+
+  it('registers the handlers before main() starts the boot', () => {
+    const names = ["process.once('SIGTERM'", "process.once('SIGINT'", 'main().catch(']
+    expect(orderOf(CODE, names)).toEqual(names)
+  })
+})
+
 describe('index.ts — eviction rebuild (PR #11 + token-fee §2, rebuild-first)', () => {
   const deps = CODE.slice(CODE.indexOf('mountArcIngest('))
   const rebuild = deps.slice(deps.indexOf('rebuildAssetStateExcluding:'), deps.indexOf('purgeAdminHistory:'))

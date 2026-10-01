@@ -6,7 +6,6 @@ import {
 } from '@bsv/overlay-topics'
 import { KnexStorage } from '@bsv/overlay'
 import { MerklePath, PrivateKey, ProtoWallet, WalletInterface } from '@bsv/sdk'
-import { MongoClient } from 'mongodb'
 import { config } from 'dotenv'
 import type { Request, Response } from 'express'
 import { buildActivity, LinkageRowLite } from './activity.js'
@@ -25,12 +24,17 @@ import { assetAuthHeadHandler, assetAuthBeefHandler, withFrozenRowFlags, type Ad
 import { withFeeRateFold, withFeeRate, rebuildFeeRateFromHistory, type FeeRateStore, type FeeRateRow, type FeeRateHistoryEntry } from './feeRates.js'
 import { adminAuth, adminCors, parseAdminCorsOrigins, warnIfAdminAuthDisabled } from './adminAuth.js'
 import { readBootConfig } from './bootConfig.js'
+import { createShutdown } from './shutdown.js'
 import { withArcadeStatusParity } from './arcadeParity.js'
 import {
   RegistryStore, RegistryTopicManager, createRegistryLookup,
   registryScreening, REGISTRY_TOPIC, REGISTRY_LOOKUP
 } from './registry.js'
 config()
+
+// Assigned in main() the moment the server exists, so a signal or a failed boot
+// can drain whatever has been opened so far through OverlayExpress.close().
+let overlay: OverlayExpress | undefined
 
 const main = async (): Promise<void> => {
   // Every boot variable is validated here, before anything is constructed: a
@@ -50,6 +54,7 @@ const main = async (): Promise<void> => {
   // overlay-express 2.7.3 takes a bare https host here (it rejects http:// URLs
   // and paths), hence advertisableHost rather than the HOSTING_URL as given.
   const server = new OverlayExpress(cfg.nodeName, cfg.serverPrivateKey, cfg.advertisableHost)
+  overlay = server
   server.configurePort(8080)
   server.configureNetwork(cfg.network)
 
@@ -87,14 +92,14 @@ const main = async (): Promise<void> => {
   })
   await server.configureMongo(cfg.mongoUrl)
 
-  // OverlayExpress.configureMongo uses db `${cfg.nodeName}_lookup_services` (i.e. "mandala_lookup_services").
-  // We must use that same db name so sharedStorage reads/writes the same collections.
-  const mongoClient = new MongoClient(cfg.mongoUrl)
-  await mongoClient.connect()
-  const sharedStorage = new MandalaStorageManager(mongoClient.db(`${cfg.nodeName}_lookup_services`))
+  // OverlayExpress.configureMongo owns the one Mongo client (closed by
+  // OverlayExpress.close()) and its db `${cfg.nodeName}_lookup_services`, i.e.
+  // "mandala_lookup_services". Reuse that db so sharedStorage reads/writes the
+  // same collections, and so nothing here holds a client close() cannot reach.
+  const lookupDb = server.mongoDb!
+  const sharedStorage = new MandalaStorageManager(lookupDb)
 
   const mandalaWallet = new ProtoWallet(PrivateKey.fromHex(cfg.serverPrivateKey)) as unknown as WalletInterface
-  const lookupDb = mongoClient.db(`${cfg.nodeName}_lookup_services`)
   const registryStore = new RegistryStore(lookupDb)
   await registryStore.ensureIndexes()
 
@@ -633,4 +638,13 @@ const main = async (): Promise<void> => {
   console.log(`mandala overlay listening on ${cfg.hostingUrl}`)
 }
 
-main().catch((e) => { console.error(e); process.exit(1) })
+const log = (m: string, e?: unknown): void => { if (e == null) console.log(m); else console.error(m, e) }
+const close = async (): Promise<void> => { await overlay?.close() }
+// Drain on a signal: stop accepting work, let in-flight requests finish, close
+// knex and Mongo, then exit 0. 25s sits inside compose's 30s stop_grace_period.
+const onSignal = createShutdown({ close, exit: (code) => process.exit(code), log, deadlineMs: 25_000 })
+// A failed startup exits 1 whether or not the cleanup close succeeds.
+const onStartupFailure = createShutdown({ close, exit: () => process.exit(1), log, deadlineMs: 10_000 })
+process.once('SIGTERM', () => { void onSignal('SIGTERM') })
+process.once('SIGINT', () => { void onSignal('SIGINT') })
+main().catch((e) => { console.error(e); void onStartupFailure('startup-failure') })
