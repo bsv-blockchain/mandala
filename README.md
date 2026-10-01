@@ -9,8 +9,11 @@ Every state change is a real on-chain BSV transaction. The overlay indexes and
 enforces admissible transactions; MessageBox handles peer-to-peer handoff so
 recipients can claim what was sent.
 
-**Built on:** @bsv/sdk v2.1.6, @bsv/templates v1.9.0, @bsv/overlay-topics
-v1.5.0, @bsv/overlay v2.2.0, BRC-100 identity protocol.
+**Built on:** BRC-100 identity protocol. The TS overlay runs @bsv/overlay v2.6.2,
+@bsv/overlay-express v2.7.3, @bsv/sdk v2.8.11, @bsv/overlay-topics v1.6.0 and
+@bsv/templates v1.9.0 (requires Node 24). The app and `lib/` are still on
+@bsv/sdk v2.1.6 with @bsv/templates v1.9.0. The Go overlay (`overlay-go/`) runs
+go-overlay-services v1.3.7 and go-sdk v1.7.1 on Go 1.26.
 
 ---
 
@@ -44,11 +47,18 @@ v1.5.0, @bsv/overlay v2.2.0, BRC-100 identity protocol.
 
 ### 1. Start the Overlay Service
 
+Requires Node 24 (`overlay/package.json` engines: `>=24 <25`).
+
 ```bash
 cd overlay
 npm install
 npm run gen-key
 ```
+
+npm 12 and later skip dependency install scripts, so the `sqlite3` native
+binding may not be built. If `node -e "require('sqlite3')"` fails, run
+`npm rebuild sqlite3 --foreground-scripts` (see `runbook.md` if that still
+leaves it missing).
 
 This prints:
 ```
@@ -72,10 +82,12 @@ docker compose up --build
 Verify it's running:
 
 ```bash
-curl http://localhost:8080/api/v1/info
+curl http://localhost:8080/health
 ```
 
-You should see the overlay info response with `tm_mandala` configured.
+You should get a JSON health report: HTTP 200 once the overlay is ready, 503
+before that. `curl http://localhost:8080/listTopicManagers` lists `tm_mandala`
+and `tm_mandala_registry`.
 
 ### 2. Start the Frontend App
 
@@ -203,7 +215,7 @@ Mongo indexes backing the hot paths (`linkage.createdAt`,
 
 ### Setup
 
-- [ ] Overlay running on localhost:8080; `curl http://localhost:8080/api/v1/info` returns valid response.
+- [ ] Overlay running on localhost:8080; `curl http://localhost:8080/health` returns 200.
 - [ ] App running on localhost:5173 with `VITE_OVERLAY_IDENTITY_KEY` set to overlay's identity pubkey.
 - [ ] Issuer wallet connected (identity key matches the overlay's).
 
@@ -265,6 +277,7 @@ SQLITE_FILE=/data/overlay.sqlite
 # Optional — makes the overlay a full network participant (broadcast + SPV):
 # ARCADE_URL=<arcade host>
 # ARCADE_API_KEY=<key>
+# ARCADE_CALLBACK_TOKEN=<32+ bytes; required with ARCADE_URL, and HOSTING_URL must then be https://>
 # CHAINTRACKS_URL=<defaults to $ARCADE_URL/chaintracks>
 ```
 
@@ -283,11 +296,11 @@ VITE_MESSAGEBOX_URL=https://messagebox.babbage.systems
 
 ## Key Dependencies
 
-- **@bsv/sdk** `^2.1.6` — core blockchain and transaction utilities.
+- **@bsv/sdk** `^2.8.11` in the overlay, `^2.1.6` in the app and `lib/` — core blockchain and transaction utilities.
 - **@bsv/templates** `^1.9.0` — `MandalaToken` / `MandalaAdmin` script templates. App and overlay MUST run the same version (assetId byte-order encoding must agree).
-- **@bsv/overlay** `^2.2.0` — overlay engine + Knex/Mongo storage.
-- **@bsv/overlay-express** `^2.4.1` — Express host for the overlay HTTP API.
-- **@bsv/overlay-topics** `^1.5.0` — `tm_mandala` topic manager + `ls_mandala` lookup service + `MandalaStorageManager`.
+- **@bsv/overlay** `^2.6.2` — overlay engine + Knex/Mongo storage.
+- **@bsv/overlay-express** `^2.7.3` — Express host for the overlay HTTP API.
+- **@bsv/overlay-topics** `^1.6.0` — `tm_mandala` topic manager + `ls_mandala` lookup service + `MandalaStorageManager`.
 - **@bsv/identity-react** `^1.1.14` — identity resolution hooks.
 - **@bsv/message-box-client** `^2.2.0` — peer-to-peer transfer handoff.
 - **React 19 / Vite 6 / Tailwind CSS 4** — frontend stack.
@@ -307,7 +320,7 @@ VITE_MESSAGEBOX_URL=https://messagebox.babbage.systems
 ### App won't connect to overlay
 
 - Verify `VITE_OVERLAY_URL=http://localhost:8080`.
-- Check overlay is running: `curl http://localhost:8080/api/v1/info`.
+- Check overlay is running: `curl http://localhost:8080/health`.
 - Clear browser cache and restart dev server.
 
 ### Issuer console not appearing

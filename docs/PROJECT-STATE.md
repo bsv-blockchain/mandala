@@ -28,9 +28,12 @@ Two repos are in play:
   (the `tm_mandala` topic manager + `ls_mandala` lookup service). Both are
   **published to npm**; the app and overlay consume them as versioned deps.
 
-Current dep floor: `@bsv/templates@^1.9.0`, `@bsv/overlay-topics@^1.5.0`,
-`@bsv/overlay@^2.2.0`, `@bsv/sdk@^2.1.6` (both app and overlay pinned to the same templates version —
-they MUST agree on assetId encoding, see §7).
+Current dep floor: `@bsv/templates@^1.9.0`, `@bsv/overlay-topics@^1.6.0`
+(locked at exactly 1.6.0), `@bsv/overlay@^2.6.2`, `@bsv/overlay-express@^2.7.3`,
+`@bsv/sdk@^2.8.11` in the overlay (Node 24); the app and `lib/` are on
+`@bsv/sdk@^2.1.6` (both app and overlay pinned to the same templates version —
+they MUST agree on assetId encoding, see §7). `overlay-go/` is on
+go-overlay-services v1.3.7 and go-sdk v1.7.1 (Go 1.26).
 
 ---
 
@@ -560,7 +563,7 @@ in `adminState.ts` and `adminHistory.ts` (not via `LookupResolver`).
 
 **What it is.** A case-for-case Go port of `overlay/` (the demo overlay's
 Express app): the `go-overlay-services` engine (topic manager `tm_mandala` +
-lookup service `ls_mandala`, pinned at v1.3.2) plus a hand-written Fiber HTTP
+lookup service `ls_mandala`, pinned at v1.3.7, with go-sdk v1.7.1 on Go 1.26) plus a hand-written Fiber HTTP
 layer that reproduces the same custom admin endpoints, `/submit`, `/lookup`,
 CORS, and 404/error shapes to match what the frontend expects. Lives in
 `overlay-go/`. It's an interchangeable alternative backend, not additive — the
@@ -636,14 +639,16 @@ code fix here:
 | `/submit` verdict taxonomy: `{status,code,retryable,description,message,spendTxid?}`, 400 final (`ERR_CONSERVATION`/`ERR_LINKAGE`/`ERR_SHAPE`/`ERR_SATOSHIS`/`ERR_INPUT_SPENT`) persisted per txid, 409 liftable (`ERR_PAUSED`/`ERR_FROZEN`/`ERR_SANCTIONED`/`ERR_ACCESS`/`ERR_MEMBERSHIP`), 410 `ERR_EVICTED`, 503 `ERR_UNAVAILABLE` | done (`overlay/src/submitVerdict.ts`) | done (`overlay-go/internal/httpapi/verdict.go`) | Same substring-match reject-reason table, same evaluation order, on both stacks. **Shared quirk — NOT TS-only:** both the pinned TS manager (`MandalaTopicManager.js`) and Go's own native control gate (`topic_manager.go`) throw one fixed string for gates 1 (frozen/evicted input) / 2 (paused) / 3 (access-mode) — `"control gate rejected the transaction (paused asset or access mode)"` — and since the reason table checks `"paused"` before `"frozen"` on both stacks, a genuinely frozen-input rejection reports `ERR_PAUSED` on both engines, not just TS. `ERR_FROZEN` is effectively unreachable via this path on either stack; HTTP shape (409, retryable) is unaffected either way |
 | Reject-not-skip: an un-linked (or mismatched-linkage) MandalaToken-decodable output rejects the whole submission | done — wrapper (`overlay/src/tokenLinkageGuard.ts`) around the pinned manager | done — native (`overlay-go/internal/mandala/topic_manager.go`) | Identical error string both stacks: `"output <idx>: MandalaToken-decodable output with no verified linkage"`; phantom-coin regression tests on both (`overlay/src/tokenLinkageGuard.test.ts`, `overlay-go/internal/mandala/topic_manager_test.go`) |
 | Eviction restore (FIX E): eviction restores spent inputs from the admission record's snapshot before deleting the evicted outputs | done (`overlay/src/eviction.ts`) | done (`overlay-go/internal/wiring/engine.go`'s `evictTx`) | order: unmark spent → restore token rows → stamp `evictedAt` |
-| `/arc-ingest` not mounted when `ARCADE_CALLBACK_TOKEN` is empty | done | done | both log a warning and skip mounting rather than exposing an unauthenticated, eviction-capable ingest route; `/health*` stay mounted regardless |
+| No unauthenticated `/arc-ingest` | done — the overlay refuses to boot when `ARCADE_URL` is set without an `ARCADE_CALLBACK_TOKEN` (32 to 16384 bytes, constant-time compare; overlay-express 2.7.3 requires it); without `ARCADE_URL` no `/arc-ingest` is mounted | done — logs a warning and skips mounting when `ARCADE_CALLBACK_TOKEN` is empty | **Divergence:** TS fails the boot, Go boots without the route (and has no 32-byte rule). Neither ever exposes an unauthenticated, eviction-capable ingest route; `/health*` stay mounted regardless |
 | Admission record: `mandalaAdmissions` Mongo collection, written synchronously before the `/submit` response | done (`overlay/src/index.ts`) | done (`overlay-go/internal/mandala/admissions.go`) | same collection name both stacks; carries the restore snapshot plus `refusedCode`/`refusedDescription`/`refusedSpendTxid`/`evictedAt` |
 
 **New `lib/` (`@bsv/mandala`) modules backing the above (2026-09-15).** `lib/src/admission.ts` (`admissionDigestV2`, `verifyAdmission`) and `lib/src/bundle.ts` (`AdmissionBundle`, `canonicalBundleId`, pure `cover()`) are stack-agnostic — the same client code verifies a σI signed by either overlay. `lib/src/overlay.ts` gained `OverlayRefusedError` and `createOverlayFacilitator`; σI is now captured on every admin/registry/transfer pipeline call and journaled (`lib/src/txJournal.ts`); `lib/src/receive.ts` verifies an optional `admission` field on an incoming transfer (unverifiable ⇒ treated as absent, not rejected); `configureMandala({basket, storage})` is new (`lib/src/constants.ts`). `lib/dist` has been rebuilt. `lib/package.json` is still `"version": "0.1.0"` and the app still consumes it via the `file:../lib` symlink in `app/package.json` — npm publish (manual, by the maintainer) is still pending.
 
-**Upstream engine bug + compensation.** The pinned `go-overlay-services@v1.3.2`
-engine's `Submit` marks spent inputs in engine storage *before* broadcasting,
-and never unwinds that mark if the broadcast fails — a bug that would
+**Upstream engine bug + compensation.** The pinned `go-overlay-services@v1.3.7`
+engine's `Submit` (unchanged since v1.3.2) marks spent inputs in engine storage
+*before* broadcasting, and never unwinds that mark if the broadcast fails
+(`ErrorOnBroadcastFailure` is still dead: declared and copied into the engine,
+never read) — a bug that would
 otherwise permanently and incorrectly lock up UTXOs on any failed broadcast.
 `overlay-go` compensates at the wiring/HTTP layer: `submit.go`'s
 `PrepareSubmitCompensation` seam captures a compensation closure before
@@ -695,7 +700,9 @@ the demo's threat model accepts this for both.
 ## 12. State of the repo / open threads
 
 - On `master`. Package versions: `@bsv/templates@^1.9.0`,
-  `@bsv/overlay-topics@^1.5.0`, `@bsv/overlay@^2.2.0`.
+  `@bsv/overlay-topics@^1.6.0`, `@bsv/overlay@^2.6.2`,
+  `@bsv/overlay-express@^2.7.3`, `@bsv/sdk@^2.8.11` (overlay, Node 24);
+  `overlay-go/` on go-overlay-services v1.3.7, go-sdk v1.7.1, Go 1.26.
 - Issuer console restructured into Overview / Treasury / Operations /
   Activity / Banking; registration lives in the Overview top bar; the
   standalone Regulatory page merged into Operations.
@@ -740,7 +747,7 @@ the demo's threat model accepts this for both.
 | Basket | `mandala-tokens` |
 | Message box | `mandala-payments` |
 | Templates pkg | `@bsv/templates@^1.9.0` |
-| Overlay topics pkg | `@bsv/overlay-topics@^1.5.0` |
+| Overlay topics pkg | `@bsv/overlay-topics@^1.6.0` |
 | FT script | `<assetId> <amount> OP_2DROP` + P2PKH (8 chunks) |
 | Admin script | `[<json> OP_DROP]` + P2PKH (5 or 7 chunks) |
 | assetId on-chain | reversed txid (`tx.hash()` order) + LE vout, 36 bytes |

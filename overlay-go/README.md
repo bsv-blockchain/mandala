@@ -19,23 +19,24 @@ broadcaster/chaintracks client — see §10 of `docs/PROJECT-STATE.md`).
 ## Toolchain
 
 - Built/verified with `go1.26.0 darwin/arm64` (local toolchain).
-- `go-overlay-services@v1.3.2` requires Go 1.25+; `go.mod` declares `go 1.25.4`
-  and `go get` auto-bumped it from 1.25.0 during dependency resolution.
+- `go-overlay-services@v1.3.7` and `go-sdk@v1.7.1` both declare `go 1.26.0`,
+  so `go.mod` declares `go 1.26.0` and the Docker builder is `golang:1.26`.
   `GOTOOLCHAIN=auto` (default) will download a matching toolchain if the local
   one is older than what a dependency requires.
 
 ## Pinned dependencies
 
 ```
-github.com/bsv-blockchain/go-overlay-services v1.3.2
-github.com/bsv-blockchain/go-sdk              v1.2.24   (@latest at pin time)
-go.mongodb.org/mongo-driver/v2                v2.7.0    (@latest at pin time)
-github.com/gofiber/fiber/v2                   v2.52.14  (@latest at pin time)
+github.com/bsv-blockchain/go-overlay-services v1.3.7
+github.com/bsv-blockchain/go-sdk              v1.7.1
+go.mongodb.org/mongo-driver/v2                v2.9.1
+github.com/gofiber/fiber/v2                   v2.52.15
 ```
 
 `github.com/b-open-io/overlay` (pinned at v0.3.0 in Task 1) was **dropped in
 Task 12**: no published tag implements go-overlay-services v1.3.2's
-`engine.Storage` (see the compatibility verdict below), so the spec fallback
+`engine.Storage`, which v1.3.7 leaves unchanged (see the compatibility verdict
+below), so the spec fallback
 governs and `internal/enginestore` is the in-repo Mongo implementation.
 
 `go mod tidy` is safe to run: every pinned dependency, including fiber, is a
@@ -44,9 +45,18 @@ direct import of shipped code (`internal/httpapi` imports fiber directly).
 ## Pinned API notes
 
 Reconciled via `go doc` against the exact pinned versions above. These are
-the signatures later tasks should code against verbatim.
+the signatures later tasks should code against verbatim. `TopicManager`,
+`LookupService`, `Config`, `Storage` and `Output` are identical in v1.3.2 and
+v1.3.7.
 
-### `engine.TopicManager` (go-overlay-services v1.3.2)
+`Engine.Submit` builds `previousCoins` with `Storage.FindOutputs(..., spent=nil)`,
+so a coin another transaction already spent is still listed (tm_mandala retains
+every previous coin). The FIX L spend guard depends on that: it inspects only
+the listed inputs. `internal/wiring/previous_coins_test.go` pins it. If a bump
+starts dropping spent coins (as `@bsv/overlay` 2.6 did), port the TS guard
+(`overlay/src/spentGuard.ts`: every input inspected, self-heal) first.
+
+### `engine.TopicManager` (go-overlay-services v1.3.7)
 
 ```
 type TopicManager interface {
@@ -57,7 +67,7 @@ type TopicManager interface {
 }
 ```
 
-### `engine.LookupService` (go-overlay-services v1.3.2)
+### `engine.LookupService` (go-overlay-services v1.3.7)
 
 ```
 type LookupService interface {
@@ -72,7 +82,7 @@ type LookupService interface {
 }
 ```
 
-### `engine.Config` (go-overlay-services v1.3.2)
+### `engine.Config` (go-overlay-services v1.3.7)
 
 ```
 type Config struct {
@@ -96,7 +106,7 @@ type Config struct {
 
 Use `NewEngine(Config)` to construct an `*Engine`.
 
-### `Engine.Submit` (go-overlay-services v1.3.2)
+### `Engine.Submit` (go-overlay-services v1.3.7)
 
 ```
 func (e *Engine) Submit(ctx context.Context, taggedBEEF overlay.TaggedBEEF, mode SumbitMode, onSteakReady OnSteakReady) (overlay.Steak, error)
@@ -142,7 +152,7 @@ func (p *ProtoWallet) Decrypt(
 ) (*DecryptResult, error)
 ```
 
-### `engine.Storage` (go-overlay-services v1.3.2) — the interface a Mongo/BEEF store must satisfy
+### `engine.Storage` (go-overlay-services v1.3.7) — the interface a Mongo/BEEF store must satisfy
 
 ```
 type Storage interface {
@@ -176,11 +186,13 @@ This section documents the Task 1 investigation that justified dropping
 `b-open-io/overlay` from `go.mod` in Task 12 (see "Pinned dependencies"
 above) in favor of `internal/enginestore`, an in-repo `engine.Storage`
 implementation. It is kept verbatim as the record of that decision, not as a
-description of the current dependency graph.
+description of the current dependency graph. It ran against the then-pinned
+`v1.3.2`; the pin is now `v1.3.7`, whose `engine.Storage` and `engine.Output`
+are identical, so the verdict stands.
 
 **Verdict: `github.com/b-open-io/overlay` did NOT implement
-`go-overlay-services@v1.3.2`'s `engine.Storage` interface, at any currently
-published tag (`v0.1.0`, `v0.2.0`, `v0.2.1`, `v0.3.0` — there is no v2.x/v3.x
+the then-pinned `go-overlay-services@v1.3.2`'s `engine.Storage` interface, at any tag
+published then (`v0.1.0`, `v0.2.0`, `v0.2.1`, `v0.3.0` — there is no v2.x/v3.x
 line; the module has never left 0.x).** This contradicts the brief's
 assumption that a `v2.x`/`v3.x` tag might resolve the mismatch — no such tags
 exist. Per the brief's instruction, this is flagged rather than
@@ -197,11 +209,11 @@ implementation) is the spec-level decision a later task needs to make.**
    replace github.com/bsv-blockchain/go-overlay-services => github.com/bsv-blockchain/go-overlay-services v0.1.2-0.20250808182921-aeae02752891
    ```
    i.e. b-open-io's own code was written and tested against a pre-`v0.1.2`
-   snapshot of `engine.Storage` — many minor versions behind our pinned
-   `v1.3.2`. **`replace` directives in a dependency's `go.mod` are ignored
+   snapshot of `engine.Storage` — many minor versions behind our then-pinned
+   `v1.3.2` (now `v1.3.7`). **`replace` directives in a dependency's `go.mod` are ignored
    when that module is not the main module**, so in `overlay-go`'s build,
-   Minimal Version Selection picks our higher pin, `v1.3.2`, for the shared
-   dependency — confirmed via `go list -m github.com/bsv-blockchain/go-overlay-services` → `v1.3.2`. b-open-io/overlay's storage code is therefore
+   Minimal Version Selection picks our higher pin (then `v1.3.2`, now `v1.3.7`) for the shared
+   dependency — confirmed at the time via `go list -m github.com/bsv-blockchain/go-overlay-services` → `v1.3.2`. b-open-io/overlay's storage code is therefore
    compiled against an `engine.Storage` interface that has moved on since
    they wrote it.
 3. Building `overlay-go` with a probe file that imports
@@ -245,7 +257,7 @@ implementation) is the spec-level decision a later task needs to make.**
    - `storage/mongo.go:157` — `s.beefStore.SaveBeef(ctx, &utxo.Outpoint.Txid, utxo.Beef)`
      fails to compile: `beef.BeefStorage.SaveBeef` (see `beef/{filesystem,junglebus,sqlite,redis}.go`)
      takes `beefBytes []byte`, but `utxo` is `*engine.Output` and
-     `engine.Output.Beef` is typed `*transaction.Beef` in v1.3.2 (confirmed via
+     `engine.Output.Beef` is typed `*transaction.Beef` in v1.3.2 and v1.3.7 (confirmed via
      `go doc .../engine Output`). Same shape of error recurs at
      `storage/mongo.go:211,238,271,305` for `LoadBeef`'s return value.
    - This same `FindOutpointsByMerkleState`/Beef-type failure pattern was
@@ -255,7 +267,7 @@ implementation) is the spec-level decision a later task needs to make.**
      directly). All four tags fail the same way.
 
 4. Conclusion: no published `b-open-io/overlay` tag built cleanly as an
-   `engine.Storage` against `go-overlay-services@v1.3.2`, independent of the
+   `engine.Storage` against the then-pinned `go-overlay-services@v1.3.2`, independent of the
    `pubsub` compile bug. At the time of this investigation, `go.mod` still
    pinned `b-open-io/overlay@v0.3.0` (the most recent tag, and the only one
    that got past the interface-shape issues once the unrelated `pubsub` bug
@@ -285,8 +297,10 @@ derived/child context anywhere in the call chain. The exact same `ctx`
 variable is threaded through every intermediate call:
 
 ```
-$(go env GOMODCACHE)/github.com/bsv-blockchain/go-overlay-services@v1.3.2/pkg/core/engine/engine.go
+$(go env GOMODCACHE)/github.com/bsv-blockchain/go-overlay-services@v1.3.7/pkg/core/engine/engine.go
 ```
+
+(Line numbers re-checked against v1.3.7; the chain is unchanged from v1.3.2.)
 
 - `engine.go:312` — `func (e *Engine) Submit(ctx context.Context, ...)`
 - `engine.go:323` — `return e.SubmitParsedBeef(ctx, beef, txid, ...)` (same `ctx`)
@@ -294,8 +308,8 @@ $(go env GOMODCACHE)/github.com/bsv-blockchain/go-overlay-services@v1.3.2/pkg/co
 - `engine.go:341` — `return e.submitParsedBeefInternal(ctx, &submitParsedBeefParams{...})` (same `ctx`; note `ctx` is a separate positional arg, not a struct field)
 - `engine.go:349` — `func (e *Engine) submitParsedBeefInternal(ctx context.Context, p *submitParsedBeefParams)`
 - `engine.go:369` — `if err := e.identifyAdmissibleOutputsPerTopic(ctx, p, managers, inpoints, steak, topicInputs, dupeTopics); err != nil {` (same `ctx`)
-- `engine.go:440-441` — `func (e *Engine) identifyAdmissibleOutputsPerTopic(ctx context.Context, p *submitParsedBeefParams, ...)`
-- **`engine.go:465`** — `admit, err := managers[t].IdentifyAdmissibleOutputs(ctx, topicBeef, p.Txid, previousCoins)` — the call site, same `ctx` all the way from `Submit`.
+- `engine.go:444-445` — `func (e *Engine) identifyAdmissibleOutputsPerTopic(ctx context.Context, p *submitParsedBeefParams, ...)`
+- **`engine.go:472`** — `admit, err := managers[t].IdentifyAdmissibleOutputs(ctx, topicBeef, p.Txid, previousCoins)` — the call site, same `ctx` all the way from `Submit`.
 
 **Decision: `ctx propagated: YES` → Task 10 uses the `context.WithValue`
 strategy**, not the `sync.Map` fallback.

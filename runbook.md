@@ -75,7 +75,7 @@ App treats `identityKey === VITE_OVERLAY_IDENTITY_KEY` as issuer. Overlay admin 
 | Piece | How | URL |
 | --- | --- | --- |
 | Mongo | Existing Docker `local-mongo-1` replica set. **Do not stop it.** | `127.0.0.1:27017` |
-| Overlay | **Native Node**, not Compose. Rebuilt from `overlay/dist` + restarted ~23:44 local (2026-09-15, wire contract v2 build; supersedes an earlier ~22:35 restart same day). | `http://localhost:8080` (`HOSTING_URL=https://deggen.ngrok.app`) |
+| Overlay | **Native Node 24** (`engines: >=24 <25`), not Compose. Rebuilt from `overlay/dist` + restarted ~23:44 local (2026-09-15, wire contract v2 build; supersedes an earlier ~22:35 restart same day). | `http://localhost:8080` (`HOSTING_URL=https://deggen.ngrok.app`) |
 | overlay-go | Not running this session. Compose service in `overlay/docker-compose.yml`, published on host `:8081`. | `http://localhost:8081` |
 | Vite app | `app/` | `http://127.0.0.1:5173/` (`VITE_OVERLAY_URL=https://deggen.ngrok.app`) |
 | ngrok | User runs it | `https://deggen.ngrok.app` → `http://localhost:8080` |
@@ -110,9 +110,11 @@ Logs used this session:
 
 Health: `GET http://127.0.0.1:8080/health` (not `/api/v1/info`). Topics: `tm_mandala` + `tm_mandala_registry`.
 
-Advertiser warning `https://https://deggen.ngrok.app` (double scheme) disables SHIP/SLAP; not blocking.
+SQLite overlay DB: `/tmp/mandala-overlay.sqlite`.
 
-SQLite overlay DB: `/tmp/mandala-overlay.sqlite`. Earlier `@bsv/overlay` migrations needed `INSERT OR IGNORE` instead of `INSERT IGNORE` (patched in the installed package).
+Before first boot on `@bsv/overlay` 2.6.2 with an existing sqlite: the topical-uniqueness migration aborts on duplicates. Mandala has no users, so wipe `overlay-data` / `/tmp/mandala-overlay.sqlite`.
+
+npm 12 and later skip dependency install scripts unless `package.json` `allowScripts` covers them, so after `npm install` / `npm ci` the `sqlite3` native binding may be missing. Check with `node -e "require('sqlite3')"`; if it fails, run `npm rebuild sqlite3 --foreground-scripts`. The rebuild obeys the same policy: on npm 12.0.1 it printed success and built nothing. If `require('sqlite3')` still fails, approve the script first with `npm approve-scripts sqlite3` (it writes `allowScripts` into `package.json`; per `npm help approve-scripts`, not yet exercised here), then rebuild again. The `node:24-bookworm` Docker image ships npm 11, which still runs install scripts, so the image build is unaffected.
 
 After `lib/` changes: `cd lib && npm test && npm run build` (app imports `@bsv/mandala` from `lib/dist`). Hard-reload the Vite app.
 
@@ -288,6 +290,8 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 Then bump the tags in the flux manifests. `ADMIN_API_TOKEN` is deliberately unset (would have to be baked into the public bundle).
+
+Go bump reaches flux only via a new `v*` tag (user-pushed): a dependency or toolchain bump in `overlay-go/` (go-overlay-services v1.3.7, go-sdk v1.7.1, `golang:1.26`) changes nothing deployed until the user pushes a new `v*` tag, the workflow publishes the image, and the flux manifest is bumped to that tag.
 
 ## Token-fee P0 deploy check
 

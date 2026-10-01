@@ -114,3 +114,11 @@ record, the `mandalaFuelDrafts` / `mandalaFuelNonces` collections, and
 unlinked-token → conflicting-spend → admin-chain anchoring → fuel → topic manager.
 §9.13 carve-out: a send in fee mode (`feeMode:'issuer'`) is submit-first; every
 other send stays hand-over-first.
+
+## 11. Amendment v2.3 (2026-10-01) — upstream re-base (BRC-162 P0)
+
+11.1 TS overlay on @bsv/overlay ≥2.6: submits are serialized per process, so §9.7's in-flight 503 is no longer emitted by TS (a concurrent submit waits, then receives the guard's authoritative answer). Go is unchanged.
+11.2 TS only (Go's engine still passes spent coins to the guard and its compensation seam unmarks interrupted spends): the spent-input guard inspects every input. A coin left spent by an interrupted attempt of the same txid, or by an evicted competitor, is released and answered `503 ERR_UNAVAILABLE` (retryable). The retry converges. Go (go-overlay-services v1.3.7 still lists spent coins in `previousCoins`; pinned by `overlay-go/internal/wiring/previous_coins_test.go`) reaches the same end state without that 503: a failed broadcast is unwound by the compensation seam; a coin still marked spent by the same txid after a crash is not a conflict to the guard (it skips its own txid, and the engine's re-mark is idempotent for the same spender); an evicted competitor's spend is undone by `EvictTx` and reads as live to the guard. So on the first resubmit after an interruption the TS guard answers a retryable 503 where the Go guard does not refuse; a live competitor is `400 ERR_INPUT_SPENT` on both.
+11.3 Edge refusals (TS): `ERR_SERVER_BUSY` maps to `503 ERR_UNAVAILABLE`; body-limit refusals map to `400 ERR_SHAPE` (never persisted). Clients treat any 503/429 as retryable.
+11.4 A non-terminal Arcade 2xx status counts as a successful broadcast on both engines.
+11.5 Upstream error messages are masked by overlay-express 2.7.3 ("Request could not be processed"); only `description` text is affected, never codes.

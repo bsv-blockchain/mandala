@@ -278,7 +278,7 @@ Conflicting spend → (fuel, P3) → layer A → B → C → D.
 - **Bump:** `@bsv/overlay` 2.6.2, `@bsv/overlay-express` 2.7.3, `@bsv/sdk` 2.8.11 (later `@bsv/overlay-topics`/`@bsv/templates` to the new PR versions); Node 24.
 - **Adopt from upstream:**
   - `securityConfig.ts` style (strict env parsing; `MANDALA_ISSUER_KEYS` replaces the admin private key);
-  - `configureEngineParams({throwOnBroadcastFailure: true})`, `configureHealth`, `lifecycle.ts`, `logger.ts`;
+  - Skipped: pino logger, OTel telemetry, `configureHealth` contextProvider (2.7.3 hides details by default; exposing them is public). Adopted instead: explicit `throwOnBroadcastFailure`, graceful `close()` shutdown, ≥32-byte secrets with constant-time compare, https advertisable host, advertiser disabled, edge-policy-aware `/submit` wrapper, Arcade status parity;
   - `allowPrivateHosts: true` for local Arcade/Chaintracks; chaintracks prefix `/chaintracks/v2`; ≥32-char callback/admin tokens with constant-time compare.
 - **Keep (still needed on 2.6.2):**
   - verdict side channel (Engine.submit still swallows manager throws);
@@ -293,6 +293,9 @@ Conflicting spend → (fuel, P3) → layer A → B → C → D.
   - the CAS monkeypatch (upstream KnexStorage CAS);
   - the token-less `/arc-ingest` stub (upstream fails closed);
   - `registry.ts` (topic moves to the package).
+- **Recorded in P0 (wire contract v2.3, §11):**
+  - the in-flight hold (wire contract §9.7's 503) is removed on TS, because 2.6.2 serializes submits;
+  - a CAS conflict (upstream `markUTXOAsSpent` refusing a coin another transaction already spent) now surfaces as `503 ERR_UNAVAILABLE`; the retry converges on the guard's `400 ERR_INPUT_SPENT`.
 
 ### 7.2 Go (`overlay-go/`) — base is go-overlay-services
 
@@ -401,6 +404,6 @@ Wire contract v3 file (§6 made standalone), PROJECT-STATE refresh, runbook env 
 | Strict-CBOR divergence TS vs Go | Same re-encode rule on both engines; shared accept/reject vectors |
 | ESM-only CBOR libs in RN/Jest | Metro resolves the `import` condition; add to wallet Jest `transformIgnorePatterns`; P6 smoke on device |
 | ts-stack publish cycle blocks P2+ | Tarball consumption until publish; P1 PR kept self-contained |
-| Upstream overlay 2.6.2 behaviour shifts (submit serialization, CAS errors) | P0 isolates the bump; double-spend e2e checks the CAS error maps to the conflicting-spend path |
+| Upstream overlay 2.6.2 behaviour shifts (submit serialization, CAS errors) | P0 isolates the bump; double-spend e2e checks the CAS error maps to `503 ERR_UNAVAILABLE`, and the retry converges on `400 ERR_INPUT_SPENT` |
 | Fold ordering with concurrent authority branches | Unchanged (height, offset, admitSeq) last-write-wins; continuity is tx-local so no state race |
 | Spec-faithful readers disagree with Mandala on I > O and payload-commitment txs | Documented as policy (§2, §4.5); Mandala never broadcasts such txs |
