@@ -17,7 +17,7 @@ import {
 import { admissionHandler } from './admissionRoute.js'
 import { SubmitSideChannel, withVerdictCapture, type AdmissionTokenRow } from './submitSideChannel.js'
 import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
-import { withSpentInputGuard, casMarkUTXOAsSpent, InFlightOutpoints, type SpentInputStore } from './spentGuard.js'
+import { withSpentInputGuard, casMarkUTXOAsSpent, knexSpentInputStore, InFlightOutpoints, type SpentInputStore } from './spentGuard.js'
 import { mountArcIngest } from './eviction.js'
 import { replayAssetState, type ReplayStorage } from './pinnedReducer.js'
 import { withAdminChainAnchor } from './adminChainGuard.js'
@@ -272,17 +272,10 @@ const main = async (): Promise<void> => {
 
   // FIX L — the live spend state of an input, and whether the transaction that
   // spent it has since been evicted (in which case the coin counts as live).
-  const spentInputStore: SpentInputStore = {
-    spendStateOf: async (txid, outputIndex) => {
-      const out = await engineStorage().findOutput(txid, outputIndex, TOKEN_TOPIC)
-      if (out == null) return null
-      return { spent: out.spent, consumedBy: out.consumedBy ?? [] }
-    },
-    wasEvicted: async (txid) => {
-      const rec = await admissionsCol.findOne({ txid }, { projection: { evictedAt: 1 } })
-      return rec?.evictedAt != null
-    }
-  }
+  const spentInputStore: SpentInputStore = knexSpentInputStore(server.knex!, TOKEN_TOPIC, async (txid) => {
+    const rec = await admissionsCol.findOne({ txid }, { projection: { evictedAt: 1 } })
+    return rec?.evictedAt != null
+  })
 
   // Wrapper stack for tm_mandala, outermost first. The inner four are §9.6's
   // CANONICAL GUARD ORDER, and both engines must refuse in exactly this order,

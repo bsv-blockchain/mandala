@@ -57,6 +57,8 @@ describe('index.ts — tm_mandala guard order (§9.6)', () => {
 
   it('passes every guard the state it gates on', () => {
     expect(stack).toContain('spentInputStore')
+    // The production store reads the engine's `outputs` table, not a stand-in.
+    expect(CODE).toContain('knexSpentInputStore(server.knex!, TOKEN_TOPIC')
     expect(stack).toContain('adminChainStore')
     expect(stack).toContain('admissionStore')
     // §9.7 — the in-flight claim is the guard's, not the wrapper's, to make.

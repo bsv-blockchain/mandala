@@ -265,3 +265,29 @@ export const casMarkUTXOAsSpent = (deps: CasMarkSpentDeps) =>
       deps.onMarked?.(txid, outputIndex, topic)
     }
   }
+
+/** Minimal knex surface the spent-input store needs (a knex instance satisfies it). */
+export type KnexLike = (table: string) => any
+
+const parseConsumedBy = (raw: unknown): ConsumedByEntry[] => {
+  if (Array.isArray(raw)) return raw as ConsumedByEntry[]
+  if (typeof raw === 'string' && raw !== '') {
+    try { const v = JSON.parse(raw); return Array.isArray(v) ? v as ConsumedByEntry[] : [] } catch { return [] }
+  }
+  return []
+}
+
+/**
+ * The production SpentInputStore: reads the engine's `outputs` table directly
+ * (KnexStorage.findOutput does not select `spentBy`).
+ */
+export const knexSpentInputStore = (
+  knex: KnexLike, topic: string, wasEvicted: (txid: string) => Promise<boolean>
+): SpentInputStore => ({
+  spendStateOf: async (txid, outputIndex) => {
+    const row = await knex('outputs').where({ txid, outputIndex, topic }).first()
+    if (row == null) return null
+    return { spent: row.spent === true || row.spent === 1, consumedBy: parseConsumedBy(row.consumedBy) }
+  },
+  wasEvicted
+})
