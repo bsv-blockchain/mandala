@@ -60,7 +60,10 @@ export type OverlayErrorCode =
  * the wire contract's, not the server's: a server that mislabels a liftable
  * policy refusal as permanent must not be able to strand a payment, and one
  * that mislabels a permanent refusal as retryable must not make a wallet spin.
- * An unrecognised code falls back to whatever the body claimed.
+ * An unrecognised code falls back to whatever the body claimed. Whatever the
+ * code says, an HTTP 503 or 429 is a transient condition of the edge (busy,
+ * rate-limited, unavailable), never a verdict on the bytes — see
+ * `isTransientStatus`.
  */
 const RETRYABLE_BY_CODE: Record<string, boolean> = {
   ERR_CONSERVATION: false,
@@ -76,7 +79,21 @@ const RETRYABLE_BY_CODE: Record<string, boolean> = {
   ERR_MEMBERSHIP: true,
   ERR_UNAVAILABLE: true,
   ERR_NO_ADMISSION: true,
-  ERR_BAD_ADMISSION: true
+  ERR_BAD_ADMISSION: true,
+  // An edge refusal (concurrency cap / saturation), not a manager verdict: the
+  // server maps it to 503 ERR_UNAVAILABLE, but a proxy or an older overlay may
+  // still surface the raw code, and it must never be read as final.
+  ERR_SERVER_BUSY: true
+}
+
+/**
+ * 503 and 429 are transient by definition: the same bytes may succeed once the
+ * overlay (or a proxy in front of it) has capacity again. Treating one as final
+ * would persist a refusal client-side and strand a payment that was never
+ * actually judged.
+ */
+function isTransientStatus (httpStatus: number | undefined): boolean {
+  return httpStatus === 503 || httpStatus === 429
 }
 
 /**
@@ -101,7 +118,7 @@ export class OverlayRefusedError extends Error {
     super(p.description != null && p.description !== '' ? `overlay refused (${p.code}): ${p.description}` : `overlay refused (${p.code})`)
     this.name = 'OverlayRefusedError'
     this.code = p.code
-    this.retryable = RETRYABLE_BY_CODE[p.code] ?? p.retryable === true
+    this.retryable = (RETRYABLE_BY_CODE[p.code] ?? p.retryable === true) || isTransientStatus(p.httpStatus)
     this.spendTxid = p.spendTxid
     this.httpStatus = p.httpStatus ?? 0
   }
