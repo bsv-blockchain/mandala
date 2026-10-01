@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { Transaction, UnlockingScript, P2PKH, PrivateKey } from '@bsv/sdk'
 import {
-  conflictingSpend, withSpentInputGuard, casMarkUTXOAsSpent, spendTxidOf,
+  conflictingSpend, withSpentInputGuard, casMarkUTXOAsSpent, spendTxidOf, knexSpentInputStore,
   InFlightOutpoints, IN_FLIGHT_DESCRIPTION, tokenInputOutpoints,
   type SpentInputStore, type ConsumedByEntry
 } from './spentGuard.js'
@@ -179,6 +179,77 @@ describe('withSpentInputGuard — a store fault is an InfraError, never a verdic
     // keeps a store fault out of the persisted set.
     expect(classifyManagerReason('the engine output store is unavailable: already spent')).toBe('ERR_INPUT_SPENT')
     expect(isInfraError(new InfraError('the engine output store is unavailable: already spent'))).toBe(true)
+  })
+})
+
+// ───────── §9.5 — the production reader decodes the engine row fail-CLOSED ─────────
+
+/** A knex stand-in answering `knex('outputs').where(...).first()` with `row`. */
+const rowKnex = (row: Record<string, unknown> | undefined): any =>
+  () => ({ where: () => ({ first: async () => row }) })
+
+const COMPETITOR_ENTRY = JSON.stringify([{ txid: COMPETITOR, outputIndex: 0 }])
+
+describe('knexSpentInputStore — decodes the engine row, failing CLOSED on anything unreadable', () => {
+  const read = async (row: Record<string, unknown> | undefined) =>
+    await knexSpentInputStore(rowKnex(row), 'tm_x', async () => false).spendStateOf(SRC, 0)
+
+  it('decodes the shapes the engine writes (0/1 or boolean, JSON-string or array consumedBy)', async () => {
+    expect(await read(undefined)).toBeNull()
+    expect(await read({ spent: 1, consumedBy: COMPETITOR_ENTRY }))
+      .toEqual({ spent: true, consumedBy: [{ txid: COMPETITOR, outputIndex: 0 }] })
+    expect(await read({ spent: true, consumedBy: [`${COMPETITOR}.0`] }))
+      .toEqual({ spent: true, consumedBy: [`${COMPETITOR}.0`] })
+    expect(await read({ spent: 0, consumedBy: '[]' })).toEqual({ spent: false, consumedBy: [] })
+    expect(await read({ spent: false, consumedBy: [] })).toEqual({ spent: false, consumedBy: [] })
+    expect(await read({ spent: 1n, consumedBy: '[]' })).toEqual({ spent: true, consumedBy: [] })
+  })
+
+  it('a nullable consumedBy is "nothing consumed it" — the same as the engine\'s own parse', async () => {
+    expect(await read({ spent: 0, consumedBy: null })).toEqual({ spent: false, consumedBy: [] })
+    expect(await read({ spent: 0, consumedBy: 'null' })).toEqual({ spent: false, consumedBy: [] })
+  })
+
+  it.each([
+    ['unparseable JSON', 'not json'],
+    ['an empty string', ''],
+    ['a JSON object', '{}'],
+    ['a JSON string', '"abc"'],
+    ['a JSON number', '7'],
+    ['a non-string, non-array value', 5]
+  ])('a consumedBy that is %s is a fault, not an empty list', async (_label, consumedBy) => {
+    await expect(read({ spent: 1, consumedBy })).rejects.toThrow(/consumedBy/)
+  })
+
+  it.each([
+    ['the string "1"', '1'],
+    ['the string "0"', '0'],
+    ['a number other than 0/1', 2],
+    ['a Buffer', Buffer.from([1])],
+    ['null', null],
+    ['undefined', undefined]
+  ])('a spent flag that is %s is a fault — never read as unspent', async (_label, spent) => {
+    await expect(read({ spent, consumedBy: '[]' })).rejects.toThrow(/spent/)
+  })
+
+  const inner = (calls: { n: number }): any => ({
+    identifyAdmissibleOutputs: async () => { calls.n++; return { outputsToAdmit: [0], coinsToRetain: [] } }
+  })
+
+  it.each([
+    ['a malformed consumedBy', { spent: 1, consumedBy: 'not json' }],
+    ['a non-array consumedBy', { spent: 1, consumedBy: '{}' }],
+    ['an unreadable spent flag', { spent: '1', consumedBy: COMPETITOR_ENTRY }]
+  ])('%s refuses the spend retryably (InfraError), never a final ERR_INPUT_SPENT and never admits', async (_label, row) => {
+    const calls = { n: 0 }
+    // wasEvicted(true) must not matter: the competitor cannot be named, so the
+    // §7 rescue cannot be evaluated and the guard must not guess either way.
+    const tm = withSpentInputGuard(inner(calls),
+      knexSpentInputStore(rowKnex(row), 'tm_x', async () => true))
+    const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [0], undefined).catch((e: unknown) => e)
+    expect(isInfraError(err)).toBe(true)
+    expect(err).not.toBeInstanceOf(InputSpentError)
+    expect(calls.n).toBe(0)
   })
 })
 

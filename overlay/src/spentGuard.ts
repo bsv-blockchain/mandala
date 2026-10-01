@@ -269,12 +269,31 @@ export const casMarkUTXOAsSpent = (deps: CasMarkSpentDeps) =>
 /** Minimal knex surface the spent-input store needs (a knex instance satisfies it). */
 export type KnexLike = (table: string) => any
 
+// §9.5 — a guard that cannot READ the state it gates on fails CLOSED. These two
+// decoders are the only place the engine's raw row is interpreted, so each THROWS
+// on a shape it does not recognise (`infra()` in `conflictingSpend` re-badges that
+// as a retryable 503). Coercing instead is the failure mode: a garbled
+// `consumedBy` read as "no competitor" mints a final 400 ERR_INPUT_SPENT out of a
+// storage fault, and a garbled `spent` read as false admits a double spend.
+// Messages name the column and the type, never the row's contents.
+
+/** `consumedBy` as the engine writes it: a JSON array in a text column (or already an array). NULL/'null' = unconsumed. */
 const parseConsumedBy = (raw: unknown): ConsumedByEntry[] => {
-  if (Array.isArray(raw)) return raw as ConsumedByEntry[]
-  if (typeof raw === 'string' && raw !== '') {
-    try { const v = JSON.parse(raw); return Array.isArray(v) ? v as ConsumedByEntry[] : [] } catch { return [] }
+  let value: unknown = raw
+  if (typeof raw === 'string') {
+    try { value = JSON.parse(raw) } catch (e) { throw new Error('outputs.consumedBy is not valid JSON', { cause: e }) }
   }
-  return []
+  if (value == null) return []
+  if (!Array.isArray(value)) throw new Error('outputs.consumedBy is not a JSON array')
+  return value as ConsumedByEntry[]
+}
+
+/** `spent` as the supported backends return a boolean column: a boolean, or integer 0/1. */
+const parseSpent = (raw: unknown): boolean => {
+  if (typeof raw === 'boolean') return raw
+  const n = typeof raw === 'bigint' ? Number(raw) : raw
+  if (n === 0 || n === 1) return n === 1
+  throw new Error(`outputs.spent has an unexpected value of type ${raw === null ? 'null' : typeof raw}`)
 }
 
 /**
@@ -287,7 +306,7 @@ export const knexSpentInputStore = (
   spendStateOf: async (txid, outputIndex) => {
     const row = await knex('outputs').where({ txid, outputIndex, topic }).first()
     if (row == null) return null
-    return { spent: row.spent === true || row.spent === 1, consumedBy: parseConsumedBy(row.consumedBy) }
+    return { spent: parseSpent(row.spent), consumedBy: parseConsumedBy(row.consumedBy) }
   },
   wasEvicted
 })
