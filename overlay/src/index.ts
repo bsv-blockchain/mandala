@@ -24,43 +24,38 @@ import { withAdminChainAnchor } from './adminChainGuard.js'
 import { assetAuthHeadHandler, assetAuthBeefHandler, withFrozenRowFlags, type AdminHistoryRowLite } from './assetAuth.js'
 import { withFeeRateFold, withFeeRate, rebuildFeeRateFromHistory, type FeeRateStore, type FeeRateRow, type FeeRateHistoryEntry } from './feeRates.js'
 import { adminAuth, adminCors, parseAdminCorsOrigins, warnIfAdminAuthDisabled } from './adminAuth.js'
+import { readBootConfig } from './bootConfig.js'
 import {
   RegistryStore, RegistryTopicManager, createRegistryLookup,
   registryScreening, REGISTRY_TOPIC, REGISTRY_LOOKUP
 } from './registry.js'
 config()
 
-const requireEnv = (name: string): string => {
-  const v = process.env[name]
-  if (v == null || v === '') throw new Error(`Missing required environment variable: ${name}`)
-  return v
-}
-
 const main = async (): Promise<void> => {
-  const NODE_NAME = requireEnv('NODE_NAME')
-  const SERVER_PRIVATE_KEY = requireEnv('SERVER_PRIVATE_KEY')
-  const HOSTING_URL = requireEnv('HOSTING_URL')
-  const MONGO_URL = requireEnv('MONGO_URL')
-  const NETWORK = requireEnv('NETWORK')
-  if (NETWORK !== 'main' && NETWORK !== 'test') throw new Error('NETWORK must be "main" or "test"')
+  // Every boot variable is validated here, before anything is constructed: a
+  // missing or malformed value fails the boot with a message naming it, never a
+  // half-configured server. See bootConfig.ts.
+  const cfg = readBootConfig(process.env)
 
   // A13: bearer auth + narrowed CORS on the identity-bearing admin routes
   // (registry, activity, admission). Unset ADMIN_API_TOKEN is a supported
   // dev default — the routes stay open — but it must be loud, hence the one
-  // startup warning rather than a silent fallback.
-  const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN ?? ''
-  warnIfAdminAuthDisabled(ADMIN_API_TOKEN)
-  const ADMIN_CORS_ORIGINS = parseAdminCorsOrigins(process.env.ADMIN_CORS_ORIGINS, HOSTING_URL)
-  const adminGate = [adminCors(ADMIN_CORS_ORIGINS), adminAuth(ADMIN_API_TOKEN)] as const
+  // startup warning rather than a silent fallback. A set token must be a
+  // 32-byte-plus shared secret (readBootConfig), or the boot fails.
+  warnIfAdminAuthDisabled(cfg.adminApiToken)
+  const ADMIN_CORS_ORIGINS = parseAdminCorsOrigins(process.env.ADMIN_CORS_ORIGINS, cfg.hostingUrl)
+  const adminGate = [adminCors(ADMIN_CORS_ORIGINS), adminAuth(cfg.adminApiToken)] as const
 
-  const server = new OverlayExpress(NODE_NAME, SERVER_PRIVATE_KEY, HOSTING_URL)
+  // overlay-express 2.7.3 takes a bare https host here (it rejects http:// URLs
+  // and paths), hence advertisableHost rather than the HOSTING_URL as given.
+  const server = new OverlayExpress(cfg.nodeName, cfg.serverPrivateKey, cfg.advertisableHost)
   server.configurePort(8080)
-  server.configureNetwork(NETWORK)
+  server.configureNetwork(cfg.network)
 
   // With ARCADE_URL set, the overlay becomes a real network participant:
   //  - broadcasts accepted txs itself (ArcadeProvider POSTs to `${ARCADE_URL}/tx`;
-  //    engine broadcasts BEFORE folding state, and throwOnBroadcastFailure
-  //    defaults true, so a failed broadcast rejects the submit — the app then
+  //    engine broadcasts BEFORE folding state, and throwOnBroadcastFailure is set
+  //    explicitly below, so a failed broadcast rejects the submit — the app then
   //    aborts safely instead of desyncing),
   //  - refreshes merkle proofs from `${ARCADE_URL}/tx/:txid`,
   //  - runs FULL SPV: configureChaintracks installs the go-chaintracks client
@@ -68,38 +63,37 @@ const main = async (): Promise<void> => {
   //    SSE), replacing the local 'scripts only' mode.
   // Without it (local demo): validate scripts only; the wallet is the sole
   // broadcaster.
-  const ARCADE_URL = process.env.ARCADE_URL
+  //
   // FIX E, second half: eviction restores spent inputs, so an unauthenticated
-  // /arc-ingest lets anyone strand or resurrect a coin. The token is mandatory
-  // whenever ARCADE_URL is set: overlay-express 2.7.3's start() refuses Arcade
-  // without one, and this repo's own route (see mountArcIngest below) 401s
-  // every request if the token is ever empty.
-  const ARCADE_CALLBACK_TOKEN = process.env.ARCADE_CALLBACK_TOKEN ?? ''
-  if (ARCADE_URL != null && ARCADE_URL !== '') {
-    server.configureArcade(ARCADE_URL, { apiKey: process.env.ARCADE_API_KEY })
-    if (ARCADE_CALLBACK_TOKEN !== '') server.configureArcCallbackToken(ARCADE_CALLBACK_TOKEN)
-    // Chaintracks lives at the /chaintracks service of the same Arcade host by
-    // default, but both the host and API prefix are independently overridable.
-    const CHAINTRACKS_URL = process.env.CHAINTRACKS_URL ?? `${ARCADE_URL}/chaintracks`
-    server.configureChaintracks(CHAINTRACKS_URL, { apiPrefix: process.env.CHAINTRACKS_API_PREFIX ?? '/v2' })
+  // /arc-ingest lets anyone strand or resurrect a coin. The callback token is
+  // therefore mandatory with Arcade: readBootConfig refuses to boot without a
+  // 32-byte-plus one, overlay-express 2.7.3's start() refuses Arcade without
+  // one, and this repo's own route (mountArcIngest below) 401s every request if
+  // the token is ever empty. Chaintracks lives at the /chaintracks service of
+  // the same Arcade host by default; the host and API prefix are independently
+  // overridable. allowPrivateHosts reaches BOTH calls — it is not inherited.
+  if (cfg.arcade != null) {
+    server.configureArcade(cfg.arcade.url, { apiKey: cfg.arcade.apiKey, allowPrivateHosts: cfg.arcade.allowPrivateHosts })
+    server.configureArcCallbackToken(cfg.arcade.callbackToken)
+    server.configureChaintracks(cfg.arcade.chaintracksUrl, { apiPrefix: cfg.arcade.chaintracksApiPrefix, allowPrivateHosts: cfg.arcade.allowPrivateHosts })
   } else {
     server.configureChainTracker('scripts only')
   }
   await server.configureKnex({
     client: 'sqlite3',
-    connection: { filename: process.env.SQLITE_FILE ?? '/data/overlay.sqlite' },
+    connection: { filename: cfg.sqliteFile },
     useNullAsDefault: true
   })
-  await server.configureMongo(MONGO_URL)
+  await server.configureMongo(cfg.mongoUrl)
 
-  // OverlayExpress.configureMongo uses db `${NODE_NAME}_lookup_services` (i.e. "mandala_lookup_services").
+  // OverlayExpress.configureMongo uses db `${cfg.nodeName}_lookup_services` (i.e. "mandala_lookup_services").
   // We must use that same db name so sharedStorage reads/writes the same collections.
-  const mongoClient = new MongoClient(MONGO_URL)
+  const mongoClient = new MongoClient(cfg.mongoUrl)
   await mongoClient.connect()
-  const sharedStorage = new MandalaStorageManager(mongoClient.db(`${NODE_NAME}_lookup_services`))
+  const sharedStorage = new MandalaStorageManager(mongoClient.db(`${cfg.nodeName}_lookup_services`))
 
-  const mandalaWallet = new ProtoWallet(PrivateKey.fromHex(SERVER_PRIVATE_KEY)) as unknown as WalletInterface
-  const lookupDb = mongoClient.db(`${NODE_NAME}_lookup_services`)
+  const mandalaWallet = new ProtoWallet(PrivateKey.fromHex(cfg.serverPrivateKey)) as unknown as WalletInterface
+  const lookupDb = mongoClient.db(`${cfg.nodeName}_lookup_services`)
   const registryStore = new RegistryStore(lookupDb)
   await registryStore.ensureIndexes()
 
@@ -112,7 +106,7 @@ const main = async (): Promise<void> => {
   // without the unique index the admission record is not single-valued and
   // "verdict wins" stops winning.
   await ensureAdmissionIndexes(admissionsCol)
-  const overlayPriv = PrivateKey.fromHex(SERVER_PRIVATE_KEY)
+  const overlayPriv = PrivateKey.fromHex(cfg.serverPrivateKey)
 
   // Wire-contract §4. The write is AWAITED before the /submit response is sent
   // (see admission.ts), so a client holding a 200 is guaranteed the very next
@@ -254,7 +248,7 @@ const main = async (): Promise<void> => {
   // membershipHolds. Issuer keys are read live from the asset-state cache on
   // every check, so a fresh register is honoured on the next submit.
   const assetStatesCol = lookupDb.collection('mandalaAssetStates')
-  const overlayIdentityKey = PrivateKey.fromHex(SERVER_PRIVATE_KEY).toPublicKey().toString()
+  const overlayIdentityKey = PrivateKey.fromHex(cfg.serverPrivateKey).toPublicKey().toString()
   const membership = registryScreening(registryStore, [], {
     issuers: {
       issuerIdentityKeys: async () =>
@@ -362,19 +356,30 @@ const main = async (): Promise<void> => {
   server.configureLookupService(REGISTRY_LOOKUP, createRegistryLookup(registryStore))
 
   server.configureEnableGASPSync(false)
+  // "A failed broadcast rejects the submit" is load-bearing (the engine
+  // broadcasts before folding state), so it is stated rather than left to
+  // overlay-express's current default.
+  server.configureEngineParams({ throwOnBroadcastFailure: true })
   await server.configureEngine(false)
+  // overlay-express 2.7.3 builds a SHIP/SLAP WalletAdvertiser once the FQDN is
+  // a valid https host. Mandala does not advertise (GASP sync is off), and the
+  // advertiser would run babbage-storage calls at boot and SLAP lookups inside
+  // the engine's submission lock. start() only inits it when it is a
+  // WalletAdvertiser, so clearing it is safe.
+  ;(server.engine as unknown as { advertiser?: unknown }).advertiser = undefined
 
   // FIX E. Mounted BEFORE server.start(), which is where OverlayExpress
   // registers its own /arc-ingest, so this route matches first: the pinned
   // route evicts without restoring inputs. The callback token is mandatory
-  // whenever ARCADE_URL is set (start() refuses Arcade without one).
+  // whenever Arcade is configured (readBootConfig and start() both refuse
+  // Arcade without one).
   //
   // Gated on the same condition the pinned route uses — with no provider
   // configured it never mounts /arc-ingest at all, so there is nothing to
   // shadow (the local demo has no Arcade).
-  if (ARCADE_URL != null && ARCADE_URL !== '') {
+  if (cfg.arcade != null) {
     mountArcIngest(server.app as any, {
-      callbackToken: ARCADE_CALLBACK_TOKEN,
+      callbackToken: cfg.arcade.callbackToken,
       store: admissionStore,
       // unmarkSpent only while the evicted tx still holds the coin (or a
       // legacy NULL spentBy); isUnspent fails closed on an unreadable row.
@@ -609,7 +614,7 @@ const main = async (): Promise<void> => {
   })
 
   await server.start()
-  console.log(`mandala overlay listening on ${HOSTING_URL}`)
+  console.log(`mandala overlay listening on ${cfg.hostingUrl}`)
 }
 
 main().catch((e) => { console.error(e); process.exit(1) })

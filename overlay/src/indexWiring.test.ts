@@ -108,6 +108,59 @@ describe('index.ts — boot safety (§9.9)', () => {
   })
 })
 
+describe('index.ts — boot configuration for overlay-express 2.7.3', () => {
+  it('reads every boot variable through readBootConfig, not process.env', () => {
+    expect(CODE).toContain('readBootConfig(process.env)')
+    expect(CODE).not.toContain('requireEnv')
+    // ADMIN_CORS_ORIGINS is the one console-only knob that is not in BootConfig.
+    const reads = CODE.match(/process\.env\.\w+/g) ?? []
+    expect(reads).toEqual(['process.env.ADMIN_CORS_ORIGINS'])
+    // The env a secret was validated from is the only one that may reach the server.
+    expect(CODE).not.toMatch(/HOSTING_URL|SERVER_PRIVATE_KEY|ARCADE_CALLBACK_TOKEN/)
+  })
+
+  it('constructs OverlayExpress with the canonical key and the bare https host, not the URL', () => {
+    expect(CODE).toContain('new OverlayExpress(cfg.nodeName, cfg.serverPrivateKey, cfg.advertisableHost)')
+    // The single overlay key signs sigma-I and decrypts linkage; no second key is read.
+    expect(CODE).not.toMatch(/MANDALA_\w*PRIVATE_KEY/)
+  })
+
+  it('wires Arcade with the callback token unconditionally and the private-host flag on both calls', () => {
+    const arcade = CODE.slice(CODE.indexOf('if (cfg.arcade != null) {'), CODE.indexOf('await server.configureKnex('))
+    expect(arcade).toContain('server.configureArcade(cfg.arcade.url, { apiKey: cfg.arcade.apiKey, allowPrivateHosts: cfg.arcade.allowPrivateHosts })')
+    expect(arcade).toContain('server.configureArcCallbackToken(cfg.arcade.callbackToken)')
+    expect(arcade).toContain('server.configureChaintracks(cfg.arcade.chaintracksUrl, { apiPrefix: cfg.arcade.chaintracksApiPrefix, allowPrivateHosts: cfg.arcade.allowPrivateHosts })')
+    // No `if (token !== '')` escape hatch: start() refuses Arcade without one.
+    expect(arcade).not.toMatch(/callbackToken\s*(!==|===|!=|==)/)
+    expect(arcade).toContain("server.configureChainTracker('scripts only')")
+    expect(orderOf(arcade, ['configureArcade(', 'configureArcCallbackToken(', 'configureChaintracks(']))
+      .toEqual(['configureArcade(', 'configureArcCallbackToken(', 'configureChaintracks('])
+  })
+
+  it('makes "a failed broadcast rejects the submit" explicit, before the engine is built', () => {
+    const names = ['configureEngineParams({ throwOnBroadcastFailure: true })', 'await server.configureEngine(false)']
+    for (const n of names) expect(CODE).toContain(n)
+    expect(orderOf(CODE, names)).toEqual(names)
+  })
+
+  it('turns the SHIP/SLAP advertiser off after the engine exists and before start()', () => {
+    const names = [
+      'await server.configureEngine(false)',
+      '.advertiser = undefined',
+      'await server.start()'
+    ]
+    for (const n of names) expect(CODE).toContain(n)
+    expect(orderOf(CODE, names)).toEqual(names)
+    expect(CODE).toMatch(/\(server\.engine as unknown as \{ advertiser\?: unknown \}\)\.advertiser = undefined/)
+  })
+
+  it('mounts /arc-ingest only with Arcade, using the validated token', () => {
+    const mount = CODE.slice(CODE.indexOf('mountArcIngest('))
+    expect(CODE).toMatch(/if \(cfg\.arcade != null\) \{\s*\n\s*mountArcIngest\(/)
+    expect(mount).toContain('callbackToken: cfg.arcade.callbackToken')
+  })
+})
+
 describe('index.ts — eviction rebuild (PR #11 + token-fee §2, rebuild-first)', () => {
   const deps = CODE.slice(CODE.indexOf('mountArcIngest('))
   const rebuild = deps.slice(deps.indexOf('rebuildAssetStateExcluding:'), deps.indexOf('purgeAdminHistory:'))

@@ -46,6 +46,7 @@ import type { AdmissionStore, AdmissionRecord } from './admission.js'
 import type { AdmissionTokenRow } from './submitSideChannel.js'
 import type { KnexLike } from './spentGuard.js'
 import { errorBody, InfraError, isInfraError } from './submitVerdict.js'
+import { constantTimeEqual } from './secrets.js'
 
 /**
  * `@bsv/overlay-express`'s own classifier, the one its /arc-ingest route and
@@ -300,8 +301,9 @@ export const arcIngestHandler = (deps: ArcIngestDeps) =>
     void (async () => {
       try {
         // An empty configured token authenticates nothing (as upstream's
-        // arcCallbackAuthorized): otherwise an empty presented header matches.
-        if (deps.callbackToken === '' || !presented(req.headers ?? {}).includes(deps.callbackToken)) {
+        // arcCallbackAuthorized): otherwise an empty presented header matches,
+        // since constantTimeEqual('', '') is true — so the empty check stays first.
+        if (deps.callbackToken === '' || !presented(req.headers ?? {}).some(c => constantTimeEqual(c, deps.callbackToken))) {
           res.status(401).json({ status: 'error', message: 'Unauthorized callback' })
           return
         }

@@ -1,4 +1,5 @@
 import { afterEach, describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
 import {
   isTerminalArcStatus, evictWithRestore, arcIngestHandler, mountArcIngest, knexEvictionCoins,
   type EvictionDeps
@@ -337,6 +338,40 @@ describe('arcIngestHandler', () => {
   it('accepts Authorization: Bearer <token>', async () => {
     const { h, handler } = base()
     const got = await runHandler(handler, { headers: { authorization: `Bearer ${TOKEN}` }, body: { txid: TXID, txStatus: 'REJECTED' } })
+    expect(got.status).toBe(200)
+    expect(h.evicted).toHaveLength(1)
+  })
+
+  // Both comparisons are string equality, so this passes before and after the
+  // switch to constantTimeEqual; it pins that the swap changed only the timing.
+  it('401s a wrong token of the same length and a wrong token of another length', async () => {
+    const { h, handler } = base()
+    for (const wrong of ['sekreT', 'sekre', 'sekrets', '']) {
+      for (const headers of [{ 'x-callback-token': wrong }, { authorization: `Bearer ${wrong}` }]) {
+        const got = await runHandler(handler, { headers, body: { txid: TXID, txStatus: 'REJECTED' } })
+        expect(got.status).toBe(401)
+        expect(got.body).toEqual({ status: 'error', message: 'Unauthorized callback' })
+      }
+    }
+    expect(h.unmarked).toEqual([])
+    expect(h.evicted).toEqual([])
+  })
+
+  // Behaviourally indistinguishable from string equality, so pin the source:
+  // `.includes` / `===` on a shared secret is a timing side channel.
+  it('compares presented tokens with constantTimeEqual, never string equality', () => {
+    const src = readFileSync(new URL('./eviction.ts', import.meta.url), 'utf8')
+    const handler = src.slice(src.indexOf('export const arcIngestHandler'), src.indexOf('interface AppLike'))
+    expect(handler).toContain('.some(c => constantTimeEqual(c, deps.callbackToken))')
+    expect(handler).not.toMatch(/\.includes\(deps\.callbackToken\)/)
+  })
+
+  it('accepts the right token on x-callback-token even beside a wrong Authorization header', async () => {
+    const { h, handler } = base()
+    const got = await runHandler(handler, {
+      headers: { authorization: 'Bearer wrong!', 'x-callback-token': TOKEN },
+      body: { txid: TXID, txStatus: 'REJECTED' }
+    })
     expect(got.status).toBe(200)
     expect(h.evicted).toHaveLength(1)
   })
