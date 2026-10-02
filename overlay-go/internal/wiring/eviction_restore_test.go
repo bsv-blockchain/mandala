@@ -275,3 +275,29 @@ func TestEvictTxCountsRestorableRowsEvenWhenAlreadyPresent(t *testing.T) {
 		t.Fatalf("balance = %d, want 40 (credited once, by the earlier restore)", f.balance(t))
 	}
 }
+
+// The crash-window retry, end to end on the Go side: the admitting attempt's
+// records carry a snapshot without X's row (the crashed attempt's OutputSpent
+// already deleted it), yet the eviction still puts the row back, because the
+// store merges into the first attempt's snapshot instead of replacing it.
+func TestEvictTxAfterACrashRetryStillRestoresTheRow(t *testing.T) {
+	f := evictFixtureFor(t, "evict_crash_retry", 0x89)
+	ctx := context.Background()
+	degraded := &mandala.RestoreSnapshot{SpentOutpoints: []string{f.parentID.String() + ".0"}, TokenRows: []mandala.TokenRow{}}
+	for _, pending := range []bool{true, false} {
+		rec := mandala.AdmissionRecord{Txid: f.child, Topics: []string{tokenTopic}, Pending: pending, Restore: degraded}
+		if !pending {
+			rec.OutputsToAdmit, rec.AdmissionSignature, rec.AdmissionIdentityKey = []uint32{0}, "3044", "02aa"
+		}
+		if err := f.app.Store.RecordAdmission(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := f.app.EvictTx(ctx, f.child)
+	if err != nil {
+		t.Fatal("EvictTx:", err)
+	}
+	if out.RestoredTokenRows != 1 || f.parentRow(t) == nil || f.balance(t) != 40 {
+		t.Fatalf("outcome %+v row %v balance %d: the first snapshot's row must come back", out, f.parentRow(t), f.balance(t))
+	}
+}
