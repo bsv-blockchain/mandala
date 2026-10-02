@@ -1,7 +1,7 @@
 # Mandala on BRC-162 (BSV-21 binary, authority supply) — design
 
 - **Date:** 2026-10-01
-- **Status:** draft for maintainer review
+- **Status:** approved 2026-10-01; amended 2026-10-02 (§4.2a stored-owner index, D14)
 - **Branch:** mandala `feat/brc162`; ts-stack PR from a worktree off `origin/main`; bsv-wallet worktree off `master`
 - **Invariant spec:** [`docs/design/brc-0162-bsv21-binary.pinned.md`](../../design/brc-0162-bsv21-binary.pinned.md) (verbatim, bsv-blockchain/BRCs @ `8f36bdf`)
 - **Supersedes:** the MandalaToken / MandalaAdmin formats, `docs/design/2026-09-15-mandala-wire-contract-v2.md` (replaced by wire contract v3, §9 below; σI digest and the offline-settlement model carry over unchanged)
@@ -55,6 +55,7 @@ Taken with the maintainer on 2026-10-01. Do not re-litigate.
 | D11 | Admin action details travel off-chain as DAG-CBOR bytes; the payload carries only their SHA-256 | Maintainer: "the hash of administrative tasks … in that CBOR payload" |
 | D12 | Offline validation = issuer σI over txid (no BRC-176) | Unchanged |
 | D13 | Clean break, no migration | |
+| D14 | Stored owner rows are a rebuildable index; index faults are repaired or answered 503, never a final refusal (amendment 2026-10-02) | §4.2a; found when overlay-topics 1.8 turned a missing row into a persisted final ERR_SHAPE |
 
 ## 3. On-chain format
 
@@ -160,7 +161,27 @@ Identity checks, kept separate from layer A as the maintainer asked:
 - `requireOneSat` → `ERR_SATOSHIS`.
 - `requireSafeAmounts` (§3.4) → `ERR_SHAPE`.
 - `verifyOutputLinkage`: each token output needs a linkage at its index whose derived pkh equals the remainder's pkh → identity. Missing or mismatched → `ERR_LINKAGE`. This is the reject-not-skip rule, generalized to every role.
-- `resolveInputOwner`: the owner of a spent token input is the stored row (`mandalaTokens` / `mandalaAuthorities`), which must exist and match id, role and amount. An input linkage, when present, must corroborate it (prover + L·G == source pkh, prover == stored owner) → else `ERR_LINKAGE`. This adopts the Go model on both engines (closes the TS/Go gap found 2026-10-01; prerequisite of blinded A′, stablecoin-mobile decision 2).
+- `resolveInputOwner`: the owner of a spent token input is its stored owner row (`mandalaTokens` / `mandalaAuthorities`). That row is an **index**, rebuilt from the owner journal when it is missing or disagrees with the source script (§4.2a). A missing or wrong row is never the holder's fault and never a final refusal. An input linkage, when present, must corroborate the owner (prover + L·G == source pkh, prover == owner) → else `ERR_LINKAGE`. That is a payload defect, so it is final and keyed by payload hash. This adopts the Go model of a payload-independent owner on both engines (closes the TS/Go gap found 2026-10-01; prerequisite of blinded A′, stablecoin-mobile decision 2).
+
+### 4.2a Stored-owner index: faults and repair (amendment 2026-10-02)
+
+**Why.** `@bsv/overlay-topics` 1.8 made the stored row the only owner source. A missing row there throws a reason that falls through to a persisted final `ERR_SHAPE`. The row is written by the lookup service in the engine's phase 3, and the engine only *logs* lookup errors (`@bsv/overlay` 2.6 `Engine.js`). So one failed index write left a valid, σI-signed coin permanently unspendable, refused as if the holder had sent a malformed transaction. Go tolerated a missing row and fell back to the linkage, so the two engines also disagreed. Neither behaviour is acceptable for v3.
+
+**Rules (both engines, byte-identical reasons):**
+
+1. **Owner journal = source of truth.** For every token output it admits (all roles, both `tm_mandala` and `tm_mandala_registry`), the topic manager reports `{vout, tokenId, role, amount, identityKey}`, the owner already verified in layer B (`verifyOutputLinkage`). The admission wrapper persists this set as `owners` on the provisional admission record, **before the engine can broadcast** (same write as v2.1 §9.4). If that write fails, the submit is refused `503 ERR_UNAVAILABLE` and nothing is broadcast. `mandalaTokens` / `mandalaAuthorities` are a projection of journal + engine outputs and can always be rebuilt.
+2. **Read fault.** The owner-row read fails → `503 ERR_UNAVAILABLE`, never persisted (v2.1 §9.5).
+3. **Row missing, or present but disagreeing with the source script** (id, role or amount): the guard **repairs inline before judging**:
+   - It requires the engine's admitted output for that outpoint on this topic, and the journal entry for it.
+   - It checks that the journal entry agrees with the on-chain source script.
+   - It upserts the row from the journal. The lookup's balance projection is credited exactly once, on insert only, like the eviction restore (`mongoRestoreTokenRow` / Go `RestoreTokens`).
+   - Validation then continues as if the row had always been there.
+   - The repair is logged with its outpoint. The holder sees no refusal at all.
+4. **Unrepairable** (no admitted engine output, no journal entry, or the journal disagrees with the script): `503 ERR_UNAVAILABLE`, never persisted, with reason `owner index unavailable for <outpoint>`. The overlay **fails closed**: it never admits on a linkage fallback, because the payload names identities (blinded A′) and is not an owner source. The wallet's existing retry/strand path (v2.1 §9.11) surfaces the coin; recovery is operator work, never a holder verdict.
+5. **Boot and periodic reconciler.** At start and on an interval, rule 3 runs over every unspent admitted engine output of both topics that lacks a matching row. Rows it cannot repair are counted, logged, and reported by a `mandala-owner-index` readiness check: degraded, not critical, so the overlay keeps serving every other coin.
+6. **What stays final.** Only payload or content defects are final: the input linkage does not control the source pkh, or names someone other than the owner (`ERR_LINKAGE`). Index faults of any kind never are.
+
+Repair writes happen during validation (phase 1, before broadcast). They are idempotent upserts of rows for coins the engine has already admitted, so a refused or abandoned submit leaves only a correct index behind.
 
 ### 4.3 Layer C — Mandala authority policy (`overlay-topics/src/mandala/authority.ts`)
 
@@ -256,6 +277,7 @@ The `cover()` walk follows every input whose source output decodes as a valid BR
 |---|---|---|---|---|
 | `ERR_AUTHORITY` | 400 | false | yes | missing or invalid `deploySig`, continuity break, duplicate commitment, fixed-supply deploy, authority output without an admitted authority input |
 | `ERR_UNTRUSTED` | 409 | true | **never** | a deploy/authority output identity or linkage prover is not in `MANDALA_ISSUER_KEYS` |
+| `ERR_UNAVAILABLE` (v2, unchanged) | 503 | true | **never** | also covers every stored-owner index fault (§4.2a rules 2 and 4) and a failed owner-journal write; an index fault is never `ERR_SHAPE` / `ERR_LINKAGE` |
 - Reason strings are pinned in the conformance vectors and byte-identical TS ≡ Go. The v2 §6 string becomes `output <idx>: token output with no verified linkage`.
 
 ### 6.4 Guard order (replaces v2 §9.6)
@@ -325,6 +347,14 @@ Conflicting spend → (fuel, P3) → layer A → B → C → D.
 - Fixed-supply deploy; deploy at vout ≠ 0; 36-byte id; non-minimal amount; amount > 2^53−1; sum overflow; non-P2PKH remainder; 2-sat output; token-shaped garbage output.
 - Reissue: of an unfrozen outpoint, with a wrong amount, with value inputs, to the wrong recipient.
 - Registry: value output; second deploy.
+- Owner index (§4.2a; real engine + real Mongo, both engines):
+  - owner row deleted after admission (simulated failed lookup write) → the next spend repairs the row inline, is admitted, and the balance is credited once;
+  - row present with a wrong amount → repaired from the journal, admitted;
+  - row and journal entry both missing → `503 ERR_UNAVAILABLE`, nothing persisted, and the retry is still 503 (never `ERR_SHAPE`);
+  - journal disagrees with the script → 503;
+  - the owner-journal write fails → 503 and nothing broadcast;
+  - input linkage naming a non-owner → `ERR_LINKAGE`, persisted for that payload hash only;
+  - reconciler repairs a backlog at boot and reports unrepairable rows on the readiness check.
 
 ### 8.3 Conformance vectors
 
@@ -355,6 +385,7 @@ The §7 bumps and adoptions, done as separate commits with full suites green, be
   - Update `browser-budget.json`, `pack:check` exports, governance mutation targets.
 - **`@bsv/overlay-topics`:**
   - `bsv21/` (layer A); rewritten `mandala/` (layers B–D, lookup, storage incl. `mandalaAuthorities`, reducer with fee rate, typed rejects); `mandala-registry/` topic + lookup (moved from the mandala repo).
+  - §4.2a seams: the manager reports verified owners of admitted outputs; `stateStore` gains an owner-journal read, an idempotent `repairOwnerRow` (credit-on-insert), and a reconciler scan. Index faults throw the typed infra reject (503), never a final code.
   - Export the reducer and the reject type.
   - Delete the old mandala sources and tests.
 - **`infra/overlay-server`:** Mandala wiring → `MANDALA_ISSUER_KEYS`, registry topic; docs, README, release notes, `pnpm docs:facts`.
@@ -364,11 +395,11 @@ The §7 bumps and adoptions, done as separate commits with full suites green, be
 
 ### P2 — TS overlay
 
-Consume the new packages; §7.1 deletions; side channel reads `.code`; v3 routes; `MANDALA_ISSUER_KEYS` config.
+Consume the new packages; §7.1 deletions; side channel reads `.code`; v3 routes; `MANDALA_ISSUER_KEYS` config. Owner journal on the admission record (`owners`, written with the provisional record before broadcast), the boot/interval reconciler, and the `mandala-owner-index` readiness check (§4.2a).
 
 ### P3 — Go overlay
 
-Port layers A–D + registry file-for-file (`internal/bsv21`, `internal/mandala`); strict CBOR wrapper; `mandalaAuthorities`; v3 routes and verdicts; vectors parity. Delete `token.go`/`admin.go`/`adminwallet.go` commitment code.
+Port layers A–D + registry file-for-file (`internal/bsv21`, `internal/mandala`); strict CBOR wrapper; `mandalaAuthorities`; v3 routes and verdicts; vectors parity. §4.2a on the Go side: `RecordAdmission` carries `owners`; drop the missing-row linkage fallback in `resolveSpendIdentities` in favour of repair-or-503; same reconciler and readiness check. Delete `token.go`/`admin.go`/`adminwallet.go` commitment code.
 
 ### P4 — lib (`@bsv/mandala`)
 
@@ -407,3 +438,5 @@ Wire contract v3 file (§6 made standalone), PROJECT-STATE refresh, runbook env 
 | Upstream overlay 2.6.2 behaviour shifts (submit serialization, CAS errors) | P0 isolates the bump; double-spend e2e checks the CAS error maps to `503 ERR_UNAVAILABLE`, and the retry converges on `400 ERR_INPUT_SPENT` |
 | Fold ordering with concurrent authority branches | Unchanged (height, offset, admitSeq) last-write-wins; continuity is tx-local so no state race |
 | Spec-faithful readers disagree with Mandala on I > O and payload-commitment txs | Documented as policy (§2, §4.5); Mandala never broadcasts such txs |
+| A swallowed lookup write leaves an admitted coin with no owner row (found in overlay-topics 1.8, 2026-10-02) | §4.2a: owner journal written before broadcast, inline repair, reconciler, readiness check; index faults are 503, never final |
+| Owner journal and index drift (journal says X, script says Y) | Never auto-trusted: repair requires journal ≡ script; otherwise 503 and an operator alert |
