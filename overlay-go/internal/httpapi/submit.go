@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"slices"
@@ -465,9 +466,17 @@ func nonNilUint32(s []uint32) []uint32 {
 	return s
 }
 
-// readVarInt reads a Bitcoin VarInt (little-endian) from r: the leading
-// byte is either a literal value (<0xfd), or a 0xfd/0xfe/0xff prefix
-// introducing a 2/4/8-byte little-endian length.
+// errNonCanonicalVarInt is a CompactSize written in a wider form than its
+// value needs. The TS overlay refuses it (@bsv/sdk readVarIntNumStrict, read by
+// overlay-express 2.7.3's /submit route and by overlay/src/admission.ts), so
+// the same bytes must not decode here either: the handler's framing-error
+// branch answers it 400 ERR_SHAPE, exactly as TS does.
+var errNonCanonicalVarInt = errors.New("non-canonical varInt")
+
+// readVarInt reads a canonical Bitcoin CompactSize (little-endian) from r: the
+// leading byte is either a literal value (<0xfd), or a 0xfd/0xfe/0xff prefix
+// introducing a 2/4/8-byte little-endian length that does not fit the
+// narrower form (0xfd: >= 0xfd, 0xfe: > 0xffff, 0xff: > 0xffffffff).
 func readVarInt(r *bytes.Reader) (uint64, error) {
 	first, err := r.ReadByte()
 	if err != nil {
@@ -479,17 +488,26 @@ func readVarInt(r *bytes.Reader) (uint64, error) {
 		if err := binary.Read(r, binary.LittleEndian, &v); err != nil {
 			return 0, err
 		}
+		if v < 0xfd {
+			return 0, errNonCanonicalVarInt
+		}
 		return uint64(v), nil
 	case 0xfe:
 		var v uint32
 		if err := binary.Read(r, binary.LittleEndian, &v); err != nil {
 			return 0, err
 		}
+		if v <= 0xffff {
+			return 0, errNonCanonicalVarInt
+		}
 		return uint64(v), nil
 	case 0xff:
 		var v uint64
 		if err := binary.Read(r, binary.LittleEndian, &v); err != nil {
 			return 0, err
+		}
+		if v <= 0xffffffff {
+			return 0, errNonCanonicalVarInt
 		}
 		return v, nil
 	default:
