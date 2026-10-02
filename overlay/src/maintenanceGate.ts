@@ -6,8 +6,30 @@ import type { RequestHandler } from 'express'
  * with a live fold. Submits share the gate; maintenance is exclusive, waits for
  * in-flight submits to drain, and blocks new ones while it waits (writer
  * preference, so a busy overlay cannot starve the reconciler).
+ *
+ * NOT re-entrant: never call enter()/exclusive() from inside an exclusive fn,
+ * and never call exclusive() while holding a shared slot (deadlock until the
+ * drain timeout rejects it). /arc-ingest must not be mounted behind
+ * gateSubmits.
+ *
+ * An exclusive that cannot acquire within drainTimeoutMs stops waiting and
+ * rejects with MaintenanceBusyError (fn is not run).
  */
+export const DEFAULT_DRAIN_TIMEOUT_MS = 60_000
+
+export class MaintenanceBusyError extends Error {
+  constructor (inFlight: number) {
+    super(`maintenance gate busy: ${inFlight} in-flight submit(s) did not drain`)
+    this.name = 'MaintenanceBusyError'
+  }
+}
+
 export class MaintenanceGate {
+  private readonly drainTimeoutMs: number
+  constructor (opts: { drainTimeoutMs?: number } = {}) {
+    this.drainTimeoutMs = opts.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS
+  }
+
   private shared = 0
   private exclusiveActive = false
   private exclusiveWaiting = 0
@@ -36,12 +58,18 @@ export class MaintenanceGate {
 
   async exclusive<T> (fn: () => Promise<T>): Promise<T> {
     this.exclusiveWaiting++
+    let timedOut = false
+    const timer = setTimeout(() => { timedOut = true; this.wake() }, this.drainTimeoutMs)
+    timer.unref()
     try {
       while (this.exclusiveActive || this.shared > 0) {
+        if (timedOut) throw new MaintenanceBusyError(this.shared)
         await new Promise<void>(r => this.waiters.push(r))
       }
     } finally {
+      clearTimeout(timer)
       this.exclusiveWaiting--
+      if (timedOut) this.wake()
     }
     this.exclusiveActive = true
     try {
@@ -53,11 +81,19 @@ export class MaintenanceGate {
   }
 }
 
-/** Holds a shared slot for the life of one /submit response. */
+/**
+ * Holds a shared slot until the response's end() is INVOKED (not on
+ * finish/close): the route only calls res.json -> res.end after engine.submit
+ * and the settle returned, and Express invokes end even on a destroyed socket,
+ * so the slot spans the whole fold regardless of client abort.
+ */
 export const gateSubmits = (gate: MaintenanceGate): RequestHandler => (req, res, next) => {
   gate.enter().then(release => {
-    res.once('finish', release)
-    res.once('close', release)
+    const end = res.end
+    res.end = function (this: unknown, ...args: unknown[]) {
+      release()
+      return (end as (...a: unknown[]) => unknown).apply(this, args)
+    } as typeof res.end
     next()
   }, next)
 }
