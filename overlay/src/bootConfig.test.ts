@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import OverlayExpress from '@bsv/overlay-express'
-import { readBootConfig, type BootConfig } from './bootConfig.js'
+import { PrivateKey } from '@bsv/sdk'
+import { readBootConfig, parseIssuerKeys, type BootConfig } from './bootConfig.js'
 
 const KEY = '1'.repeat(64)
-const base = { NODE_NAME: 'mandala', SERVER_PRIVATE_KEY: KEY, HOSTING_URL: 'http://localhost:8080', MONGO_URL: 'mongodb://m', NETWORK: 'test' }
+const K1 = PrivateKey.fromHex('66'.repeat(32)).toPublicKey().toString()
+const K2 = PrivateKey.fromHex('44'.repeat(32)).toPublicKey().toString()
+const base = { NODE_NAME: 'mandala', SERVER_PRIVATE_KEY: KEY, HOSTING_URL: 'http://localhost:8080', MONGO_URL: 'mongodb://m', NETWORK: 'test', MANDALA_ISSUER_KEYS: JSON.stringify([K1]) }
 const TOKEN = 't'.repeat(32)
 
 describe('readBootConfig', () => {
@@ -174,5 +177,30 @@ describe('readBootConfig — accepted by the real OverlayExpress 2.7.3', () => {
       const cfg = readBootConfig({ ...base, HOSTING_URL: 'https://o.example.com', ARCADE_URL: 'https://arcade.example.com', ARCADE_CALLBACK_TOKEN: token })
       expect(() => construct(cfg).configureArcCallbackToken(cfg.arcade!.callbackToken)).not.toThrow()
     }
+  })
+})
+
+describe('MANDALA_ISSUER_KEYS (spec §5.1)', () => {
+  it('parses a JSON array of compressed keys', () => {
+    expect(parseIssuerKeys(JSON.stringify([K1, K2]))).toEqual([K1, K2])
+  })
+  it.each([
+    [undefined, /MANDALA_ISSUER_KEYS is required/],
+    ['', /MANDALA_ISSUER_KEYS is required/],
+    ['[]', /at least one/],
+    ['not json', /JSON array/],
+    ['{"a":1}', /JSON array/],
+    [JSON.stringify([K1, K1]), /duplicate/],
+    [JSON.stringify([K1.toUpperCase()]), /lowercase/],
+    [JSON.stringify(['04' + 'ab'.repeat(64)]), /compressed/],
+    [JSON.stringify(['02' + '00'.repeat(32)]), /not a valid public key/],
+    [JSON.stringify([7]), /compressed/]
+  ])('refuses %j', (raw, msg) => {
+    expect(() => parseIssuerKeys(raw as string | undefined)).toThrow(msg)
+  })
+  it('readBootConfig exposes issuerKeys and fails boot without them', () => {
+    expect(readBootConfig({ ...base, MANDALA_ISSUER_KEYS: JSON.stringify([K1]) }).issuerKeys).toEqual([K1])
+    const { MANDALA_ISSUER_KEYS: _drop, ...without } = { ...base, MANDALA_ISSUER_KEYS: '' }
+    expect(() => readBootConfig(without)).toThrow(/MANDALA_ISSUER_KEYS is required/)
   })
 })

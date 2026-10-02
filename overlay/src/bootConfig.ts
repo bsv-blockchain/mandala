@@ -1,3 +1,4 @@
+import { PublicKey } from '@bsv/sdk'
 import { canonicalPrivateKey, readBooleanEnv, readOptionalSecretEnv } from './secrets.js'
 
 export interface BootConfig {
@@ -9,6 +10,7 @@ export interface BootConfig {
   network: 'main' | 'test'
   sqliteFile: string
   adminApiToken: string // '' = open (dev default, warned)
+  issuerKeys: readonly string[] // canonical lowercase compressed keys, input order, non-empty
   arcade?: {
     url: string
     apiKey?: string
@@ -20,6 +22,28 @@ export interface BootConfig {
 }
 
 type Env = Record<string, string | undefined>
+
+/**
+ * MANDALA_ISSUER_KEYS (spec §5.1): the trusted-issuer set, a JSON array of
+ * compressed identity keys in canonical lowercase hex. The package refuses a
+ * non-canonical set at construction; failing here names the env var instead.
+ */
+export const parseIssuerKeys = (raw: string | undefined): string[] => {
+  if (raw == null || raw.trim() === '') throw new Error('MANDALA_ISSUER_KEYS is required (JSON array of compressed identity public keys)')
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) } catch { throw new Error('MANDALA_ISSUER_KEYS must be a JSON array of compressed public keys') }
+  if (!Array.isArray(parsed)) throw new Error('MANDALA_ISSUER_KEYS must be a JSON array of compressed public keys')
+  if (parsed.length === 0) throw new Error('MANDALA_ISSUER_KEYS must name at least one issuer key')
+  const seen = new Set<string>()
+  for (const [i, k] of parsed.entries()) {
+    if (typeof k !== 'string' || !/^0[23][0-9a-fA-F]{64}$/.test(k)) throw new Error(`MANDALA_ISSUER_KEYS[${i}] is not a compressed public key (02/03 + 64 hex)`)
+    if (k !== k.toLowerCase()) throw new Error(`MANDALA_ISSUER_KEYS[${i}] must be lowercase hex`)
+    try { PublicKey.fromString(k) } catch { throw new Error(`MANDALA_ISSUER_KEYS[${i}] is not a valid public key`) }
+    if (seen.has(k)) throw new Error(`MANDALA_ISSUER_KEYS[${i}] is a duplicate`)
+    seen.add(k)
+  }
+  return [...seen]
+}
 
 const requireEnv = (env: Env, name: string): string => {
   const v = env[name]
@@ -77,6 +101,7 @@ export const readBootConfig = (env: Env): BootConfig => {
   const mongoUrl = requireEnv(env, 'MONGO_URL')
   const network = requireEnv(env, 'NETWORK')
   if (network !== 'main' && network !== 'test') throw new Error('NETWORK must be "main" or "test"')
+  const issuerKeys = parseIssuerKeys(env.MANDALA_ISSUER_KEYS)
   const adminApiToken = readOptionalSecretEnv(env, 'ADMIN_API_TOKEN')
   const arcadeUrl = optionalEnv(env, 'ARCADE_URL')
   let arcade: BootConfig['arcade']
@@ -95,6 +120,6 @@ export const readBootConfig = (env: Env): BootConfig => {
   }
   return {
     nodeName, serverPrivateKey, hostingUrl, advertisableHost,
-    mongoUrl, network, sqliteFile: optionalEnv(env, 'SQLITE_FILE') ?? '/data/overlay.sqlite', adminApiToken, arcade
+    mongoUrl, network, sqliteFile: optionalEnv(env, 'SQLITE_FILE') ?? '/data/overlay.sqlite', adminApiToken, issuerKeys, arcade
   }
 }
