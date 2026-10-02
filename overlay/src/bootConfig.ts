@@ -33,13 +33,39 @@ const optionalEnv = (env: Env, name: string): string | undefined => {
   return v == null || v === '' ? undefined : v
 }
 
-/** overlay-express 2.7.3 wants a bare HTTPS host (it rejects http:// URLs and paths). */
+/**
+ * overlay-express 2.7.3 wants a bare HTTPS host (it rejects http:// URLs and
+ * paths), so a HOSTING_URL with a scheme is reduced to its host here — but only
+ * when it IS an origin. overlay-express builds the Arcade callback as
+ * `https://${advertisableFQDN}/arc-ingest` and refuses a raw value carrying a
+ * path or credentials ("Advertisable FQDN must be an HTTPS host without
+ * credentials or a path"); cutting such a URL down to its host would bypass
+ * that fail-closed check and send every proof and eviction callback to the
+ * bare host, where nothing is mounted behind a path-routed proxy (overlay-go,
+ * which keeps the path, would call back somewhere else). So anything beyond an
+ * origin fails the boot, with or without Arcade, as upstream does.
+ */
 export const advertisableHostOf = (hostingUrl: string): string => {
   if (!hostingUrl.includes('://')) return hostingUrl
+  let url: URL
   try {
-    return new URL(hostingUrl).host
+    url = new URL(hostingUrl)
   } catch {
     throw new Error('HOSTING_URL must be a valid URL or a bare host')
+  }
+  if (url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '' || url.pathname !== '/') {
+    throw new Error('HOSTING_URL must be an origin (no path, query, fragment or credentials)')
+  }
+  return url.host
+}
+
+/** True only for an https URL; the scheme is read from the parsed URL, so case does not matter. */
+const isHttpsUrl = (hostingUrl: string): boolean => {
+  if (!hostingUrl.includes('://')) return false
+  try {
+    return new URL(hostingUrl).protocol === 'https:'
+  } catch {
+    return false
   }
 }
 
@@ -47,6 +73,7 @@ export const readBootConfig = (env: Env): BootConfig => {
   const nodeName = requireEnv(env, 'NODE_NAME')
   const serverPrivateKey = canonicalPrivateKey(requireEnv(env, 'SERVER_PRIVATE_KEY'), 'SERVER_PRIVATE_KEY')
   const hostingUrl = requireEnv(env, 'HOSTING_URL')
+  const advertisableHost = advertisableHostOf(hostingUrl)
   const mongoUrl = requireEnv(env, 'MONGO_URL')
   const network = requireEnv(env, 'NETWORK')
   if (network !== 'main' && network !== 'test') throw new Error('NETWORK must be "main" or "test"')
@@ -56,7 +83,7 @@ export const readBootConfig = (env: Env): BootConfig => {
   if (arcadeUrl != null) {
     const callbackToken = readOptionalSecretEnv(env, 'ARCADE_CALLBACK_TOKEN')
     if (callbackToken === '') throw new Error('ARCADE_CALLBACK_TOKEN is required when ARCADE_URL is set (overlay-express 2.7.3 refuses to start without it)')
-    if (!hostingUrl.startsWith('https://')) throw new Error('HOSTING_URL must be an https URL when ARCADE_URL is set (Arcade calls back https://<host>/arc-ingest)')
+    if (!isHttpsUrl(hostingUrl)) throw new Error('HOSTING_URL must be an https URL when ARCADE_URL is set (Arcade calls back https://<host>/arc-ingest)')
     arcade = {
       url: arcadeUrl,
       apiKey: optionalEnv(env, 'ARCADE_API_KEY'),
@@ -67,7 +94,7 @@ export const readBootConfig = (env: Env): BootConfig => {
     }
   }
   return {
-    nodeName, serverPrivateKey, hostingUrl, advertisableHost: advertisableHostOf(hostingUrl),
+    nodeName, serverPrivateKey, hostingUrl, advertisableHost,
     mongoUrl, network, sqliteFile: optionalEnv(env, 'SQLITE_FILE') ?? '/data/overlay.sqlite', adminApiToken, arcade
   }
 }

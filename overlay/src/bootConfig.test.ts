@@ -94,6 +94,37 @@ describe('readBootConfig — edges', () => {
   it('an unparseable HOSTING_URL names the variable instead of surfacing a bare "Invalid URL"', () => {
     expect(() => readBootConfig({ ...base, HOSTING_URL: 'http://' })).toThrow(/^HOSTING_URL must be a valid URL/)
   })
+  // overlay-express 2.7.3 builds the Arcade callback as
+  // `https://${advertisableFQDN}/arc-ingest` and refuses a raw value with a
+  // path or credentials. Reducing such a URL to its host silently would
+  // misroute every proof and eviction callback (Go keeps the path), so it
+  // fails the boot instead — with or without Arcade, as upstream does.
+  it.each([
+    ['a path', 'https://h.example.com/overlay'],
+    ['a trailing path segment', 'https://h.example.com/overlay/'],
+    ['credentials', 'https://u:p@h.example.com'],
+    ['a username only', 'https://u@h.example.com'],
+    ['a query', 'https://h.example.com/?x=1'],
+    ['a fragment', 'https://h.example.com/#top'],
+    ['a path on an http URL', 'http://localhost:8080/overlay']
+  ])('a HOSTING_URL with %s fails boot, with or without Arcade', (_label, url) => {
+    expect(() => readBootConfig({ ...base, HOSTING_URL: url }))
+      .toThrow('HOSTING_URL must be an origin (no path, query, fragment or credentials)')
+    expect(() => readBootConfig({ ...arcadeEnv, HOSTING_URL: url }))
+      .toThrow('HOSTING_URL must be an origin (no path, query, fragment or credentials)')
+  })
+  it('an origin with a bare trailing slash is still an origin', () => {
+    expect(readBootConfig({ ...arcadeEnv, HOSTING_URL: 'https://h.example.com/' }).advertisableHost).toBe('h.example.com')
+  })
+  it('the https check reads the parsed scheme, so an upper-case HTTPS boots with Arcade', () => {
+    const c = readBootConfig({ ...arcadeEnv, HOSTING_URL: 'HTTPS://O.Example.com' })
+    expect(c.arcade).toBeDefined()
+    expect(c.advertisableHost).toBe('o.example.com')
+  })
+  it('a bare host with Arcade is refused as not https, naming HOSTING_URL', () => {
+    expect(() => readBootConfig({ ...arcadeEnv, HOSTING_URL: 'o.example.com' }))
+      .toThrow(/^HOSTING_URL must be an https URL when ARCADE_URL is set/)
+  })
   it('a weak ADMIN_API_TOKEN names the variable even when arcade is on', () => {
     expect(() => readBootConfig({ ...arcadeEnv, ADMIN_API_TOKEN: ' ' + TOKEN })).toThrow(/^ADMIN_API_TOKEN must not contain/)
   })
@@ -121,7 +152,7 @@ describe('readBootConfig — accepted by the real OverlayExpress 2.7.3', () => {
     expect(() => construct(cfg)).not.toThrow()
   })
 
-  it.each(['https://deggen.ngrok.app', 'https://o.example.com:8443', 'overlay.example.com'])('constructs for HOSTING_URL=%s', url => {
+  it.each(['https://deggen.ngrok.app', 'https://o.example.com:8443', 'overlay.example.com', 'HTTPS://O.Example.com/'])('constructs for HOSTING_URL=%s', url => {
     expect(() => construct(readBootConfig({ ...base, HOSTING_URL: url }))).not.toThrow()
   })
 

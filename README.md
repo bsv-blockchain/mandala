@@ -278,7 +278,7 @@ SQLITE_FILE=/data/overlay.sqlite
 # Optional — makes the overlay a full network participant (broadcast + SPV):
 # ARCADE_URL=<arcade host>
 # ARCADE_API_KEY=<key>
-# ARCADE_CALLBACK_TOKEN=<32+ bytes; required with ARCADE_URL, and HOSTING_URL must then be https://>
+# ARCADE_CALLBACK_TOKEN=<32+ bytes; required with ARCADE_URL, and HOSTING_URL must then be an https:// origin (no path)>
 # CHAINTRACKS_URL=<defaults to $ARCADE_URL/chaintracks>
 ```
 
