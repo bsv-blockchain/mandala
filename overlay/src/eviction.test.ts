@@ -193,11 +193,14 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
     expect(h.rows[TXID].evictedAt).toBeUndefined()
   })
 
-  it('a non-busy failure inside quiesce keeps its own type', async () => {
-    const h = deps(record(), { purgeAndRefold: vi.fn(async () => { throw new Error('x') }) })
-    const quiesce = async <T>(fn: () => Promise<T>): Promise<T> => await fn()
+  it('a quiesce that rejects with another error surfaces it unchanged (not an InfraError)', async () => {
+    const h = deps(record())
+    const boom = new Error('gate bug')
+    const quiesce = async <T>(_fn: () => Promise<T>): Promise<T> => { throw boom }
     const err = await evictWithRestore(TXID, 'REJECTED', { ...h.d, quiesce }).catch((e: unknown) => e)
-    expect(isInfraError(err)).toBe(true)
+    expect(err).toBe(boom)
+    expect(isInfraError(err)).toBe(false)
+    expect(h.evicted).toEqual([])
   })
 
   it('journalRestoreInput restores the journaled owner; a non-token input is a no-op', async () => {

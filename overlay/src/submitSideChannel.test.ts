@@ -286,6 +286,15 @@ describe('snapshotRestore — every input, no store read', () => {
   })
 })
 
+describe('snapshotRestore — sourceTransaction only', () => {
+  it('derives the outpoint from the source transaction when sourceTXID is absent', () => {
+    const src = tx()
+    const t = new Transaction()
+    t.addInput({ sourceTransaction: src, sourceOutputIndex: 0, unlockingScript: new UnlockingScript() })
+    expect(snapshotRestore(t)).toEqual({ spentOutpoints: [`${src.id('hex')}.0`] })
+  })
+})
+
 describe('mergeRestore — union of outpoints', () => {
   it('unions, keeps first-seen order, drops case-insensitive duplicates', () => {
     const A = 'aa'.repeat(32)
