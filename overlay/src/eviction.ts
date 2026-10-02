@@ -349,10 +349,11 @@ const presented = (headers: Record<string, unknown>): string[] => {
 /**
  * Shape-compatible with the pinned overlay-express /arc-ingest route (same
  * status codes and messages) and with overlay-go's `arcIngestHandler`. The
- * differences: a terminal status restores inputs before evicting; a txid that
- * is not 64 hex characters is refused up front (400); and a long reason is
- * truncated. The engine would reject both of the last two only after
- * `evictedAt` is stamped.
+ * differences from the pinned route: a terminal status restores inputs before
+ * evicting; a txid that is not 64 hex characters is refused up front (400);
+ * and a long reason is truncated. The engine would reject both of the last two
+ * only after `evictedAt` is stamped. overlay-go does the same three (same
+ * message, same 256-unit bound), so the §9.12 body matches across engines.
  */
 export const arcIngestHandler = (deps: ArcIngestDeps) =>
   (req: IngestReq, res: IngestRes): void => {

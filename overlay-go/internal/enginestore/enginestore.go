@@ -516,6 +516,31 @@ func (s *Store) SpendStateOf(ctx context.Context, topic, txid string, vout uint3
 	return doc.SpendTxid, nil
 }
 
+// IsUnspent reports whether an output document for (topic, txid.vout) exists
+// and is unspent. It is the eviction restore's liveness test (wire contract
+// §9.12 / the TS overlay's knexEvictionCoins.isUnspent): a token row is handed
+// back only for a coin that is live again. Unlike SpendStateOf, a missing
+// document is NOT live — restoring a row for it would mint a phantom. Not part
+// of engine.Storage.
+func (s *Store) IsUnspent(ctx context.Context, topic, txid string, vout uint32) (bool, error) {
+	var doc outputDoc
+	err := s.outputs.FindOne(ctx,
+		bson.D{
+			{Key: "topic", Value: topic},
+			{Key: "txid", Value: txid},
+			{Key: "outputIndex", Value: vout},
+		},
+		options.FindOne().SetProjection(bson.D{{Key: "spent", Value: 1}}),
+	).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !doc.Spent, nil
+}
+
 // AdmittedOutputIndexes lists, ascending, the output indexes this topic
 // admitted for txid — spent ones included, because admission is history, not
 // current liquidity. It is FIX C's fallback source of outputsToAdmit when the

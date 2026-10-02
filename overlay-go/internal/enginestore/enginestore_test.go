@@ -983,6 +983,42 @@ func TestSpendStateOfLiveAndUnknownOutpoints(t *testing.T) {
 	}
 }
 
+// IsUnspent is the eviction restore's "is this coin live" test: true only for
+// a document that exists and is unspent. Unlike SpendStateOf it does NOT read
+// a missing document as live — restoring a token row for a coin the engine
+// has no output for would mint a phantom row (TS isUnspent: no row → false).
+func TestIsUnspentOnlyForAnExistingLiveCoin(t *testing.T) {
+	ctx := context.Background()
+	st := mustNew(t, testDB(t))
+
+	parent := newTx(0x4a, 2)
+	parentID := parent.TxID()
+	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0, 1}, nil, beefFor(t, parent), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(parentID, 1)}, topic, newTx(0x4b, 1).TxID()); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		topic string
+		txid  string
+		vout  uint32
+		want  bool
+	}{
+		{"live coin", topic, parentID.String(), 0, true},
+		{"spent coin", topic, parentID.String(), 1, false},
+		{"no document at all", topic, newTx(0x4c, 1).TxID().String(), 0, false},
+		{"live on another topic only", "tm_other", parentID.String(), 0, false},
+	}
+	for _, tc := range cases {
+		got, err := st.IsUnspent(ctx, tc.topic, tc.txid, tc.vout)
+		if err != nil || got != tc.want {
+			t.Fatalf("%s: IsUnspent = %v, %v; want %v", tc.name, got, err, tc.want)
+		}
+	}
+}
+
 // --- FIX C: deriving outputsToAdmit from the engine's own stored outputs ---
 
 func TestAdmittedOutputIndexes(t *testing.T) {
