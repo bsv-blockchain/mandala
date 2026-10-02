@@ -11,10 +11,10 @@
  * name: a transient fault is indistinguishable from a permanent refusal, so a
  * wallet either strands a good payment forever or retries a dead one forever.
  *
- * This module is the repo-local classifier both halves of the fix share:
- * `submitSideChannel.ts` captures the manager's OWN reason before the engine
- * swallows it, and `admission.ts`'s /submit wrapper turns that reason into the
- * contract's error body via the table here.
+ * This module is the repo-local verdict shaping both halves of the fix share:
+ * `submitSideChannel.ts` captures the manager's OWN reject (reason + the typed
+ * `MandalaReject.code`) before the engine swallows it, and `admission.ts`'s
+ * /submit wrapper turns that code into the contract's error body via SHAPES.
  *
  * MAPPING RULE (binding): a 400/409 code may ONLY be minted from a genuine
  * topic-manager reject reason. Anything else — SPV/chaintracker, storage,
@@ -22,8 +22,8 @@
  * `ERR_UNAVAILABLE` (503, retryable). Never infer a policy code from an
  * engine-level error string.
  *
- * The table below is duplicated verbatim in overlay-go; the two stacks must
- * match substring for substring, in this order.
+ * There is no substring table: codes are read structurally (codeOfManagerError).
+ * Go P3 drops its copy of the old table too.
  */
 
 export type VerdictCode =
@@ -33,12 +33,14 @@ export type VerdictCode =
   | 'ERR_SHAPE'
   | 'ERR_SATOSHIS'
   | 'ERR_INPUT_SPENT'
+  | 'ERR_AUTHORITY'
   // 409, liftable (the overlay's own condition may change; retry with backoff)
   | 'ERR_PAUSED'
   | 'ERR_FROZEN'
   | 'ERR_SANCTIONED'
   | 'ERR_ACCESS'
   | 'ERR_MEMBERSHIP'
+  | 'ERR_UNTRUSTED'
   // 410, final — admitted then evicted; the INPUTS are live again (FIX E)
   | 'ERR_EVICTED'
   // 503, retryable — not a manager verdict at all
@@ -55,6 +57,8 @@ const SHAPES: Record<VerdictCode, VerdictShape> = {
   ERR_SHAPE: { httpStatus: 400, retryable: false },
   ERR_SATOSHIS: { httpStatus: 400, retryable: false },
   ERR_INPUT_SPENT: { httpStatus: 400, retryable: false },
+  ERR_AUTHORITY: { httpStatus: 400, retryable: false },
+  ERR_UNTRUSTED: { httpStatus: 409, retryable: true },
   ERR_PAUSED: { httpStatus: 409, retryable: true },
   ERR_FROZEN: { httpStatus: 409, retryable: true },
   ERR_SANCTIONED: { httpStatus: 409, retryable: true },
@@ -81,44 +85,27 @@ const SHAPES: Record<VerdictCode, VerdictShape> = {
  *    GET /admin/admission/<spendTxid> before treating it as terminal.
  */
 export const FINAL_CODES: ReadonlySet<VerdictCode> = new Set<VerdictCode>([
-  'ERR_CONSERVATION', 'ERR_LINKAGE', 'ERR_SHAPE', 'ERR_SATOSHIS', 'ERR_EVICTED'
+  'ERR_CONSERVATION', 'ERR_LINKAGE', 'ERR_SHAPE', 'ERR_SATOSHIS', 'ERR_AUTHORITY', 'ERR_EVICTED'
 ])
 
-/**
- * The shared substring table, in evaluation order — FIRST HIT WINS. Two rows
- * deviate from the order printed in contract §2, both deliberately and both
- * required for the contract's own stated outcomes:
- *
- *  1. `not anchored to the asset admin chain` is pre-empted to ERR_SHAPE.
- *     That refusal (adminChainGuard.ts) ends "...spent by this transaction",
- *     so the generic `spent` row would otherwise mint ERR_INPUT_SPENT for a
- *     bad admin chain — which §2 explicitly files under ERR_SHAPE. Pre-empting
- *     is what makes the table produce the code the contract asks for.
- *  2. The membership row precedes the `sanction` row. §2's own note says the
- *     upstream membership string is "sanctioned party involved in transfer"
- *     and must map to ERR_MEMBERSHIP, not ERR_SANCTIONED — impossible if
- *     `sanction` is tested first, since it is a substring of it.
- */
-export const REASON_TABLE: ReadonlyArray<{ readonly match: readonly string[], readonly code: VerdictCode }> = [
-  { match: ['not anchored to the asset admin chain'], code: 'ERR_SHAPE' },
-  { match: ['conservation'], code: 'ERR_CONSERVATION' },
-  { match: ['no verified linkage', 'linkage'], code: 'ERR_LINKAGE' },
-  { match: ['satoshi'], code: 'ERR_SATOSHIS' },
-  { match: ['sanctioned party', 'not admitted', 'membership'], code: 'ERR_MEMBERSHIP' },
-  { match: ['paused'], code: 'ERR_PAUSED' },
-  { match: ['frozen'], code: 'ERR_FROZEN' },
-  { match: ['sanction'], code: 'ERR_SANCTIONED' },
-  { match: ['access mode', 'allowlist', 'denylist'], code: 'ERR_ACCESS' },
-  { match: ['spent'], code: 'ERR_INPUT_SPENT' }
-]
+import { isMandalaReject, type MandalaRejectCode } from '@bsv/overlay-topics'
 
-/** Map a topic-manager reject reason to its contract code. Default ERR_SHAPE. */
-export const classifyManagerReason = (reason: string): VerdictCode => {
-  const hay = String(reason ?? '').toLowerCase()
-  for (const row of REASON_TABLE) {
-    if (row.match.some(m => hay.includes(m))) return row.code
-  }
-  return 'ERR_SHAPE'
+// Every package code is a contract code; this line stops compiling if topics adds one we do not shape.
+const _packageCodesAreContractCodes: MandalaRejectCode extends VerdictCode ? true : never = true
+void _packageCodesAreContractCodes
+
+/**
+ * The contract code a topic-manager throw carries STRUCTURALLY (spec §6.3), or
+ * undefined. Never derived from wording: a MandalaReject carries `.code`
+ * (isMandalaReject is name-based, so a second package copy still matches), and
+ * the spent-input guard's InputSpentError is ERR_INPUT_SPENT by type. Anything
+ * else (a package bug, an unreadable BEEF) is untyped: answered 400 ERR_SHAPE
+ * but never persisted (see admission.ts `refuse`).
+ */
+export const codeOfManagerError = (e: unknown): VerdictCode | undefined => {
+  if (isMandalaReject(e)) return e.code
+  if (e instanceof InputSpentError) return 'ERR_INPUT_SPENT'
+  return undefined
 }
 
 export const verdictFor = (code: VerdictCode): VerdictShape => SHAPES[code]
@@ -162,8 +149,8 @@ export const requestErrorBody = (description: string): SubmitErrorBody =>
 
 /**
  * FIX L: raised by the spent-input guard. Carries the competing txid so
- * /submit can name it in `spendTxid`; the message is worded so the shared
- * table classifies it even if the typed channel is lost.
+ * /submit can name it in `spendTxid`. Its verdict code is carried by type
+ * (see codeOfManagerError), never by its message.
  */
 export class InputSpentError extends Error {
   constructor (readonly outpoint: string, readonly spendTxid: string) {

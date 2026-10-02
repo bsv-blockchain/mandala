@@ -30,7 +30,7 @@
 import { Hash, PrivateKey, Transaction, Utils } from '@bsv/sdk'
 import type { TopicManager } from '@bsv/overlay'
 import {
-  classifyManagerReason, errorBody, requestErrorBody, verdictFor, FINAL_CODES, FinalVerdictError,
+  errorBody, requestErrorBody, verdictFor, FINAL_CODES, FinalVerdictError,
   InfraError, isInfraError, infra,
   type VerdictCode, type SubmitErrorBody
 } from './submitVerdict.js'
@@ -338,7 +338,7 @@ export const finalVerdictOf = (
  *
  * The refusal is thrown as a `FinalVerdictError`, which `SubmitSideChannel`
  * carries structurally to the /submit wrapper: ERR_EVICTED has no reason string
- * for the substring table to classify, so the code travels as data.
+ * to carry a code, so the code travels as data.
  */
 export const withPersistedVerdict = (inner: TopicManager, store: AdmissionStore): TopicManager => {
   const guarded: TopicManager = {
@@ -488,11 +488,14 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
      * verdict, so only tm_mandala's own verdict is persisted.
      */
     const refuse = async (
-      txid: string, reason: string, spendTxid: string | undefined, refusingTopic: string | undefined,
-      payloadHash: string
+      txid: string, code: VerdictCode | undefined, reason: string, spendTxid: string | undefined,
+      refusingTopic: string | undefined, payloadHash: string
     ): Promise<void> => {
-      const code = classifyManagerReason(reason)
-      if (deps.store != null && refusingTopic === TOKEN_TOPIC && FINAL_CODES.has(code)) {
+      // An untyped throw (no MandalaReject code) is answered as ERR_SHAPE but is
+      // NEVER persisted: it may be a package fault rather than a content verdict,
+      // and a persisted final would outlive the fix.
+      const answered: VerdictCode = code ?? 'ERR_SHAPE'
+      if (deps.store != null && code != null && refusingTopic === TOKEN_TOPIC && FINAL_CODES.has(code)) {
         try {
           await deps.store.putRefusal({
             txid,
@@ -509,7 +512,7 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
           console.warn('[mandala] refusal persist failed:', e)
         }
       }
-      send(verdictFor(code).httpStatus, errorBody(code, reason, spendTxid))
+      send(verdictFor(answered).httpStatus, errorBody(answered, reason, spendTxid))
     }
 
     /**
@@ -555,7 +558,7 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
 
       // A verdict the wrapper carried structurally — an already-persisted final
       // verdict (withPersistedVerdict) or an InfraError (§9.5) — is replayed
-      // verbatim rather than re-classified through the substring table, and is
+      // verbatim rather than re-derived from `outcome.code`, and is
       // never (re-)persisted from here.
       if (outcome?.verdict != null) {
         sendVerdict(outcome.verdict)
@@ -569,7 +572,7 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
       // infrastructure (503).
       if (isErrorBody) {
         if (outcome?.reason != null) {
-          await refuse(txid, outcome.reason, outcome.spendTxid, outcome.topic, payloadHash)
+          await refuse(txid, outcome.code, outcome.reason, outcome.spendTxid, outcome.topic, payloadHash)
           return
         }
         const message = (body as { message?: unknown }).message
@@ -611,7 +614,7 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
         // honest answer for the token half) and log the swallowed reason.
         const otherAdmitted = Object.keys(steak).some(t => t !== TOKEN_TOPIC && (steak[t]?.outputsToAdmit?.length ?? 0) > 0)
         if (!otherAdmitted) {
-          await refuse(txid, outcome.reason, outcome.spendTxid, outcome.topic, payloadHash)
+          await refuse(txid, outcome.code, outcome.reason, outcome.spendTxid, outcome.topic, payloadHash)
           return
         }
         console.warn(`[mandala] tm_mandala rejected ${txid} but another topic admitted; returning STEAK. Reason: ${outcome.reason}`)

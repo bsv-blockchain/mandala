@@ -25,7 +25,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { Transaction } from '@bsv/sdk'
 import type { TopicManager } from '@bsv/overlay'
-import { InputSpentError, FinalVerdictError, InfraError, isInfraError, type VerdictCode } from './submitVerdict.js'
+import { InputSpentError, FinalVerdictError, InfraError, isInfraError, codeOfManagerError, type VerdictCode } from './submitVerdict.js'
 
 /** Pre-spend snapshot of one token row, as persisted on the admission record. */
 export interface AdmissionTokenRow {
@@ -141,10 +141,11 @@ export interface ManagerOutcome {
   reason?: string
   /** Competing txid, when the reject was FIX L's InputSpentError. */
   spendTxid?: string
+  /** The structural contract code of `reason`, when it has one (codeOfManagerError). */
+  code?: VerdictCode
   /**
    * A structurally-carried verdict, set when the wrapper refused from an
-   * already-persisted final verdict. Takes precedence over classifying
-   * `reason` through the substring table.
+   * already-persisted final verdict. Takes precedence over `code`.
    */
   verdict?: { code: VerdictCode, description: string, spendTxid?: string }
   /** Which topic manager produced `reason` — tm_mandala's takes precedence. */
@@ -251,16 +252,16 @@ export class SubmitSideChannel {
       ? error.spendTxid
       : error instanceof FinalVerdictError ? error.spendTxid : undefined
     // Both markers travel STRUCTURALLY, so neither code depends on wording:
-    // a FinalVerdictError because ERR_EVICTED has no reason string to classify,
-    // and an InfraError (§9.5) because the substring table would otherwise read
-    // "…store is unavailable: connection refused" as a final 400 ERR_SHAPE and
-    // the /submit wrapper would persist it.
+    // a FinalVerdictError because ERR_EVICTED has no reason string to carry a code,
+    // and an InfraError (§9.5) because it is untyped (no MandalaReject code) and
+    // must answer 503, never a persisted content verdict.
     const verdict = error instanceof FinalVerdictError
       ? { code: error.code, description: error.description, spendTxid: error.spendTxid }
       : isInfraError(error)
         ? { code: 'ERR_UNAVAILABLE' as VerdictCode, description: error.message }
         : undefined
-    this.upsert(txid, { reason, spendTxid, verdict, topic })
+    const code = codeOfManagerError(error)
+    this.upsert(txid, { reason, code, spendTxid, verdict, topic })
   }
 
   noteRestore (txid: string, restore: AdmissionRestore): void {

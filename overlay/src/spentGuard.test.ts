@@ -5,7 +5,7 @@ import {
   SELF_HEAL_DESCRIPTION, EVICTED_HEAL_DESCRIPTION, MOVED_DESCRIPTION,
   type SpentInputStore, type SpendState
 } from './spentGuard.js'
-import { InputSpentError, InfraError, isInfraError, classifyManagerReason } from './submitVerdict.js'
+import { InputSpentError, InfraError, isInfraError, codeOfManagerError } from './submitVerdict.js'
 
 const SRC = 'aa'.repeat(32)
 const COMPETITOR = 'cc'.repeat(32)
@@ -176,7 +176,7 @@ describe('withSpentInputGuard', () => {
     const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [0], undefined).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(InputSpentError)
     expect((err as InputSpentError).spendTxid).toBe(COMPETITOR)
-    expect(classifyManagerReason((err as Error).message)).toBe('ERR_INPUT_SPENT')
+    expect(codeOfManagerError(err)).toBe('ERR_INPUT_SPENT')
     expect(calls.n).toBe(0)
   })
 
@@ -281,13 +281,6 @@ describe('withSpentInputGuard — a store fault is an InfraError, never a verdic
     })
     const err = await tm.identifyAdmissibleOutputs(spendTx().toBEEF(), [0], undefined).catch((e: unknown) => e)
     expect(isInfraError(err)).toBe(true)
-  })
-
-  it('an InfraError message is NEVER re-classified into a final 400 by the table', async () => {
-    // The table reads "spent" as ERR_INPUT_SPENT; only the structural marker
-    // keeps a store fault out of the persisted set.
-    expect(classifyManagerReason('the engine output store is unavailable: already spent')).toBe('ERR_INPUT_SPENT')
-    expect(isInfraError(new InfraError('the engine output store is unavailable: already spent'))).toBe(true)
   })
 })
 

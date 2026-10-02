@@ -1,59 +1,9 @@
 import { describe, it, expect } from 'vitest'
+import { MandalaReject } from '@bsv/overlay-topics'
 import {
-  classifyManagerReason, verdictFor, errorBody, requestErrorBody, InputSpentError,
+  codeOfManagerError, verdictFor, errorBody, requestErrorBody, InputSpentError,
   InfraError, isInfraError, infra, FINAL_CODES, type VerdictCode
 } from './submitVerdict.js'
-
-// Table-driven, per wire-contract v2 §2. Every row is a substring the shared
-// table must recognise; the "real string" column is the literal message the
-// producing layer emits today, so a reword upstream shows up here first.
-const CASES: Array<{ reason: string, code: VerdictCode, why: string }> = [
-  // ── 400, final ────────────────────────────────────────────────────────────
-  { reason: 'conservation violated: outputs exceed authorized inputs/issuance', code: 'ERR_CONSERVATION', why: 'pinned MandalaTopicManager' },
-  { reason: 'output 1: MandalaToken-decodable output with no verified linkage', code: 'ERR_LINKAGE', why: 'FIX A wrapper (contract §6)' },
-  { reason: 'missing linkage for output 3', code: 'ERR_LINKAGE', why: 'bare "linkage" substring' },
-  { reason: 'token output 1 must carry exactly 1 satoshi', code: 'ERR_SATOSHIS', why: 'pinned manager 1-sat rule' },
-  { reason: 'admin output 0 must carry exactly 1 satoshi', code: 'ERR_SATOSHIS', why: 'pinned manager 1-sat rule' },
-  { reason: 'input ab.0: already spent by ' + 'cd'.repeat(32), code: 'ERR_INPUT_SPENT', why: 'FIX L guard' },
-  { reason: 'unknown admin kind: wibble', code: 'ERR_SHAPE', why: 'default row' },
-  { reason: '', code: 'ERR_SHAPE', why: 'empty reason still deterministic' },
-  // The repo-local admin-chain refusal contains the word "spent" incidentally
-  // ("…spent by this transaction"). Contract §2 files a bad admin chain under
-  // ERR_SHAPE, so it must be pre-empted ahead of the generic "spent" row.
-  {
-    reason: 'tm_mandala: admin action is not anchored to the asset admin chain ' +
-      '(priorOutpoint must be a previously admitted admin output of this asset, spent by this transaction)',
-    code: 'ERR_SHAPE',
-    why: 'adminChainGuard.ts — pre-empt over "spent"'
-  },
-  { reason: 'tm_mandala: freezeOutput targets an outpoint with no token row: ab.0', code: 'ERR_SHAPE', why: 'adminChainGuard A16' },
-  // ── 409, liftable ─────────────────────────────────────────────────────────
-  { reason: 'control gate rejected the transaction (paused asset or access mode)', code: 'ERR_PAUSED', why: 'pinned manager control gate' },
-  { reason: 'asset is paused', code: 'ERR_PAUSED', why: 'bare "paused"' },
-  { reason: 'input coin is frozen', code: 'ERR_FROZEN', why: 'bare "frozen"' },
-  { reason: 'sanctions provider flagged this identity', code: 'ERR_SANCTIONED', why: 'bare "sanction"' },
-  { reason: 'access mode refused the transfer', code: 'ERR_ACCESS', why: 'bare "access mode"' },
-  { reason: 'identity is not on the allowlist', code: 'ERR_ACCESS', why: 'allowlist' },
-  { reason: 'identity is on the denylist', code: 'ERR_ACCESS', why: 'denylist' },
-  // Contract §2 note: the TS upstream membership string is "sanctioned party
-  // involved in transfer" and maps to ERR_MEMBERSHIP, NOT ERR_SANCTIONED —
-  // so the membership row must be tested before the "sanction" row.
-  { reason: 'sanctioned party involved in transfer', code: 'ERR_MEMBERSHIP', why: 'pinned manager membership gate' },
-  { reason: 'identity not admitted to the registry', code: 'ERR_MEMBERSHIP', why: '"not admitted"' },
-  { reason: 'registry membership required', code: 'ERR_MEMBERSHIP', why: '"membership"' }
-]
-
-describe('classifyManagerReason — shared substring table (contract §2)', () => {
-  for (const c of CASES) {
-    it(`${JSON.stringify(c.reason.slice(0, 56))} → ${c.code} (${c.why})`, () => {
-      expect(classifyManagerReason(c.reason)).toBe(c.code)
-    })
-  }
-
-  it('is case-insensitive', () => {
-    expect(classifyManagerReason('CONSERVATION VIOLATED')).toBe('ERR_CONSERVATION')
-  })
-})
 
 describe('verdictFor — HTTP status / retryable / persistence', () => {
   // The last column is PERSISTENCE, not wire finality: §9.2 makes
@@ -100,9 +50,6 @@ describe('InfraError — §9.5, infra faults are never final', () => {
 
   it('is NOT a persistable code, and 503 is not classifiable from a reason', () => {
     expect(FINAL_CODES.has('ERR_UNAVAILABLE')).toBe(false)
-    // The substring table would happily read a store fault as a final 400 —
-    // which is exactly why the marker travels structurally instead.
-    expect(classifyManagerReason('the admission record store is unavailable: ECONNREFUSED')).toBe('ERR_SHAPE')
   })
 
   it('infra() re-badges any store fault, and passes an InfraError through unchanged', async () => {
@@ -168,6 +115,32 @@ describe('InputSpentError', () => {
   it('carries the competing txid and reads as a spent reason', () => {
     const e = new InputSpentError('ab'.repeat(32) + '.0', 'cd'.repeat(32))
     expect(e.spendTxid).toBe('cd'.repeat(32))
-    expect(classifyManagerReason(e.message)).toBe('ERR_INPUT_SPENT')
+    expect(codeOfManagerError(e)).toBe('ERR_INPUT_SPENT')
+  })
+})
+
+describe('typed manager codes (spec §6.3)', () => {
+  it('reads .code from a MandalaReject', () => {
+    expect(codeOfManagerError(new MandalaReject('ERR_AUTHORITY', 'output 0: deploy signature is missing or invalid'))).toBe('ERR_AUTHORITY')
+    expect(codeOfManagerError(new MandalaReject('ERR_UNTRUSTED', 'x'))).toBe('ERR_UNTRUSTED')
+  })
+  it('accepts a structurally-equal reject from a second package copy', () => {
+    const e = Object.assign(new Error('r'), { name: 'MandalaReject', code: 'ERR_FROZEN', reason: 'r' })
+    expect(codeOfManagerError(e)).toBe('ERR_FROZEN')
+  })
+  it('maps InputSpentError structurally', () => {
+    expect(codeOfManagerError(new InputSpentError('a'.repeat(64) + '.0', 'b'.repeat(64)))).toBe('ERR_INPUT_SPENT')
+  })
+  it('leaves untyped errors and infra errors untyped', () => {
+    expect(codeOfManagerError(new Error('conservation violated'))).toBeUndefined()
+    expect(codeOfManagerError(new TypeError('x is undefined'))).toBeUndefined()
+    expect(codeOfManagerError(new InfraError('store', new Error('down')))).toBeUndefined()
+  })
+  it('shapes the two new codes', () => {
+    expect(verdictFor('ERR_AUTHORITY')).toEqual({ httpStatus: 400, retryable: false })
+    expect(verdictFor('ERR_UNTRUSTED')).toEqual({ httpStatus: 409, retryable: true })
+    expect(FINAL_CODES.has('ERR_AUTHORITY')).toBe(true)
+    expect(FINAL_CODES.has('ERR_UNTRUSTED')).toBe(false)
+    expect(FINAL_CODES.has('ERR_UNAVAILABLE')).toBe(false)
   })
 })

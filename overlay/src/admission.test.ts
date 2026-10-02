@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
+import { MandalaReject } from '@bsv/overlay-topics'
 import { Hash, P2PKH, PrivateKey, Signature, Transaction, UnlockingScript, Utils } from '@bsv/sdk'
 import {
   admissionDigestV2, admissionMessageV2, outputSetString, signAdmissionV2Sync,
@@ -268,13 +269,15 @@ describe('/submit success — STEAK + σ_I, record awaited before the response',
 // ───────────────────────── FIX D — verdict taxonomy ─────────────────────────
 
 describe('/submit refusal — FIX D verdict taxonomy (contract §2)', () => {
-  const cases: Array<{ reason: string, status: number, code: string, retryable: boolean, final: boolean }> = [
-    { reason: 'conservation violated: outputs exceed authorized inputs/issuance', status: 400, code: 'ERR_CONSERVATION', retryable: false, final: true },
-    { reason: 'output 1: MandalaToken-decodable output with no verified linkage', status: 400, code: 'ERR_LINKAGE', retryable: false, final: true },
-    { reason: 'token output 0 must carry exactly 1 satoshi', status: 400, code: 'ERR_SATOSHIS', retryable: false, final: true },
-    { reason: 'something weird happened in the payload', status: 400, code: 'ERR_SHAPE', retryable: false, final: true },
-    { reason: 'control gate rejected the transaction (paused asset or access mode)', status: 409, code: 'ERR_PAUSED', retryable: true, final: false },
-    { reason: 'sanctioned party involved in transfer', status: 409, code: 'ERR_MEMBERSHIP', retryable: true, final: false }
+  const cases: Array<{ reason: string, rejectCode: any, status: number, code: string, retryable: boolean, final: boolean }> = [
+    { reason: 'conservation violated: outputs exceed authorized inputs/issuance', rejectCode: 'ERR_CONSERVATION', status: 400, code: 'ERR_CONSERVATION', retryable: false, final: true },
+    { reason: 'output 1: MandalaToken-decodable output with no verified linkage', rejectCode: 'ERR_LINKAGE', status: 400, code: 'ERR_LINKAGE', retryable: false, final: true },
+    { reason: 'token output 0 must carry exactly 1 satoshi', rejectCode: 'ERR_SATOSHIS', status: 400, code: 'ERR_SATOSHIS', retryable: false, final: true },
+    { reason: 'something weird happened in the payload', rejectCode: 'ERR_SHAPE', status: 400, code: 'ERR_SHAPE', retryable: false, final: true },
+    { reason: 'output 0: deploy signature is missing or invalid', rejectCode: 'ERR_AUTHORITY', status: 400, code: 'ERR_AUTHORITY', retryable: false, final: true },
+    { reason: 'control gate rejected the transaction (paused asset or access mode)', rejectCode: 'ERR_PAUSED', status: 409, code: 'ERR_PAUSED', retryable: true, final: false },
+    { reason: 'output 1: authority owner k is not a trusted issuer', rejectCode: 'ERR_UNTRUSTED', status: 409, code: 'ERR_UNTRUSTED', retryable: true, final: false },
+    { reason: 'sanctioned party involved in transfer', rejectCode: 'ERR_MEMBERSHIP', status: 409, code: 'ERR_MEMBERSHIP', retryable: true, final: false }
   ]
 
   for (const c of cases) {
@@ -283,7 +286,7 @@ describe('/submit refusal — FIX D verdict taxonomy (contract §2)', () => {
       const channel = new SubmitSideChannel()
       const h = harness({ priv, store, channel })
       await h.nexted
-      channel.noteReject(h.txid, new Error(c.reason))
+      channel.noteReject(h.txid, new MandalaReject(c.rejectCode, c.reason))
       // the pinned engine swallows the reject into a 200 with an empty STEAK
       h.res.json({ tm_mandala: { outputsToAdmit: [], coinsToRetain: [] } })
       const { status, body } = await h.sent
@@ -294,6 +297,19 @@ describe('/submit refusal — FIX D verdict taxonomy (contract §2)', () => {
       expect(store.refusals.length).toBe(c.final ? 1 : 0)
     })
   }
+
+  it('an untyped manager throw answers 400 ERR_SHAPE and is NOT persisted', async () => {
+    const store = memStore()
+    const channel = new SubmitSideChannel()
+    const h = harness({ priv, store, channel })
+    await h.nexted
+    channel.noteReject(h.txid, new Error('conservation violated'))
+    h.res.json({ tm_mandala: { outputsToAdmit: [], coinsToRetain: [] } })
+    const { status, body } = await h.sent
+    expect(status).toBe(400)
+    expect(body.code).toBe('ERR_SHAPE')
+    expect(store.refusals).toHaveLength(0)
+  })
 
   // Parity item 3: the record is keyed by txid alone, so persisting a
   // registry-only refusal would refuse a later, valid token submit of the same
@@ -318,7 +334,7 @@ describe('/submit refusal — FIX D verdict taxonomy (contract §2)', () => {
     const h = harness({ priv, store, channel }, 31, { 'x-topics': JSON.stringify(['tm_mandala', 'tm_mandala_registry']) })
     await h.nexted
     channel.noteReject(h.txid, new Error('registry entry is malformed'), 'tm_mandala_registry')
-    channel.noteReject(h.txid, new Error('conservation violated'), 'tm_mandala')
+    channel.noteReject(h.txid, new MandalaReject('ERR_CONSERVATION', 'conservation violated'), 'tm_mandala')
     h.res.json({ tm_mandala: { outputsToAdmit: [], coinsToRetain: [] }, tm_mandala_registry: { outputsToAdmit: [], coinsToRetain: [] } })
     const { body } = await h.sent
     expect(body.code).toBe('ERR_CONSERVATION')
@@ -330,7 +346,7 @@ describe('/submit refusal — FIX D verdict taxonomy (contract §2)', () => {
     const channel = new SubmitSideChannel()
     const h = harness({ priv, store, channel }, 31, { 'x-topics': JSON.stringify(['tm_mandala', 'tm_mandala_registry']) })
     await h.nexted
-    channel.noteReject(h.txid, new Error('conservation violated'), 'tm_mandala')
+    channel.noteReject(h.txid, new MandalaReject('ERR_CONSERVATION', 'conservation violated'), 'tm_mandala')
     channel.noteReject(h.txid, new Error('registry entry is malformed'), 'tm_mandala_registry')
     h.res.json({ tm_mandala: { outputsToAdmit: [], coinsToRetain: [] } })
     expect((await h.sent).body.code).toBe('ERR_CONSERVATION')
@@ -388,7 +404,7 @@ describe('/submit refusal — FIX D verdict taxonomy (contract §2)', () => {
     const channel = new SubmitSideChannel()
     const h = harness({ priv, store, channel })
     await h.nexted
-    channel.noteReject(h.txid, new Error('asset is paused'))
+    channel.noteReject(h.txid, new MandalaReject('ERR_PAUSED', 'asset is paused'))
     h.res.json({ tm_mandala: { outputsToAdmit: [], coinsToRetain: [] } })
     await h.sent
     expect(store.rows[h.txid]).toBeUndefined()
@@ -411,7 +427,7 @@ describe('/submit refusal — FIX D verdict taxonomy (contract §2)', () => {
     const channel = new SubmitSideChannel()
     const h = harness({ priv, store: memStore(), channel })
     await h.nexted
-    channel.noteReject(h.txid, new Error('conservation violated'))
+    channel.noteReject(h.txid, new MandalaReject('ERR_CONSERVATION', 'conservation violated'))
     h.res.json({ status: 'error', message: 'An unknown error occurred' })
     const { status, body } = await h.sent
     expect(status).toBe(400)
@@ -423,7 +439,7 @@ describe('/submit refusal — FIX D verdict taxonomy (contract §2)', () => {
     const channel = new SubmitSideChannel()
     const h = harness({ priv, store, channel })
     await h.nexted
-    channel.noteReject(h.txid, new Error('conservation violated'))
+    channel.noteReject(h.txid, new MandalaReject('ERR_CONSERVATION', 'conservation violated'))
     h.res.json({
       tm_mandala: { outputsToAdmit: [], coinsToRetain: [] },
       tm_mandala_registry: { outputsToAdmit: [0], coinsToRetain: [] }
@@ -687,7 +703,7 @@ describe('payloadHash — a refusal is keyed by (txid, payload), never by txid a
     const channel = new SubmitSideChannel()
     const h = harness({ priv, store, channel })
     await h.nexted
-    channel.noteReject(h.txid, new Error('conservation violated'))
+    channel.noteReject(h.txid, new MandalaReject('ERR_CONSERVATION', 'conservation violated'))
     h.res.json({ tm_mandala: { outputsToAdmit: [], coinsToRetain: [] } })
     await h.sent
     expect(store.refusals[0].refusedPayloadHash).toBe(EMPTY_PAYLOAD_HASH)
@@ -717,7 +733,7 @@ describe('persistence is gated on the REFUSING topic, not the x-topics header', 
     const channel = new SubmitSideChannel()
     const h = harness({ priv, store, channel })
     await h.nexted
-    channel.noteReject(h.txid, new Error('conservation violated'), 'tm_mandala')
+    channel.noteReject(h.txid, new MandalaReject('ERR_CONSERVATION', 'conservation violated'), 'tm_mandala')
     h.res.json({ tm_mandala: { outputsToAdmit: [], coinsToRetain: [] } })
     await h.sent
     expect(store.refusals).toHaveLength(1)
@@ -877,7 +893,7 @@ describe('§9.7 — concurrent submits of one txid each get their own verdict', 
         if (++arrived === 2) release()
         await bothInFlight
         if (payloadHashOfValues(payload) === payloadHashOfValues(REFUSED)) {
-          throw new Error('conservation violated: outputs exceed authorized inputs/issuance')
+          throw new MandalaReject('ERR_CONSERVATION', 'conservation violated: outputs exceed authorized inputs/issuance')
         }
         return { outputsToAdmit: [0], coinsToRetain: [] }
       }

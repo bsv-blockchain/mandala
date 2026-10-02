@@ -4,6 +4,7 @@ import {
   SubmitSideChannel, withVerdictCapture, newSubmitScope, runInSubmitScope, PENDING_WRITE_FAILED,
   type AdmissionPending
 } from './submitSideChannel.js'
+import { MandalaReject } from '@bsv/overlay-topics'
 import { InputSpentError, InfraError, isInfraError } from './submitVerdict.js'
 
 const tx = (): Transaction => {
@@ -19,6 +20,20 @@ describe('SubmitSideChannel', () => {
     ch.noteReject('ab'.repeat(32), new Error('conservation violated'))
     expect(ch.take('ab'.repeat(32))?.reason).toBe('conservation violated')
     expect(ch.take('ab'.repeat(32))).toBeUndefined()
+  })
+
+  it('records the MandalaReject code next to the reason', () => {
+    const ch = new SubmitSideChannel()
+    ch.noteReject('t'.repeat(64), new MandalaReject('ERR_UNTRUSTED', 'output 1: authority owner k is not a trusted issuer'))
+    const o = ch.take('t'.repeat(64))
+    expect(o?.code).toBe('ERR_UNTRUSTED')
+    expect(o?.reason).toBe('output 1: authority owner k is not a trusted issuer')
+  })
+
+  it('leaves code undefined for an untyped throw', () => {
+    const ch = new SubmitSideChannel()
+    ch.noteReject('u'.repeat(64), new Error('boom'))
+    expect(ch.take('u'.repeat(64))?.code).toBeUndefined()
   })
 
   it('keeps the spendTxid off an InputSpentError', () => {
