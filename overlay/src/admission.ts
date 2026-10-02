@@ -36,7 +36,6 @@ import {
 } from './submitVerdict.js'
 import { TOKEN_TOPIC, newSubmitScope, runInSubmitScope } from './submitSideChannel.js'
 import type { AdmissionPending, AdmissionRestore, SubmitSideChannel } from './submitSideChannel.js'
-import type { InFlightOutpoints } from './spentGuard.js'
 
 export const ADMISSION_PREFIX = 'mandala-admit:'
 export { TOKEN_TOPIC }
@@ -79,7 +78,9 @@ export function txidFromSubmitBody (body: number[], includesOffChain: boolean): 
     let beef = body
     if (includesOffChain) {
       const r = new Utils.Reader(beef)
-      const l = r.readVarIntNum()
+      // Canonical CompactSize only, as the upstream route reads it: a frame it
+      // refuses must not decode here, or its final 400 reads as a 503.
+      const l = r.readVarIntNumStrict(false)
       beef = r.read(l)
     }
     return Transaction.fromBEEF(beef).id('hex')
@@ -131,7 +132,7 @@ export const payloadHashOfBody = (body: number[], includesOffChain: boolean): st
   if (!includesOffChain) return EMPTY_PAYLOAD_HASH
   try {
     const r = new Utils.Reader(body)
-    const beefLength = r.readVarIntNum()
+    const beefLength = r.readVarIntNumStrict(false)
     r.read(beefLength)
     return payloadHashOfValues(r.read())
   } catch {
@@ -230,7 +231,8 @@ export interface AdmissionStore {
    * `refusedDescription`, `refusedAt`, `refusedPayloadHash`,
    * `refusedSpendTxid`), so a transaction that is admitted after an earlier
    * payload was refused stops carrying that refusal. §9.4: it also clears
-   * `pending`.
+   * `pending`. `restore` MUST be merged into the stored snapshot
+   * (`mergeRestore`), never replace it.
    */
   putAdmitted: (rec: AdmissionAdmitted) => Promise<void>
   putRefusal: (rec: AdmissionRefusal) => Promise<void>
@@ -239,6 +241,9 @@ export interface AdmissionStore {
    * §9.4 — the provisional record, written before the engine can broadcast.
    * Optional so a store that predates the amendment still type-checks; when it
    * is absent the restore snapshot only becomes durable on the way out.
+   * `restore` MUST be merged into the stored snapshot (`mergeRestore`), never
+   * replace it: a retry after a crash snapshots inputs whose token rows are
+   * already gone.
    */
   putPending?: (rec: AdmissionPending) => Promise<void>
 }
@@ -281,10 +286,6 @@ export interface AppliedProof {
 /** Identical on both engines — the wallet keys its "build a new spend" branch on it. */
 export const EVICTED_DESCRIPTION = (txid: string): string =>
   `transaction ${txid} was admitted and later evicted; its inputs are spendable again`
-
-/** FIX L race backstop (503, retryable) — never the final ERR_INPUT_SPENT. */
-export const SPEND_CONFLICT_DESCRIPTION =
-  'an input of this transaction was marked spent by another transaction while it was being admitted; retry'
 
 export interface FinalVerdict {
   code: VerdictCode
@@ -379,15 +380,13 @@ export interface SubmitWrapDeps {
   store?: AdmissionStore
   applied?: AppliedProof
   channel?: SubmitSideChannel
-  /** §9.7 — released here when the request settles (the leak-guard half). */
-  inFlight?: InFlightOutpoints
 }
 
 /** §9.4 — the finalize write failed, so the client must retry (503). */
 export const FINALIZE_FAILED =
   'the admission was not recorded; the transaction may already be applied — retry to collect its signature'
 
-interface ReqLike { path: string, method: string, body: unknown, headers: Record<string, unknown> }
+interface ReqLike { body: unknown, headers: Record<string, unknown> }
 interface ResLike { json: (b: unknown) => unknown, status?: (code: number) => unknown }
 
 const bytesOf = (raw: unknown): number[] =>
@@ -398,8 +397,25 @@ const bytesOf = (raw: unknown): number[] =>
 const nowIso = (): string => new Date().toISOString()
 
 /**
- * Wraps POST /submit. Installed with `app.use` BEFORE `configureEngine`, so it
- * is on the stack ahead of the route OverlayExpress registers in `start()`.
+ * Collapses a leading run of slashes to one (`//submit` → `/submit`), exactly
+ * as overlay-express 2.7.3's `initialDoubleSlashCompatibility` does. Upstream
+ * installs that inside `start()`, AFTER every route this repo registers, so
+ * without this a `//submit` misses our /submit route, is collapsed later, and
+ * reaches the upstream route with no σ_I and no admission record. index.ts
+ * mounts it first, so it covers our `/admin/*` and `/arc-ingest` routes too.
+ */
+export const normalizeDoubleSlash = (req: { url: string }, _res: unknown, next: () => void): void => {
+  if (req.url.startsWith('//')) req.url = req.url.replace(/^\/{2,}/, '/')
+  next()
+}
+
+/**
+ * Wraps POST /submit. Mounted with `app.post('/submit', …)` BEFORE
+ * `configureEngine`, so it is on the stack ahead of the route OverlayExpress
+ * registers in `start()`, and it matches exactly what that route matches
+ * (Express routing is case-insensitive and non-strict: `/Submit`, `/submit/`).
+ * It does no path check of its own — the route is the gate — and its `next()`
+ * runs overlay-express's edge policy and then the upstream route.
  *
  * `req.body` is read LAZILY, inside the response interceptor: OverlayExpress
  * installs its `bodyParser.raw` at the top of `start()`, i.e. AFTER everything
@@ -416,10 +432,6 @@ const nowIso = (): string => new Date().toISOString()
  */
 export function wrapSubmitJson (deps: SubmitWrapDeps) {
   return (req: ReqLike, res: ResLike, next: () => void): void => {
-    if (req.path !== '/submit' || req.method !== 'POST') {
-      next()
-      return
-    }
     const origJson = res.json.bind(res)
 
     const send = (status: number, body: unknown): void => {
@@ -438,6 +450,14 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
     const scope = newSubmitScope()
 
     res.json = (body: unknown) => {
+      // overlay-express 2.7.3 edge policy answers synchronously from inside
+      // next() (concurrency cap, body limits). ERR_SERVER_BUSY is transient and
+      // must reach the client as the contract's retryable 503, never a 400.
+      const edge = body as { status?: unknown, code?: unknown, description?: unknown } | null
+      if (edge?.status === 'error' && edge.code === 'ERR_SERVER_BUSY') {
+        send(503, errorBody('ERR_UNAVAILABLE', typeof edge.description === 'string' ? edge.description : 'overlay at capacity'))
+        return res
+      }
       void (async () => {
         const txid = txidFromSubmitBody(bytesOf(req.body), includesOffChain())
         try {
@@ -450,16 +470,10 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
             console.warn('[mandala] admission post-processing failed:', e)
             origJson(body)
           }
-        } finally {
-          // §9.7 leak-guard: whatever this request still holds is freed when it
-          // ends. The compare-and-swap frees each outpoint earlier, as it marks
-          // it spent; this covers every path that never reaches one.
-          if (txid != null) deps.inFlight?.releaseAll(txid)
         }
       })()
       return res
     }
-    runInSubmitScope(scope, () => { next() })
 
     /**
      * `refusingTopic` is the topic whose OWN manager produced `reason` — not
@@ -526,11 +540,12 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
       if (txid == null) {
         // Nothing to key on. If the engine also failed, this is framing or
         // payload — a request-level 400 that still carries the full body shape.
+        // The upstream route's catch-all says `message`; the edge policy's
+        // body-limit and invalid-body answers say `description`.
         if (isErrorBody) {
-          const message = (body as { message?: unknown }).message
-          send(400, requestErrorBody(
-            typeof message === 'string' && message !== '' ? message : requestProblem() ?? 'malformed submission'
-          ))
+          const { message, description } = body as { message?: unknown, description?: unknown }
+          const said = [message, description].find((t): t is string => typeof t === 'string' && t !== '')
+          send(400, requestErrorBody(said ?? requestProblem() ?? 'malformed submission'))
           return
         }
         origJson(body)
@@ -576,20 +591,12 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
 
       if (admitted.length > 0) {
         const signed = attachAdmissionSignaturesSync(steak, txid, deps.priv)
-        // FIX L, storage half. A compare-and-swap mark-spent that affected zero
-        // rows means another still-admitted transaction got this coin first.
-        // The engine runs that UPDATE after it has already answered, inside its
-        // own swallowing try/catch, so it can only ever be a RACE BACKSTOP:
-        // 503 (retryable), never a final 400. The authoritative answer is the
-        // manager's own live-token-row guard, which mints 400 ERR_INPUT_SPENT
-        // {spendTxid} on the retry — that is what the client converges on.
-        const spent = outcome?.restore?.spentOutpoints ?? []
-        const conflicted = (): boolean => deps.channel?.hadSpendConflict(spent, scope) === true
-        if (!conflicted()) await persist(txid, signed, admitted, outcome?.restore)
-        if (conflicted()) {
-          send(503, errorBody('ERR_UNAVAILABLE', SPEND_CONFLICT_DESCRIPTION))
-          return
-        }
+        // A spend-mark conflict never reaches here: the engine's own
+        // compare-and-swap mark-spent runs before the STEAK exists and its
+        // failure rejects Engine.submit, which arrives above as an error body
+        // (→ 503 ERR_UNAVAILABLE, retryable). The retry converges on the
+        // spent-input guard's 400 ERR_INPUT_SPENT {spendTxid}.
+        await persist(txid, signed, admitted, outcome?.restore)
         origJson(signed)
         return
       }
@@ -710,6 +717,11 @@ export function wrapSubmitJson (deps: SubmitWrapDeps) {
         console.warn(`[mandala] could not finalize the pending admission record for ${id}:`, e)
       }
     }
+
+    // LAST, after every helper above is initialized: the edge policy can answer
+    // synchronously from inside next(), and that answer runs the res.json
+    // override — which reaches `settle` and everything it calls — at once.
+    runInSubmitScope(scope, () => { next() })
   }
 }
 

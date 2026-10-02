@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -116,6 +118,50 @@ func IsoStamp(t time.Time) string {
 	return t.UTC().Format("2006-01-02T15:04:05.000Z")
 }
 
+// MergeRestoreSnapshot is §9.4's "the restore snapshot only grows" rule — the
+// TS overlay's mergeRestore (overlay/src/submitSideChannel.ts), byte for byte
+// in behaviour: the union of SpentOutpoints, and the union of TokenRows keyed
+// by outpoint (txid case-insensitive) with the first-seen row kept, existing
+// before incoming. A row's content cannot change (an outpoint names one output
+// forever), so first-seen loses nothing.
+//
+// Why it must merge: every attempt of a txid writes a snapshot, and an attempt
+// that died after the engine's OutputSpent deleted an input's token row (a
+// crash, or a mid-commit storage fault the compensation seam does not unwind)
+// leaves every later snapshot of that input without its row. Replacing the
+// stored snapshot with a later one would leave an eviction nothing to put
+// back. Union rather than write-once, so an early empty snapshot is grown.
+func MergeRestoreSnapshot(existing, incoming *RestoreSnapshot) *RestoreSnapshot {
+	if existing == nil && incoming == nil {
+		return nil
+	}
+	out := &RestoreSnapshot{SpentOutpoints: []string{}, TokenRows: []TokenRow{}}
+	seenOutpoints := make(map[string]bool)
+	seenRows := make(map[string]bool)
+	for _, src := range []*RestoreSnapshot{existing, incoming} {
+		if src == nil {
+			continue
+		}
+		for _, op := range src.SpentOutpoints {
+			k := strings.ToLower(op)
+			if seenOutpoints[k] {
+				continue
+			}
+			seenOutpoints[k] = true
+			out.SpentOutpoints = append(out.SpentOutpoints, op)
+		}
+		for _, r := range src.TokenRows {
+			k := fmt.Sprintf("%s.%d", strings.ToLower(r.Txid), r.OutputIndex)
+			if seenRows[k] {
+				continue
+			}
+			seenRows[k] = true
+			out.TokenRows = append(out.TokenRows, r)
+		}
+	}
+	return out
+}
+
 // RecordAdmission persists an admission record for txid, in either of wire
 // contract §9.4's two shapes:
 //
@@ -132,7 +178,8 @@ func IsoStamp(t time.Time) string {
 // Neither shape can overwrite an eviction stamp, and the provisional shape
 // cannot overwrite an existing admission: the conditional filter turns those
 // into a no-op (the unique-txid upsert collision is that signal, not a
-// failure).
+// failure). Neither shape replaces the restore snapshot either: rec.Restore
+// is merged into the stored one (MergeRestoreSnapshot).
 func (s *Store) RecordAdmission(ctx context.Context, rec AdmissionRecord) error {
 	if rec.At == "" {
 		rec.At = IsoStamp(time.Now())
@@ -147,7 +194,20 @@ func (s *Store) RecordAdmission(ctx context.Context, rec AdmissionRecord) error 
 		{Key: "at", Value: rec.At},
 	}
 	if rec.Restore != nil {
-		set = append(set, bson.E{Key: "restore", Value: rec.Restore})
+		// Merged into the stored snapshot, never replacing it
+		// (MergeRestoreSnapshot). A read-then-write is sound: a snapshot that
+		// lacks a row was taken after some attempt's OutputSpent, which ran
+		// after that attempt had already written the full snapshot, so every
+		// degraded writer reads a record that already holds the row.
+		prior, err := s.GetAdmission(ctx, rec.Txid)
+		if err != nil {
+			return err
+		}
+		var stored *RestoreSnapshot
+		if prior != nil {
+			stored = prior.Restore
+		}
+		set = append(set, bson.E{Key: "restore", Value: MergeRestoreSnapshot(stored, rec.Restore)})
 	}
 	update := bson.D{}
 	if rec.Pending {

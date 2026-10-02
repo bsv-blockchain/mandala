@@ -236,7 +236,7 @@ func wiringTestTx(t *testing.T, src *transaction.Transaction, vout uint32, outpu
 // TestBuildArcadeCompensationRoundTrip drives Build's
 // PrepareSubmitCompensation closure against real Mongo: seed the state the
 // engine would have seen pre-submit, snapshot, replay the exact mutations
-// v1.3.2's markSpentAndNotify performs before a failed broadcast, then
+// v1.3.7's markSpentAndNotify performs before a failed broadcast, then
 // compensate and assert everything is restored.
 func TestBuildArcadeCompensationRoundTrip(t *testing.T) {
 	requireMongo(t)
@@ -304,7 +304,7 @@ func TestBuildArcadeCompensationRoundTrip(t *testing.T) {
 		t.Fatalf("restore.spentOutpoints = %v", restore.SpentOutpoints)
 	}
 
-	// Replay what v1.3.2's markSpentAndNotify does before broadcastIfNeeded
+	// Replay what v1.3.7's markSpentAndNotify does before broadcastIfNeeded
 	// fails: MarkUTXOsAsSpent + ls_mandala.OutputSpent (balance debit + row
 	// delete).
 	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *parentID, Index: 0}}, topic, childID); err != nil {
@@ -353,7 +353,7 @@ func TestBuildArcadeCompensationRoundTrip(t *testing.T) {
 // TestBuildArcadeCompensationSkipsAlreadyCommittedTx is the dupe-resubmit
 // case: a tx already folded (applied-transaction record exists, its input
 // already spent by it, and the mandala token row it consumed already gone)
-// gets resubmitted — go-overlay-services v1.3.2 lets a duplicate through its
+// gets resubmitted — go-overlay-services v1.3.7 lets a duplicate through its
 // per-topic dupe gate before re-attempting broadcast, so a broadcast failure
 // on the SECOND attempt must not compensate: doing so would unmark the
 // original successful submit's spent input and try to resurrect a token row

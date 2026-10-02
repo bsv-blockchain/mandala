@@ -203,6 +203,17 @@ func TestReadVarInt(t *testing.T) {
 
 		// Empty input
 		{"empty reader", []byte{}, 0, true},
+
+		// Non-canonical CompactSize: a value written in a wider form than it
+		// needs. TS refuses these (@bsv/sdk readVarIntNumStrict, used by
+		// overlay-express 2.7.3's /submit route and by overlay/src/admission.ts),
+		// so Go must too, or the same bytes get two different verdicts.
+		{"non-canonical: 0xfd holding 0", []byte{0xfd, 0x00, 0x00}, 0, true},
+		{"non-canonical: 0xfd holding 0xfc", []byte{0xfd, 0xfc, 0x00}, 0, true},
+		{"non-canonical: 0xfe holding 0", []byte{0xfe, 0x00, 0x00, 0x00, 0x00}, 0, true},
+		{"non-canonical: 0xfe holding 0xffff", []byte{0xfe, 0xff, 0xff, 0x00, 0x00}, 0, true},
+		{"non-canonical: 0xff holding 0", []byte{0xff, 0, 0, 0, 0, 0, 0, 0, 0}, 0, true},
+		{"non-canonical: 0xff holding 0xffffffff", []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0}, 0, true},
 	}
 
 	for _, tc := range cases {
@@ -221,6 +232,56 @@ func TestReadVarInt(t *testing.T) {
 				if got != tc.want {
 					t.Fatalf("readVarInt(%v) = %d, want %d", tc.input, got, tc.want)
 				}
+			}
+		})
+	}
+}
+
+// A non-canonical length prefix on the off-chain frame is a final 400
+// ERR_SHAPE, as on the TS overlay (overlay/src/admission.test.ts, "off-chain
+// framing is read with the strict CompactSize reader"): the bytes never reach
+// the engine. The first case is the TS test's own shape — a BEEF shorter than
+// 0xfd bytes whose real length is written in the 3-byte 0xfd form.
+func TestSubmit_NonCanonicalFramingIsShape(t *testing.T) {
+	beef := make([]byte, 100)
+	for i := range beef {
+		beef[i] = byte(i % 256)
+	}
+	offChain := []byte(`{"inputs":[],"outputs":[],"admin":[]}`)
+	le16 := func(n int) []byte { b := make([]byte, 2); binary.LittleEndian.PutUint16(b, uint16(n)); return b }
+	le32 := func(n int) []byte { b := make([]byte, 4); binary.LittleEndian.PutUint32(b, uint32(n)); return b }
+	le64 := func(n int) []byte { b := make([]byte, 8); binary.LittleEndian.PutUint64(b, uint64(n)); return b }
+	cases := []struct {
+		name   string
+		prefix []byte
+	}{
+		{"real BEEF length in the 0xfd form", append([]byte{0xfd}, le16(len(beef))...)},
+		{"real BEEF length in the 0xfe form", append([]byte{0xfe}, le32(len(beef))...)},
+		{"real BEEF length in the 0xff form", append([]byte{0xff}, le64(len(beef))...)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var wire bytes.Buffer
+			wire.Write(tc.prefix)
+			wire.Write(beef)
+			wire.Write(offChain)
+
+			stub := &stubSubmitter{steak: overlay.Steak{}}
+			app := newServer(stub, nil, nil, nil)
+			req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(wire.Bytes()))
+			req.Header.Set("X-Topics", `["tm_mandala"]`)
+			req.Header.Set("x-includes-off-chain-values", "true")
+
+			resp := doRequest(t, app, req)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body: %s)", resp.StatusCode, readRawBody(t, resp))
+			}
+			body := decodeJSON(t, resp)
+			if body["code"] != CodeShape || body["retryable"] != false {
+				t.Fatalf("body = %v, want ERR_SHAPE, not retryable", body)
+			}
+			if stub.gotCtx != nil {
+				t.Fatal("a non-canonical frame must not reach Engine.Submit")
 			}
 		})
 	}

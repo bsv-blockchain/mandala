@@ -75,7 +75,7 @@ App treats `identityKey === VITE_OVERLAY_IDENTITY_KEY` as issuer. Overlay admin 
 | Piece | How | URL |
 | --- | --- | --- |
 | Mongo | Existing Docker `local-mongo-1` replica set. **Do not stop it.** | `127.0.0.1:27017` |
-| Overlay | **Native Node**, not Compose. Rebuilt from `overlay/dist` + restarted ~23:44 local (2026-09-15, wire contract v2 build; supersedes an earlier ~22:35 restart same day). | `http://localhost:8080` (`HOSTING_URL=https://deggen.ngrok.app`) |
+| Overlay | **Native Node 24** (`engines: >=24 <25`), not Compose. Rebuilt from `overlay/dist` + restarted ~23:44 local (2026-09-15, wire contract v2 build; supersedes an earlier ~22:35 restart same day). | `http://localhost:8080` (`HOSTING_URL=https://deggen.ngrok.app`) |
 | overlay-go | Not running this session. Compose service in `overlay/docker-compose.yml`, published on host `:8081`. | `http://localhost:8081` |
 | Vite app | `app/` | `http://127.0.0.1:5173/` (`VITE_OVERLAY_URL=https://deggen.ngrok.app`) |
 | ngrok | User runs it | `https://deggen.ngrok.app` → `http://localhost:8080` |
@@ -89,7 +89,11 @@ Start:
 ```bash
 docker start local-mongo-1   # if exited
 
-# overlay
+# overlay — overlay/.env sets ARCADE_URL, so the boot REFUSES to start unless
+# ARCADE_CALLBACK_TOKEN is 32–16384 UTF-8 bytes (no leading/trailing whitespace —
+# a trailing newline from a secret store fails it) and HOSTING_URL is an https
+# ORIGIN (no path/query/credentials; https://deggen.ngrok.app qualifies).
+# Generate a token once, e.g. `openssl rand -hex 32`, and keep it in overlay/.env.
 cd overlay
 MONGO_URL=mongodb://127.0.0.1:27017/mandala \
 SQLITE_FILE=/tmp/mandala-overlay.sqlite \
@@ -110,9 +114,13 @@ Logs used this session:
 
 Health: `GET http://127.0.0.1:8080/health` (not `/api/v1/info`). Topics: `tm_mandala` + `tm_mandala_registry`.
 
-Advertiser warning `https://https://deggen.ngrok.app` (double scheme) disables SHIP/SLAP; not blocking.
+SQLite overlay DB: `/tmp/mandala-overlay.sqlite`.
 
-SQLite overlay DB: `/tmp/mandala-overlay.sqlite`. Earlier `@bsv/overlay` migrations needed `INSERT OR IGNORE` instead of `INSERT IGNORE` (patched in the installed package).
+First boot on `@bsv/overlay` 2.6.2 with an existing sqlite: **do not wipe by default.** The 2026-09-20 spent-by migration only adds a NULL `spentBy` column, which the spent-input guard reads through its legacy (`consumedBy`) path. The topical-uniqueness migration (`2026-09-17-001-topical-uniqueness.js`) aborts only when duplicate `(txid, outputIndex, topic)` or `(txid, topic)` rows already exist.
+
+Only if the boot fails with `Cannot enforce outputs uniqueness while duplicate … rows exist`, reset the TS overlay's state **as one unit**: the sqlite (`overlay-data` / `/tmp/mandala-overlay.sqlite`) AND its Mongo lookup db `${NODE_NAME}_lookup_services` (`mandala_lookup_services`: `mandalaAdmissions`, token rows, balances, asset states, admin history, linkage, fee rates). Under compose overlay-go shares that db, so stop overlay-go and reset it too. Or start the TS overlay on a fresh `NODE_NAME` / Mongo db instead. Never wipe the sqlite alone. The engine would forget every output the lookup still reports. A spend of a pre-wipe coin would then reach the manager with empty `previousCoins` and be refused `ERR_CONSERVATION`, a FINAL verdict persisted in `mandalaAdmissions` that overlay-go honours too. σI records would also keep vouching for transactions the engine no longer knows, which offline-settlement COVER relies on. This overlay runs on mainnet, so this is the real upgrade path.
+
+npm 12 and later skip dependency install scripts unless `package.json` `allowScripts` covers them. `overlay/package.json` approves exactly one, `"allowScripts": {"sqlite3@5.1.7": true}`, so a plain `npm ci` builds the `sqlite3` native binding on npm 12.0.1; check with `node -e "require('sqlite3')"`. The entry names the version, so after a `sqlite3` bump re-approve with `npm approve-scripts sqlite3`, run `npm rebuild sqlite3 --foreground-scripts`, and re-run the check. Without the approval the rebuild obeys the same policy and builds nothing (on npm 12.0.1 it printed success anyway), and `--allow-scripts` is refused in a project-scoped install (`EALLOWSCRIPTS`). The `node:24-bookworm` Docker image ships npm 11, which runs install scripts regardless.
 
 After `lib/` changes: `cd lib && npm test && npm run build` (app imports `@bsv/mandala` from `lib/dist`). Hard-reload the Vite app.
 
@@ -182,7 +190,7 @@ Codes come only from a genuine topic-manager reject reason, matched by a shared 
 
 **Reject-not-skip** — an un-linked MandalaToken-decodable output rejects the whole submission (was silently skipped before): `"output <idx>: MandalaToken-decodable output with no verified linkage"`, identical on both stacks (TS `overlay/src/tokenLinkageGuard.ts` wrapper around the pinned manager; Go native in `topic_manager.go`). Phantom-coin regression tests exist on both (`overlay/src/tokenLinkageGuard.test.ts` / `wrapperStack.test.ts`; `overlay-go/internal/mandala/topic_manager_test.go`).
 
-**Eviction restore (FIX E) + conflicting spend (FIX L):** eviction now restores inputs from the admission record's snapshot before deleting the evicted outputs (TS `overlay/src/eviction.ts`; Go `wiring/engine.go`'s `evictTx`). Since 2026-09-22 eviction also purges the tx's `mandalaAdminHistory` rows and rebuilds each touched asset state  — before that, an evicted admin action stayed the asset-auth head (2026-09-21 incident). Since 2026-09-23 the rebuild runs BEFORE the delete (assets touched → rebuild each from history excluding the txid → delete rows; TS `assetsTouchedBy`/`rebuildAssetStateExcluding`/`purgeAdminHistory`, Go `FindAssetsTouchedByTxid`/`RebuildStateExcluding`/`DeleteAdminHistoryByTxid`), so a 503 retry after a failed rebuild still finds the rows and converges. Two residual windows, both closed by a retry: an incremental admit for the same asset landing between the rebuild's read and its state write is overwritten (its row stays, so the next rebuild restores it); and a rebuild that succeeds but whose delete fails leaves the rolled-back state live while `PickAssetAuthHead` still names the evicted tx until the callback is re-delivered. The purge runs on repeat callbacks too, so re-POSTing a terminal status to `/arc-ingest` (header `x-callback-token`; the edge strips `Authorization` on mandala-test) is the repair for heads stuck behind an older eviction. `/arc-ingest` is not mounted at all when `ARCADE_CALLBACK_TOKEN` is empty, on both stacks (logs an error and skips mounting; server still starts). A conflicting spend is refused `ERR_INPUT_SPENT{spendTxid}` (compare-and-swap mark-spent, naming the competing still-admitted tx); a storage CAS conflict itself is `ERR_UNAVAILABLE` (503, retryable), never surfaced as a policy refusal.
+**Eviction restore (FIX E) + conflicting spend (FIX L):** eviction now restores inputs from the admission record's snapshot before deleting the evicted outputs (TS `overlay/src/eviction.ts`; Go `wiring/engine.go`'s `evictTx`). Since 2026-09-22 eviction also purges the tx's `mandalaAdminHistory` rows and rebuilds each touched asset state  — before that, an evicted admin action stayed the asset-auth head (2026-09-21 incident). Since 2026-09-23 the rebuild runs BEFORE the delete (assets touched → rebuild each from history excluding the txid → delete rows; TS `assetsTouchedBy`/`rebuildAssetStateExcluding`/`purgeAdminHistory`, Go `FindAssetsTouchedByTxid`/`RebuildStateExcluding`/`DeleteAdminHistoryByTxid`), so a 503 retry after a failed rebuild still finds the rows and converges. Two residual windows, both closed by a retry: an incremental admit for the same asset landing between the rebuild's read and its state write is overwritten (its row stays, so the next rebuild restores it); and a rebuild that succeeds but whose delete fails leaves the rolled-back state live while `PickAssetAuthHead` still names the evicted tx until the callback is re-delivered. The purge runs on repeat callbacks too, so re-POSTing a terminal status to `/arc-ingest` (header `x-callback-token`; the edge strips `Authorization` on mandala-test) is the repair for heads stuck behind an older eviction. Without a callback token the two stacks differ (wire contract §11.6). TS refuses to boot when `ARCADE_URL` is set and `ARCADE_CALLBACK_TOKEN` is missing or not 32–16384 bytes, and it also requires an https-origin `HOSTING_URL`. Go logs an error, skips mounting `/arc-ingest` and still starts, so its route answers 404. A conflicting spend is refused `ERR_INPUT_SPENT{spendTxid}` (compare-and-swap mark-spent, naming the competing still-admitted tx); a storage CAS conflict itself is `ERR_UNAVAILABLE` (503, retryable), never surfaced as a policy refusal.
 
 **Admission record** — new Mongo collection `mandalaAdmissions` on both stacks (`overlay/src/index.ts`'s `admissionsCol`; Go `overlay-go/internal/mandala/admissions.go`'s `AdmissionsCollection`), carrying the restore snapshot plus `refusedCode`/`refusedDescription`/`refusedSpendTxid`/`evictedAt`. Written synchronously **before** the `/submit` response is sent, so a client that got a 200 is guaranteed the very next `GET /admin/admission/:txid` succeeds.
 
@@ -250,7 +258,7 @@ Settlement-contract tests (wire contract v2): `cd overlay && npm test -- src/sub
 
 - `overlay/.env`: `HOSTING_URL=https://deggen.ngrok.app`, `SERVER_PRIVATE_KEY` copied from **`overlay-go/.env`** (so overlay signs as `0215643b…`).
 - `app/.env`: `VITE_OVERLAY_URL=https://deggen.ngrok.app`, `VITE_OVERLAY_IDENTITY_KEY=0215643bc656ca42007faa32e94f70050f64a566ffd9e3a2ebc098389936dea57e`.
-- `ADMIN_API_TOKEN`, `ADMIN_CORS_ORIGINS`, `ARCADE_CALLBACK_TOKEN` (documented in both `overlay/.env.example` and `overlay-go/.env.example`) are **unset** in this session's running overlay — confirmed from the ~23:44 restart log: `/admin/registry`, `/admin/activity` and `/admin/admission/:txid` are unauthenticated, and `/arc-ingest` is not mounted. Fine for local dev; set before any public demo.
+- `ADMIN_API_TOKEN` and `ADMIN_CORS_ORIGINS` (documented in both `overlay/.env.example` and `overlay-go/.env.example`) are **unset** in the local overlay, so `/admin/registry`, `/admin/activity` and `/admin/admission/:txid` are unauthenticated. That is fine for local dev; set them before any public demo. `ARCADE_CALLBACK_TOKEN` is **required** now: `overlay/.env` sets `ARCADE_URL`, and since the P0 re-base (overlay-express 2.7.3) the TS overlay refuses to boot with Arcade unless the token is 32–16384 bytes with no trailing newline, and `HOSTING_URL` is an https origin (the ngrok URL qualifies). The ~23:44 2026-09-15 restart log, which showed the token unset and `/arc-ingest` unmounted, predates that and no longer describes a bootable configuration.
 - Cancelled earlier: do not try to set admin from pubkey `02210a518b6accdc…` alone.
 
 Network is **main**. Overlay-first, then broadcast (Arcade).
@@ -288,6 +296,8 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 Then bump the tags in the flux manifests. `ADMIN_API_TOKEN` is deliberately unset (would have to be baked into the public bundle).
+
+Go bump reaches flux only via a new `v*` tag (user-pushed): a dependency or toolchain bump in `overlay-go/` (go-overlay-services v1.3.7, go-sdk v1.7.1, `golang:1.26`) changes nothing deployed until the user pushes a new `v*` tag, the workflow publishes the image, and the flux manifest is bumped to that tag.
 
 ## Token-fee P0 deploy check
 

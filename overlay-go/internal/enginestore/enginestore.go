@@ -1,6 +1,6 @@
 // Package enginestore is the in-repo Mongo implementation of
-// go-overlay-services v1.3.2's engine.Storage (Task 12, amended: the
-// b-open-io/overlay storage does not implement the v1.3.2 interface at any
+// go-overlay-services v1.3.7's engine.Storage (Task 12, amended: the
+// b-open-io/overlay storage does not implement the v1.3.7 interface at any
 // published tag, so the spec fallback governs and we own the storage layer).
 //
 // Design (brief-pinned): outputs live in `engineOutputs` (unique index
@@ -32,7 +32,7 @@ import (
 // compensation/eviction methods below — UnmarkSpentBySpendTxid,
 // FindOutputsByTxid, DeleteOutputsByTxid, DeleteAppliedTransactionsByTxid —
 // which are deliberately NOT part of go-overlay-services' engine.Storage:
-// they exist to undo/evict what the pinned v1.3.2 engine cannot.
+// they exist to undo/evict what the pinned v1.3.7 engine cannot.
 type Store struct {
 	outputs      *mongo.Collection
 	applied      *mongo.Collection
@@ -516,6 +516,31 @@ func (s *Store) SpendStateOf(ctx context.Context, topic, txid string, vout uint3
 	return doc.SpendTxid, nil
 }
 
+// IsUnspent reports whether an output document for (topic, txid.vout) exists
+// and is unspent. It is the eviction restore's liveness test (wire contract
+// §9.12 / the TS overlay's knexEvictionCoins.isUnspent): a token row is handed
+// back only for a coin that is live again. Unlike SpendStateOf, a missing
+// document is NOT live — restoring a row for it would mint a phantom. Not part
+// of engine.Storage.
+func (s *Store) IsUnspent(ctx context.Context, topic, txid string, vout uint32) (bool, error) {
+	var doc outputDoc
+	err := s.outputs.FindOne(ctx,
+		bson.D{
+			{Key: "topic", Value: topic},
+			{Key: "txid", Value: txid},
+			{Key: "outputIndex", Value: vout},
+		},
+		options.FindOne().SetProjection(bson.D{{Key: "spent", Value: 1}}),
+	).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !doc.Spent, nil
+}
+
 // AdmittedOutputIndexes lists, ascending, the output indexes this topic
 // admitted for txid — spent ones included, because admission is history, not
 // current liquidity. It is FIX C's fallback source of outputsToAdmit when the
@@ -548,8 +573,9 @@ func (s *Store) AdmittedOutputIndexes(ctx context.Context, topic, txid string) (
 // UnmarkSpentBySpendTxid reverses MarkUTXOsAsSpent for every output document
 // whose spendTxid matches: spent flips back to false and spendTxid is
 // cleared, across all topics. It is NOT part of engine.Storage — it exists
-// because go-overlay-services v1.3.2's Submit marks inputs spent BEFORE
-// broadcasting and never unwinds on broadcast failure; the HTTP layer calls
+// because go-overlay-services v1.3.7's Submit marks inputs spent BEFORE
+// broadcasting and never unwinds on broadcast failure (ErrorOnBroadcastFailure
+// is still unread); the HTTP layer calls
 // this (via wiring's compensation closure) to restore the engine-side spend
 // state. Returns the number of documents modified (0 when nothing matched —
 // re-running the compensation is a harmless no-op).

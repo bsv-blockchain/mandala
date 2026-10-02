@@ -255,3 +255,87 @@ func TestMarkEvictedStampsOnceAndSurvivesOnARecordlessTxid(t *testing.T) {
 		t.Fatalf("eviction of a recordless txid: %+v %v", rec, err)
 	}
 }
+
+// §9.4 / FIX E — the restore snapshot only GROWS (the TS overlay's
+// mergeRestore, overlay/src/submitSideChannel.ts). A retry after an attempt
+// that died between OutputSpent (which deleted the input's token row) and the
+// commit re-snapshots that input with no row; replacing the stored snapshot
+// with it left an eviction nothing to put back.
+func TestRecordAdmissionMergesTheRestoreSnapshot(t *testing.T) {
+	ctx := context.Background()
+	s := mustStore(t, testDB(t))
+	full := sampleAdmission().Restore
+	degraded := &RestoreSnapshot{SpentOutpoints: []string{"aa.0"}, TokenRows: []TokenRow{}}
+
+	// Attempt 1's provisional row, then the retry's provisional row, then the
+	// retry's finalize — the last two carry the degraded snapshot.
+	if err := s.RecordAdmission(ctx, AdmissionRecord{Txid: recTxid, Topics: []string{"tm_mandala"}, Pending: true, Restore: full}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordAdmission(ctx, AdmissionRecord{Txid: recTxid, Topics: []string{"tm_mandala"}, Pending: true, Restore: degraded}); err != nil {
+		t.Fatal(err)
+	}
+	final := sampleAdmission()
+	final.Restore = degraded
+	if err := s.RecordAdmission(ctx, final); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetAdmission(ctx, recTxid)
+	if err != nil || got == nil || got.Restore == nil {
+		t.Fatalf("record: %+v %v", got, err)
+	}
+	if len(got.Restore.TokenRows) != 1 || got.Restore.TokenRows[0].Txid != "aa" || got.Restore.TokenRows[0].Amount != 100 {
+		t.Fatalf("the first snapshot's token row was lost: %+v", got.Restore.TokenRows)
+	}
+	if len(got.Restore.SpentOutpoints) != 1 || got.Restore.SpentOutpoints[0] != "aa.0" {
+		t.Fatalf("spentOutpoints = %v, want [aa.0]", got.Restore.SpentOutpoints)
+	}
+	if !got.Admitted() {
+		t.Fatalf("the finalize must still land: %+v", got)
+	}
+}
+
+// Union, not write-once: an early empty snapshot is grown by a later one, and
+// a write with no snapshot at all leaves the stored one alone.
+func TestRecordAdmissionGrowsAnEarlyEmptySnapshot(t *testing.T) {
+	ctx := context.Background()
+	s := mustStore(t, testDB(t))
+	empty := &RestoreSnapshot{SpentOutpoints: []string{}, TokenRows: []TokenRow{}}
+	if err := s.RecordAdmission(ctx, AdmissionRecord{Txid: recTxid, Topics: []string{"tm_mandala"}, Pending: true, Restore: empty}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordAdmission(ctx, AdmissionRecord{Txid: recTxid, Topics: []string{"tm_mandala"}, Pending: true, Restore: sampleAdmission().Restore}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordAdmission(ctx, AdmissionRecord{Txid: recTxid, Topics: []string{"tm_mandala"}, Pending: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetAdmission(ctx, recTxid)
+	if got == nil || got.Restore == nil || len(got.Restore.TokenRows) != 1 || len(got.Restore.SpentOutpoints) != 1 {
+		t.Fatalf("restore = %+v, want the later snapshot", got)
+	}
+}
+
+func TestMergeRestoreSnapshot(t *testing.T) {
+	row := func(txid string, vout uint32, amt int64) TokenRow {
+		return TokenRow{Txid: txid, OutputIndex: vout, AssetID: "a.0", Amount: amt, IdentityKey: "02k"}
+	}
+	first := &RestoreSnapshot{SpentOutpoints: []string{"AA.0", "bb.1"}, TokenRows: []TokenRow{row("aa", 0, 5)}}
+	later := &RestoreSnapshot{SpentOutpoints: []string{"aa.0", "cc.2", "cc.2"}, TokenRows: []TokenRow{row("AA", 0, 999), row("cc", 2, 7), row("cc", 2, 7)}}
+	got := MergeRestoreSnapshot(first, later)
+	if len(got.SpentOutpoints) != 3 || got.SpentOutpoints[0] != "AA.0" || got.SpentOutpoints[1] != "bb.1" || got.SpentOutpoints[2] != "cc.2" {
+		t.Fatalf("spentOutpoints = %v", got.SpentOutpoints)
+	}
+	if len(got.TokenRows) != 2 || got.TokenRows[0].Amount != 5 || got.TokenRows[1].Txid != "cc" {
+		t.Fatalf("tokenRows = %+v, want first-seen aa.0 then cc.2", got.TokenRows)
+	}
+	if MergeRestoreSnapshot(nil, nil) != nil {
+		t.Fatal("nil + nil must stay nil")
+	}
+	if m := MergeRestoreSnapshot(nil, first); m == nil || len(m.TokenRows) != 1 || m.SpentOutpoints == nil {
+		t.Fatalf("nil + snapshot = %+v", m)
+	}
+	if m := MergeRestoreSnapshot(&RestoreSnapshot{}, &RestoreSnapshot{}); m.SpentOutpoints == nil || m.TokenRows == nil {
+		t.Fatalf("an empty merge must marshal as arrays, not null: %+v", m)
+	}
+}

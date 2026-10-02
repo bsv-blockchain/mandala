@@ -1,23 +1,11 @@
-FROM node:20.18-bullseye
+FROM node:24-bookworm
 WORKDIR /app
-COPY package.json ./
-RUN npm install
-# Patch @bsv/overlay migration that uses MySQL-only syntax so it works with SQLite.
-# The migration moves data from outputs→transactions; on a fresh DB (no prior rows) both
-# INSERT IGNORE and INSERT OR IGNORE are equivalent — the table is always empty at this point.
-RUN node -e "\
-const fs = require('fs'); \
-const files = [ \
-  'node_modules/@bsv/overlay/dist/cjs/src/storage/knex/migrations/2024-07-17-001-transactions.js', \
-  'node_modules/@bsv/overlay/dist/esm/src/storage/knex/migrations/2024-07-17-001-transactions.js' \
-]; \
-files.forEach(f => { \
-  let c = fs.readFileSync(f, 'utf8'); \
-  c = c.replace(/INSERT IGNORE INTO/g, 'INSERT OR IGNORE INTO'); \
-  fs.writeFileSync(f, c); \
-}); \
-console.log('migration patched'); \
-"
+# Lockfile + npm ci: a lockfile-less `npm install` floats ^1.6.0 overlay-topics
+# to the newest 1.x, not the 1.6.0 the tests pin.
+COPY package.json package-lock.json ./
+RUN npm ci
+# No SQLite migration patch: @bsv/overlay >= 2.6 emits ON CONFLICT DO NOTHING
+# off MySQL in 2024-07-17-001-transactions.
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build

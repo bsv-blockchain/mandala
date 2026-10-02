@@ -375,7 +375,7 @@ func unverifiedLinkageErr(idx uint32) error {
 // same return value. FIX D's whole allowlist discipline rests on that
 // distinction: only a *RejectError may be minted into one of the 400/409
 // wire codes; everything else is ERR_UNAVAILABLE (503, retryable). The
-// pinned go-overlay-services v1.3.2 engine returns a manager's error
+// pinned go-overlay-services v1.3.7 engine returns a manager's error
 // verbatim (identifyAdmissibleOutputsPerTopic's bare `return err`), so
 // errors.As reaches this from httpapi without any string archaeology.
 type RejectError struct {

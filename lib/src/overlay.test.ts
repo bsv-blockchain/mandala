@@ -192,6 +192,36 @@ describe('overlayErrorFromResponse — one row per §2 status', () => {
     expect(overlayErrorFromResponse(400, body('ERR_FUTURE', false)).retryable).toBe(false)
   })
 
+  it('never treats a transient edge status as final: ERR_SERVER_BUSY and any 503/429 are retryable', () => {
+    // The overlay's edge answers 503 ERR_SERVER_BUSY when it is saturated. A body
+    // that claims retryable:false must not turn that into a final verdict.
+    const busy = overlayErrorFromResponse(503, body('ERR_SERVER_BUSY', false))
+    expect(busy).toBeInstanceOf(OverlayRefusedError)
+    expect(busy.code).toBe('ERR_SERVER_BUSY')
+    expect(busy.retryable).toBe(true)
+    expect(busy.httpStatus).toBe(503)
+    // Rate limiting (a code the lib does not know) is keyed off the status.
+    const rate = overlayErrorFromResponse(429, body('ERR_RATE', false))
+    expect(rate.code).toBe('ERR_RATE')
+    expect(rate.retryable).toBe(true)
+    // …and so is any other 503, whatever code it carries.
+    expect(overlayErrorFromResponse(503, body('ERR_SOMETHING_NEW', false)).retryable).toBe(true)
+  })
+
+  it('does not widen the permanent verdicts: a 400 ERR_CONSERVATION stays final', () => {
+    const err = overlayErrorFromResponse(400, body('ERR_CONSERVATION', false))
+    expect(err.code).toBe('ERR_CONSERVATION')
+    expect(err.retryable).toBe(false)
+    expect(overlayErrorFromResponse(400, body('ERR_RATE', false)).retryable).toBe(false)
+  })
+
+  it('a refusal built directly from a 503/429 is retryable even if the code is a known permanent one', () => {
+    expect(new OverlayRefusedError({ code: 'ERR_CONSERVATION', httpStatus: 503 }).retryable).toBe(true)
+    expect(new OverlayRefusedError({ code: 'ERR_SHAPE', httpStatus: 429 }).retryable).toBe(true)
+    expect(new OverlayRefusedError({ code: 'ERR_SERVER_BUSY' }).retryable).toBe(true)
+    expect(new OverlayRefusedError({ code: 'ERR_CONSERVATION', httpStatus: 400 }).retryable).toBe(false)
+  })
+
   it('treats a non-JSON, empty or unstructured body as ERR_UNAVAILABLE/retryable', () => {
     for (const raw of ['<html>502 Bad Gateway</html>', '', null, undefined, '{"nope":1}']) {
       const err = overlayErrorFromResponse(502, raw)
@@ -231,6 +261,26 @@ describe('createOverlayFacilitator', () => {
     })
     await expect(createOverlayFacilitator(fetchImpl).send(OVERLAY, { beef: [1], topics: ['tm_mandala'] }))
       .rejects.toMatchObject({ code: 'ERR_FROZEN', retryable: true, httpStatus: 409 })
+  })
+
+  it('surfaces a 503 ERR_SERVER_BUSY edge refusal as retryable, never as a verdict', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      text: async () => JSON.stringify({ status: 'error', code: 'ERR_SERVER_BUSY', retryable: false, description: 'busy' })
+    })
+    await expect(createOverlayFacilitator(fetchImpl).send(OVERLAY, { beef: [1], topics: ['tm_mandala'] }))
+      .rejects.toMatchObject({ code: 'ERR_SERVER_BUSY', retryable: true, httpStatus: 503 })
+  })
+
+  it('surfaces a 429 as retryable, never as a verdict', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 429,
+      text: async () => JSON.stringify({ status: 'error', code: 'ERR_RATE', retryable: false })
+    })
+    await expect(createOverlayFacilitator(fetchImpl).send(OVERLAY, { beef: [1], topics: ['tm_mandala'] }))
+      .rejects.toMatchObject({ code: 'ERR_RATE', retryable: true, httpStatus: 429 })
   })
 
   it('reports a network fault as ERR_UNAVAILABLE, never as a verdict', async () => {

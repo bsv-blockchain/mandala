@@ -50,6 +50,7 @@ Per-flow payload shapes:
 - 200 with empty/missing `outputsToAdmit` for `tm_mandala` → app throws `'overlay rejected the transaction'`.
 - Either failure ⇒ `submitAndBroadcast` calls `wallet.abortAction({reference})` to release inputs (`overlay.ts:61-72`); success ⇒ journaled, then broadcast via `wallet.createAction({ options: { sendWith:[txid] } })` in the background (`overlay.ts:26-31,79-87`). **So a rejection MUST be either non-2xx or an empty-admit STEAK; a rewrite must never return 200 + non-empty admit for a tx it didn't fold in.**
 - TS reference server behavior: rejects with `400 {"status":"error","message":...}` (`OverlayExpress.ts:1494-1500`); reads topics from lowercase `x-topics` header, throws if missing (`OverlayExpress.ts:1465-1470`).
+  - *Note (2026-10-01, BRC-162 P0):* the line numbers above are from the pre-2.7.3 overlay-express of the original port. On overlay-express 2.7.3 the route's catch-all masks every non-public error message as `"Request could not be processed"`, and `x-topics` also accepts a comma-separated list. Mandala's `/submit` wrapper rewrites that answer into the wire contract v2 taxonomy (`{status, code, retryable, description, spendTxid?}`), and manager verdicts reach it through the side channel, not the message. So the masking changes only `description` text (an infrastructure 503 may now read "Request could not be processed"), never codes (wire contract v2.3 §11.5).
 
 ---
 

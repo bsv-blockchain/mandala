@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 
 	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
@@ -78,9 +79,11 @@ type App struct {
 	ArcadeEnabled       bool
 	ArcadeCallbackToken string
 
-	// PrepareSubmitCompensation compensates for the pinned v1.3.2 engine's
+	// PrepareSubmitCompensation compensates for the pinned v1.3.7 engine's
 	// submit ordering (inputs marked spent + mandala projections destroyed
-	// BEFORE broadcast; a failed broadcast aborts without unwinding). The
+	// BEFORE broadcast; a failed broadcast aborts without unwinding — still
+	// present in v1.3.7: Submit marks spends before broadcast;
+	// ErrorOnBroadcastFailure unread). The
 	// submit handler calls it with the raw BEEF before Engine.Submit; the
 	// returned closure — run only on a broadcast-classified Submit error —
 	// unmarks the engine-side spends (UnmarkSpentBySpendTxid) and restores
@@ -360,7 +363,7 @@ func prepareSubmitCompensation(store *mandala.Store, es *enginestore.Store) func
 		spendTxid := txid.String()
 		return func(ctx context.Context) error {
 			// A duplicate resubmit of an already-committed tx can reach this
-			// closure too: go-overlay-services v1.3.2's per-topic dupe gate
+			// closure too: go-overlay-services v1.3.7's per-topic dupe gate
 			// lets a resubmit past validation, and a broadcast failure on
 			// THAT attempt is classified the same as a genuine one. But a
 			// genuine broadcast failure can never have an applied-transaction
@@ -385,7 +388,8 @@ func prepareSubmitCompensation(store *mandala.Store, es *enginestore.Store) func
 			if _, err := es.UnmarkSpentBySpendTxid(ctx, spendTxid); err != nil {
 				return fmt.Errorf("wiring: unmark spends of %s: %w", spendTxid, err)
 			}
-			if err := store.RestoreTokens(ctx, snapshot); err != nil {
+			// Same never-clobber rule as eviction: only coins live again.
+			if _, err := restoreLiveTokenRows(ctx, es, store, restore); err != nil {
 				return fmt.Errorf("wiring: restore token rows spent by %s: %w", spendTxid, err)
 			}
 			return nil
@@ -467,8 +471,10 @@ func (f spendCheckerFunc) SpentBy(ctx context.Context, txid string, vout uint32)
 // provably unspent on chain. The order is deliberate:
 //
 //  1. restore the inputs (unmark the engine-side spends, re-insert the
-//     snapshotted mandala token rows and re-credit balances) — do this FIRST,
-//     so a crash anywhere later leaves coins live rather than stranded;
+//     snapshotted mandala token rows of the coins that are live again and
+//     re-credit balances; a coin another live tx has spent since keeps no
+//     row, and a repeat callback restores nothing) — do this FIRST, so a
+//     crash anywhere later leaves coins live rather than stranded;
 //  2. stamp evictedAt, which makes ERR_EVICTED permanent for these bytes and
 //     simultaneously tells the FIX L spend guard that the restored coins are
 //     live again;
@@ -494,17 +500,31 @@ func evictTx(es *enginestore.Store, ls *mandala.LookupService, store *mandala.St
 		// has succeeded. Any failure below returns before the stamp, so the
 		// callback answers 503, Arcade retries, and the transaction is never
 		// left marked evicted with its inputs still gone.
-		unmarked, err := es.UnmarkSpentBySpendTxid(ctx, txid)
-		if err != nil {
-			return out, fmt.Errorf("wiring: unmark spends of %s: %w", txid, err)
-		}
-		out.RestoredOutpoints = int(unmarked)
-		if rec != nil && rec.Restore != nil {
-			if err := store.RestoreTokens(ctx, rec.Restore.TokenRows); err != nil {
+		//
+		// A repeat callback (already stamped) restores nothing, as on TS: the
+		// first one already handed the inputs back, and a coin may have been
+		// legitimately re-spent since — re-inserting its row then would mint
+		// a phantom row and credit the holder twice.
+		switch {
+		case out.AlreadyEvicted:
+			// nothing to restore; the stamp and the deletions below are idempotent
+		case rec != nil && rec.Restore != nil:
+			unmarked, err := es.UnmarkSpentBySpendTxid(ctx, txid)
+			if err != nil {
+				return out, fmt.Errorf("wiring: unmark spends of %s: %w", txid, err)
+			}
+			out.RestoredOutpoints = int(unmarked)
+			restored, err := restoreLiveTokenRows(ctx, es, store, rec.Restore)
+			if err != nil {
 				return out, fmt.Errorf("wiring: restore token rows spent by %s: %w", txid, err)
 			}
-			out.RestoredTokenRows = len(rec.Restore.TokenRows)
-		} else {
+			out.RestoredTokenRows = restored
+		default:
+			unmarked, err := es.UnmarkSpentBySpendTxid(ctx, txid)
+			if err != nil {
+				return out, fmt.Errorf("wiring: unmark spends of %s: %w", txid, err)
+			}
+			out.RestoredOutpoints = int(unmarked)
 			log.Printf("wiring: evicting %s with no restore snapshot on record — engine-side spends unmarked, token rows cannot be replayed", txid)
 		}
 		if err := store.MarkEvicted(ctx, txid); err != nil {
@@ -543,6 +563,68 @@ func evictTx(es *enginestore.Store, ls *mandala.LookupService, store *mandala.St
 		}
 		return out, nil
 	}
+}
+
+// restoreLiveTokenRows hands back the snapshot's token rows whose coin is
+// live again — unmarked by the caller just now, or already unspent because an
+// earlier, partly failed attempt unmarked it — and returns how many it handed
+// to RestoreTokens. It is the TS overlay's evictWithRestore rule
+// (overlay/src/eviction.ts): a coin another live transaction has spent since,
+// or one the engine holds no output for, is in neither set, so it keeps no
+// row. The count is of rows restored-or-already-present (RestoreTokens is an
+// idempotent upsert), which is what TS reports as restoredTokenRows.
+//
+// The liveness read fails CLOSED (wire contract §9.5): an error is returned
+// rather than read as "not live", so the callback answers 503 and is retried.
+// The narrow in-call race — another spend landing between the unmark and this
+// read — is the same one TS has.
+func restoreLiveTokenRows(ctx context.Context, es *enginestore.Store, store *mandala.Store, snap *mandala.RestoreSnapshot) (int, error) {
+	if snap == nil {
+		return 0, nil
+	}
+	live := make(map[string]bool, len(snap.SpentOutpoints))
+	for _, op := range snap.SpentOutpoints {
+		txid, vout, ok := parseOutpoint(op)
+		if !ok {
+			// Bad data in the snapshot, not a failed restore: it names no coin.
+			continue
+		}
+		unspent, err := es.IsUnspent(ctx, tokenTopic, txid, vout)
+		if err != nil {
+			return 0, fmt.Errorf("spend state of %s: %w", op, err)
+		}
+		if unspent {
+			live[fmt.Sprintf("%s.%d", txid, vout)] = true
+		}
+	}
+	rows := make([]mandala.TokenRow, 0, len(snap.TokenRows))
+	for _, r := range snap.TokenRows {
+		if live[fmt.Sprintf("%s.%d", strings.ToLower(r.Txid), r.OutputIndex)] {
+			rows = append(rows, r)
+		}
+	}
+	if err := store.RestoreTokens(ctx, rows); err != nil {
+		return 0, err
+	}
+	return len(rows), nil
+}
+
+// parseOutpoint splits a "<64-hex txid>.<vout>" snapshot outpoint, lowercasing
+// the txid; anything else is not an outpoint.
+func parseOutpoint(s string) (string, uint32, bool) {
+	dot := strings.LastIndexByte(s, '.')
+	if dot != 64 {
+		return "", 0, false
+	}
+	txid := strings.ToLower(s[:dot])
+	if _, err := chainhash.NewHashFromHex(txid); err != nil {
+		return "", 0, false
+	}
+	n, err := strconv.ParseUint(s[dot+1:], 10, 32)
+	if err != nil {
+		return "", 0, false
+	}
+	return txid, uint32(n), true
 }
 
 type evictHistoryDeps struct {
