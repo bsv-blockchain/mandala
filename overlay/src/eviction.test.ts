@@ -1,15 +1,18 @@
-import { afterEach, describe, it, expect } from 'vitest'
+import { afterEach, describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import {
-  isTerminalArcStatus, evictWithRestore, arcIngestHandler, mountArcIngest, knexEvictionCoins,
+  isTerminalArcStatus, evictWithRestore, arcIngestHandler, mountArcIngest, knexEvictionCoins, journalRestoreInput,
   type EvictionDeps
 } from './eviction.js'
 import type { AdmissionRecord, AdmissionStore } from './admission.js'
 import { isInfraError } from './submitVerdict.js'
+import { MaintenanceBusyError } from './maintenanceGate.js'
 import { createHarness, HARNESS_TOPIC, type Harness } from './testkit/engineHarness.js'
 
 const TXID = 'ab'.repeat(32)
 const IN0 = 'cc'.repeat(32)
+
+const TOKEN_A = 'a'.repeat(64) + '_0'
 
 const record = (over: Partial<AdmissionRecord> = {}): AdmissionRecord => ({
   txid: TXID,
@@ -18,10 +21,7 @@ const record = (over: Partial<AdmissionRecord> = {}): AdmissionRecord => ({
   admissionSignature: 's',
   admissionIdentityKey: 'k',
   at: '2026-09-14T00:00:00.000Z',
-  restore: {
-    spentOutpoints: [`${IN0}.0`, `${IN0}.1`],
-    tokenRows: [{ txid: IN0, outputIndex: 0, assetId: 'a.0', amount: 100, identityKey: '02ab' }]
-  },
+  restore: { spentOutpoints: [`${IN0}.0`, `${IN0}.1`] },
   ...over
 })
 
@@ -29,8 +29,7 @@ const deps = (rec: AdmissionRecord | null, over: Partial<EvictionDeps> = {}) => 
   const unmarked: string[] = []
   const restored: string[] = []
   const evicted: string[] = []
-  const purged: string[] = []
-  const rebuilt: string[] = []
+  const refolded: string[] = []
   const rows: Record<string, AdmissionRecord> = rec != null ? { [rec.txid]: rec } : {}
   const order: string[] = []
   const store: AdmissionStore = {
@@ -44,15 +43,13 @@ const deps = (rec: AdmissionRecord | null, over: Partial<EvictionDeps> = {}) => 
     // One engine row per outpoint, held by the evicted tx: each unmark affects it.
     unmarkSpent: async (txid, vout) => { order.push('unmark'); unmarked.push(`${txid}.${vout}`); return 1 },
     isUnspent: async () => { order.push('isUnspent'); return false },
-    restoreTokenRow: async (row) => { order.push('restore'); restored.push(`${row.txid}.${row.outputIndex}`) },
+    restoreInput: vi.fn(async (txid: string, vout: number) => { order.push('restore'); restored.push(`${txid}.${vout}`); return true }),
     evict: async (txid, reason) => { order.push('evict'); evicted.push(`${txid}|${reason ?? ''}`); return { evictedOutputs: 1 } },
-    assetsTouchedBy: async () => { order.push('assets'); return ['a.0', 'b.0'] },
-    rebuildAssetStateExcluding: async (assetId, txid) => { order.push(`rebuild(${assetId})`); rebuilt.push(`${assetId}|${txid}`) },
-    purgeAdminHistory: async (txid) => { order.push('purge'); purged.push(txid) },
+    purgeAndRefold: vi.fn(async (txid: string) => { order.push('refold'); refolded.push(txid); return [TOKEN_A] }),
     now: () => '2026-09-14T09:00:00.000Z',
     ...over
   }
-  return { d, unmarked, restored, evicted, purged, rebuilt, rows, order }
+  return { d, unmarked, restored, evicted, refolded, rows, order }
 }
 
 describe('isTerminalArcStatus', () => {
@@ -78,16 +75,17 @@ describe('isTerminalArcStatus', () => {
 })
 
 describe('evictWithRestore — FIX E (contract §5)', () => {
-  it('unmarks spent inputs, restores token rows, stamps evictedAt, THEN evicts', async () => {
+  it('unmarks spent inputs, restores through the journal, stamps evictedAt, THEN evicts and refolds', async () => {
     const h = deps(record())
     const report = await evictWithRestore(TXID, 'REJECTED', h.d)
     expect(h.unmarked).toEqual([`${IN0}.0`, `${IN0}.1`])
-    expect(h.restored).toEqual([`${IN0}.0`])
+    expect(h.restored).toEqual([`${IN0}.0`, `${IN0}.1`])
     expect(h.rows[TXID].evictedAt).toBe('2026-09-14T09:00:00.000Z')
     expect(h.evicted).toEqual([`${TXID}|REJECTED`])
-    expect(h.order).toEqual(['unmark', 'unmark', 'restore', 'markEvicted', 'evict', 'assets', 'rebuild(a.0)', 'rebuild(b.0)', 'purge'])
+    expect(h.order).toEqual(['unmark', 'unmark', 'restore', 'restore', 'markEvicted', 'evict', 'refold'])
+    expect(h.refolded).toEqual([TXID])
     expect(report.restoredOutpoints).toBe(2)
-    expect(report.restoredTokenRows).toBe(1)
+    expect(report.restoredTokenRows).toBe(2)
   })
 
   it('still evicts (and still stamps evictedAt) when there is no record to restore from', async () => {
@@ -108,75 +106,108 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
     expect(h.evicted).toEqual([`${TXID}|REJECTED`]) // deletion is safe to repeat
   })
 
-  // 2026-09-21 incident: the evicted tx's admin-history rows stayed behind, so
-  // the asset-auth head kept naming a never-mined tx and the asset state kept
-  // its folded action. Eviction purges the rows and rebuilds every touched
-  // asset's state, AFTER the engine eviction (same phase as the output delete).
-  it('purges the evicted tx\'s admin-history rows and rebuilds each touched asset state', async () => {
+  it('restores every live input through the journal (value and authority alike), never a coin still spent elsewhere', async () => {
+    const live = `${'1'.repeat(64)}.0`, auth = `${'2'.repeat(64)}.1`, taken = `${'3'.repeat(64)}.0`
+    const h = deps(record({ restore: { spentOutpoints: [live, auth, taken] } }), {
+      unmarkSpent: async (t: string) => (t === '3'.repeat(64) ? 0 : 1),
+      isUnspent: async () => false
+    })
+    const rep = await evictWithRestore(TXID, 'REJECTED', h.d)
+    expect(h.d.restoreInput).toHaveBeenCalledWith('1'.repeat(64), 0)
+    expect(h.d.restoreInput).toHaveBeenCalledWith('2'.repeat(64), 1)
+    expect(h.d.restoreInput).not.toHaveBeenCalledWith('3'.repeat(64), 0)
+    expect(rep.restoredTokenRows).toBe(2)
+  })
+
+  it('counts only journal restores that inserted a row', async () => {
+    const h = deps(record(), { restoreInput: vi.fn(async (_t: string, vout: number) => vout === 0) })
+    const rep = await evictWithRestore(TXID, 'REJECTED', h.d)
+    expect(h.d.restoreInput).toHaveBeenCalledTimes(2)
+    expect(rep.restoredOutpoints).toBe(2)
+    expect(rep.restoredTokenRows).toBe(1)
+  })
+
+  it('a restoreInput failure stamps nothing and answers InfraError', async () => {
+    const h = deps(record(), { restoreInput: vi.fn(async () => { throw new Error('mongo down') }) })
+    const err = await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e)
+    expect(isInfraError(err)).toBe(true)
+    expect(h.order).not.toContain('markEvicted')
+    expect(h.rows[TXID].evictedAt).toBeUndefined()
+    expect(h.evicted).toEqual([])
+    expect(h.refolded).toEqual([])
+  })
+
+  // A repeat callback must repair a head stuck behind an older eviction, so the
+  // refold is NOT gated on alreadyEvicted.
+  it('purgeAndRefold runs after evict, even when alreadyEvicted', async () => {
     const h = deps(record())
     await evictWithRestore(TXID, 'REJECTED', h.d)
-    expect(h.purged).toEqual([TXID])
-    expect(h.rebuilt).toEqual([`a.0|${TXID}`, `b.0|${TXID}`])
-    expect(h.order).toEqual(['unmark', 'unmark', 'restore', 'markEvicted', 'evict', 'assets', 'rebuild(a.0)', 'rebuild(b.0)', 'purge'])
+    expect(h.order.slice(-2)).toEqual(['evict', 'refold'])
+    const again = deps(record({ evictedAt: '2026-09-13T00:00:00.000Z' }))
+    const rep = await evictWithRestore(TXID, 'REJECTED', again.d)
+    expect(rep.alreadyEvicted).toBe(true)
+    expect(again.order).toEqual(['markEvicted', 'evict', 'refold'])
+    expect(again.refolded).toEqual([TXID])
   })
 
-  it('purges admin history on a repeat callback too — production heads were stuck behind a pre-fix eviction', async () => {
-    const h = deps(record({ evictedAt: '2026-09-13T00:00:00.000Z' }))
-    await evictWithRestore(TXID, 'REJECTED', h.d)
-    expect(h.purged).toEqual([TXID])
-    expect(h.rebuilt).toEqual([`a.0|${TXID}`, `b.0|${TXID}`])
-  })
-
-  it('a failed history purge is retryable (InfraError) — it runs only after every rebuild succeeded', async () => {
-    const h = deps(record(), { purgeAdminHistory: async () => { throw new Error('mongo down') } })
-    const err = await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e)
-    expect(isInfraError(err)).toBe(true)
-    expect(h.rebuilt).toEqual([`a.0|${TXID}`, `b.0|${TXID}`])
-  })
-
-  it('a failed asset lookup is an InfraError and rebuilds/purges nothing', async () => {
-    const h = deps(record(), { assetsTouchedBy: async () => { throw new Error('mongo down') } })
-    const err = await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e)
-    expect(isInfraError(err)).toBe(true)
-    expect(h.rebuilt).toEqual([])
-    expect(h.purged).toEqual([])
-  })
-
-  // Rebuild-first: the rows are the only record of which assets need a
-  // rebuild, so deleting them before the rebuild succeeds strands the asset.
-  it('a failed rebuild leaves purge uncalled and raises an InfraError', async () => {
-    const h = deps(record(), {
-      rebuildAssetStateExcluding: async (assetId) => { if (assetId === 'b.0') throw new Error('mongo down') }
-    })
+  it('a purgeAndRefold failure is a retryable InfraError', async () => {
+    const h = deps(record(), { purgeAndRefold: vi.fn(async () => { throw new Error('mongo down') }) })
     const err = await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e)
     expect(isInfraError(err)).toBe(true)
     expect((err as Error).message).toMatch(/retry/)
-    expect(h.purged).toEqual([])
-    expect(h.order).not.toContain('purge')
+    expect(h.evicted).toEqual([`${TXID}|REJECTED`])
   })
 
-  it('a repeat callback after a failed rebuild runs the full sequence again (rows still present) and converges', async () => {
-    const rowsLeft = new Set([TXID])
-    let fail = true
-    const rebuilt: string[] = []
-    const order: string[] = []
-    const h = deps(record(), {
-      assetsTouchedBy: async (txid) => { order.push('assets'); return rowsLeft.has(txid) ? ['a.0', 'b.0'] : [] },
-      rebuildAssetStateExcluding: async (assetId) => {
-        order.push(`rebuild(${assetId})`)
-        if (fail && assetId === 'b.0') throw new Error('mongo down')
-        rebuilt.push(assetId)
-      },
-      purgeAdminHistory: async (txid) => { order.push('purge'); rowsLeft.delete(txid) }
-    })
-    expect(isInfraError(await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e))).toBe(true)
-    expect(rowsLeft.has(TXID)).toBe(true)
-    fail = false
-    order.length = 0
-    await evictWithRestore(TXID, 'REJECTED', h.d)
-    expect(order).toEqual(['assets', 'rebuild(a.0)', 'rebuild(b.0)', 'purge'])
-    expect(rebuilt).toEqual(['a.0', 'a.0', 'b.0'])
-    expect(rowsLeft.has(TXID)).toBe(false)
+  it('runs the whole eviction inside quiesce when provided', async () => {
+    const h = deps(record())
+    const seen: string[] = []
+    let quiesceCalls = 0
+    const quiesce = async <T>(fn: () => Promise<T>): Promise<T> => {
+      quiesceCalls++
+      seen.push('enter')
+      const out = await fn()
+      seen.push('exit')
+      return out
+    }
+    const wrap = (name: string, f: (...a: any[]) => Promise<any>) => async (...a: any[]) => { seen.push(name); return await f(...a) }
+    const d: EvictionDeps = {
+      ...h.d, quiesce,
+      restoreInput: wrap('restore', h.d.restoreInput),
+      evict: wrap('evict', h.d.evict),
+      purgeAndRefold: wrap('refold', h.d.purgeAndRefold)
+    }
+    await evictWithRestore(TXID, 'REJECTED', d)
+    expect(quiesceCalls).toBe(1)
+    expect(seen).toEqual(['enter', 'restore', 'restore', 'evict', 'refold', 'exit'])
+  })
+
+  it('a quiesce that rejects with MaintenanceBusyError becomes a retryable InfraError and runs nothing', async () => {
+    const h = deps(record())
+    const quiesce = async <T>(_fn: () => Promise<T>): Promise<T> => { throw new MaintenanceBusyError(1) }
+    const err = await evictWithRestore(TXID, 'REJECTED', { ...h.d, quiesce }).catch((e: unknown) => e)
+    expect(isInfraError(err)).toBe(true)
+    expect(h.unmarked).toEqual([])
+    expect(h.restored).toEqual([])
+    expect(h.evicted).toEqual([])
+    expect(h.refolded).toEqual([])
+    expect(h.rows[TXID].evictedAt).toBeUndefined()
+  })
+
+  it('a non-busy failure inside quiesce keeps its own type', async () => {
+    const h = deps(record(), { purgeAndRefold: vi.fn(async () => { throw new Error('x') }) })
+    const quiesce = async <T>(fn: () => Promise<T>): Promise<T> => await fn()
+    const err = await evictWithRestore(TXID, 'REJECTED', { ...h.d, quiesce }).catch((e: unknown) => e)
+    expect(isInfraError(err)).toBe(true)
+  })
+
+  it('journalRestoreInput restores the journaled owner; a non-token input is a no-op', async () => {
+    const j = { txid: '1'.repeat(64), outputIndex: 0, topic: 'tm_mandala', tokenId: 'a'.repeat(64) + '_0', role: 'authority', amount: 0, identityKey: '02' + 'ab'.repeat(32), createdAt: new Date() }
+    const restore = vi.fn(async () => true)
+    const f = journalRestoreInput(async (t, v) => (t === j.txid && v === 0 ? j as any : null), restore, 'tm_mandala')
+    expect(await f(j.txid, 0)).toBe(true)
+    expect(restore).toHaveBeenCalledWith(j)
+    expect(await f('9'.repeat(64), 0)).toBe(false)
+    expect(restore).toHaveBeenCalledTimes(1)
   })
 
   // §9.8 — this USED to log and carry on, stamping evictedAt anyway. That
@@ -193,14 +224,6 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
     // It aborts on the FIRST failure: the second outpoint is never attempted.
     expect(h.unmarked).toEqual([])
     expect(h.restored).toEqual([])
-  })
-
-  it('a failed token-row restore also stamps nothing', async () => {
-    const h = deps(record(), { restoreTokenRow: async () => { throw new Error('mongo down') } })
-    const err = await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e)
-    expect(isInfraError(err)).toBe(true)
-    expect(h.rows[TXID].evictedAt).toBeUndefined()
-    expect(h.evicted).toEqual([])
   })
 
   it('an unreadable admission record fails closed rather than evicting blind', async () => {
@@ -222,17 +245,16 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
   it('ignores a malformed outpoint in the snapshot', async () => {
     // Bad data in the snapshot carries no coin to restore, so it is not a failed
     // restore and must not block the eviction.
-    const h = deps(record({ restore: { spentOutpoints: ['nonsense', `${IN0}.0`], tokenRows: [] } }))
+    const h = deps(record({ restore: { spentOutpoints: ['nonsense', `${IN0}.0`] } }))
     await evictWithRestore(TXID, 'REJECTED', h.d)
     expect(h.unmarked).toEqual([`${IN0}.0`])
     expect(h.rows[TXID].evictedAt).toBeTypeOf('string')
   })
 
   // /arc-ingest runs outside Engine.submit's lock. Between a failed attempt and
-  // Arcade's retry, another tx can spend the coin (the engine's CAS sets
-  // spentBy to it and the lookup deletes the token row). Unmarking it again, or
-  // re-inserting its row, would resurrect a coin that is live-spent.
-  it('never clobbers a live spend — a coin now spent by another tx is not unmarked and gets no token row', async () => {
+  // Arcade's retry, another tx can spend the coin. Unmarking it again, or
+  // restoring its row, would resurrect a coin that is live-spent.
+  it('never clobbers a live spend — a coin now spent by another tx is not unmarked and gets no owner row', async () => {
     const calls: string[] = []
     const h = deps(record(), {
       unmarkSpent: async (txid, vout, evictedTxid) => { calls.push(`${txid}.${vout}|${evictedTxid}`); return 0 },
@@ -248,17 +270,9 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
     expect(report.restoredTokenRows).toBe(0)
   })
 
-  it('restores only the token rows of coins it could hand back', async () => {
+  it('restores only the owner rows of coins it could hand back', async () => {
     const IN1 = 'dd'.repeat(32)
-    const h = deps(record({
-      restore: {
-        spentOutpoints: [`${IN0}.0`, `${IN1}.0`],
-        tokenRows: [
-          { txid: IN0, outputIndex: 0, assetId: 'a.0', amount: 100, identityKey: '02ab' },
-          { txid: IN1, outputIndex: 0, assetId: 'a.0', amount: 50, identityKey: '02ab' }
-        ]
-      }
-    }), {
+    const h = deps(record({ restore: { spentOutpoints: [`${IN0}.0`, `${IN1}.0`] } }), {
       // IN0.0 is now spent by someone else; IN1.0 was still held by the evicted tx.
       unmarkSpent: async (txid) => txid === IN1 ? 1 : 0,
       isUnspent: async () => false
@@ -269,31 +283,32 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
     expect(report.restoredTokenRows).toBe(1)
   })
 
-  it('a retry after a partial failure still restores the token row of a coin the first attempt unmarked', async () => {
+  it('a retry after a partial failure still restores the owner row of a coin the first attempt unmarked', async () => {
     const spent = new Set([`${IN0}.0`, `${IN0}.1`])
     const restored: string[] = []
     let failRestore = true
     const h = deps(record(), {
       unmarkSpent: async (txid, vout) => spent.delete(`${txid}.${vout}`) ? 1 : 0,
       isUnspent: async (txid, vout) => !spent.has(`${txid}.${vout}`),
-      restoreTokenRow: async (row) => {
+      restoreInput: vi.fn(async (txid: string, vout: number) => {
         if (failRestore) throw new Error('mongo down')
-        restored.push(`${row.txid}.${row.outputIndex}`)
-      }
+        restored.push(`${txid}.${vout}`)
+        return true
+      })
     })
-    // Attempt 1: both coins unmarked, then the token-row restore fails → 503, nothing stamped.
+    // Attempt 1: both coins unmarked, then the restore fails → 503, nothing stamped.
     expect(isInfraError(await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e))).toBe(true)
     expect(spent.size).toBe(0)
     expect(h.rows[TXID].evictedAt).toBeUndefined()
-    // Attempt 2: the unmarks affect nothing (already unspent), yet the coin is
-    // live, so its token row is restored and the eviction completes.
+    // Attempt 2: the unmarks affect nothing (already unspent), yet the coins are
+    // live, so their rows are restored and the eviction completes.
     failRestore = false
     const report = await evictWithRestore(TXID, 'REJECTED', h.d)
-    expect(restored).toEqual([`${IN0}.0`])
+    expect(restored).toEqual([`${IN0}.0`, `${IN0}.1`])
     expect(h.rows[TXID].evictedAt).toBe('2026-09-14T09:00:00.000Z')
     expect(h.evicted).toEqual([`${TXID}|REJECTED`])
     expect(report.restoredOutpoints).toBe(0)
-    expect(report.restoredTokenRows).toBe(1)
+    expect(report.restoredTokenRows).toBe(2)
   })
 
   // §9.5 — an unreadable spend state is "we do not know", not "not restorable".
@@ -550,7 +565,7 @@ describe('arcIngestHandler', () => {
         txStatus: 'DOUBLE_SPEND_ATTEMPTED',
         reason: 'DOUBLE_SPEND_ATTEMPTED competing tx seen',
         restoredOutpoints: 2,
-        restoredTokenRows: 1,
+        restoredTokenRows: 2,
         alreadyEvicted: false
       }
     })
@@ -671,16 +686,14 @@ describe('knexEvictionCoins on the real engine schema', () => {
     let failRestore = true
     const hd = deps(record({
       txid: A,
-      restore: {
-        spentOutpoints: [`${root}.0`],
-        tokenRows: [{ txid: root, outputIndex: 0, assetId: 'a.0', amount: 100, identityKey: '02ab' }]
-      }
+      restore: { spentOutpoints: [`${root}.0`] }
     }), {
       ...knexEvictionCoins(h.knex, HARNESS_TOPIC),
-      restoreTokenRow: async (row) => {
+      restoreInput: vi.fn(async (txid: string, vout: number) => {
         if (failRestore) throw new Error('mongo down')
-        restored.push(`${row.txid}.${row.outputIndex}`)
-      },
+        restored.push(`${txid}.${vout}`)
+        return true
+      }),
       evict: async (txid, reason) => await h.engine.evictAppliedTransaction(txid, { reason })
     })
 

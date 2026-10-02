@@ -204,7 +204,7 @@ describe('/submit success — STEAK + σ_I, record awaited before the response',
     const store = memStore()
     const channel = new SubmitSideChannel()
     const h = harness({ priv, store, channel })
-    channel.noteRestore(h.txid, { spentOutpoints: ['aa'.repeat(32) + '.0'], tokenRows: [] })
+    channel.noteRestore(h.txid, { spentOutpoints: ['aa'.repeat(32) + '.0'] })
     await h.nexted
     h.res.json({ tm_mandala: { outputsToAdmit: [0], coinsToRetain: [0] } })
     await h.sent
@@ -789,7 +789,7 @@ describe('§9.4 — the dupe path finalizes a record left pending by a crash', (
         topics: ['tm_mandala'],
         at: '2026-09-15T00:00:00.000Z',
         pending: true,
-        restore: { spentOutpoints: ['aa'.repeat(32) + '.0'], tokenRows: [] }
+        restore: { spentOutpoints: ['aa'.repeat(32) + '.0'] }
       }
     })
     const h = harness({ priv, store, applied: applied({ applied: [h0.txid], outputs: { [h0.txid]: [0] } }) })

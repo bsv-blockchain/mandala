@@ -12,7 +12,7 @@
  * collapsed 200. No `Engine.js` patch and no ts-stack PR are required.
  *
  * The same wrapper takes the FIX E restore snapshot on the way in: the
- * pre-spend token rows and the outpoints this transaction is about to consume,
+ * outpoints this transaction is about to consume,
  * captured before the engine mutates anything. The pre-Submit compensation path
  * already captures this data in a closure; persisting it on the admission
  * record is what makes it still available at eviction time, long after that
@@ -27,43 +27,25 @@ import { Transaction } from '@bsv/sdk'
 import type { TopicManager } from '@bsv/overlay'
 import { InputSpentError, FinalVerdictError, InfraError, isInfraError, codeOfManagerError, type VerdictCode } from './submitVerdict.js'
 
-/** Pre-spend snapshot of one token row, as persisted on the admission record. */
-export interface AdmissionTokenRow {
-  txid: string
-  outputIndex: number
-  assetId: string
-  amount: number
-  identityKey: string
-  createdAt?: string
-}
-
 export interface AdmissionRestore {
   /**
    * `txid.vout` of every input of this transaction (as overlay-go records it).
    * Eviction hands a coin back only while this transaction still holds it, so
-   * an input it never marked spent is inert here.
+   * an input it never marked spent is inert here. Owners are not snapshotted:
+   * the package's owner journal (never purged) supplies them at eviction.
    */
   spentOutpoints: string[]
-  /** The token rows as they stood BEFORE the spend. */
-  tokenRows: AdmissionTokenRow[]
 }
-
-const outpointKey = (txid: string, outputIndex: number): string => `${String(txid).toLowerCase()}.${outputIndex}`
 
 /**
  * §9.4 / FIX E — the restore snapshot on the admission record only ever GROWS.
  *
  * Every attempt of a txid writes a snapshot before the engine runs, and the
- * admitting attempt writes one again on the way out. An attempt that died after
- * the engine marked an input spent has already let the lookup delete that
- * input's token row, so every LATER snapshot of the same input finds no row:
- * the crash-window self-heal takes three attempts, and the last two would each
- * have replaced the one snapshot that still held the row. Merging instead —
- * the union of `spentOutpoints`, and the union of `tokenRows` keyed by outpoint
- * with the first-seen row kept — keeps it. A row's content cannot change (an
- * outpoint names one output forever), so first-seen loses nothing. Merging
- * rather than "write once" also keeps refused-then-admitted right: an early
- * empty snapshot is grown, not frozen in.
+ * admitting attempt writes one again on the way out. Merging (the union of
+ * `spentOutpoints`, first-seen order kept) instead of replacing keeps an input
+ * an earlier attempt named, and keeps refused-then-admitted right: an early
+ * empty snapshot is grown, not frozen in. A legacy stored `tokenRows` is
+ * dropped (clean break).
  */
 export const mergeRestore = (
   existing: AdmissionRestore | null | undefined,
@@ -71,70 +53,26 @@ export const mergeRestore = (
 ): AdmissionRestore | undefined => {
   if (existing == null && incoming == null) return undefined
   const spentOutpoints: string[] = []
-  const seenOutpoints = new Set<string>()
-  const tokenRows: AdmissionTokenRow[] = []
-  const seenRows = new Set<string>()
+  const seen = new Set<string>()
   for (const source of [existing, incoming]) {
     if (source == null) continue
     for (const outpoint of Array.isArray(source.spentOutpoints) ? source.spentOutpoints : []) {
       const key = String(outpoint).toLowerCase()
-      if (seenOutpoints.has(key)) continue
-      seenOutpoints.add(key)
+      if (seen.has(key)) continue
+      seen.add(key)
       spentOutpoints.push(outpoint)
     }
-    for (const row of Array.isArray(source.tokenRows) ? source.tokenRows : []) {
-      if (row == null) continue
-      const key = outpointKey(row.txid, row.outputIndex)
-      if (seenRows.has(key)) continue
-      seenRows.add(key)
-      tokenRows.push(row)
-    }
   }
-  return { spentOutpoints, tokenRows }
+  return { spentOutpoints }
 }
 
-/** The fields of a lookup token row the snapshot keeps (MandalaTokenRecord). */
-export interface TokenRowLike {
-  txid: string
-  outputIndex: number
-  assetId: string
-  amount: number
-  identityKey: string
-  createdAt?: Date | string | null
-}
-
-/**
- * The production `snapshotRestore`: every input of the transaction and the
- * token row each one still has, read before the engine can touch them.
- *
- * Every input, not `previousCoins`: since @bsv/overlay 2.6 the engine omits a
- * spent coin from previousCoins, so on the crash-window heal rounds the very
- * input whose spend is being recovered would be missing from the snapshot. The
- * spent-input guard inspects every input for the same reason, and overlay-go's
- * snapshot has always named every input.
- */
-export const snapshotRestoreFrom = (
-  getTokenRow: (txid: string, outputIndex: number) => Promise<TokenRowLike | null | undefined>
-) => async (tx: Transaction, _previousCoins?: number[]): Promise<AdmissionRestore> => {
-  const spentOutpoints: string[] = []
-  const tokenRows: AdmissionTokenRow[] = []
-  for (const inp of tx.inputs) {
+/** Every input of the transaction (overlay-go names every input too); owners come from the journal at eviction. */
+export const snapshotRestore = (tx: Transaction): AdmissionRestore => ({
+  spentOutpoints: tx.inputs.flatMap(inp => {
     const srcTxid = inp.sourceTXID ?? inp.sourceTransaction?.id('hex') ?? ''
-    if (srcTxid === '') continue
-    spentOutpoints.push(`${srcTxid}.${inp.sourceOutputIndex}`)
-    const row = await getTokenRow(srcTxid, inp.sourceOutputIndex)
-    if (row == null) continue
-    tokenRows.push({
-      txid: row.txid,
-      outputIndex: row.outputIndex,
-      assetId: row.assetId,
-      amount: row.amount,
-      identityKey: row.identityKey,
-      createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : String(row.createdAt ?? '')
-    })
-  }
-  return { spentOutpoints, tokenRows }
-}
+    return srcTxid === '' ? [] : [`${srcTxid}.${inp.sourceOutputIndex}`]
+  })
+})
 
 export interface ManagerOutcome {
   /** The topic manager's own reject reason, verbatim. */
@@ -308,7 +246,7 @@ export interface VerdictCaptureDeps {
    * never refuse a submission. `putPending` then writes no snapshot, and the
    * store's merge keeps whatever an earlier attempt recorded.
    */
-  snapshotRestore?: (tx: Transaction, previousCoins: number[]) => Promise<AdmissionRestore>
+  snapshotRestore?: (tx: Transaction, previousCoins?: number[]) => AdmissionRestore | Promise<AdmissionRestore>
   /**
    * §9.4 — writes `{txid, topics, restore, at, pending: true}` BEFORE
    * delegating, i.e. before the engine can broadcast or mutate anything.

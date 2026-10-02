@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { Transaction, UnlockingScript, P2PKH, PrivateKey } from '@bsv/sdk'
 import {
-  SubmitSideChannel, withVerdictCapture, newSubmitScope, runInSubmitScope, PENDING_WRITE_FAILED,
+  SubmitSideChannel, withVerdictCapture, snapshotRestore, mergeRestore, newSubmitScope, runInSubmitScope, PENDING_WRITE_FAILED,
   type AdmissionPending
 } from './submitSideChannel.js'
 import { MandalaReject } from '@bsv/overlay-topics'
@@ -46,14 +46,14 @@ describe('SubmitSideChannel', () => {
 
   it('carries the restore snapshot alongside a successful admission', () => {
     const ch = new SubmitSideChannel()
-    const restore = { spentOutpoints: ['aa'.repeat(32) + '.0'], tokenRows: [] }
+    const restore = { spentOutpoints: ['aa'.repeat(32) + '.0'] }
     ch.noteRestore('ab'.repeat(32), restore)
     expect(ch.take('ab'.repeat(32))?.restore).toEqual(restore)
   })
 
   it('merges a restore note and a later reject for the same txid', () => {
     const ch = new SubmitSideChannel()
-    ch.noteRestore('ab'.repeat(32), { spentOutpoints: ['x.0'], tokenRows: [] })
+    ch.noteRestore('ab'.repeat(32), { spentOutpoints: ['x.0'] })
     ch.noteReject('ab'.repeat(32), new Error('boom'))
     const got = ch.take('ab'.repeat(32))
     expect(got?.reason).toBe('boom')
@@ -132,7 +132,7 @@ describe('withVerdictCapture', () => {
       channel: ch,
       snapshotRestore: async (parsed, previousCoins) => {
         order.push('snapshot')
-        return { spentOutpoints: previousCoins.map(ci => `${parsed.inputs[ci].sourceTXID ?? ''}.${parsed.inputs[ci].sourceOutputIndex}`), tokenRows: [] }
+        return { spentOutpoints: (previousCoins ?? []).map(ci => `${parsed.inputs[ci].sourceTXID ?? ''}.${parsed.inputs[ci].sourceOutputIndex}`) }
       }
     })
     const res = await tm.identifyAdmissibleOutputs(t.toBEEF(), [0], undefined)
@@ -189,7 +189,7 @@ describe('withVerdictCapture — provisional record (§9.4)', () => {
     const t = tx()
     const tm = withVerdictCapture(inner, {
       channel: ch,
-      snapshotRestore: async () => { order.push('snapshot'); return { spentOutpoints: ['aa'.repeat(32) + '.0'], tokenRows: [] } },
+      snapshotRestore: async () => { order.push('snapshot'); return { spentOutpoints: ['aa'.repeat(32) + '.0'] } },
       putPending: async (rec) => { order.push('pending'); written.push(rec) }
     })
     await tm.identifyAdmissibleOutputs(t.toBEEF(), [0], undefined)
@@ -274,5 +274,36 @@ describe('SubmitSideChannel — request scopes (§9.7)', () => {
     const ch = new SubmitSideChannel()
     ch.noteReject(A, new Error('conservation violated'))
     expect(ch.take(A, newSubmitScope())?.reason).toBe('conservation violated')
+  })
+})
+
+describe('snapshotRestore — every input, no store read', () => {
+  it('names every input as txid.vout, synchronously', () => {
+    const t = new Transaction()
+    t.addInput({ sourceTXID: 'aa'.repeat(32), sourceOutputIndex: 0, unlockingScript: new UnlockingScript() })
+    t.addInput({ sourceTXID: 'bb'.repeat(32), sourceOutputIndex: 3, unlockingScript: new UnlockingScript() })
+    expect(snapshotRestore(t)).toEqual({ spentOutpoints: [`${'aa'.repeat(32)}.0`, `${'bb'.repeat(32)}.3`] })
+  })
+})
+
+describe('mergeRestore — union of outpoints', () => {
+  it('unions, keeps first-seen order, drops case-insensitive duplicates', () => {
+    const A = 'aa'.repeat(32)
+    const got = mergeRestore(
+      { spentOutpoints: [`${A}.0`, 'bb'.repeat(32) + '.1'] },
+      { spentOutpoints: [`${A.toUpperCase()}.0`, 'cc'.repeat(32) + '.2'] }
+    )
+    expect(got).toEqual({ spentOutpoints: [`${A}.0`, 'bb'.repeat(32) + '.1', 'cc'.repeat(32) + '.2'] })
+  })
+
+  it('nothing on either side is undefined; one side is returned as a snapshot', () => {
+    expect(mergeRestore(null, undefined)).toBeUndefined()
+    expect(mergeRestore(undefined, { spentOutpoints: ['x.0'] })).toEqual({ spentOutpoints: ['x.0'] })
+  })
+
+  it('tolerates a malformed or legacy stored snapshot, dropping its tokenRows', () => {
+    const s = { spentOutpoints: ['x.0'] }
+    expect(mergeRestore({ spentOutpoints: 'x', tokenRows: [{ txid: 'q' }] } as any, s)).toEqual(s)
+    expect(mergeRestore({ spentOutpoints: ['y.0'], tokenRows: [{ txid: 'q' }] } as any, s)).toEqual({ spentOutpoints: ['y.0', 'x.0'] })
   })
 })

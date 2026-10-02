@@ -16,8 +16,8 @@ export const mongoAdmissionStore = (admissionsCol: Collection<Document>): Admiss
    * inside the engine's per-process submission lock (`putPending`, from the
    * topic manager) or right after it for the same attempt (`putAdmitted`), and
    * a concurrent same-txid submit meets the engine's dupe check before its
-   * manager runs. A lost update could only drop a row that a concurrent writer
-   * added and this one lacked; every writer's rows were already written by its
+   * manager runs. A lost update could only drop an outpoint that a concurrent writer
+   * added and this one lacked; every writer's outpoints were already written by its
    * own `putPending` first, so none can be.
    */
   const restoreToWrite = async (txid: string, incoming?: AdmissionRestore): Promise<AdmissionRestore | undefined> => {

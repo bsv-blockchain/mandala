@@ -27,7 +27,7 @@ describe('GET /admin/admission/:txid — contract §3', () => {
       txid: TXID, topics: ['tm_mandala'], outputsToAdmit: [0, 2],
       admissionSignature: 'deadbeef', admissionIdentityKey: '02' + 'cc'.repeat(32),
       at: '2026-09-14T00:00:00.000Z',
-      restore: { spentOutpoints: ['x.0'], tokenRows: [] }
+      restore: { spentOutpoints: ['x.0'] }
     }
     const out = await admissionResponse(TXID, { store: store({ [TXID]: rec }), applied: applied(), priv })
     expect(out.status).toBe(200)
