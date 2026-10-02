@@ -11,10 +11,11 @@ import type { Request, Response } from 'express'
 import { buildActivity, LinkageRowLite } from './activity.js'
 import {
   wrapSubmitJson, normalizeDoubleSlash, withPersistedVerdict, ensureAdmissionIndexes, TOKEN_TOPIC,
-  type AdmissionRecord, type AdmissionStore, type AppliedProof
+  type AdmissionStore, type AppliedProof
 } from './admission.js'
 import { admissionHandler } from './admissionRoute.js'
-import { SubmitSideChannel, withVerdictCapture, type AdmissionTokenRow } from './submitSideChannel.js'
+import { SubmitSideChannel, withVerdictCapture, snapshotRestoreFrom } from './submitSideChannel.js'
+import { mongoAdmissionStore } from './admissionStore.js'
 import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
 import { withSpentInputGuard, knexSpentInputStore, type SpentInputStore } from './spentGuard.js'
 import { mountArcIngest, knexEvictionCoins, mongoRestoreTokenRow, type TokenRowsCollection } from './eviction.js'
@@ -117,79 +118,12 @@ const main = async (): Promise<void> => {
   // Wire-contract §4. The write is AWAITED before the /submit response is sent
   // (see admission.ts), so a client holding a 200 is guaranteed the very next
   // GET /admin/admission/:txid succeeds — the race SC-3.4/EB-2.3 describe.
-  const admissionStore: AdmissionStore = {
-    get: async (txid) =>
-      await admissionsCol.findOne({ txid }, { projection: { _id: 0 } }) as AdmissionRecord | null,
-    // §9.4 — the provisional record, written by the topic-manager wrapper
-    // before the engine can broadcast. `pending` is set ONLY on insert, so a
-    // re-submit of an already-finalized txid never downgrades its record.
-    putPending: async (rec) => {
-      await admissionsCol.updateOne(
-        { txid: rec.txid },
-        {
-          $set: {
-            topics: rec.topics,
-            ...(rec.restore != null ? { restore: rec.restore } : {})
-          },
-          $setOnInsert: { txid: rec.txid, at: rec.at, pending: true }
-        },
-        { upsert: true }
-      )
-    },
-    putAdmitted: async (rec) => {
-      await admissionsCol.updateOne(
-        { txid: rec.txid },
-        {
-          $set: {
-            topics: rec.topics,
-            outputsToAdmit: rec.outputsToAdmit,
-            admissionSignature: rec.admissionSignature,
-            admissionIdentityKey: rec.admissionIdentityKey,
-            pending: false,
-            // The pre-spend snapshot FIX E reads back at eviction time. Absent
-            // only when the topic-manager wrapper could not take it; the
-            // eviction still runs, it just restores nothing.
-            ...(rec.restore != null ? { restore: rec.restore } : {})
-          },
-          // §9.1 — an admission CLEARS the refusal fields. A transaction whose
-          // earlier payload was refused and whose corrected payload is admitted
-          // must stop carrying that refusal, or GET /admin/admission/:txid would
-          // keep serving a 400 for a transaction this overlay has just signed.
-          $unset: {
-            refusedCode: '', refusedDescription: '', refusedAt: '',
-            refusedPayloadHash: '', refusedSpendTxid: ''
-          },
-          $setOnInsert: { txid: rec.txid, at: rec.at }
-        },
-        { upsert: true }
-      )
-    },
-    putRefusal: async (rec) => {
-      // §9.1 — keyed by (txid, payloadHash). A later submission with a DIFFERENT
-      // payload overwrites these fields with its own verdict; one with the same
-      // payload is short-circuited before it ever reaches here.
-      await admissionsCol.updateOne(
-        { txid: rec.txid },
-        {
-          $set: {
-            refusedCode: rec.refusedCode,
-            refusedDescription: rec.refusedDescription,
-            refusedAt: rec.refusedAt,
-            refusedPayloadHash: rec.refusedPayloadHash
-          },
-          $setOnInsert: { txid: rec.txid, at: rec.refusedAt }
-        },
-        { upsert: true }
-      )
-    },
-    markEvicted: async (txid, at) => {
-      await admissionsCol.updateOne(
-        { txid },
-        { $set: { evictedAt: at }, $setOnInsert: { txid, at } },
-        { upsert: true }
-      )
-    }
-  }
+  //
+  // §9.4 — the restore snapshot on the record only ever grows: putPending and
+  // putAdmitted MERGE into it (mergeRestore), because a retry after a crash
+  // snapshots inputs whose token rows the crashed attempt already let the
+  // lookup delete. See admissionStore.ts.
+  const admissionStore: AdmissionStore = mongoAdmissionStore(admissionsCol)
 
   // FIX C — the engine's own durable proof that a txid went through
   // tm_mandala, independent of the Mongo record. σ_I is deterministic, so a
@@ -328,29 +262,9 @@ const main = async (): Promise<void> => {
       channel: submitChannel,
       // §9.4 — the snapshot is made durable here, before the engine broadcasts.
       putPending: async (rec) => { await admissionStore.putPending?.(rec) },
-      snapshotRestore: async (tx, previousCoins) => {
-        const spentOutpoints: string[] = []
-        const tokenRows: AdmissionTokenRow[] = []
-        for (const ci of previousCoins) {
-          const inp = tx.inputs[ci]
-          if (inp == null) continue
-          const srcTxid = inp.sourceTXID ?? inp.sourceTransaction?.id('hex') ?? ''
-          if (srcTxid === '') continue
-          spentOutpoints.push(`${srcTxid}.${inp.sourceOutputIndex}`)
-          const row = await sharedStorage.getTokenRow(srcTxid, inp.sourceOutputIndex)
-          if (row != null) {
-            tokenRows.push({
-              txid: row.txid,
-              outputIndex: row.outputIndex,
-              assetId: row.assetId,
-              amount: row.amount,
-              identityKey: row.identityKey,
-              createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : String(row.createdAt ?? '')
-            })
-          }
-        }
-        return { spentOutpoints, tokenRows }
-      }
+      // Every input and the token row it still has (not previousCoins, which
+      // omits a coin an interrupted attempt left marked spent).
+      snapshotRestore: snapshotRestoreFrom(async (txid, vout) => await sharedStorage.getTokenRow(txid, vout))
     }
   ))
   const mandalaLookup = createMandalaLookupService(mandalaWallet, sharedStorage)

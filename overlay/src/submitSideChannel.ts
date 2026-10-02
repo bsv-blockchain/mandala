@@ -38,10 +38,102 @@ export interface AdmissionTokenRow {
 }
 
 export interface AdmissionRestore {
-  /** `txid.vout` of every input this transaction marks spent. */
+  /**
+   * `txid.vout` of every input of this transaction (as overlay-go records it).
+   * Eviction hands a coin back only while this transaction still holds it, so
+   * an input it never marked spent is inert here.
+   */
   spentOutpoints: string[]
   /** The token rows as they stood BEFORE the spend. */
   tokenRows: AdmissionTokenRow[]
+}
+
+const outpointKey = (txid: string, outputIndex: number): string => `${String(txid).toLowerCase()}.${outputIndex}`
+
+/**
+ * §9.4 / FIX E — the restore snapshot on the admission record only ever GROWS.
+ *
+ * Every attempt of a txid writes a snapshot before the engine runs, and the
+ * admitting attempt writes one again on the way out. An attempt that died after
+ * the engine marked an input spent has already let the lookup delete that
+ * input's token row, so every LATER snapshot of the same input finds no row:
+ * the crash-window self-heal takes three attempts, and the last two would each
+ * have replaced the one snapshot that still held the row. Merging instead —
+ * the union of `spentOutpoints`, and the union of `tokenRows` keyed by outpoint
+ * with the first-seen row kept — keeps it. A row's content cannot change (an
+ * outpoint names one output forever), so first-seen loses nothing. Merging
+ * rather than "write once" also keeps refused-then-admitted right: an early
+ * empty snapshot is grown, not frozen in.
+ */
+export const mergeRestore = (
+  existing: AdmissionRestore | null | undefined,
+  incoming: AdmissionRestore | null | undefined
+): AdmissionRestore | undefined => {
+  if (existing == null && incoming == null) return undefined
+  const spentOutpoints: string[] = []
+  const seenOutpoints = new Set<string>()
+  const tokenRows: AdmissionTokenRow[] = []
+  const seenRows = new Set<string>()
+  for (const source of [existing, incoming]) {
+    if (source == null) continue
+    for (const outpoint of Array.isArray(source.spentOutpoints) ? source.spentOutpoints : []) {
+      const key = String(outpoint).toLowerCase()
+      if (seenOutpoints.has(key)) continue
+      seenOutpoints.add(key)
+      spentOutpoints.push(outpoint)
+    }
+    for (const row of Array.isArray(source.tokenRows) ? source.tokenRows : []) {
+      if (row == null) continue
+      const key = outpointKey(row.txid, row.outputIndex)
+      if (seenRows.has(key)) continue
+      seenRows.add(key)
+      tokenRows.push(row)
+    }
+  }
+  return { spentOutpoints, tokenRows }
+}
+
+/** The fields of a lookup token row the snapshot keeps (MandalaTokenRecord). */
+export interface TokenRowLike {
+  txid: string
+  outputIndex: number
+  assetId: string
+  amount: number
+  identityKey: string
+  createdAt?: Date | string | null
+}
+
+/**
+ * The production `snapshotRestore`: every input of the transaction and the
+ * token row each one still has, read before the engine can touch them.
+ *
+ * Every input, not `previousCoins`: since @bsv/overlay 2.6 the engine omits a
+ * spent coin from previousCoins, so on the crash-window heal rounds the very
+ * input whose spend is being recovered would be missing from the snapshot. The
+ * spent-input guard inspects every input for the same reason, and overlay-go's
+ * snapshot has always named every input.
+ */
+export const snapshotRestoreFrom = (
+  getTokenRow: (txid: string, outputIndex: number) => Promise<TokenRowLike | null | undefined>
+) => async (tx: Transaction, _previousCoins?: number[]): Promise<AdmissionRestore> => {
+  const spentOutpoints: string[] = []
+  const tokenRows: AdmissionTokenRow[] = []
+  for (const inp of tx.inputs) {
+    const srcTxid = inp.sourceTXID ?? inp.sourceTransaction?.id('hex') ?? ''
+    if (srcTxid === '') continue
+    spentOutpoints.push(`${srcTxid}.${inp.sourceOutputIndex}`)
+    const row = await getTokenRow(srcTxid, inp.sourceOutputIndex)
+    if (row == null) continue
+    tokenRows.push({
+      txid: row.txid,
+      outputIndex: row.outputIndex,
+      assetId: row.assetId,
+      amount: row.amount,
+      identityKey: row.identityKey,
+      createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : String(row.createdAt ?? '')
+    })
+  }
+  return { spentOutpoints, tokenRows }
 }
 
 export interface ManagerOutcome {
@@ -212,7 +304,8 @@ export interface VerdictCaptureDeps {
   /**
    * Captures the pre-spend state this submission is about to consume, called
    * before delegating. A failure here is logged and ignored — bookkeeping must
-   * never refuse a submission.
+   * never refuse a submission. `putPending` then writes no snapshot, and the
+   * store's merge keeps whatever an earlier attempt recorded.
    */
   snapshotRestore?: (tx: Transaction, previousCoins: number[]) => Promise<AdmissionRestore>
   /**
@@ -228,6 +321,10 @@ export interface VerdictCaptureDeps {
    *
    * A failure is an `InfraError` — 503, retryable, never persisted — because a
    * submission whose compensation data is not durable must not proceed.
+   *
+   * The store MUST merge `restore` into what it already holds (`mergeRestore`),
+   * never replace it: a retry after a crash snapshots inputs whose token rows
+   * the crashed attempt already let the lookup delete.
    */
   putPending?: (rec: AdmissionPending) => Promise<void>
 }

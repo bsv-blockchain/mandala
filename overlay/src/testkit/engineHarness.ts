@@ -1,4 +1,4 @@
-import { Engine, KnexStorage, KnexStorageMigrations } from '@bsv/overlay'
+import { Engine, KnexStorage, KnexStorageMigrations, type LookupService, type TopicManager } from '@bsv/overlay'
 import { MerklePath, P2PKH, PrivateKey, Transaction } from '@bsv/sdk'
 import knexFactory from 'knex'
 import { withSpentInputGuard, knexSpentInputStore } from '../spentGuard.js'
@@ -7,7 +7,19 @@ export const HARNESS_TOPIC = 'tm_harness'
 
 export interface SubmitOutcome { steak?: unknown, error?: unknown, refusal?: unknown }
 
-export const createHarness = async (opts: { wasEvicted?: (txid: string) => Promise<boolean> } = {}) => {
+export interface HarnessOptions {
+  wasEvicted?: (txid: string) => Promise<boolean>
+  /**
+   * Wraps the guarded manager the way index.ts wraps tm_mandala's (e.g. in
+   * withVerdictCapture), so a test can drive the production stack's outer
+   * layers over the real engine. Receives the harness knex.
+   */
+  wrap?: (guarded: TopicManager, knex: any) => TopicManager
+  /** Lookup services the engine notifies (none by default). */
+  lookupServices?: Record<string, LookupService>
+}
+
+export const createHarness = async (opts: HarnessOptions = {}) => {
   const knex = knexFactory({ client: 'sqlite3', connection: { filename: ':memory:' }, useNullAsDefault: true })
   const migrations: any[] = (KnexStorageMigrations as any).default ?? KnexStorageMigrations
   await knex.migrate.latest({
@@ -28,8 +40,9 @@ export const createHarness = async (opts: { wasEvicted?: (txid: string) => Promi
     getDocumentation: async () => '',
     getMetaData: async () => ({ name: HARNESS_TOPIC, shortDescription: '' })
   }
-  const guarded = withSpentInputGuard(admitAll as any,
+  const spendGuarded = withSpentInputGuard(admitAll as any,
     knexSpentInputStore(knex, HARNESS_TOPIC, opts.wasEvicted ?? (async () => false)))
+  const guarded = opts.wrap != null ? opts.wrap(spendGuarded, knex) : spendGuarded
   // Outermost recorder: the engine swallows manager throws, so capture them here.
   const recorded = {
     ...guarded,
@@ -37,7 +50,7 @@ export const createHarness = async (opts: { wasEvicted?: (txid: string) => Promi
       try { return await (guarded.identifyAdmissibleOutputs as any)(...args) } catch (e) { refusals.push(e); throw e }
     }
   }
-  const engine = new (Engine as any)({ [HARNESS_TOPIC]: recorded }, {}, storage, 'scripts only',
+  const engine = new (Engine as any)({ [HARNESS_TOPIC]: recorded }, opts.lookupServices ?? {}, storage, 'scripts only',
     'https://harness.invalid', [], [], undefined, undefined, {})
 
   const key = PrivateKey.fromRandom()

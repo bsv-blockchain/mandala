@@ -80,6 +80,14 @@ describe('index.ts — tm_mandala guard order (§9.6)', () => {
     expect(registry).not.toContain('withPersistedVerdict')
   })
 
+  // FIX E — the snapshot is taken from every input and only ever merged into
+  // the record (restoreSnapshot.test.ts drives both over the real engine).
+  it('snapshots every input and stores it through the merging admission store', () => {
+    expect(CODE).toContain('const admissionStore: AdmissionStore = mongoAdmissionStore(admissionsCol)')
+    expect(stack).toContain('snapshotRestore: snapshotRestoreFrom(async (txid, vout) => await sharedStorage.getTokenRow(txid, vout))')
+    expect(stack).not.toMatch(/for \(const ci of previousCoins\)/)
+  })
+
   // @bsv/overlay >= 2.6's markUTXOAsSpent is itself a compare-and-swap that
   // records spentBy (the 4th argument). Replacing it would drop spentBy, and the
   // spent-input guard's self-heal keys on it.
