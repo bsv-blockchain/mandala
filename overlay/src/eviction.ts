@@ -66,7 +66,11 @@ export interface EvictionDeps {
   unmarkSpent: (txid: string, outputIndex: number, evictedTxid: string) => Promise<number>
   /** True when the coin's engine row exists with `spent = false`. */
   isUnspent: (txid: string, outputIndex: number) => Promise<boolean>
-  /** Re-insert (upsert) a pre-spend token row into the lookup store. */
+  /**
+   * Re-insert a pre-spend token row into the lookup store. MUST be idempotent
+   * (an upsert that leaves an existing row alone): a re-delivery after a
+   * partial failure restores the same rows again. See `mongoRestoreTokenRow`.
+   */
   restoreTokenRow: (row: AdmissionTokenRow) => Promise<void>
   /** `engine.evictAppliedTransaction(txid, { reason })`. */
   evict: (txid: string, reason?: string) => Promise<unknown>
@@ -109,6 +113,60 @@ export const knexEvictionCoins = (
     throw new Error(`outputs.spent has an unexpected value of type ${row.spent === null ? 'null' : typeof row.spent}`)
   }
 })
+
+/** The slice of the shared `mandalaTokens` collection the restore writes through. */
+export interface TokenRowsCollection {
+  updateOne: (
+    filter: { txid: string, outputIndex: number },
+    update: { $setOnInsert: Record<string, unknown> },
+    options: { upsert: true }
+  ) => Promise<{ upsertedCount?: number }>
+}
+
+/**
+ * The production `restoreTokenRow`: an idempotent upsert into the lookup's
+ * `mandalaTokens` collection, the same shape as overlay-go's
+ * `mandala.Store.RestoreTokens`.
+ *
+ * It has to be idempotent because §9.8's convergence rests on it: a terminal
+ * callback whose restore fails part-way stamps nothing and is re-delivered, and
+ * the re-delivery meets every row the first attempt already put back. A plain
+ * `insertOne` (MandalaStorageManager.storeToken) hits the unique
+ * (txid, outputIndex) index on that row, answers 503 forever and never reaches
+ * `markEvicted` or `evict` — while the unmarks before it have already made the
+ * rejected tx's inputs live, and its own outputs stay admitted.
+ *
+ * The holder's balance is re-credited only when the upsert really inserted the
+ * row: that is the debit MandalaLookupService.outputSpent made when it deleted
+ * it, and a row that is already present was either never deleted (never
+ * debited) or restored, and credited, by an earlier attempt.
+ *
+ * Residual window, shared with Go: a failure between the insert and the credit
+ * leaves the row back but the balance short; the retry sees the row and does
+ * not credit. Closing it needs a multi-document transaction.
+ */
+export const mongoRestoreTokenRow = (
+  tokens: TokenRowsCollection,
+  adjustBalance: (identityKey: string, delta: number) => Promise<void>
+) => async (row: AdmissionTokenRow): Promise<void> => {
+  const createdAt = row.createdAt != null && row.createdAt !== '' ? new Date(row.createdAt) : new Date()
+  const doc = {
+    txid: row.txid,
+    outputIndex: row.outputIndex,
+    assetId: row.assetId,
+    amount: row.amount,
+    identityKey: row.identityKey,
+    createdAt: Number.isNaN(createdAt.getTime()) ? new Date() : createdAt
+  }
+  const res = await tokens.updateOne(
+    { txid: doc.txid, outputIndex: doc.outputIndex },
+    { $setOnInsert: doc },
+    { upsert: true }
+  )
+  if (res.upsertedCount === 1 && doc.identityKey != null && doc.identityKey !== '') {
+    await adjustBalance(doc.identityKey, doc.amount)
+  }
+}
 
 export interface EvictionReport {
   txid: string

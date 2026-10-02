@@ -17,7 +17,7 @@ import { admissionHandler } from './admissionRoute.js'
 import { SubmitSideChannel, withVerdictCapture, type AdmissionTokenRow } from './submitSideChannel.js'
 import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
 import { withSpentInputGuard, knexSpentInputStore, type SpentInputStore } from './spentGuard.js'
-import { mountArcIngest, knexEvictionCoins } from './eviction.js'
+import { mountArcIngest, knexEvictionCoins, mongoRestoreTokenRow, type TokenRowsCollection } from './eviction.js'
 import { replayAssetState, type ReplayStorage } from './pinnedReducer.js'
 import { withAdminChainAnchor } from './adminChainGuard.js'
 import { assetAuthHeadHandler, assetAuthBeefHandler, withFrozenRowFlags, type AdminHistoryRowLite } from './assetAuth.js'
@@ -405,16 +405,13 @@ const main = async (): Promise<void> => {
       // unmarkSpent only while the evicted tx still holds the coin (or a
       // legacy NULL spentBy); isUnspent fails closed on an unreadable row.
       ...knexEvictionCoins(server.knex!, TOKEN_TOPIC),
-      restoreTokenRow: async (row) => {
-        await sharedStorage.storeToken({
-          txid: row.txid,
-          outputIndex: row.outputIndex,
-          assetId: row.assetId,
-          amount: row.amount,
-          identityKey: row.identityKey,
-          createdAt: row.createdAt != null && row.createdAt !== '' ? new Date(row.createdAt) : new Date()
-        })
-      },
+      // An idempotent upsert that re-credits the holder only when it really
+      // re-inserted the row — never storeToken's plain insert, which E11000s on
+      // every re-delivery after a partial restore (Go: RestoreTokens).
+      restoreTokenRow: mongoRestoreTokenRow(
+        lookupDb.collection('mandalaTokens') as unknown as TokenRowsCollection,
+        async (identityKey, delta) => { await sharedStorage.adjustBalance(identityKey, delta) }
+      ),
       evict: async (txid, reason) =>
         await (server.engine as unknown as {
           evictAppliedTransaction: (t: string, o: { reason?: string }) => Promise<unknown>

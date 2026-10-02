@@ -303,6 +303,18 @@ describe('index.ts — eviction rebuild (PR #11 + token-fee §2, rebuild-first)'
     expect(assets).toMatch(/adminHistoryCol\.distinct\('assetId', \{ txid \}\)[\s\S]*?\.sort\(\)/)
   })
 
+  // §9.8's re-delivery converges only over an idempotent restore: the plain
+  // insert storeToken makes E11000s on every row an earlier attempt put back.
+  // tokenRestore.test.ts drives mongoRestoreTokenRow against a real Mongo.
+  it('restores token rows through the idempotent upsert into mandalaTokens, never storeToken', () => {
+    const restore = deps.slice(deps.indexOf('restoreTokenRow:'), deps.indexOf('evict:'))
+    expect(restore).toContain('mongoRestoreTokenRow(')
+    expect(restore).toContain("lookupDb.collection('mandalaTokens')")
+    expect(restore).toContain('sharedStorage.adjustBalance(identityKey, delta)')
+    expect(restore).not.toMatch(/\.storeToken\(/)
+    expect(CODE).not.toMatch(/sharedStorage\.storeToken\(/)
+  })
+
   it('eviction.ts purges only after every rebuild (rebuild-first)', () => {
     const ev = readFileSync(new URL('./eviction.ts', import.meta.url), 'utf8')
     const body = ev.slice(ev.indexOf('export const evictWithRestore'))
