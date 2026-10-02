@@ -27,7 +27,8 @@ describe('SIGHASH_CHRONICLE shared vectors: @bsv/sdk Transaction.verify and the 
     expect(vectors.map(v => v.name)).toEqual([
       'v1_plain', 'v1_chronicle', 'v2_plain', 'v2_chronicle',
       'v2_child_of_unproven_v1_chronicle', 'v2_child_of_proven_v1_chronicle',
-      'v2_child_of_proven_v1_chronicle_ancestor_present', 'v1_chronicle_after_chronicle_opcode'
+      'v2_child_of_proven_v1_chronicle_ancestor_present', 'v1_chronicle_after_chronicle_opcode',
+      'v1_plain_epoch_divergent_lock'
     ])
   })
 

@@ -303,6 +303,54 @@ func chronicleOpcodeFirstSpend(t *testing.T) []byte {
 	return atomicBEEF(t, signedSpend(t, key, src, 1, chronicleSighash, lock))
 }
 
+// epochDivergentLockSpend is a version-1 spend of `OP_SUBSTR <pub> OP_CHECKSIG`
+// unlocked by `<sig||0x00> OP_0 <len(sig)>`, signed with a plain
+// SIGHASH_ALL|FORKID. Under Chronicle rules (the engine's spv.Verify, and TS at
+// every version, since Transaction.verify passes no verifyFlags) OP_SUBSTR trims
+// the junk byte and the signature verifies. Pre-Chronicle, go-sdk runs OP_SUBSTR
+// as a NOP, so CHECKSIG takes the one-byte length operand as its "signature"
+// and fails on its hash type: the pre-check's own epoch would refuse a tx both
+// engines accept, unless it skips scripts that behave differently by epoch.
+func epochDivergentLockSpend(t *testing.T) []byte {
+	t.Helper()
+	key, outLock := p2pkhKeyAndLock(t)
+	lock := &script.Script{}
+	if err := lock.AppendOpcodes(script.OpSUBSTR); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.AppendPushData(key.PubKey().Compressed()); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.AppendOpcodes(script.OpCHECKSIG); err != nil {
+		t.Fatal(err)
+	}
+	src := transaction.NewTransaction()
+	src.Version = 1
+	src.AddOutput(&transaction.TransactionOutput{Satoshis: 1000, LockingScript: lock})
+	withMerklePath(src)
+
+	child := transaction.NewTransaction()
+	child.Version = 1
+	child.AddInput(&transaction.TransactionInput{
+		SourceTXID: src.TxID(), SourceTxOutIndex: 0, SourceTransaction: src, SequenceNumber: 0xffffffff,
+	})
+	child.AddOutput(&transaction.TransactionOutput{Satoshis: 900, LockingScript: outLock})
+	digest, err := child.CalcInputSignatureHash(0, sighash.AllForkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := key.Sign(digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := append(sig.Serialize(), byte(sighash.AllForkID))
+	padded := append(append([]byte{}, full...), 0x00) // the junk byte OP_SUBSTR trims
+	raw := append([]byte{byte(len(padded))}, padded...)
+	raw = append(raw, 0x00, 0x01, byte(len(full))) // OP_0, then push len(full)
+	child.Inputs[0].UnlockingScript = script.NewFromBytes(raw)
+	return atomicBEEF(t, child)
+}
+
 func spendBEEF(version uint32, flag sighash.Flag) func(*testing.T) []byte {
 	return func(t *testing.T) []byte {
 		child, _ := chronicleSighashSpend(t, version, flag)
@@ -322,6 +370,7 @@ var chronicleVectorBuilders = map[string]func(*testing.T) []byte{
 	"v2_child_of_proven_v1_chronicle":     func(t *testing.T) []byte { return chronicleChain(t, true) },
 	"v1_chronicle_after_chronicle_opcode": chronicleOpcodeFirstSpend,
 	"v2_child_of_proven_v1_chronicle_ancestor_present": chronicleProvenParentWithAncestor,
+	"v1_plain_epoch_divergent_lock":                    epochDivergentLockSpend,
 }
 
 type chronicleVector struct {
@@ -432,8 +481,9 @@ func TestChronicleSighashRuleIgnoresUnparseableBeef(t *testing.T) {
 }
 
 // The one open corner, pinned so closing it is a deliberate decision: the
-// Chronicle-only opcode runs before the CHECKSIG, the pre-Chronicle run stops
-// there (ErrDisabledOpcode), and the engine's after-Chronicle run admits the
+// locking script holds an epoch-divergent opcode (OP_2MUL), so the pre-check
+// skips the input — a pre-Chronicle run would stop on it anyway
+// (ErrDisabledOpcode) — and the engine's after-Chronicle run admits the
 // signature TS refuses. The shared vector records the TS side of the same bytes.
 func TestChronicleSighashCheckMissesWhenAChronicleOpcodeRunsFirst(t *testing.T) {
 	raw := chronicleOpcodeFirstSpend(t)
@@ -452,5 +502,52 @@ func TestChronicleSighashCheckMissesWhenAChronicleOpcodeRunsFirst(t *testing.T) 
 	}
 	if ok, verr := spv.Verify(context.Background(), tx, scriptsOnlyTracker{}, nil); verr != nil || !ok {
 		t.Fatalf("go-sdk spv.Verify admits the corner: ok=%v err=%v", ok, verr)
+	}
+}
+
+// Every opcode that behaves differently before and after Chronicle marks a
+// locking script as one the pre-check must not run; a plain P2PKH lock (and a
+// nil script) does not; an unparseable script does (the engine judges it).
+func TestEpochDivergentScripts(t *testing.T) {
+	_, p2pkhLock := p2pkhKeyAndLock(t)
+	if epochDivergent(p2pkhLock) || epochDivergent(nil) {
+		t.Fatal("a P2PKH lock and a nil script are not epoch-divergent")
+	}
+	for _, op := range []byte{
+		script.OpSUBSTR, script.OpLEFT, script.OpRIGHT, script.OpLSHIFTNUM, script.OpRSHIFTNUM,
+		script.OpVER, script.OpVERIF, script.OpVERNOTIF, script.Op2MUL, script.Op2DIV,
+	} {
+		s := &script.Script{}
+		if err := s.AppendOpcodes(script.Op1, op); err != nil {
+			t.Fatal(err)
+		}
+		*s = append(*s, *p2pkhLock...)
+		if !epochDivergent(s) {
+			t.Errorf("opcode 0x%02x must mark the script epoch-divergent", op)
+		}
+	}
+	// A push whose length runs past the end of the script does not parse.
+	if !epochDivergent(script.NewFromBytes([]byte{0x4c, 0xff, 0x01})) {
+		t.Error("an unparseable script must be treated as epoch-divergent")
+	}
+	// The byte value of OP_SUBSTR inside pushed DATA is not an opcode.
+	pushed := &script.Script{}
+	if err := pushed.AppendPushData([]byte{script.OpSUBSTR, script.Op2MUL}); err != nil {
+		t.Fatal(err)
+	}
+	if epochDivergent(pushed) {
+		t.Error("opcode bytes inside a push are data, not opcodes")
+	}
+}
+
+// The false refusal the scan exists to stop, asserted directly: the pre-check
+// passes the v1 OP_SUBSTR spend, and so does the engine's verify.
+func TestChronicleSighashRuleDoesNotRefuseAnEpochDivergentLock(t *testing.T) {
+	raw := epochDivergentLockSpend(t)
+	if err := CheckChronicleSighashRule(raw); err != nil {
+		t.Fatalf("false refusal: %v", err)
+	}
+	if !overlayAdmitsScripts(t, raw) {
+		t.Fatal("the engine's verify must admit it too")
 	}
 }

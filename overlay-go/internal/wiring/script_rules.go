@@ -3,6 +3,7 @@ package wiring
 import (
 	"fmt"
 
+	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	"github.com/bsv-blockchain/go-sdk/script/interpreter/errs"
 	"github.com/bsv-blockchain/go-sdk/transaction"
@@ -37,10 +38,28 @@ func (e *ChronicleSighashError) Error() string {
 // cell: the SDK's strict hash-type check strips the Chronicle bit only under
 // after-Chronicle + ForkID, so "refused pre-Chronicle" for a ForkID signature
 // is precisely "carries SIGHASH_CHRONICLE", and any other invalid hash type
-// is refused by the engine's own after-Chronicle run as well (same 503). For
-// a script with no Chronicle-only construct the pre- and after-Chronicle runs
-// execute the same path, so the check never refuses anything TS accepts and
-// opens no divergence of its own.
+// is refused by the engine's own after-Chronicle run as well (same 503).
+//
+// That holds only for scripts that execute the same path in both epochs, so an
+// input whose LOCKING script contains an epoch-divergent opcode is skipped
+// (epochDivergentOpcodes): OP_SUBSTR/LEFT/RIGHT/LSHIFTNUM/RSHIFTNUM are NOPs
+// before Chronicle, OP_VERIF/VERNOTIF are NOPs in a non-executing branch
+// before it and conditionals after, OP_VER and OP_2MUL/2DIV error before it.
+// Run pre-Chronicle, such a script can follow a different stack and raise
+// ErrInvalidSigHashType on an operand that is not the real signature — a
+// false refusal of a tx TS and the engine both accept (shared vector
+// v1_plain_epoch_divergent_lock). A locking script that fails to parse is
+// skipped too; the engine judges it. For every other script the pre- and
+// after-Chronicle runs execute the same path, so the check refuses nothing
+// TS accepts.
+//
+// The UNLOCKING script is not scanned. Every epoch-divergent opcode is a
+// non-push opcode, and TS refuses any version-1 tx whose unlocking script is
+// not push-only (Spend.js: SIGPUSHONLY is enforced for a non-relaxed tx,
+// "Unlocking scripts can only contain push operations"), so skipping on the
+// unlock could only turn "both refuse" into "Go admits, TS refuses". The one
+// other epoch difference, the post-Chronicle sighash subscript of a CHECKSIG
+// executing in the unlocking script, needs a non-push unlock as well.
 //
 // Why not the pre-Chronicle run as the verdict, or the interpreter Debugger:
 // pre-Chronicle also rejects Chronicle-only opcodes, which TS accepts at every
@@ -50,12 +69,12 @@ func (e *ChronicleSighashError) Error() string {
 // This check costs one extra plain interpreter run per version-1 input.
 //
 // Known open corner (documented, pinned by
-// TestChronicleSighashCheckMissesWhenAChronicleOpcodeRunsFirst): if a
-// Chronicle-only construct (OP_2MUL, OP_SUBSTR, ...) executes before the
-// CHECKSIG in the same input, the pre-Chronicle run fails on it first and the
-// signature is never reached, so the engine's after-Chronicle run admits what
-// TS refuses. It needs a version-1 tx that uses a Chronicle-only opcode AND a
-// SIGHASH_CHRONICLE signature in one input.
+// TestChronicleSighashCheckMissesWhenAChronicleOpcodeRunsFirst): an input
+// whose locking script holds an epoch-divergent opcode (OP_2MUL, OP_SUBSTR,
+// ...) is not pre-checked at all, so if it also carries a SIGHASH_CHRONICLE
+// signature the engine's after-Chronicle run admits what TS refuses. It needs
+// a version-1 tx that uses such an opcode AND a SIGHASH_CHRONICLE signature in
+// one input; no Mandala template does either.
 //
 // Fail-closed (wire contract §9.5): a nil result means "not refused"; an
 // unparseable BEEF is left to Submit's own parse, which rejects it. A panic
@@ -103,6 +122,9 @@ func CheckChronicleSighashRule(beefBytes []byte) (err error) {
 			if tx.Version >= 2 {
 				continue
 			}
+			if epochDivergent(prevOut.LockingScript) {
+				continue
+			}
 			xerr := interpreter.NewEngine().Execute(
 				interpreter.WithTx(tx, vin, prevOut),
 				interpreter.WithForkID(),
@@ -114,4 +136,38 @@ func CheckChronicleSighashRule(beefBytes []byte) (err error) {
 		}
 	}
 	return nil
+}
+
+// epochDivergentOpcodes behave differently before and after Chronicle in
+// go-sdk v1.7.1's interpreter (script/interpreter/operations.go, thread.go).
+var epochDivergentOpcodes = map[byte]bool{
+	script.OpSUBSTR:    true,
+	script.OpLEFT:      true,
+	script.OpRIGHT:     true,
+	script.OpLSHIFTNUM: true,
+	script.OpRSHIFTNUM: true,
+	script.OpVER:       true,
+	script.OpVERIF:     true,
+	script.OpVERNOTIF:  true,
+	script.Op2MUL:      true,
+	script.Op2DIV:      true,
+}
+
+// epochDivergent reports whether a pre-Chronicle run of a script could take a
+// different path from the engine's after-Chronicle run: it contains an
+// epoch-divergent opcode, or it does not parse. A nil script is not divergent.
+func epochDivergent(sc *script.Script) bool {
+	if sc == nil {
+		return false
+	}
+	chunks, err := sc.Chunks()
+	if err != nil {
+		return true
+	}
+	for _, c := range chunks {
+		if epochDivergentOpcodes[c.Op] {
+			return true
+		}
+	}
+	return false
 }

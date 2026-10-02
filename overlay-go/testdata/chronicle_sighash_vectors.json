@@ -1,5 +1,5 @@
 {
-  "note": "Shared TS/Go vectors for the version-gated SIGHASH_CHRONICLE rule. Every BEEF is an AtomicBEEF of one-input P2PKH spends (fixed key, RFC6979, deterministic) whose source tx is proven by a trivial merkle path. plain = SIGHASH_ALL|FORKID (0x41); chronicle = SIGHASH_ALL|FORKID|CHRONICLE (0x61). tsVerifies is the measured result of @bsv/sdk 2.8.11 Transaction.fromBEEF(bytes).verify(tracker) and of the TS overlay Engine.submit on these exact bytes (true = admitted, false = script error thrown, answered 503 ERR_UNAVAILABLE). The Go overlay (wiring.CheckChronicleSighashRule, then go-sdk spv.Verify) must give the same verdict, except where knownGap is set. Both stacks read this one file: overlay/src/chronicleSighashParity.test.ts and overlay-go/internal/wiring/script_rules_test.go (which also rebuilds every vector and fails if the bytes drift).",
+  "note": "Shared TS/Go vectors for the version-gated SIGHASH_CHRONICLE rule. Every BEEF is an AtomicBEEF of one-input spends (fixed key, RFC6979, deterministic) whose source tx is proven by a trivial merkle path; all but v1_plain_epoch_divergent_lock spend P2PKH (or P2PKH behind a Chronicle-only prefix). plain = SIGHASH_ALL|FORKID (0x41); chronicle = SIGHASH_ALL|FORKID|CHRONICLE (0x61). tsVerifies is the measured result of @bsv/sdk 2.8.11 Transaction.fromBEEF(bytes).verify(tracker) and of the TS overlay Engine.submit on these exact bytes (true = admitted, false = script error thrown, answered 503 ERR_UNAVAILABLE). The Go overlay (wiring.CheckChronicleSighashRule, then go-sdk spv.Verify) must give the same verdict, except where knownGap is set. Both stacks read this one file: overlay/src/chronicleSighashParity.test.ts and overlay-go/internal/wiring/script_rules_test.go (which also rebuilds every vector and fails if the bytes drift).",
   "vectors": [
     {
       "name": "v1_plain",
@@ -47,8 +47,14 @@
       "name": "v1_chronicle_after_chronicle_opcode",
       "tsVerifies": false,
       "description": "v1 tx whose lock runs OP_2MUL before the CHECKSIG, signed with SIGHASH_CHRONICLE: TS accepts the opcode and refuses the signature",
-      "knownGap": "the pre-check runs the interpreter pre-Chronicle, which stops at the Chronicle-only OP_2MUL before reaching the CHECKSIG; the engine then admits (open corner, see CheckChronicleSighashRule)",
+      "knownGap": "the pre-check skips any input whose locking script holds an opcode that behaves differently before and after Chronicle (OP_2MUL here), because running such a script under pre-Chronicle rules can follow a different path from the engine's; the engine then admits what TS refuses (open corner, see CheckChronicleSighashRule)",
       "beefHex": "01010101502ac1b6590d6c94a06ad0cd38bca60a1fb6de16cc3334a8466cd798577eaad30200beef0101010100024fbaa8f99f0b1d62e9f4aef933cff35818da344d65e13895cc6001e7ccc70e36020100010000000001e8030000000000001d518d528876a914bbc1e42a39d05a4cc61752d6963b7f69d09bb27b88ac000000000001000000014fbaa8f99f0b1d62e9f4aef933cff35818da344d65e13895cc6001e7ccc70e36000000006b48304502210094a40edaa3d05d5e6d9235decfdfd45f9ee5367e925b632de1b58f6ea678d6e402205007ee193fa1b62fd76b14f8ab187890d69fa007d2314aecb35d511cc1052b2b612103f028892bad7ed57d2fb57bf33081d5cfcf6f9ed3d3d7f159c2e2fff579dc341affffffff0184030000000000001976a914bbc1e42a39d05a4cc61752d6963b7f69d09bb27b88ac00000000"
+    },
+    {
+      "name": "v1_plain_epoch_divergent_lock",
+      "tsVerifies": true,
+      "description": "v1 tx spending `OP_SUBSTR <pub> OP_CHECKSIG` with `<sig||0x00> OP_0 <len(sig)>` and a plain signature: valid under Chronicle rules (TS at every version, and the engine); pre-Chronicle OP_SUBSTR is a NOP, so a pre-Chronicle run would hit CHECKSIG with the 1-byte length operand and an invalid hash type. The pre-check must not refuse it.",
+      "beefHex": "010101016bd2d932d1d63764408bcd6c507ec8920ef91c25c28e67dcca929365eab248db0200beef010101010002b5de3d21bcfa639cc6e51a8d2be5994248a8f96744321a0db54a75aa7c5b67ad020100010000000001e80300000000000024b32103f028892bad7ed57d2fb57bf33081d5cfcf6f9ed3d3d7f159c2e2fff579dc341aac00000000000100000001b5de3d21bcfa639cc6e51a8d2be5994248a8f96744321a0db54a75aa7c5b67ad000000004c48304402207be5915b1c45f52e2dfd1b0ac468ac913a284ad3b473268b64e09661cc3c009202206dff5dc8ea9a883ab8d87b2c81d7ad4ff0a0d4be7a03d0834b938e233249bab84100000147ffffffff0184030000000000001976a914bbc1e42a39d05a4cc61752d6963b7f69d09bb27b88ac00000000"
     }
   ]
 }
