@@ -322,10 +322,15 @@ describe('cover — malformed and hostile bundles terminate', () => {
   it('a self-referential input terminates instead of recursing forever', () => {
     const T = mkTx([], [token(ASSET, 10)])
     const self = id(T)
-    ;(T.inputs as any[]).push({ sourceTXID: self, sourceOutputIndex: 0, unlockingScript: new UnlockingScript(), sequence: 0xffffffff })
-    // The map key now lies about T's own (post-mutation) id, so the lookup fails.
+    // addInput, not a raw inputs.push: @bsv/sdk >= 2.8 caches the txid and only
+    // its own mutators invalidate the cache.
+    T.addInput({ sourceTXID: self, sourceOutputIndex: 0, unlockingScript: new UnlockingScript(), sequence: 0xffffffff })
+    // The map key now lies about T's own (post-mutation) id, so lookup rejects
+    // it: the walk terminates on a missing parent and refuses. (@bsv/sdk 2.1.6
+    // failed earlier, computing the mutated tip's id, and answered 'shape';
+    // callers treat every refusal alike — receive.ts maps it to not_covered.)
     const res = cover(T, bundleOf({ tip: T, beef: new Map([[self, T]]) }), TRUST)
-    expect(res).toEqual({ ok: false, reason: 'shape' })
+    expect(res).toEqual({ ok: false, reason: 'uncovered_ancestor' })
   })
 
   it('refuses a bundle with no asset or an unusable overlay identity key', () => {
