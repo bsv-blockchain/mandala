@@ -10,10 +10,9 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { MandalaStorageManager } from '@bsv/overlay-topics'
-import { evictWithRestore, mongoRestoreTokenRow, type EvictionDeps } from './eviction.js'
+import { arcIngestHandler, evictWithRestore, mongoRestoreTokenRow, type EvictionDeps } from './eviction.js'
 import type { AdmissionRecord, AdmissionStore } from './admission.js'
 import type { AdmissionTokenRow } from './submitSideChannel.js'
-import { isInfraError } from './submitVerdict.js'
 import { connectTestMongo, mongoAvailable, type TestMongo } from './testkit/mongo.js'
 
 const T = 'aa'.repeat(32)
@@ -104,9 +103,22 @@ describe.skipIf(!up)('FIX E token-row restore on the real lookup store (Mongo)',
       await prod(r)
     }, new Map([[`${X}.0`, T], [`${Y}.0`, T]]))
 
+    // Over the /arc-ingest handler itself, so the status codes are pinned.
+    const TOKEN = 'k'.repeat(32)
+    const handler = arcIngestHandler({ ...deps, callbackToken: TOKEN, ingestProof: async () => {} })
+    const deliver = async (): Promise<{ status: number, body: any }> => await new Promise(resolve => {
+      let status = 200
+      const res: any = {
+        status (n: number) { status = n; return res },
+        json (b: unknown) { resolve({ status, body: b }); return res }
+      }
+      handler({ headers: { 'x-callback-token': TOKEN }, body: { txid: T, txStatus: 'REJECTED' } }, res)
+    })
+
     // Delivery 1: X's row is restored, Y's fails — nothing stamped, nothing evicted.
-    const first = await evictWithRestore(T, 'REJECTED', deps).catch((e: unknown) => e)
-    expect(isInfraError(first)).toBe(true)
+    const first = await deliver()
+    expect(first.status).toBe(503)
+    expect(first.body.code).toBe('ERR_UNAVAILABLE')
     expect(rec.evictedAt).toBeUndefined()
     expect(evicted).toEqual([])
     expect(await storage.getTokenRow(X, 0)).not.toBeNull()
@@ -114,9 +126,9 @@ describe.skipIf(!up)('FIX E token-row restore on the real lookup store (Mongo)',
 
     // Delivery 2: X's row is already there — that must not be an error.
     failY = false
-    const second = await evictWithRestore(T, 'REJECTED', deps)
-    expect(second.alreadyEvicted).toBe(false)
-    expect(second.restoredTokenRows).toBe(2)
+    const second = await deliver()
+    expect(second.status).toBe(200)
+    expect(second.body.data).toMatchObject({ restoredOutpoints: 0, restoredTokenRows: 2, alreadyEvicted: false })
     expect(rec.evictedAt).toBeDefined()
     expect(evicted).toEqual([T])
     expect(await tokens.countDocuments({ txid: X, outputIndex: 0 })).toBe(1)
