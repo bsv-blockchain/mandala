@@ -152,6 +152,19 @@ Two engines can only agree byte-for-byte on a whitelist they both implement.
 
 **Encoding:** canonical by construction (sorted keys, minimal headers). `strictDecode` also re-encodes and compares as a final guard.
 
+**Reject messages and check order are part of the contract** (amended 2026-10-02):
+1. header additional info (indefinite / reserved);
+2. argument bytes present;
+3. minimality;
+4. major type;
+5. any length or count compared with the **total** input length before anything is read;
+6. map count before depth;
+7. per key: text type, ordering / duplicates, then the value;
+8. trailing bytes;
+9. the re-encode guard last.
+
+The exact messages are pinned by the `error` field of every strict-CBOR row in `@bsv/templates` `test/vectors/brc162.json`, and Go must reproduce them. `number[]` input entries outside 0..255 are refused (`non-canonical encoding`); they are never wrapped.
+
 - **TS:** `src/strictCbor.ts` in `@bsv/templates`. Pure functions, CJS + ESM safe, and reused by lib (P4) and the wallet (P6). The code descends from the in-repo LCH codec (`packages/content/lch/src/cbor.ts`) minus its NFC rule and limits.
 - **Go:** a line-for-line port in `overlay-go/internal/brc162/strictcbor.go`.
 - **Vectors:** the shared vectors (§8.3) pin accept/reject for every rule above. That includes float `1.0`, tag 42, a negative int, an array, depth 5, unsorted keys, non-minimal headers and trailing bytes. `{"sym":"USD","dec":2}` must encode as `a263646563026373796d63555344`.
@@ -214,6 +227,7 @@ Identity checks, kept separate from layer A as the maintainer asked:
    - It upserts the row from the journal. The lookup's balance projection is credited exactly once, on insert only, like the eviction restore (`mongoRestoreTokenRow` / Go `RestoreTokens`).
    - Validation then continues as if the row had always been there.
    - The repair is logged with its outpoint. The holder sees no refusal at all.
+   - Amended 2026-10-02 (spend race): after inserting a repaired row, re-read the engine output. If it has gone, take the row back (value: `takeToken`, debiting only if this call removed it; authority: `takeAuthority`) and answer `owner index unavailable for <op>`.
 4. **Unrepairable** (no admitted engine output, no journal entry, or the journal disagrees with the script): `503 ERR_UNAVAILABLE`, never persisted, with reason `owner index unavailable for <outpoint>`. The overlay **fails closed**: it never admits on a linkage fallback, because the payload names identities (blinded A′) and is not an owner source. The wallet's existing retry/strand path (v2.1 §9.11) surfaces the coin; recovery is operator work, never a holder verdict.
 5. **Boot and periodic reconciler.** At start and on an interval, rule 3 runs over every unspent admitted engine output of both topics that lacks a matching row. Rows it cannot repair are counted, logged, and reported by a `mandala-owner-index` readiness check: degraded, not critical, so the overlay keeps serving every other coin.
 6. **What stays final.** Only payload or content defects are final: the input linkage does not control the source pkh, or names someone other than the owner (`ERR_LINKAGE`). Index faults of any kind never are.
@@ -225,6 +239,10 @@ Repair writes happen during validation (phase 1, before broadcast). They are ide
 Everything below fails with `ERR_AUTHORITY` unless noted:
 
 1. **Trusted identities (D4).** Every deploy and authority output's linked identity, and its linkage `prover`, is in the trusted-issuer set (→ `ERR_UNTRUSTED`, retryable, never persisted, §6.3).
+   - Amended 2026-10-02 (P1 final review): the owner of every **spent authority coin**, as resolved by layer B, must also be trusted.
+   - This is checked in input order after the output owners and provers.
+   - Reason: `input <i>: authority owner <k> is not a trusted issuer` (`ERR_UNTRUSTED`).
+   - Effect: de-trusting an issuer also freezes the authorities it holds.
 2. **Deploy signature (§5.3).** A deploy needs a valid issuer `deploySig` over its txid.
 3. **No fixed supply.** A deploy with amount > 0 is refused.
 4. **Continuity (D8).** For each token T with ≥1 authority input, the tx creates ≥1 authority output of T.
@@ -314,7 +332,7 @@ The `cover()` walk follows every input whose source output decodes as a valid BR
 |---|---|---|---|---|
 | `ERR_AUTHORITY` | 400 | false | yes | missing or invalid `deploySig`, continuity break, duplicate commitment, fixed-supply deploy, authority output without an admitted authority input |
 | `ERR_UNTRUSTED` | 409 | true | **never** | a deploy/authority output identity or linkage prover is not in `MANDALA_ISSUER_KEYS` |
-| `ERR_UNAVAILABLE` (v2, unchanged) | 503 | true | **never** | also covers every stored-owner index fault (§4.2a rules 2 and 4) and a failed owner-journal write; an index fault is never `ERR_SHAPE` / `ERR_LINKAGE` |
+| `ERR_UNAVAILABLE` (v2, unchanged) | 503 | true | **never** | also covers every stored-owner index fault (§4.2a rules 2 and 4) and a failed owner-journal write; an index fault is never `ERR_SHAPE` / `ERR_LINKAGE`. Reasons distinguish reads (`<what> could not be read; retry`) from writes (`<what> could not be written; retry`: owner journal, owner-index repair and take-back) |
 - Reason strings are pinned in the conformance vectors and byte-identical TS ≡ Go. The v2 §6 string becomes `output <idx>: token output with no verified linkage`.
 
 ### 6.4 Guard order (replaces v2 §9.6)
@@ -349,9 +367,14 @@ All collections live in the lookup database. Field names and types are frozen he
 | `mandalaBalances` | unchanged `{identityKey, balance}` | unchanged |
 | `mandalaMetadata` | `{tokenId, txid, outputIndex: 0, sym, dec, label, feeRatePerKb: number\|null}` (decoded deploy payload) | unique `tokenId` |
 | `mandalaAssetStates` | `{tokenId, isPaused, accessMode, blockedIdentities, allowedIdentities, frozenOutpoints: [{outpoint, amount, owner}], evictedOutpoints, feeRatePerKb: number\|null, lastProcessedHeight, lastProcessedOffset, lastAdmitSeq}`; `issuerIdentityKey` removed (trusted set, §5.1) | unique `tokenId` |
-| `mandalaAdminHistory` | `{tokenId, txid, outputIndex, kind, detailsHex, commitment, delta, height, offset, admitSeq, createdAt}` | `(tokenId, height, offset, admitSeq)`; `(tokenId, txid, outputIndex)`; `txid` |
+| `mandalaAdminHistory` | `{tokenId, txid, outputIndex, kind, detailsHex, commitment, delta, height, offset, admitSeq, createdAt}`. `freezeOutput` rows also carry optional `frozenAmount: number, frozenOwner: string`, the fold context recorded at append time (`0` / `''` when the frozen coin has no row of this token); a refold uses them when present. | `(tokenId, height, offset, admitSeq)`; `(tokenId, txid, outputIndex)`; `txid` |
 | `mandalaRegistry` | as today (moved from the mandala repo) | as today |
 | `mandalaCounters` | as today (`admitSeq`, `registryAdmitSeq`) | as today |
+
+**Overlay duties (amended 2026-10-02):**
+- At boot, before admitting, refold every token returned by `tokenIdsWithHistory()`. Repeat on the reconciler interval while quiesced.
+- Call `purgeAndRefold(txid)` per evicted txid, quiesced.
+- Call `restoreInputRow` only after the engine confirms the coin is live.
 
 Eviction (package API): purge `mandalaAdminHistory` rows by txid and refold each touched token from surviving history (fee rate included). Delete the evicted outputs' `mandalaTokens` / `mandalaAuthorities` rows. Restore the inputs' rows only for coins live again (v2.3 §11). `mandalaOwners` is never purged.
 
