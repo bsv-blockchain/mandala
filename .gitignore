@@ -3,3 +3,7 @@ node_modules/
 dist/
 ~$*
 .claude/launch.json
+
+/fuelkeeper/fuelkeeper
+/fuelkeeper/*.sqlite*
+/fuelkeeper/fuelkeeper-infra.yaml

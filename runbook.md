@@ -304,3 +304,149 @@ db.mandalaAdminHistory.find({
 
 For any hit, delete the row and rebuild that asset's state — a register row
 keyed under a foreign `assetId` is a forged prior (spec §12 P5).
+
+## fuelKeeper local run (P2)
+
+New Go module `fuelkeeper/` (spec `docs/design/2026-09-22-mandala-token-fee-design.md`
+§4, P2 done 2026-09-23). One binary: an in-process go-wallet-toolbox storage
+server, an issuer wallet client over loopback, the pool keeper, the fuel HTTP
+API (guarded by the `X-Fuel-Key` shared-secret header; `/health` and `/livez`
+excepted), and the sweeper. Not wired into the TS/Go overlays yet (P3) — this
+section is for running fuelKeeper on its own to exercise the
+draft/consume/settle/sweep flow directly.
+
+**Single replica.** Run exactly one keeper per issuer: sweeper rule 2's
+"spent" readings, rule 4's observations and the pool-drain snapshot are
+in-process memory, the pool keeper assumes it is the only one fanning out,
+and the default store is a SQLite file. A restart only delays those
+decisions. In the cluster (P5) the NetworkPolicy must cover `FK_API_PORT`
+(default 8090) as well as the storage port: only the overlay pods may reach
+the API, only the console and the keeper's own pod the storage server.
+
+### Env
+
+Required:
+
+```bash
+export ISSUER_ROOT_KEY=<32-byte hex — the issuer's wallet root key, SSM in prod>
+export FK_API_KEY=<random string, at least 32 chars>
+export FK_NETWORK=test
+export FK_STORAGE_CONFIG=./fuelkeeper-infra.yaml   # path to the yaml below
+export FUEL_ASSET_IDS=                             # comma list of "<64 hex>.<vout>" genesis outpoints, or empty = nothing eligible yet
+```
+
+A few you would plausibly change for a local run (defaults shown; full surface
+is in `fuelkeeper/internal/config/config.go`):
+
+```bash
+export FK_API_PORT=8090                # must be >= 1025
+export FK_STORAGE_URL=http://127.0.0.1:8100   # must match the infra yaml's http.port
+export FK_DB_DRIVER=sqlite             # or postgres
+export FK_DB_DSN=fuelkeeper.sqlite     # fuelKeeper's own reservation-table DB, separate from the storage DB below (relative: in the image it resolves under /data, the PVC mount)
+export FUEL_D=200                      # must equal the infra yaml's denomination_satoshis
+export FK_FANOUT_OUTPUTS_PER_TX=20     # must equal the infra yaml's fanout_outputs_per_tx — the keeper exits 1 on mismatch at startup
+# export FK_WOC_API_KEY=...            # optional; without it the sweeper's chain check (rule 2) is disabled and needs_recheck rows stay pending (on ttn/tstn it is always off: WhatsOnChain has no index for them)
+```
+
+### Minimal infra yaml (`fuelkeeper-infra.yaml`)
+
+Modeled on `go-wallet-toolbox/infra-config-docker-throughput-tstn.yaml`'s key
+names, trimmed to what a local sqlite run needs (generate your own
+`server_private_key`, e.g. `openssl rand -hex 32` — do not reuse any key
+committed elsewhere in this repo or in go-wallet-toolbox's example configs):
+
+```yaml
+name: fuelkeeper-local
+server_private_key: "<32-byte hex, generated locally>"
+
+bsv_network: test
+
+db:
+  engine: sqlite
+  sqlite:
+    connection_string: ./fuelkeeper-storage.sqlite
+
+http:
+  port: 8100
+
+fee_model:
+  type: sat/kb
+  value: 100
+
+utxo_management:
+  strategy: throughput
+  throughput:
+    denomination_satoshis: 200
+    pool_basket: fuel
+    reserve_basket: reserve
+    fanout_outputs_per_tx: 20
+    fanout_max_txs_per_round: 5
+    top_up:
+      enabled: true
+
+observability:
+  metrics:
+    enabled: false   # required: a second metrics provider in the same process would register duplicate gauges
+
+monitor:
+  enabled: true
+```
+
+Fields left out (logging, change_basket, tracing, commission, …) fall back to
+go-wallet-toolbox's own defaults; see `pkg/defs` there for the full schema.
+`denomination_satoshis`, `pool_basket`/`reserve_basket`,
+`fanout_outputs_per_tx` and `bsv_network` here MUST agree with `FUEL_D` /
+`FK_POOL_BASKET` / `FK_RESERVE_BASKET` / `FK_FANOUT_OUTPUTS_PER_TX` /
+`FK_NETWORK` above, `strategy` must be `throughput` and
+`observability.metrics.enabled` must be `false`. The keeper compares network,
+strategy, both baskets, denomination, fan-out width and metrics at startup and
+exits 1 on any mismatch (it reads fuel rows through its own read-only
+in-process storage provider built from this same config, on the same DB). A
+`http.port` that differs from `FK_STORAGE_URL`'s port is only warned about.
+
+### Run
+
+```bash
+cd fuelkeeper && GOTOOLCHAIN=auto go run ./cmd/fuelkeeper
+```
+
+Check it came up (`/livez` does no I/O; `/health` reads the pool, the
+reservation counts and the issuer balance, the first two cached for 10 s):
+
+```bash
+curl http://127.0.0.1:8090/livez
+curl http://127.0.0.1:8090/health
+```
+
+In the container image (`fuelkeeper/Dockerfile`, distroless `nonroot`) the
+working directory is `/data`: mount the PVC there and set `securityContext.fsGroup: 65532`
+(the distroless `nonroot` uid/gid) so the volume is writable.
+
+**The issuer wallet must be funded before the keeper can mint fuel.** Send
+BSV to the issuer wallet's receiving address via the storage server (the
+console / any go-wallet-toolbox client pointed at `FK_STORAGE_URL` with
+`ISSUER_ROOT_KEY`) — `/health`'s `issuerBsvSats` stays at 0 and the pool
+stays empty until this happens, and every `/draft` call fails
+`ERR_FUEL_UNAVAILABLE` (no proven fuel) until the keeper's first fan-out
+round confirms.
+
+### Alerts
+
+Logged at Error with an `alert` attribute: `low_water` (proven pool below
+`FK_POOL_TARGET × FK_LOW_WATER_PERCENT / 100`), `issuer_balance_low` (below
+`20 × FUEL_D × FK_POOL_TARGET`), `pool_drain_unexplained` (the pool shrank by
+more than the keeper's own claims since the last tick), `spent_external`,
+`consumedUnsettled`, `chain_check_untrusted` (the chain service failed on, or
+called spent, a pool output the wallet holds as spendable — rule 2 is skipped
+for that tick) and `settle_invalid` (a `/settle` that can never succeed,
+answered `400 ERR_SETTLE_INVALID`).
+
+A released draft's fuel is never re-drafted (spec §13 rev 3); each release
+strands `FUEL_D` sat in a `released` row until the planned relink task
+returns it to the pool.
+
+### Tests
+
+```bash
+cd fuelkeeper && GOTOOLCHAIN=auto go test ./... -count=1 -race
+```
