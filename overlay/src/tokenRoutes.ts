@@ -102,8 +102,9 @@ export async function adminHistoryPageResponse (tokenId: unknown, limit: unknown
 }): Promise<RouteResult> {
   const id = tokenIdParam(tokenId)
   if (id == null) return INVALID_TOKEN_ID
-  const l = Number(limit ?? 100)
-  const o = Number(offset ?? 0)
+  // An empty `?limit=` is missing, not 0.
+  const l = Number(limit === '' ? 100 : limit ?? 100)
+  const o = Number(offset === '' ? 0 : offset ?? 0)
   const lim = Number.isFinite(l) ? Math.min(Math.max(Math.trunc(l), 1), 500) : 100
   const off = Number.isFinite(o) ? Math.max(Math.trunc(o), 0) : 0
   try {

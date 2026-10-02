@@ -8,7 +8,7 @@ import { defaultAssetState } from '@bsv/overlay-topics'
 
 const T = 'ab'.repeat(32) + '_0'
 const K = '02' + 'cd'.repeat(32)
-const BAD = ['ab'.repeat(32) + '.0', 'AB'.repeat(32) + '_0', 'ab'.repeat(32) + '_1', 'ab'.repeat(31) + '_0', '', undefined, 7, [T]]
+const BAD = ['ab'.repeat(32) + '.0', 'AB'.repeat(32) + '_0', 'ab'.repeat(32) + '_1', 'ab'.repeat(31) + '_0', '', undefined, 7, [T], T + '\n']
 
 describe('tokenIdParam', () => {
   it.each([T])('accepts %s', id => expect(tokenIdParam(id)).toBe(id))
@@ -84,6 +84,29 @@ describe('assetStateResponse', () => {
   })
 })
 
+describe('assetStateResponse frozen rows (A16)', () => {
+  it('marks each frozen ref with whether its token row is live', async () => {
+    const live = 'cc'.repeat(32) + '.0'
+    const gone = 'dd'.repeat(32) + '.3'
+    const s = { ...defaultAssetState(T, 25), frozenOutpoints: [
+      { outpoint: live, amount: 40, owner: '02aa' },
+      { outpoint: gone, amount: 0, owner: '' }
+    ] }
+    const calls: Array<[string, number]> = []
+    const r = await assetStateResponse(T, {
+      getAssetState: async () => s,
+      hasTokenRow: async (txid, vout) => { calls.push([txid, vout]); return txid === 'cc'.repeat(32) && vout === 0 }
+    })
+    expect(calls).toEqual([['cc'.repeat(32), 0], ['dd'.repeat(32), 3]])
+    expect((r.body as any).frozenOutpoints).toEqual([
+      { outpoint: live, amount: 40, owner: '02aa', hasFrozenRow: true },
+      { outpoint: gone, amount: 0, owner: '', hasFrozenRow: false }
+    ])
+    expect((r.body as any).tokenId).toBe(T)
+    expect((r.body as any).feeRatePerKb).toBe(25)
+  })
+})
+
 describe('adminHistoryPageResponse', () => {
   const run = async (limit: unknown, offset: unknown): Promise<[number, number]> => {
     const page = vi.fn(async () => [])
@@ -98,6 +121,9 @@ describe('adminHistoryPageResponse', () => {
     expect(await run('x', 0)).toEqual([100, 0])
     expect(await run(undefined, -1)).toEqual([100, 0])
     expect(await run('25', '7')).toEqual([25, 7])
+    expect(await run(2.7, 3.9)).toEqual([2, 3])
+    expect(await run(-5, 0)).toEqual([1, 0])
+    expect(await run('', '')).toEqual([100, 0])
   })
   it('passes the tokenId and returns the rows', async () => {
     const rows = [{ txid: 'a' }] as any
