@@ -1,7 +1,7 @@
 # Mandala on BRC-162 (BSV-21 binary, authority supply) — design
 
 - **Date:** 2026-10-01
-- **Status:** draft for maintainer review
+- **Status:** approved 2026-10-01; amended 2026-10-02 (§4.2a stored-owner index, D14; §3.1 push canonicality, §3.5 strict CBOR subset, §4.1 directory, §6.6 collections, §8.3 vectors, §9 P1 scope, D15–D16)
 - **Branch:** mandala `feat/brc162`; ts-stack PR from a worktree off `origin/main`; bsv-wallet worktree off `master`
 - **Invariant spec:** [`docs/design/brc-0162-bsv21-binary.pinned.md`](../../design/brc-0162-bsv21-binary.pinned.md) (verbatim, bsv-blockchain/BRCs @ `8f36bdf`)
 - **Supersedes:** the MandalaToken / MandalaAdmin formats, `docs/design/2026-09-15-mandala-wire-contract-v2.md` (replaced by wire contract v3, §9 below; σI digest and the offline-settlement model carry over unchanged)
@@ -55,6 +55,9 @@ Taken with the maintainer on 2026-10-01. Do not re-litigate.
 | D11 | Admin action details travel off-chain as DAG-CBOR bytes; the payload carries only their SHA-256 | Maintainer: "the hash of administrative tasks … in that CBOR payload" |
 | D12 | Offline validation = issuer σI over txid (no BRC-176) | Unchanged |
 | D13 | Clean break, no migration | |
+| D14 | Stored owner rows are a rebuildable index; index faults are repaired or answered 503, never a final refusal (amendment 2026-10-02) | §4.2a; found when overlay-topics 1.8 turned a missing row into a persisted final ERR_SHAPE |
+| D15 | Strict DAG-CBOR is a hand-rolled whitelist codec in `@bsv/templates`, ported to Go; no CBOR dependency (2026-10-02) | §3.5; dag-cbor broke the browser budget and CJS, and diverged from Go |
+| D16 | `infra/overlay-server` wiring ships as P1b after the packages publish; vectors package-local; templates 2.0.0 folds in #729; topics rides the unpublished 2.0.0 (2026-10-02) | §9 P1 |
 
 ## 3. On-chain format
 
@@ -70,6 +73,14 @@ OP_DUP OP_HASH160 <push pkh20> OP_EQUALVERIFY OP_CHECKSIG
 - **Token id on the wire:** 32 bytes, deploy txid in natural/internal byte order (spec §Token identification). A 36-byte id is *invalid for Mandala* (no BRC-161 tokens exist here).
 - **Token id string:** `<txid>_0` (64 lowercase hex, display byte order, underscore). Used in every API, store, frame and UI. **Outpoints** stay `<txid>.<vout>`; they get their own helper. The lib's single `outpoint()` helper that served both is split (`tokenIdString` / `outpointString`) so the two can never be confused.
 - **Amount:** minimally encoded script number per spec. The codec decodes the full 0…2^64−1 domain as `bigint`. The Mandala policy cap is in §3.4.
+- **Push canonicality (amendment 2026-10-02).** Every value has exactly one accepted encoding, so scripts that compare bytes agree and TS ≡ Go:
+  - **Token id:** a direct push of exactly 32 bytes (opcode `0x20`). `OP_PUSHDATA1/2/4` is not accepted.
+  - **Amount 0:** `OP_0`.
+  - **Amount 1–16:** `OP_1`…`OP_16`.
+  - **Any other amount:** a direct push (opcode `0x01`…`0x09`) of the minimal little-endian script number, with no sign or padding byte beyond what minimality requires. Amounts above 2^64−1 are not accepted.
+  - **Rejected:** `OP_1NEGATE`, a data push of a small number (e.g. `01 05` for 5), and `PUSHDATA*` for id or amount. Any of these makes the output token-shaped but invalid (§4.2 → `ERR_SHAPE`).
+  - **Payload:** must use the minimal push opcode for its length (direct ≤ 75 bytes, `PUSHDATA1` ≤ 255, `PUSHDATA2` above). Any other payload push carries no attributes.
+  - Encoders always emit these forms.
 - **Payload:** optional per spec. When present it must be a strict DAG-CBOR map (§3.5) to carry Mandala attributes. A non-map or non-strict payload carries no attributes. On a deploy or a committed authority output that makes the transaction fail Mandala policy (§4.3); on any other output it is ignored.
 
 ### 3.2 Roles (authority supply only)
@@ -118,15 +129,35 @@ The overlay rejects (`ERR_SHAPE`, §6.3) a transaction in which, for any token:
 
 Overlay arithmetic is `bigint` on both engines. The lib asserts `Number.isSafeInteger` on every amount it parses, builds, sums or receives. This closes the 2026-09-21 unsafe-amount class.
 
-### 3.5 DAG-CBOR strictness
+### 3.5 Strict DAG-CBOR subset (amended 2026-10-02)
 
-Readers must decode strictly per the DAG-CBOR spec. Neither chosen library is strict on its own (probe, 2026-10-01), so both engines use the same rule:
+Mandala reads attributes only from a **strict subset** of DAG-CBOR, decoded by a small hand-rolled codec. There is no third-party CBOR dependency, and Go ports the same codec rather than configuring a library.
 
-> `strictDecode(bytes)`: decode, re-encode canonically, and require the re-encoding to equal the input byte-for-byte. Anything else is "not a valid DAG-CBOR map".
+**Why not a library.** A probe on 2026-10-01 found three problems with `@ipld/dag-cbor` in `@bsv/templates`:
+- it breaks the governed browser budget on every dimension (+39 KB raw / +12 KB gzip);
+- it is ESM-only, while templates ships CJS and runs CJS Jest;
+- even with the decode→re-encode rule, it disagrees with Go's fxamacker (float `1.0` accepted by Go, tag 42 accepted by TS).
 
-- TS: `@ipld/dag-cbor` (10.x; ESM-only, no Node builtins; Metro 0.84 resolves the `import` condition from ESM imports).
-- Go: `github.com/fxamacker/cbor/v2` v2.9.4 with decode options `DupMapKeyEnforcedAPF`, `IndefLengthForbidden`, `TagsForbidden`, `NaNDecodeForbidden`, `InfDecodeForbidden`, `IntDecConvertSignedOrBigInt`, `DefaultMapType: map[string]any`, and encode options `CoreDetEncOptions()` + `SortLengthFirst`, `ShortestFloatNone`, `NaNConvertNone`, `InfConvertNone`.
-- Probe-verified: both reject indefinite lengths, duplicate keys, non-minimal ints, unsorted / wrong length-first keys, integer keys, tags, `undefined`, NaN/Infinity, float16/32 and trailing bytes, and both encode `{"sym":"USD","dec":2}` as `a263646563026373796d63555344`. Shared vectors pin this (§8.3).
+Two engines can only agree byte-for-byte on a whitelist they both implement.
+
+**Accepted (everything else is "not a valid Mandala map", i.e. no attributes):**
+- the top level is a map;
+- map keys are text strings, strictly increasing in encoded-byte order (= DAG-CBOR length-first), with no duplicates;
+- values: unsigned integers (major 0, ≤ 2^64−1, decoded as `bigint`), byte strings (major 2), text strings (major 3, strict UTF-8, NFC not required), `null` (`f6`), `true` / `false` (`f5` / `f4`), and nested maps under the same rules;
+- definite, minimal-length headers only;
+- nesting depth ≤ 4, total input ≤ 4096 bytes;
+- no trailing bytes.
+
+**Rejected:** negative integers (major 1), arrays (major 4; no Mandala attribute uses one), tags (major 6, including 42), floats, `undefined` and any other simple value, indefinite lengths, non-minimal integer or length headers, non-text or unsorted or duplicate keys, invalid UTF-8.
+
+**Encoding:** canonical by construction (sorted keys, minimal headers). `strictDecode` also re-encodes and compares as a final guard.
+
+- **TS:** `src/strictCbor.ts` in `@bsv/templates`. Pure functions, CJS + ESM safe, and reused by lib (P4) and the wallet (P6). The code descends from the in-repo LCH codec (`packages/content/lch/src/cbor.ts`) minus its NFC rule and limits.
+- **Go:** a line-for-line port in `overlay-go/internal/brc162/strictcbor.go`.
+- **Vectors:** the shared vectors (§8.3) pin accept/reject for every rule above. That includes float `1.0`, tag 42, a negative int, an array, depth 5, unsorted keys, non-minimal headers and trailing bytes. `{"sym":"USD","dec":2}` must encode as `a263646563026373796d63555344`.
+- **Integer reads:** Mandala reads integers as `bigint` and applies its own bounds: `dec` 0–18; `feeRatePerKb` a safe integer ≥ 1, or `null` to disable; anything else → `ERR_SHAPE`.
+
+This is narrower than full DAG-CBOR, which BRC-162 permits ("unknown keys are ignored"; a non-conforming payload "carries no defined attributes"). For a deploy or committed authority output the narrower reading refuses the transaction under Mandala policy (§4.3); for any other output it only means "no attributes".
 
 ### 3.6 Supply delta
 
@@ -139,7 +170,9 @@ For an authority transaction of token T: `Δ = Σ value-out(T) − Σ value-in(T
 
 Four layers, each a separate module with its own tests. They run in order; the first refusal rejects the whole transaction. The same split exists file-for-file in Go.
 
-### 4.1 Layer A — generic BRC-162 rules (`overlay-topics/src/bsv21/`)
+### 4.1 Layer A — generic BRC-162 rules (`overlay-topics/src/brc162/`)
+
+(Directory amended 2026-10-02: `src/bsv21/` already holds the public JSON BSV-21 topic, `tm_bsv21`; Go uses `internal/brc162`.)
 
 Spec-faithful. No Mandala knowledge, so any future BRC-162 topic can reuse it.
 
@@ -160,7 +193,32 @@ Identity checks, kept separate from layer A as the maintainer asked:
 - `requireOneSat` → `ERR_SATOSHIS`.
 - `requireSafeAmounts` (§3.4) → `ERR_SHAPE`.
 - `verifyOutputLinkage`: each token output needs a linkage at its index whose derived pkh equals the remainder's pkh → identity. Missing or mismatched → `ERR_LINKAGE`. This is the reject-not-skip rule, generalized to every role.
-- `resolveInputOwner`: the owner of a spent token input is the stored row (`mandalaTokens` / `mandalaAuthorities`), which must exist and match id, role and amount. An input linkage, when present, must corroborate it (prover + L·G == source pkh, prover == stored owner) → else `ERR_LINKAGE`. This adopts the Go model on both engines (closes the TS/Go gap found 2026-10-01; prerequisite of blinded A′, stablecoin-mobile decision 2).
+- `resolveInputOwner`: the owner of a spent token input is its stored owner row (`mandalaTokens` / `mandalaAuthorities`). That row is an **index**, rebuilt from the owner journal when it is missing or disagrees with the source script (§4.2a). A missing or wrong row is never the holder's fault and never a final refusal. An input linkage, when present, must corroborate the owner (prover + L·G == source pkh, prover == owner) → else `ERR_LINKAGE`. That is a payload defect, so it is final and keyed by payload hash. This adopts the Go model of a payload-independent owner on both engines (closes the TS/Go gap found 2026-10-01; prerequisite of blinded A′, stablecoin-mobile decision 2).
+
+### 4.2a Stored-owner index: faults and repair (amendment 2026-10-02)
+
+**Why.** `@bsv/overlay-topics` 1.8 made the stored row the only owner source. A missing row there throws a reason that falls through to a persisted final `ERR_SHAPE`. The row is written by the lookup service in the engine's phase 3, and the engine only *logs* lookup errors (`@bsv/overlay` 2.6 `Engine.js`). So one failed index write left a valid, σI-signed coin permanently unspendable, refused as if the holder had sent a malformed transaction. Go tolerated a missing row and fell back to the linkage, so the two engines also disagreed. Neither behaviour is acceptable for v3.
+
+**Rules (both engines, byte-identical reasons):**
+
+1. **Owner journal = source of truth.** For every token output it is about to admit (all roles, both `tm_mandala` and `tm_mandala_registry`), the topic manager writes `{txid, outputIndex, topic, tokenId, role, amount, identityKey}` (the owner already verified in layer B by `verifyOutputLinkage`) to the append-only `mandalaOwners` collection (§6.6). It does this itself, as the last step of `identifyAdmissibleOutputs`, **before returning admittance**, i.e. before the engine can broadcast.
+   - Amended 2026-10-02: the manager writes the journal itself rather than through the overlay's admission record, so it is package-contained and works for every engine wiring, `infra/overlay-server` included.
+   - If the write fails, the manager throws the infra reject: `503 ERR_UNAVAILABLE`, nothing broadcast.
+   - `context.dryRun` (GASP) skips the write.
+   - A journal row whose transaction is later not admitted (broadcast failure, eviction) is inert: repair also requires the engine's admitted output.
+   - `mandalaTokens` / `mandalaAuthorities` are a projection of journal + engine outputs and can always be rebuilt.
+2. **Read fault.** The owner-row read fails → `503 ERR_UNAVAILABLE`, never persisted (v2.1 §9.5).
+3. **Row missing, or present but disagreeing with the source script** (id, role or amount): the guard **repairs inline before judging**:
+   - It requires the engine's admitted output for that outpoint on this topic, and the journal entry for it.
+   - It checks that the journal entry agrees with the on-chain source script.
+   - It upserts the row from the journal. The lookup's balance projection is credited exactly once, on insert only, like the eviction restore (`mongoRestoreTokenRow` / Go `RestoreTokens`).
+   - Validation then continues as if the row had always been there.
+   - The repair is logged with its outpoint. The holder sees no refusal at all.
+4. **Unrepairable** (no admitted engine output, no journal entry, or the journal disagrees with the script): `503 ERR_UNAVAILABLE`, never persisted, with reason `owner index unavailable for <outpoint>`. The overlay **fails closed**: it never admits on a linkage fallback, because the payload names identities (blinded A′) and is not an owner source. The wallet's existing retry/strand path (v2.1 §9.11) surfaces the coin; recovery is operator work, never a holder verdict.
+5. **Boot and periodic reconciler.** At start and on an interval, rule 3 runs over every unspent admitted engine output of both topics that lacks a matching row. Rows it cannot repair are counted, logged, and reported by a `mandala-owner-index` readiness check: degraded, not critical, so the overlay keeps serving every other coin.
+6. **What stays final.** Only payload or content defects are final: the input linkage does not control the source pkh, or names someone other than the owner (`ERR_LINKAGE`). Index faults of any kind never are.
+
+Repair writes happen during validation (phase 1, before broadcast). They are idempotent upserts of rows for coins the engine has already admitted, so a refused or abandoned submit leaves only a correct index behind.
 
 ### 4.3 Layer C — Mandala authority policy (`overlay-topics/src/mandala/authority.ts`)
 
@@ -208,7 +266,7 @@ Linkage decryption uses the ECDH key between the overlay and `linkage.prover` wi
 
 A deploy has no authority input. Someone who saw an issuer's earlier linkage could rebuild a deploy locked to the same pkh, reusing that linkage. The prover check would still pass. The rogue token would only be spendable by the issuer, but it could spoof metadata ("USD") under the issuer's name.
 
-Fix: the off-chain envelope carries `deploySig`, an issuer signature over `"mandala-deploy:" + txid` (wallet `createSignature`, protocol `[2, 'mandala deploy']`, keyID `'1'`, counterparty `'anyone'`). The overlay verifies it against the deploy output's linked identity. The txid is known after `signAction(noSend)`, before submit, so no circularity, and a txid is unique so it cannot be replayed. Applies to the registry deploy too.
+Fix: the off-chain envelope carries `deploySig`, an issuer signature over `"mandala-deploy:" + txid`. The signed data is the UTF-8 bytes of that string, with `txid` as 64 lowercase hex in display order. It is made with wallet `createSignature`, protocol `[2, 'mandala deploy']`, keyID `'1'`, counterparty `'anyone'`, and verified with `ProtoWallet('anyone').verifySignature({…, counterparty: <deploy owner identity>})`. Any throw counts as invalid. The overlay verifies it against the deploy output's linked identity. The txid is known after `signAction(noSend)`, before submit, so no circularity, and a txid is unique so it cannot be replayed. Applies to the registry deploy too.
 
 ### 5.4 Registry
 
@@ -256,6 +314,7 @@ The `cover()` walk follows every input whose source output decodes as a valid BR
 |---|---|---|---|---|
 | `ERR_AUTHORITY` | 400 | false | yes | missing or invalid `deploySig`, continuity break, duplicate commitment, fixed-supply deploy, authority output without an admitted authority input |
 | `ERR_UNTRUSTED` | 409 | true | **never** | a deploy/authority output identity or linkage prover is not in `MANDALA_ISSUER_KEYS` |
+| `ERR_UNAVAILABLE` (v2, unchanged) | 503 | true | **never** | also covers every stored-owner index fault (§4.2a rules 2 and 4) and a failed owner-journal write; an index fault is never `ERR_SHAPE` / `ERR_LINKAGE` |
 - Reason strings are pinned in the conformance vectors and byte-identical TS ≡ Go. The v2 §6 string becomes `output <idx>: token output with no verified linkage`.
 
 ### 6.4 Guard order (replaces v2 §9.6)
@@ -270,6 +329,31 @@ Conflicting spend → (fuel, P3) → layer A → B → C → D.
 | `GET /admin/asset-auth/beef/:txid` | `GET /admin/authorities/beef/:txid?vout=` |
 | `/admin/asset-state/:assetId`, `/admin/admin-history[-page]/:assetId`, `/admin/admin-summary/:assetId`, `/admin/activity?assetId=` | same, keyed by `tokenId`. History rows carry `{txid, outputIndex, kind, detailsHex, commitment, delta, height, offset, admitSeq}`. Summary sums Δ (`totalIssued` = Σ positive, `totalRedeemed` = Σ |negative|) |
 | lookup `{metadataAssetId}` | lookup `{metadataTokenId}` |
+
+### 6.6 Persisted collections (amendment 2026-10-02; contract shared by the package, TS P2 and Go P3)
+
+All collections live in the lookup database. Field names and types are frozen here, and Go's BSON codecs must read and write the same shapes.
+
+**Types:**
+- `tokenId`: string `<txid>_0`.
+- outpoint fields: string `<txid>.<vout>`.
+- `amount` / `delta`: BSON double holding an integer with |x| ≤ 2^53−1 (TS driver default for `number`). Go writes `float64` and reads int32, int64 or double.
+- `createdAt`: Date.
+
+| Collection | Shape | Indexes |
+|---|---|---|
+| `mandalaOwners` (journal, append-only, never deleted) | `{txid, outputIndex, topic, tokenId, role: 'deploy'\|'authority'\|'value', amount, identityKey, createdAt}` | unique `(txid, outputIndex, topic)` |
+| `mandalaTokens` (value index) | `{txid, outputIndex, tokenId, amount, identityKey, createdAt}` | unique `(txid, outputIndex)`; `tokenId`; `identityKey` |
+| `mandalaAuthorities` (unspent authority index) | `{txid, outputIndex, topic, tokenId, identityKey, createdAt}`, deleted when spent or evicted | unique `(txid, outputIndex)`; `(topic, tokenId)` |
+| `mandalaLinkageRecords` | unchanged | unchanged |
+| `mandalaBalances` | unchanged `{identityKey, balance}` | unchanged |
+| `mandalaMetadata` | `{tokenId, txid, outputIndex: 0, sym, dec, label, feeRatePerKb: number\|null}` (decoded deploy payload) | unique `tokenId` |
+| `mandalaAssetStates` | `{tokenId, isPaused, accessMode, blockedIdentities, allowedIdentities, frozenOutpoints: [{outpoint, amount, owner}], evictedOutpoints, feeRatePerKb: number\|null, lastProcessedHeight, lastProcessedOffset, lastAdmitSeq}`; `issuerIdentityKey` removed (trusted set, §5.1) | unique `tokenId` |
+| `mandalaAdminHistory` | `{tokenId, txid, outputIndex, kind, detailsHex, commitment, delta, height, offset, admitSeq, createdAt}` | `(tokenId, height, offset, admitSeq)`; `(tokenId, txid, outputIndex)`; `txid` |
+| `mandalaRegistry` | as today (moved from the mandala repo) | as today |
+| `mandalaCounters` | as today (`admitSeq`, `registryAdmitSeq`) | as today |
+
+Eviction (package API): purge `mandalaAdminHistory` rows by txid and refold each touched token from surviving history (fee rate included). Delete the evicted outputs' `mandalaTokens` / `mandalaAuthorities` rows. Restore the inputs' rows only for coins live again (v2.3 §11). `mandalaOwners` is never purged.
 
 ## 7. Overlay re-base onto upstream
 
@@ -325,10 +409,22 @@ Conflicting spend → (fuel, P3) → layer A → B → C → D.
 - Fixed-supply deploy; deploy at vout ≠ 0; 36-byte id; non-minimal amount; amount > 2^53−1; sum overflow; non-P2PKH remainder; 2-sat output; token-shaped garbage output.
 - Reissue: of an unfrozen outpoint, with a wrong amount, with value inputs, to the wrong recipient.
 - Registry: value output; second deploy.
+- Owner index (§4.2a; real engine + real Mongo, both engines):
+  - owner row deleted after admission (simulated failed lookup write) → the next spend repairs the row inline, is admitted, and the balance is credited once;
+  - row present with a wrong amount → repaired from the journal, admitted;
+  - row and journal entry both missing → `503 ERR_UNAVAILABLE`, nothing persisted, and the retry is still 503 (never `ERR_SHAPE`);
+  - journal disagrees with the script → 503;
+  - the owner-journal write fails → 503 and nothing broadcast;
+  - input linkage naming a non-owner → `ERR_LINKAGE`, persisted for that payload hash only;
+  - reconciler repairs a backlog at boot and reports unrepairable rows on the readiness check.
 
 ### 8.3 Conformance vectors
 
-ts-stack generates one JSON file from the published package code. It covers scripts per role, payload bytes, details bytes and commitments, linkage, `deploySig` digests, strict-CBOR accept/reject cases, and every reject `{code, reason}`. It is copied to `overlay-go/testdata/vectors.json`; the Go tests read it. Regenerating it is a script, not hand edits.
+ts-stack generates the vectors from the package code. They stay **package-local in P1** (amended 2026-10-02); a generic `conformance/` domain may follow once the format settles. There are two files:
+- `@bsv/templates` `test/vectors/brc162.json`: scripts per role, push-canonicality accept/reject, strict-CBOR accept/reject, details bytes and commitments, `deploySig` digest bytes and a deterministic signature.
+- `@bsv/overlay-topics` `test/vectors/mandala-rejects.json`: every reject `{code, reason}` with the transaction that triggers it.
+
+Linkage entries are frozen snapshots checked semantically (derived key and pkh), because the SDK's AES-GCM IV is random. The generators live under `test/` (patch-coverage scope) and have a `--check` mode run in each package's tests. Both files are copied to `overlay-go/testdata/`, and the Go tests read them. Regenerating them is a script, not hand edits.
 
 ### 8.4 End to end
 
@@ -348,27 +444,33 @@ The §7 bumps and adoptions, done as separate commits with full suites green, be
 
 ### P1 — ts-stack PR (worktree off `origin/main`; maintainer merges, tags, publishes)
 
-- **`@bsv/templates`:**
-  - `Bsv21Binary` codec: `encode/decode` prefix + optional payload, role helpers, bigint amounts, `lock(id, amount, pkh, payload?)` pkh-only entry (needed by the blinded recipient path), `lockBRC29(...)`, `tokenIdString/parse`, `dagCborStrict` wrapper.
-  - The name avoids the existing JSON `Bsv21Token`.
-  - Delete `MandalaToken`, `MandalaAdmin`, `mandala-encoding` (keep `createMinimallyEncodedScriptChunk` / `decodeScriptNumChunk` for `MultiPushDrop` / `P2MSKH`).
-  - Update `browser-budget.json`, `pack:check` exports, governance mutation targets.
-- **`@bsv/overlay-topics`:**
-  - `bsv21/` (layer A); rewritten `mandala/` (layers B–D, lookup, storage incl. `mandalaAuthorities`, reducer with fee rate, typed rejects); `mandala-registry/` topic + lookup (moved from the mandala repo).
-  - Export the reducer and the reject type.
+(Scope amended 2026-10-02 from the ts-stack fact base.)
+
+- **`@bsv/templates` → 2.0.0** (major). The SDK-3 peer release note from the closed bsv-blockchain/ts-stack#729 is folded into this entry.
+  - `Bsv21Binary` codec (`src/Bsv21Binary.ts`): `encode/decode` prefix + optional payload with §3.1 push canonicality, role helpers, bigint script-number helpers (no `number` paths), `lock(id, amount, pkh, payload?)` pkh-only entry (needed by the blinded recipient path), `lockBRC29(...)`, and `tokenIdString/parse`. The name avoids the existing JSON `Bsv21Token`.
+  - `src/strictCbor.ts` (§3.5).
+  - Delete `MandalaToken`, `MandalaAdmin` and `mandala-signing`.
+  - Trim `mandala-encoding` to the two helpers `MultiPushDrop` / `P2MSKH` still use (`createMinimallyEncodedScriptChunk`, `decodeScriptNumChunk`).
+  - Update `browser-budget.json` `requiredExports` (sizes must stay within budget), `pack:check` exports, release notes, changelog, docs page.
+- **`@bsv/overlay-topics` → folded into the unpublished 2.0.0 candidate.**
+  - `src/brc162/` (layer A).
+  - Rewritten `src/mandala/`: layers B–D, typed `MandalaReject`, lookup, storage per §6.6 incl. `mandalaOwners` / `mandalaAuthorities`, reducer with fee rate, eviction API, §4.2a repair and reconciler.
+  - New `src/mandala-registry/` topic + lookup (moved from the mandala repo).
+  - Membership as an explicit dependency with typed `ERR_MEMBERSHIP`, not the boolean screening seam.
+  - New lookup validator `requireTokenId`.
   - Delete the old mandala sources and tests.
-- **`infra/overlay-server`:** Mandala wiring → `MANDALA_ISSUER_KEYS`, registry topic; docs, README, release notes, `pnpm docs:facts`.
-- **Conformance vectors generator** (§8.3).
-- **Supersedes open PRs** bsv-blockchain/ts-stack#535 (1.7.3 unlinked-token reject) and bsv-blockchain/ts-stack#584 (reducer export). Both touch files this PR deletes. Whether to close or merge-then-rebase them is the maintainer's call.
-- Until publish, mandala consumes the packages as packed tarballs (`file:` to a vendored `.tgz`, like the wallet does with the lib).
+- **Governance:** replace the two Mandala test targets 1:1 (ids `overlay-linkage` and `mandala-encoding` keep their slots and keep covering `src/admission/issuerPolicy.ts:36-39`), so peer branches' pinned totals don't move. This follows the division acknowledged on BotBoard (#726/#727/#732) and is edited only after acknowledgement.
+- **Vectors:** package-local (§8.3).
+- **Not in P1:** `infra/overlay-server` wiring. It is not a workspace member and pins `@bsv/overlay-topics` from npm, so it cannot compile against unpublished exports. `MANDALA_ISSUER_KEYS`, the registry topic and the env/README/deploy changes therefore move to **P1b**, a follow-up PR after the maintainer publishes templates 2.0.0 and topics 2.0.0.
+- Until publish, mandala consumes the packages as packed tarballs (`file:` to a vendored `.tgz`). Workspace `@bsv/overlay` 2.6.3 / gasp 1.3.8 are unpublished, so the mandala overlay pins `@bsv/overlay` 2.6.2 via override.
 
 ### P2 — TS overlay
 
-Consume the new packages; §7.1 deletions; side channel reads `.code`; v3 routes; `MANDALA_ISSUER_KEYS` config.
+Consume the new packages; §7.1 deletions; side channel reads `.code`; v3 routes; `MANDALA_ISSUER_KEYS` config. Wire the package's §4.2a reconciler (boot + interval) and the `mandala-owner-index` readiness check; the owner journal itself is written by the package's topic manager (`mandalaOwners`).
 
 ### P3 — Go overlay
 
-Port layers A–D + registry file-for-file (`internal/bsv21`, `internal/mandala`); strict CBOR wrapper; `mandalaAuthorities`; v3 routes and verdicts; vectors parity. Delete `token.go`/`admin.go`/`adminwallet.go` commitment code.
+Port layers A–D + registry file-for-file (`internal/bsv21`, `internal/mandala`); strict CBOR wrapper; `mandalaAuthorities`; v3 routes and verdicts; vectors parity. §4.2a on the Go side: the topic manager writes `mandalaOwners` before returning admittance; drop the missing-row linkage fallback in `resolveSpendIdentities` in favour of repair-or-503; same reconciler and readiness check; strict-CBOR port in `internal/brc162`. Delete `token.go`/`admin.go`/`adminwallet.go` commitment code.
 
 ### P4 — lib (`@bsv/mandala`)
 
@@ -401,9 +503,12 @@ Wire contract v3 file (§6 made standalone), PROJECT-STATE refresh, runbook env 
 
 | Risk | Mitigation |
 |---|---|
-| Strict-CBOR divergence TS vs Go | Same re-encode rule on both engines; shared accept/reject vectors |
-| ESM-only CBOR libs in RN/Jest | Metro resolves the `import` condition; add to wallet Jest `transformIgnorePatterns`; P6 smoke on device |
+| Strict-CBOR divergence TS vs Go | One hand-rolled whitelist codec, ported line-for-line to Go; shared accept/reject vectors (§3.5) |
+| CBOR in RN/Jest/CJS | No third-party CBOR dependency; the codec is plain TS in `@bsv/templates` (CJS + ESM) |
+| ts-stack peers editing the same governance files | Entry-level division acknowledged on BotBoard; 1:1 target replacement keeps pinned totals; peers merge first |
 | ts-stack publish cycle blocks P2+ | Tarball consumption until publish; P1 PR kept self-contained |
 | Upstream overlay 2.6.2 behaviour shifts (submit serialization, CAS errors) | P0 isolates the bump; double-spend e2e checks the CAS error maps to `503 ERR_UNAVAILABLE`, and the retry converges on `400 ERR_INPUT_SPENT` |
 | Fold ordering with concurrent authority branches | Unchanged (height, offset, admitSeq) last-write-wins; continuity is tx-local so no state race |
 | Spec-faithful readers disagree with Mandala on I > O and payload-commitment txs | Documented as policy (§2, §4.5); Mandala never broadcasts such txs |
+| A swallowed lookup write leaves an admitted coin with no owner row (found in overlay-topics 1.8, 2026-10-02) | §4.2a: owner journal written before broadcast, inline repair, reconciler, readiness check; index faults are 503, never final |
+| Owner journal and index drift (journal says X, script says Y) | Never auto-trusted: repair requires journal ≡ script; otherwise 503 and an operator alert |
