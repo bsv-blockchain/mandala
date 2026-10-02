@@ -1,16 +1,30 @@
 import { describe, it, expect } from 'vitest'
-import { summarizeTx, ActivityProof } from './activity.js'
+import { Transaction } from '@bsv/sdk'
+import { Bsv21Binary } from '@bsv/templates'
+import { summarizeTx, decodeFtOutputs, ActivityProof } from './activity.js'
+
+const codec = new Bsv21Binary()
+const PKH = new Array(20).fill(7)
+const TID = 'ab'.repeat(32) + '_0'
+const valueScript = (amt: bigint) => codec.lock(TID, amt, PKH)
+const authorityScript = () => codec.lock(TID, 0n, PKH)
+const deployScript = () => codec.lock(null, 0n, PKH)
+const txHex = (scripts: Array<ReturnType<typeof valueScript>>) => {
+  const tx = new Transaction()
+  for (const lockingScript of scripts) tx.addOutput({ lockingScript, satoshis: 1 })
+  return tx
+}
 
 const NO_PROOFS: ActivityProof[] = []
 const base = { txid: 't1', when: '2026-07-07T00:00:00.000Z', proofs: NO_PROOFS }
 
-const inp = (identityKey: string, amount: number) => ({ identityKey, amount, assetId: 'a.0' })
-const out = (outputIndex: number, identityKey: string, amount: number) => ({ outputIndex, identityKey, amount, assetId: 'a.0' })
+const inp = (identityKey: string, amount: number) => ({ identityKey, amount, tokenId: TID, role: 'value' as const })
+const out = (outputIndex: number, identityKey: string, amount: number) => ({ outputIndex, identityKey, amount, tokenId: TID, role: 'value' as const })
 
 describe('summarizeTx', () => {
   it('classifies a mint (no FT inputs) as issue to the largest output', () => {
     const e = summarizeTx({ ...base, ftInputs: [], ftOutputs: [out(0, 'alice', 100)] })
-    expect(e).toMatchObject({ kind: 'issue', from: null, to: 'alice', amount: 100, assetId: 'a.0' })
+    expect(e).toMatchObject({ kind: 'issue', from: null, to: 'alice', amount: 100, tokenId: TID })
   })
 
   it('classifies alice→bob with change back to alice as a transfer of the external amount', () => {
@@ -98,6 +112,38 @@ function pagingDeps (rows: LinkageRowLite[]): ActivityDeps {
   }
 }
 
+describe('BRC-162 decoding', () => {
+  it('ignores authority outputs when classifying value movement', () => {
+    const auth = { outputIndex: 1, identityKey: 'bob', tokenId: TID, amount: 0, role: 'authority' as const }
+    expect(summarizeTx({ ...base, ftInputs: [], ftOutputs: [auth] })).toBeNull()
+    const e = summarizeTx({ ...base, ftInputs: [inp('alice', 100)], ftOutputs: [out(0, 'alice', 100), auth] })
+    expect(e).toMatchObject({ kind: 'self', amount: 0 })
+  })
+
+  it('labels a deploy output with the tx own _0 id', () => {
+    const tx = txHex([deployScript()])
+    const [o] = decodeFtOutputs(tx.toHex(), new Map())
+    expect(o).toMatchObject({ role: 'deploy', tokenId: `${tx.id('hex')}_0`, amount: 0 })
+  })
+
+  it('decodes value and authority roles with the token id string', () => {
+    const outs = decodeFtOutputs(txHex([valueScript(5n), authorityScript()]).toHex(), new Map([[0, 'alice']]))
+    expect(outs).toMatchObject([
+      { outputIndex: 0, identityKey: 'alice', tokenId: TID, amount: 5, role: 'value' },
+      { outputIndex: 1, tokenId: TID, amount: 0, role: 'authority' }
+    ])
+  })
+
+  it('skips non-token, malformed token-shaped, and over-2^53 outputs without throwing', () => {
+    const malformed = codec.lock(TID, 1n, PKH)
+    malformed.chunks[0] = { op: 5, data: [1, 2, 3, 4, 5] } // not a 32-byte id
+    const big = valueScript(2n ** 60n)
+    const plain = new (Object.getPrototypeOf(malformed).constructor)([{ op: 0x76 }])
+    const outs = decodeFtOutputs(txHex([plain, malformed, big, valueScript(1n)]).toHex(), new Map())
+    expect(outs.map(o => o.outputIndex)).toEqual([3])
+  })
+})
+
 describe('buildActivity pagination', () => {
   it('returns a null cursor when everything fits in one page', async () => {
     const rows = [link('t1', 0, 'a', '2026-07-07T10:00:00.000Z'), link('t2', 0, 'a', '2026-07-07T09:00:00.000Z')]
@@ -142,5 +188,22 @@ describe('buildActivity pagination', () => {
     expect(requested).toBeLessThanOrEqual(509) // 500 + overlap
     await buildActivity(deps, { limit: 0 })
     expect(requested).toBeGreaterThanOrEqual(10) // 1 + overlap
+  })
+})
+
+describe('buildActivity tokenId filter', () => {
+  it('returns only entries for the requested token', async () => {
+    const OTHER = 'cd'.repeat(32) + '_0'
+    const mk = (id: string) => txHex([codec.lock(id, 9n, PKH)])
+    const a = mk(TID); const b = mk(OTHER)
+    const raws = new Map([[a.id('hex'), a.toHex()], [b.id('hex'), b.toHex()]])
+    const deps: ActivityDeps = {
+      listLinkage: async () => [link(a.id('hex'), 0, 'alice', '2026-07-07T10:00:00.000Z'), link(b.id('hex'), 0, 'alice', '2026-07-07T09:00:00.000Z')],
+      findLinkageByOutpoints: async () => [],
+      findRawTxs: async () => raws
+    }
+    expect((await buildActivity(deps, {})).entries).toHaveLength(2)
+    const page = await buildActivity(deps, { tokenId: OTHER })
+    expect(page.entries.map(e => e.tokenId)).toEqual([OTHER])
   })
 })

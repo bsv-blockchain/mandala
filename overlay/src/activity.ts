@@ -2,9 +2,9 @@
  * Overlay-wide transaction activity feed — the admin-oversight view.
  *
  * Built entirely from data the overlay operator already holds:
- *   - mandalaLinkageRecords (append-only): every FT output ever admitted, with
+ *   - the linkage records (append-only, injected via ActivityDeps): every FT output ever admitted, with
  *     the identityKey proven via revealSpecificKeyLinkage at submission time.
- *   - the engine's raw transaction store: lets us decode amounts/assetIds for
+ *   - the engine's raw transaction store: lets us decode amounts/tokenIds for
  *     every output — including spent ones — and walk each tx's inputs back to
  *     their source outpoints to identify the sender.
  *
@@ -17,8 +17,8 @@
  *   - all outputs to sender, in > out       → redeem  (amount = burned units)
  *   - all outputs to sender, in = out       → self    (0 units transferred)
  */
-import { Transaction } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { Transaction, LockingScript } from '@bsv/sdk'
+import { Bsv21Binary, tokenIdToString } from '@bsv/templates'
 
 export interface LinkageRowLite {
   txid: string
@@ -45,7 +45,7 @@ export interface ActivityProof {
 export interface ActivityEntry {
   txid: string
   when: string
-  assetId: string
+  tokenId: string
   kind: 'issue' | 'transfer' | 'self' | 'redeem'
   /** Sender identityKey (owner of the spent outputs); null for issuance. */
   from: string | null
@@ -85,17 +85,28 @@ export interface ActivityPage {
  *  or a limit-1 page filled by one such tx never advances its cursor. */
 const GROUP_OVERLAP = 9
 
-interface FtOutput { outputIndex: number, identityKey: string, amount: number, assetId: string }
+export type FtRole = 'value' | 'authority' | 'deploy'
+export interface FtOutput { outputIndex: number, identityKey: string, tokenId: string, amount: number, role: FtRole }
+interface FtInput { identityKey: string, amount: number, tokenId: string, role: FtRole }
 
-/** Decode every MandalaToken output of a raw tx, attaching owner identities. */
-function decodeFtOutputs (rawTx: string, owners: Map<number, string>): FtOutput[] {
+/** Decode one BRC-162 output; null for a non-token / malformed script or an amount past 2^53-1. */
+function decodeToken (script: LockingScript, txid: string): { tokenId: string, amount: number, role: FtRole } | null {
+  try {
+    const d = Bsv21Binary.decode(script)
+    if (d.amount > BigInt(Number.MAX_SAFE_INTEGER)) return null
+    const tokenId = d.role === 'deploy' ? `${txid}_0` : tokenIdToString(d.tokenId as number[])
+    return { tokenId, amount: Number(d.amount), role: d.role }
+  } catch { return null }
+}
+
+/** Decode every BRC-162 output of a raw tx, attaching owner identities. */
+export function decodeFtOutputs (rawTx: string, owners: Map<number, string>): FtOutput[] {
   const tx = Transaction.fromHex(rawTx)
+  const txid = tx.id('hex')
   const out: FtOutput[] = []
   for (let i = 0; i < tx.outputs.length; i++) {
-    try {
-      const decoded = MandalaToken.decode(tx.outputs[i].lockingScript)
-      out.push({ outputIndex: i, identityKey: owners.get(i) ?? '', amount: decoded.amount, assetId: decoded.assetId })
-    } catch { /* not an FT output */ }
+    const d = decodeToken(tx.outputs[i].lockingScript, txid)
+    if (d != null) out.push({ outputIndex: i, identityKey: owners.get(i) ?? '', ...d })
   }
   return out
 }
@@ -104,18 +115,20 @@ function decodeFtOutputs (rawTx: string, owners: Map<number, string>): FtOutput[
 export function summarizeTx (p: {
   txid: string
   when: string
-  ftInputs: Array<{ identityKey: string, amount: number, assetId: string }>
+  ftInputs: FtInput[]
   ftOutputs: FtOutput[]
   proofs: ActivityProof[]
 }): ActivityEntry | null {
-  const { ftInputs, ftOutputs } = p
+  // Only value coins move units; authority and deploy outputs never count.
+  const ftInputs = p.ftInputs.filter(i => i.role === 'value')
+  const ftOutputs = p.ftOutputs.filter(o => o.role === 'value')
   if (ftInputs.length === 0 && ftOutputs.length === 0) return null // no FT movement (pure admin tx)
 
-  const assetId = ftOutputs[0]?.assetId ?? ftInputs[0]?.assetId ?? ''
+  const tokenId = ftOutputs[0]?.tokenId ?? ftInputs[0]?.tokenId ?? ''
   const sender = ftInputs[0]?.identityKey ?? null
   const inTotal = ftInputs.reduce((a, b) => a + b.amount, 0)
   const outTotal = ftOutputs.reduce((a, b) => a + b.amount, 0)
-  const base = { txid: p.txid, when: p.when, assetId, proofs: p.proofs }
+  const base = { txid: p.txid, when: p.when, tokenId, proofs: p.proofs }
 
   if (sender == null || sender === '') {
     // Nothing verifiably spent — minted supply. Recipient = largest output.
@@ -142,7 +155,7 @@ export function summarizeTx (p: {
 
 export async function buildActivity (
   deps: ActivityDeps,
-  opts: { assetId?: string, limit?: number, before?: string } = {}
+  opts: { tokenId?: string, limit?: number, before?: string } = {}
 ): Promise<ActivityPage> {
   const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500)
   const rows = await deps.listLinkage(limit + GROUP_OVERLAP, opts.before)
@@ -203,7 +216,7 @@ export async function buildActivity (
 
     // FT inputs: source outpoints whose linkage we hold, amounts decoded from
     // the source tx (the linkage row proves ownership; the raw tx carries value).
-    const ftInputs: Array<{ identityKey: string, amount: number, assetId: string }> = []
+    const ftInputs: FtInput[] = []
     for (const input of tx.inputs) {
       if (input.sourceTXID == null) continue
       const link = senderByOutpoint.get(`${input.sourceTXID}.${input.sourceOutputIndex}`)
@@ -212,9 +225,9 @@ export async function buildActivity (
       if (srcRaw == null) continue
       try {
         const srcTx = Transaction.fromHex(srcRaw)
-        const decoded = MandalaToken.decode(srcTx.outputs[input.sourceOutputIndex].lockingScript)
-        ftInputs.push({ identityKey: link.identityKey, amount: decoded.amount, assetId: decoded.assetId })
-      } catch { /* source output not an FT */ }
+        const decoded = decodeToken(srcTx.outputs[input.sourceOutputIndex].lockingScript, input.sourceTXID)
+        if (decoded != null) ftInputs.push({ identityKey: link.identityKey, ...decoded })
+      } catch { /* unreadable source tx */ }
     }
 
     const when = linkRows
@@ -231,7 +244,7 @@ export async function buildActivity (
 
     const entry = summarizeTx({ txid, when, ftInputs, ftOutputs, proofs })
     if (entry == null) continue
-    if (opts.assetId != null && opts.assetId !== '' && entry.assetId !== opts.assetId) continue
+    if (opts.tokenId != null && opts.tokenId !== '' && entry.tokenId !== opts.tokenId) continue
     entries.push(entry)
   }
 
