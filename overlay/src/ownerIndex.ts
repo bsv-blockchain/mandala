@@ -15,6 +15,10 @@ export interface OwnerIndexStatus { lastRunAt: string | null, lastError: string 
 
 export interface OwnerIndexHealthResult { status: 'ok' | 'degraded', message?: string, details?: Record<string, unknown> }
 
+const bound = (errors: string[]): string | null => errors.length === 0
+  ? null
+  : `${errors.length} owner-index error(s): ${errors.slice(0, 3).map(e => e.slice(0, 200)).join('; ')}`
+
 const msg = (e: unknown): string => e instanceof Error ? e.message : String(e)
 
 /**
@@ -59,11 +63,12 @@ export class OwnerIndexMaintenance {
             log(`[mandala] owner index ${topic}: scanned ${r.scanned}, repaired ${r.repaired}, unrepairable ${r.unrepairable.length}`)
           } catch (e) { errors.push(`reconcile ${topic}: ${msg(e)}`) }
         }
+        for (const er of errors) log(`[mandala] owner index error: ${er}`)
         for (const o of unrepairable) log(`[mandala] owner index UNREPAIRABLE outpoint ${o}`)
-        this.current = { lastRunAt: new Date().toISOString(), lastError: errors.length > 0 ? errors.join('; ') : null, unrepairable }
+        this.current = { lastRunAt: new Date().toISOString(), lastError: bound(errors), unrepairable }
       })
     } catch (e) {
-      this.current = { ...this.current, lastError: msg(e) }
+      this.current = { ...this.current, lastError: bound([msg(e)]) }
       try { log(`[mandala] owner index run failed: ${msg(e)}`) } catch { /* logging must not throw */ }
     }
   }

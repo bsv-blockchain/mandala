@@ -81,4 +81,39 @@ describe('OwnerIndexMaintenance', () => {
     expect(m.status().lastError).toBeNull()
     expect((await m.healthCheck().handler()).status).toBe('ok')
   })
+  it('bounds readiness error text for many failing refolds; full list goes to the log', async () => {
+    const logs: string[] = []
+    const ids = Array.from({ length: 50 }, (_, i) => String(i).padStart(64, '0') + '_0')
+    const { m } = mk({ log: (l: string) => logs.push(l), lookup: { tokenIdsWithHistory: async () => ids, rebuildState: async () => { throw new Error('mongodb://secret-host:27017 ' + 'x'.repeat(500)) } } })
+    await m.runOnce()
+    const r = await m.healthCheck().handler()
+    expect(r.status).toBe('degraded')
+    expect(r.message!.length).toBeLessThan(1000)
+    expect(r.message!.startsWith('50 owner-index error(s)')).toBe(true)
+    expect(logs.filter(l => l.includes('owner index error:')).length).toBe(50)
+  })
+  it('concurrent runOnce calls share the in-flight promise', async () => {
+    const { m } = mk()
+    const a = m.runOnce(); const b = m.runOnce()
+    expect(a).toBe(b)
+    await a
+  })
+  it('after stop() no further run is triggered', async () => {
+    vi.useFakeTimers()
+    let n = 0
+    const { m } = mk({ reconcile: async () => { n++; return { scanned: 0, repaired: 0, unrepairable: [] } } })
+    m.start(1000)
+    await vi.advanceTimersByTimeAsync(1500)
+    const after = n
+    expect(after).toBeGreaterThan(0)
+    m.stop()
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(n).toBe(after)
+  })
+  it('a failing first refold does not stop the second', async () => {
+    const rebuilt: string[] = []
+    const { m } = mk({ lookup: { tokenIdsWithHistory: async () => ['a'.repeat(64) + '_0', 'b'.repeat(64) + '_0'], rebuildState: async (id: string) => { if (id[0] === 'a') throw new Error('x'); rebuilt.push(id[0]) } } })
+    await m.runOnce()
+    expect(rebuilt).toEqual(['b'])
+  })
 })
