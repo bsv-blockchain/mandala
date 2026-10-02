@@ -11,9 +11,9 @@
  * rebuild vs. abandon) behaves differently depending on which overlay it asked.
  *
  * `main()` needs Mongo, SQLite and a full env, so it cannot be imported here.
- * Reading the source with comments stripped is the honest way to pin the shape,
- * and it is paired below with a behavioural test of the same order over the real
- * guards.
+ * Reading the source with comments stripped is the honest way to pin the shape;
+ * wrapperStack.test.ts drives the same stack behaviourally over the real
+ * package manager.
  */
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -21,13 +21,9 @@ import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import OverlayExpress from '@bsv/overlay-express'
 import { initialDoubleSlashCompatibility } from '@bsv/overlay-express/security/edgePolicy.ts'
-import { Transaction, UnlockingScript, P2PKH, PrivateKey, ProtoWallet, Hash, Utils } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
-import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
-import { withSpentInputGuard, type SpentInputStore } from './spentGuard.js'
-import { withAdminChainAnchor, type AdminChainStore } from './adminChainGuard.js'
-import { classifyManagerReason } from './submitVerdict.js'
-import { wrapSubmitJson, normalizeDoubleSlash, signAdmissionV2Sync } from './admission.js'
+import { Transaction, UnlockingScript, P2PKH, PrivateKey } from '@bsv/sdk'
+import { MANDALA_TOPIC } from '@bsv/overlay-topics'
+import { wrapSubmitJson, normalizeDoubleSlash, signAdmissionV2Sync, TOKEN_TOPIC } from './admission.js'
 
 const SOURCE = readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
 
@@ -41,31 +37,52 @@ const CODE = SOURCE
 const orderOf = (haystack: string, needles: string[]): string[] =>
   [...needles].sort((a, b) => haystack.indexOf(a) - haystack.indexOf(b))
 
-describe('index.ts — tm_mandala guard order (§9.6)', () => {
-  const stack = CODE.slice(CODE.indexOf('configureTopicManager(TOKEN_TOPIC'))
+describe('index.ts — tm_mandala stack over @bsv/overlay-topics 2.0.0', () => {
+  const stack = CODE.slice(CODE.indexOf('configureTopicManager(TOKEN_TOPIC'), CODE.indexOf('configureTopicManager(REGISTRY_TOPIC'))
 
-  it('nests the guards in the canonical order: unlinked → spend → admin → manager', () => {
-    const names = [
-      'withUnlinkedTokenReject(',
-      'withSpentInputGuard(',
-      'withAdminChainAnchor(',
-      'new MandalaTopicManager('
-    ]
-    for (const n of names) expect(stack).toContain(n)
-    expect(orderOf(stack, names)).toEqual(names)
+  it('uses one name for the token topic, equal to the package constant', () => {
+    expect(TOKEN_TOPIC).toBe(MANDALA_TOPIC)
+    expect(CODE).not.toContain('MANDALA_TOPIC')
   })
 
-  it('keeps capture outermost and "verdict wins" directly inside it', () => {
-    const names = ['withVerdictCapture(', 'withPersistedVerdict(', 'withUnlinkedTokenReject(']
-    expect(orderOf(stack, names)).toEqual(names)
+  it('builds one MandalaStorageManager and shares it with the manager, the registry and the lookup', () => {
+    expect(CODE.match(/new MandalaStorageManager\(/g)).toHaveLength(1)
+    expect(CODE).toMatch(/const storage = new MandalaStorageManager\(lookupDb\)/)
+    // Both topic managers read and journal through it.
+    expect(CODE.match(/stateStore: storage\b/g)).toHaveLength(2)
+    expect(CODE).toMatch(/createMandalaLookupService\(mandalaWallet, storage\)/)
+    expect(CODE).toMatch(/createRegistryLookupService\(registryStorage, storage\)/)
+    expect(CODE.match(/new RegistryStorage\(/g)).toHaveLength(1)
+  })
+
+  it('passes the trusted-issuer set and the engine output reader to both managers', () => {
+    expect(CODE.match(/trustedIssuers: cfg\.issuerKeys/g)).toHaveLength(2)
+    expect(CODE).toContain('const engineOutputs = knexEngineOutputs(server.knex!)')
+    // Both managers, plus the reconciler.
+    expect(CODE.match(/\bengineOutputs\b/g)!.length).toBeGreaterThanOrEqual(4)
+    const registry = CODE.slice(CODE.indexOf('new RegistryTopicManager({'), CODE.indexOf('configureLookupServiceWithMongo(REGISTRY_LOOKUP'))
+    expect(registry).toContain('trustedIssuers: cfg.issuerKeys')
+    expect(registry).toMatch(/\bengineOutputs\b/)
+    expect(registry).toContain('registry: registryStorage')
+    expect(stack).toContain('trustedIssuers: cfg.issuerKeys')
+    expect(stack).toMatch(/\bengineOutputs\b/)
+  })
+
+  it('wires membership from the registry, exempting the overlay identity', () => {
+    expect(stack).toContain('membership: registryMembership(registryStorage)')
+    expect(stack).toContain('membershipExempt: [overlayIdentityKey]')
+    expect(stack).toContain('screeningProvider: new InMemoryScreeningProvider([])')
+  })
+
+  it('tm_mandala stack: capture → persisted verdict → spent guard → package manager (nothing between)', () => {
+    expect(CODE).toMatch(/withVerdictCapture\(\s*withPersistedVerdict\(\s*withSpentInputGuard\(\s*new MandalaTopicManager\(/)
   })
 
   it('passes every guard the state it gates on', () => {
-    expect(stack).toMatch(/withSpentInputGuard\([\s\S]*?\),\s*\n\s*spentInputStore\s*\n\s*\)/)
+    expect(stack).toMatch(/\}\) as any,\s*spentInputStore\)/)
     // The production store reads the engine's `outputs` table, not a stand-in.
     expect(CODE).toContain('knexSpentInputStore(server.knex!, TOKEN_TOPIC')
-    expect(stack).toContain('adminChainStore')
-    expect(stack).toContain('admissionStore')
+    expect(stack).toMatch(/spentInputStore\),\s*admissionStore\)/)
     const wrap = CODE.slice(CODE.indexOf('wrapSubmitJson({'), CODE.indexOf('wrapSubmitJson({') + 400)
     expect(wrap).toContain('channel: submitChannel')
     expect(wrap).toContain('store: admissionStore')
@@ -75,16 +92,17 @@ describe('index.ts — tm_mandala guard order (§9.6)', () => {
     expect(stack).toContain('putPending')
     // The registry manager is wrapped for capture but writes no token record.
     const registry = CODE.slice(CODE.indexOf('configureTopicManager(REGISTRY_TOPIC'))
-    expect(registry).toContain('withVerdictCapture(')
+    expect(registry.slice(0, registry.indexOf('configureLookupServiceWithMongo'))).toContain('withVerdictCapture(')
+    expect(registry.slice(0, registry.indexOf('configureLookupServiceWithMongo'))).toContain('topic: REGISTRY_TOPIC')
     expect(registry).not.toContain('putPending')
     expect(registry).not.toContain('withPersistedVerdict')
   })
 
-  // FIX E — the snapshot is taken from every input and only ever merged into
-  // the record (restoreSnapshot.test.ts drives both over the real engine).
+  // FIX E — the snapshot names every input; owners come from the journal at eviction.
   it('snapshots every input and stores it through the merging admission store', () => {
     expect(CODE).toContain('const admissionStore: AdmissionStore = mongoAdmissionStore(admissionsCol)')
-    expect(stack).toContain('snapshotRestore: snapshotRestoreFrom(async (txid, vout) => await sharedStorage.getTokenRow(txid, vout))')
+    expect(stack).toMatch(/,\s*snapshotRestore\s*\}\)\)/)
+    expect(CODE).not.toContain('snapshotRestoreFrom')
     expect(stack).not.toMatch(/for \(const ci of previousCoins\)/)
   })
 
@@ -94,6 +112,55 @@ describe('index.ts — tm_mandala guard order (§9.6)', () => {
   it('leaves the engine\'s own compare-and-swap mark-spent in place', () => {
     expect(CODE).not.toMatch(/markUTXOAsSpent\s*=/)
     expect(CODE).not.toContain('inFlight')
+  })
+
+  it('registers the lookups through configureLookupServiceWithMongo and fails boot loudly without ls_mandala', () => {
+    expect(CODE).toMatch(/configureLookupServiceWithMongo\('ls_mandala', db => \(mandalaLookup = createMandalaLookupService\(mandalaWallet, storage\)\(db\)\)\)/)
+    expect(CODE).toMatch(/configureLookupServiceWithMongo\(REGISTRY_LOOKUP, db => createRegistryLookupService\(registryStorage, storage\)\(db\)\)/)
+    const after = CODE.slice(CODE.indexOf('await server.configureEngine(false)'))
+    expect(after).toContain("throw new Error('ls_mandala lookup was not constructed')")
+    expect(after.indexOf("throw new Error('ls_mandala lookup was not constructed')")).toBeLessThan(after.indexOf('new OwnerIndexMaintenance('))
+  })
+
+  it('drops every 1.x wrapper and the substring table', () => {
+    for (const gone of ['withUnlinkedTokenReject', 'withAdminChainAnchor', 'withFeeRateFold', 'replayAssetState', 'classifyManagerReason', 'registryScreening', 'asset-auth', 'assetId', 'adminWallet', 'adminProtocolID', 'findAdminHistoryByAssetId', 'sharedStorage'])
+      expect(SOURCE).not.toContain(gone)
+  })
+})
+
+describe('index.ts — maintenance: quiesced /submit, owner index before start', () => {
+  it('gates /submit, and only /submit, on the maintenance gate', () => {
+    expect(CODE).toMatch(/server\.app\.post\('\/submit', gateSubmits\(gate\), wrapSubmitJson\(/)
+    // Exactly one mount: /arc-ingest (whose eviction takes `exclusive`) and every
+    // other route stay ungated, or each eviction deadlocks into a permanent 503.
+    expect(CODE.match(/gateSubmits\(/g)).toHaveLength(1)
+    const line = CODE.split('\n').find(l => l.includes('gateSubmits('))!
+    expect(line).toContain("post('/submit'")
+    expect(CODE.slice(CODE.indexOf('mountArcIngest('))).not.toContain('gateSubmits')
+    expect(CODE).toContain('const gate = new MaintenanceGate()')
+  })
+
+  it('runs maintenance before start, then on the interval, and reports readiness', () => {
+    const boot = CODE.indexOf('await ownerIndex.runOnce()')
+    const start = CODE.indexOf('await server.start()')
+    expect(boot).toBeGreaterThan(0)
+    expect(boot).toBeLessThan(start)
+    expect(CODE).toMatch(/registerHealthCheck\(ownerIndex\.healthCheck\(\)\)/)
+    expect(CODE).toMatch(/ownerIndex\.start\(OWNER_INDEX_INTERVAL_MS\)/)
+    expect(CODE.indexOf('ownerIndex.start(OWNER_INDEX_INTERVAL_MS)')).toBeLessThan(start)
+  })
+
+  it('builds the owner-index maintenance over the gate, the lookup, the reconciler and both topics', () => {
+    const m = CODE.slice(CODE.indexOf('new OwnerIndexMaintenance('), CODE.indexOf('registerHealthCheck('))
+    expect(m).toContain('gate,')
+    expect(m).toContain('lookup: mandalaLookup')
+    expect(m).toContain('reconcileOwnerIndex({ storage, engine: engineOutputs, topic })')
+    expect(m).toContain('topics: [TOKEN_TOPIC, REGISTRY_TOPIC]')
+  })
+
+  it('stops the interval on shutdown before closing the server', () => {
+    expect(CODE).toMatch(/let ownerIndex: OwnerIndexMaintenance \| undefined/)
+    expect(CODE).toContain('const close = async (): Promise<void> => { ownerIndex?.stop(); await overlay?.close() }')
   })
 })
 
@@ -189,7 +256,7 @@ describe('index.ts — boot configuration for overlay-express 2.7.3', () => {
 // router does not share with upstream, lets '/Submit', '/submit/' or '//submit'
 // reach the upstream route with no σ_I and no admission record.
 describe('index.ts — the /submit wrapper shares the upstream route matcher', () => {
-  const MOUNT = "server.app.post('/submit', wrapSubmitJson("
+  const MOUNT = "server.app.post('/submit', gateSubmits(gate), wrapSubmitJson("
   const NORMALIZER = 'server.app.use(normalizeDoubleSlash)'
 
   it('mounts the wrapper with app.post on /submit, never app.use', () => {
@@ -261,6 +328,7 @@ describe('index.ts — graceful lifecycle on OverlayExpress.close()', () => {
     // Directly after configureMongo, the db OverlayExpress named `${name}_lookup_services`.
     expect(CODE).toMatch(/await server\.configureMongo\(cfg\.mongoUrl\)\s*\n\s*const lookupDb = server\.mongoDb!\s*\n/)
     expect(CODE).toContain('new MandalaStorageManager(lookupDb)')
+    expect(CODE).toContain('new RegistryStorage(lookupDb)')
     expect(CODE.match(/const lookupDb\b/g)).toHaveLength(1)
   })
 
@@ -289,116 +357,54 @@ describe('index.ts — graceful lifecycle on OverlayExpress.close()', () => {
   })
 })
 
-describe('index.ts — eviction rebuild (PR #11 + token-fee §2, rebuild-first)', () => {
+
+describe('index.ts — eviction restores from the owner journal (BRC-162)', () => {
   const deps = CODE.slice(CODE.indexOf('mountArcIngest('))
-  const rebuild = deps.slice(deps.indexOf('rebuildAssetStateExcluding:'), deps.indexOf('purgeAdminHistory:'))
 
-  it('replays the history EXCLUDING the evicted txid, oldest first', () => {
-    expect(rebuild).toMatch(/adminHistoryCol\.find\(\{ assetId, txid: \{ \$ne: txid \} \}\)[\s\S]*?\.sort\(\{ height: 1, offset: 1, admitSeq: 1 \}\)/)
+  it('restores inputs through the journal and the lookup, refolds via purgeAndRefold, under the gate', () => {
+    expect(deps).toMatch(/restoreInput: journalRestoreInput\(\(t, v, topic\) => storage\.getOwnerJournal\(t, v, topic\), j => mandalaLookup!\.restoreInputRow\(j\), TOKEN_TOPIC\)/)
+    expect(deps).toContain('purgeAndRefold: txid => mandalaLookup!.purgeAndRefold(txid)')
+    expect(deps).toContain('quiesce: fn => gate.exclusive(fn)')
+    expect(deps).toContain('...knexEvictionCoins(server.knex!, TOKEN_TOPIC)')
   })
 
-  it('folds state via the pinned reducer, then the fee rate from the identical row set', () => {
-    expect(orderOf(rebuild, ['replayAssetState(', 'rebuildFeeRateFromHistory(feeRateStore, assetId, history)']))
-      .toEqual(['replayAssetState(', 'rebuildFeeRateFromHistory(feeRateStore, assetId, history)'])
-    expect(rebuild).not.toContain('createMandalaLookupService')
-  })
-
-  it('purge only deletes; the assets query is distinct+sorted', () => {
-    const purge = deps.slice(deps.indexOf('purgeAdminHistory:'), deps.indexOf('ingestProof:'))
-    expect(purge).toContain('adminHistoryCol.deleteMany({ txid })')
-    expect(purge).not.toContain('distinct')
-    const assets = deps.slice(deps.indexOf('assetsTouchedBy:'), deps.indexOf('rebuildAssetStateExcluding:'))
-    expect(assets).toMatch(/adminHistoryCol\.distinct\('assetId', \{ txid \}\)[\s\S]*?\.sort\(\)/)
-  })
-
-  // §9.8's re-delivery converges only over an idempotent restore: the plain
-  // insert storeToken makes E11000s on every row an earlier attempt put back.
-  // tokenRestore.test.ts drives mongoRestoreTokenRow against a real Mongo.
-  it('restores token rows through the idempotent upsert into mandalaTokens, never storeToken', () => {
-    const restore = deps.slice(deps.indexOf('restoreTokenRow:'), deps.indexOf('evict:'))
-    expect(restore).toContain('mongoRestoreTokenRow(')
-    expect(restore).toContain("lookupDb.collection('mandalaTokens')")
-    expect(restore).toContain('sharedStorage.adjustBalance(identityKey, delta)')
-    expect(restore).not.toMatch(/\.storeToken\(/)
-    expect(CODE).not.toMatch(/sharedStorage\.storeToken\(/)
-  })
-
-  it('eviction.ts purges only after every rebuild (rebuild-first)', () => {
-    const ev = readFileSync(new URL('./eviction.ts', import.meta.url), 'utf8')
-    const body = ev.slice(ev.indexOf('export const evictWithRestore'))
-    const iAssets = body.indexOf('deps.assetsTouchedBy(txid)')
-    const iRebuild = body.indexOf('deps.rebuildAssetStateExcluding(assetId, txid)')
-    const iPurge = body.indexOf('deps.purgeAdminHistory(txid)')
-    expect(iAssets).toBeGreaterThan(0)
-    expect(iRebuild).toBeGreaterThan(iAssets)
-    expect(iPurge).toBeGreaterThan(iRebuild)
+  it('drops the 1.x restore deps', () => {
+    for (const gone of ['restoreTokenRow', 'assetsTouchedBy', 'rebuildAssetStateExcluding', 'purgeAdminHistory', 'mongoRestoreTokenRow'])
+      expect(CODE).not.toContain(gone)
   })
 })
 
-// ───────────── the same order, asserted behaviourally over real guards ───────
-
-describe('§9.6 guard order — first refusal wins, over the real guards', () => {
-  const overlay = new ProtoWallet(new PrivateKey(44))
-  const key = PrivateKey.fromRandom()
-  const assetId = `${'ab'.repeat(32)}.0`
-
-  const build = (tokenOutput: boolean): { beef: number[], prior: string } => {
-    const src = new Transaction()
-    src.addInput({ sourceTXID: '11'.repeat(32), sourceOutputIndex: 0, unlockingScript: new UnlockingScript() })
-    src.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(key.toAddress()) })
-    const tx = new Transaction()
-    tx.addInput({ sourceTransaction: src, sourceOutputIndex: 0, unlockingScript: new UnlockingScript() })
-    tx.addOutput({
-      satoshis: 1,
-      lockingScript: tokenOutput
-        ? new MandalaToken().lock(assetId, 100, Hash.hash160(Utils.toArray(key.toPublicKey().toString(), 'hex')))
-        : new P2PKH().lock(key.toAddress())
-    })
-    return { beef: tx.toBEEF(), prior: `${src.id('hex')}.0` }
-  }
-
-  const payload = (admin: boolean, prior: string): number[] =>
-    Utils.toArray(JSON.stringify({
-      inputs: [],
-      outputs: [],
-      ...(admin ? { admin: [{ index: 0, actionDetails: { kind: 'unpause', assetId, priorOutpoint: prior } }] } : {})
-    }), 'utf8')
-
-  const spentInputs = (spent: boolean): SpentInputStore => ({
-    spendStateOf: async () => ({ spent, spentBy: spent ? 'dd'.repeat(32) : null, consumedBy: [] }),
-    wasEvicted: async () => false,
-    releaseSpend: async () => 0
+describe('index.ts — v3 token routes (§6.5)', () => {
+  it('mounts the v3 routes, beef before :tokenId', () => {
+    const beef = CODE.indexOf("'/admin/authorities/beef/:txid'")
+    const id = CODE.indexOf("'/admin/authorities/:tokenId'")
+    expect(beef).toBeGreaterThan(0)
+    expect(beef).toBeLessThan(id)
+    for (const r of ["'/admin/asset-state/:tokenId'", "'/admin/admin-history/:tokenId'", "'/admin/admin-history-page/:tokenId'", "'/admin/admin-summary/:tokenId'", "'/admin/registry'", "'/admin/registry/beef/:txid'"])
+      expect(CODE).toContain(r)
   })
 
-  /** Anchors nothing, so any admin entry is unanchored. */
-  const noAdminChain: AdminChainStore = { isAdminOutpoint: async () => false, hasTokenRow: async () => true }
-
-  const run = async (opts: { token: boolean, spent: boolean, admin: boolean }): Promise<string> => {
-    const { beef, prior } = build(opts.token)
-    const inner = {
-      identifyAdmissibleOutputs: async () => { throw new Error('conservation violated: outputs exceed authorized inputs/issuance') }
-    } as any
-    const tm = withUnlinkedTokenReject(
-      withSpentInputGuard(withAdminChainAnchor(inner, noAdminChain), spentInputs(opts.spent)),
-      { verifierWallet: overlay as any }
-    )
-    const err = await tm.identifyAdmissibleOutputs(beef, [0], payload(opts.admin, prior)).catch((e: unknown) => e)
-    return classifyManagerReason((err as Error).message)
-  }
-
-  it('an unlinked token output outranks a conflicting spend, an unanchored admin action and the manager', async () => {
-    expect(await run({ token: true, spent: true, admin: true })).toBe('ERR_LINKAGE')
+  it('routes each through its tokenRoutes adapter', () => {
+    for (const h of ['routes.assetStateResponse(', 'routes.authoritiesBeefResponse(', 'routes.authoritiesResponse(', 'routes.adminHistoryPageResponse(', 'routes.adminSummaryResponse('])
+      expect(CODE).toContain(h)
+    expect(CODE).toContain('storage.listAuthorities(TOKEN_TOPIC, id)')
+    // The page dep sorts newest-first by admit sequence.
+    expect(CODE).toMatch(/collection\('mandalaAdminHistory'\)\.find\(\{ tokenId: id \}, \{ projection: \{ _id: 0 \} \}\)\.sort\(\{ admitSeq: -1 \}\)\.skip\(offset\)\.limit\(limit\)/)
   })
 
-  it('a conflicting spend outranks an unanchored admin action and the manager', async () => {
-    expect(await run({ token: false, spent: true, admin: true })).toBe('ERR_INPUT_SPENT')
+  it('validates :tokenId on the full admin-history route and ?tokenId on /admin/activity', () => {
+    const hist = CODE.slice(CODE.indexOf("'/admin/admin-history/:tokenId'"), CODE.indexOf("'/admin/admin-history/:tokenId'") + 600)
+    expect(hist).toContain('routes.tokenIdParam(req.params.tokenId)')
+    expect(hist).toContain("{ error: 'invalid tokenId' }")
+    const act = CODE.slice(CODE.indexOf("server.app.get('/admin/activity'"))
+    expect(act).toContain('routes.tokenIdParam(req.query.tokenId)')
+    expect(act.slice(0, act.indexOf('buildActivity('))).toContain("{ error: 'invalid tokenId' }")
+    expect(act).not.toMatch(/tokenId: typeof req\.query\.tokenId/)
   })
 
-  it('an unanchored admin action outranks the manager', async () => {
-    expect(await run({ token: false, spent: false, admin: true })).toBe('ERR_SHAPE')
-  })
-
-  it('the pinned manager has the last word when every guard passes', async () => {
-    expect(await run({ token: false, spent: false, admin: false })).toBe('ERR_CONSERVATION')
+  it('keeps the identity-bearing routes behind the admin gate', () => {
+    expect(CODE).toMatch(/server\.app\.get\('\/admin\/registry', \.\.\.adminGate,/)
+    expect(CODE).toMatch(/server\.app\.get\('\/admin\/activity', \.\.\.adminGate,/)
+    expect(CODE).toMatch(/server\.app\.get\('\/admin\/admission\/:txid', \.\.\.adminGate,/)
   })
 })

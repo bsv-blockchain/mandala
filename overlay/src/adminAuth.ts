@@ -7,14 +7,14 @@
  * asset, and part of what D2's payee-blinding is meant to protect.
  *
  * Every other `/admin/*` route (`asset-state*`, `admin-history*`,
- * `admin-summary*`, `asset-auth*`, `registry/beef/*`) is the public audit
+ * `admin-summary*`, `authorities*`, `registry/beef/*`) is the public audit
  * surface R29 wants and stays on the existing wildcard CORS with no auth —
  * recovery (registryRecover.ts / assetRecover.ts) must keep working without
  * a console token.
  *
  * Kept pure and framework-light (only Request/Response types) so every
  * branch is unit-testable with a fake req/res, same pattern as
- * assetAuth.ts. Wire shapes (401 body, header names) mirror
+ * tokenRoutes.ts. Wire shapes (401 body, header names) mirror
  * overlay-go/internal/httpapi/admin_auth.go exactly, so both backends behave
  * identically to the console.
  */

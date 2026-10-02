@@ -1,8 +1,9 @@
 import OverlayExpress from '@bsv/overlay-express'
 import {
-  MandalaTopicManager,
-  MandalaStorageManager,
-  createMandalaLookupService
+  MandalaTopicManager, MandalaStorageManager, createMandalaLookupService,
+  RegistryStorage, RegistryTopicManager, createRegistryLookupService, registryMembership,
+  REGISTRY_TOPIC, REGISTRY_LOOKUP, InMemoryScreeningProvider, reconcileOwnerIndex,
+  type MandalaLookupService, type AdminHistoryEntry
 } from '@bsv/overlay-topics'
 import { KnexStorage } from '@bsv/overlay'
 import { MerklePath, PrivateKey, ProtoWallet, WalletInterface } from '@bsv/sdk'
@@ -14,28 +15,25 @@ import {
   type AdmissionStore, type AppliedProof
 } from './admission.js'
 import { admissionHandler } from './admissionRoute.js'
-import { SubmitSideChannel, withVerdictCapture, snapshotRestoreFrom } from './submitSideChannel.js'
+import { SubmitSideChannel, withVerdictCapture, snapshotRestore } from './submitSideChannel.js'
 import { mongoAdmissionStore } from './admissionStore.js'
-import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
 import { withSpentInputGuard, knexSpentInputStore, type SpentInputStore } from './spentGuard.js'
-import { mountArcIngest, knexEvictionCoins, mongoRestoreTokenRow, type TokenRowsCollection } from './eviction.js'
-import { replayAssetState, type ReplayStorage } from './pinnedReducer.js'
-import { withAdminChainAnchor } from './adminChainGuard.js'
-import { assetAuthHeadHandler, assetAuthBeefHandler, withFrozenRowFlags, type AdminHistoryRowLite } from './assetAuth.js'
-import { withFeeRateFold, withFeeRate, rebuildFeeRateFromHistory, type FeeRateStore, type FeeRateRow, type FeeRateHistoryEntry } from './feeRates.js'
+import { mountArcIngest, knexEvictionCoins, journalRestoreInput } from './eviction.js'
 import { adminAuth, adminCors, parseAdminCorsOrigins, warnIfAdminAuthDisabled } from './adminAuth.js'
 import { readBootConfig } from './bootConfig.js'
 import { createShutdown } from './shutdown.js'
 import { withArcadeStatusParity } from './arcadeParity.js'
-import {
-  RegistryStore, RegistryTopicManager, createRegistryLookup,
-  registryScreening, REGISTRY_TOPIC, REGISTRY_LOOKUP
-} from './registry.js'
+import { knexEngineOutputs } from './engineOutputs.js'
+import { MaintenanceGate, gateSubmits } from './maintenanceGate.js'
+import { OwnerIndexMaintenance, OWNER_INDEX_INTERVAL_MS } from './ownerIndex.js'
+import * as routes from './tokenRoutes.js'
 config()
 
 // Assigned in main() the moment the server exists, so a signal or a failed boot
 // can drain whatever has been opened so far through OverlayExpress.close().
 let overlay: OverlayExpress | undefined
+// The owner-index interval, stopped on shutdown before the server closes.
+let ownerIndex: OwnerIndexMaintenance | undefined
 
 const main = async (): Promise<void> => {
   // Every boot variable is validated here, before anything is constructed: a
@@ -94,15 +92,22 @@ const main = async (): Promise<void> => {
   await server.configureMongo(cfg.mongoUrl)
 
   // OverlayExpress.configureMongo owns the one Mongo client (closed by
-  // OverlayExpress.close()) and its db `${cfg.nodeName}_lookup_services`, i.e.
-  // "mandala_lookup_services". Reuse that db so sharedStorage reads/writes the
-  // same collections, and so nothing here holds a client close() cannot reach.
+  // OverlayExpress.close()) and its db `${cfg.nodeName}_lookup_services`.
+  // Reuse that db so the package storage reads/writes the same collections,
+  // and so nothing here holds a client close() cannot reach.
   const lookupDb = server.mongoDb!
-  const sharedStorage = new MandalaStorageManager(lookupDb)
+  // ONE instance: both topic managers, both lookups, the reconciler and the
+  // routes read and journal through the same collections.
+  const storage = new MandalaStorageManager(lookupDb)
+  const registryStorage = new RegistryStorage(lookupDb)
 
   const mandalaWallet = new ProtoWallet(PrivateKey.fromHex(cfg.serverPrivateKey)) as unknown as WalletInterface
-  const registryStore = new RegistryStore(lookupDb)
-  await registryStore.ensureIndexes()
+  // §4.2a host side: the engine's own admitted outputs, for the managers'
+  // inline owner-row repair and the reconciler.
+  const engineOutputs = knexEngineOutputs(server.knex!)
+  // Quiesces /submit while a refold, reconcile or eviction runs (Review Focus 2).
+  const gate = new MaintenanceGate()
+  const overlayIdentityKey = PrivateKey.fromHex(cfg.serverPrivateKey).toPublicKey().toString()
 
   // Wrap /submit JSON so admitted STEAKs carry σ_I, and keep a record of every
   // admission. Offline settlement hands a payment on with the signatures for
@@ -121,8 +126,8 @@ const main = async (): Promise<void> => {
   //
   // §9.4 — the restore snapshot on the record only ever grows: putPending and
   // putAdmitted MERGE into it (mergeRestore), because a retry after a crash
-  // snapshots inputs whose token rows the crashed attempt already let the
-  // lookup delete. See admissionStore.ts.
+  // snapshots inputs an earlier attempt already let the lookup consume. See
+  // admissionStore.ts.
   const admissionStore: AdmissionStore = mongoAdmissionStore(admissionsCol)
 
   // FIX C — the engine's own durable proof that a txid went through
@@ -137,9 +142,9 @@ const main = async (): Promise<void> => {
       .sort((a, b) => a - b)
   }
 
-  // FIX D — the topic manager's own reject reason, captured before the pinned
-  // Engine swallows it into a 200 with an empty STEAK. Also carries the FIX E
-  // restore snapshot from the same wrapper.
+  // FIX D — the topic manager's own reject reason and code, captured before
+  // the pinned Engine swallows it into a 200 with an empty STEAK. Also carries
+  // the FIX E restore snapshot from the same wrapper.
   const submitChannel = new SubmitSideChannel()
 
   // Collapse leading '//' before any route of ours matches (2.7.3 normalizes
@@ -148,60 +153,17 @@ const main = async (): Promise<void> => {
   // Same matcher as the upstream route (case-insensitive, non-strict), so
   // '/Submit' and '/submit/' cannot bypass the admission wrapper either.
   // Its next() runs the edge policy and then the upstream /submit route.
-  server.app.post('/submit', wrapSubmitJson({
+  //
+  // gateSubmits holds a shared maintenance slot until the response ends. It is
+  // mounted HERE ONLY: the gate is not re-entrant, and the eviction behind
+  // /arc-ingest takes `exclusive`, so gating any other route would deadlock
+  // every eviction into a permanent 503.
+  server.app.post('/submit', gateSubmits(gate), wrapSubmitJson({
     priv: overlayPriv,
     store: admissionStore,
     applied: appliedProof,
     channel: submitChannel
   }) as any)
-
-  // The admin chain is anchored repo-locally until the same gate ships in
-  // @bsv/overlay-topics: without it a third party forges admin actions, since
-  // the upstream verifier re-derives the lock key from an attacker-supplied
-  // counterparty and accepts any input as the prior. See adminChainGuard.ts.
-  const adminHistoryCol = lookupDb.collection('mandalaAdminHistory')
-  await adminHistoryCol.createIndex({ assetId: 1, txid: 1, outputIndex: 1 })
-  const hasTokenRow = async (txid: string, vout: number): Promise<boolean> =>
-    await sharedStorage.getTokenRow(txid, vout) != null
-  const adminChainStore = {
-    isAdminOutpoint: async (assetId: string, txid: string, vout: number): Promise<boolean> =>
-      await adminHistoryCol.countDocuments({ assetId, txid, outputIndex: vout }, { limit: 1 }) > 0,
-    hasTokenRow
-  }
-
-  // Per-asset feeRatePerKb (token-fee design §2), folded repo-locally from
-  // register/setFeeRate admin outputs because the pinned reducer ignores the
-  // field. Served merged into /admin/asset-state like withFrozenRowFlags.
-  const feeRatesCol = lookupDb.collection('mandalaFeeRates')
-  await feeRatesCol.createIndex({ assetId: 1 }, { unique: true })
-  const feeRateStore: FeeRateStore = {
-    get: async assetId =>
-      (await feeRatesCol.findOne({ assetId }, { projection: { _id: 0 } })) as unknown as FeeRateRow | null,
-    upsert: async row => {
-      await feeRatesCol.updateOne({ assetId: row.assetId }, { $set: row }, { upsert: true })
-    },
-    // Oldest first, the pinned findAdminHistoryByAssetId / Go
-    // FindAdminHistoryByAssetID order — the eviction rebuild replays it.
-    historyFor: async assetId =>
-      (await adminHistoryCol.find({ assetId })
-        .sort({ height: 1, offset: 1, admitSeq: 1 })
-        .project({ _id: 0, txid: 1, outputIndex: 1, actionDetails: 1 })
-        .toArray()) as unknown as FeeRateHistoryEntry[]
-  }
-
-  // Membership (A04): once the registry has a row, non-admitted identities are
-  // refused — except asset issuers and this overlay, exactly as Go's
-  // membershipHolds. Issuer keys are read live from the asset-state cache on
-  // every check, so a fresh register is honoured on the next submit.
-  const assetStatesCol = lookupDb.collection('mandalaAssetStates')
-  const overlayIdentityKey = PrivateKey.fromHex(cfg.serverPrivateKey).toPublicKey().toString()
-  const membership = registryScreening(registryStore, [], {
-    issuers: {
-      issuerIdentityKeys: async () =>
-        (await assetStatesCol.distinct('issuerIdentityKey', { issuerIdentityKey: { $ne: '' } })) as string[]
-    },
-    identityKeys: [overlayIdentityKey]
-  })
 
   // FIX L — the live spend state of an input, and whether the transaction that
   // spent it has since been evicted (in which case the guard releases the coin
@@ -211,75 +173,69 @@ const main = async (): Promise<void> => {
     return rec?.evictedAt != null
   })
 
-  // Wrapper stack for tm_mandala, outermost first. The inner four are §9.6's
-  // CANONICAL GUARD ORDER, and both engines must refuse in exactly this order,
-  // because the first refusal wins and a transaction can violate several rules
-  // at once — two stacks that disagree hand the same bytes two different codes,
-  // and a wallet keyed on the code (retry vs. rebuild vs. abandon) then behaves
-  // differently depending on which overlay it asked. Cheapest and most specific
-  // first: the linkage check reads only the submission itself, the spend check
-  // reads one row per input, the admin check reads admin history, and the pinned
-  // manager does the full validation.
-  //   withVerdictCapture     — FIX D/E/§9.4: stash the reject reason, take the
-  //                            pre-spend restore snapshot and make it durable
-  //                            (pending record) before the engine broadcasts.
+  // Wrapper stack for tm_mandala, outermost first. Every BRC-162 rule (shape,
+  // linkage, trusted issuers, authority, conservation, controls, membership)
+  // lives in the package manager, which refuses with a typed MandalaReject;
+  // the overlay never rewrites or re-classifies its reason.
+  //   withVerdictCapture     — FIX D/E/§9.4: stash the reject reason and code,
+  //                            take the pre-spend restore snapshot (every input)
+  //                            and make it durable (pending record) before the
+  //                            engine broadcasts.
   //   withPersistedVerdict   — "verdict wins": a txid with a persisted FINAL
   //                            verdict (a refusal for THIS payload, §9.1, or an
   //                            eviction) is refused before any mutation or
-  //                            broadcast. This has to live here rather than in a
-  //                            /submit pre-check, because OverlayExpress
+  //                            broadcast. It lives here rather than in a
+  //                            /submit pre-check because OverlayExpress
   //                            installs its body parsers after every route this
   //                            file registers.
-  //   ── §9.6 order starts here ──
-  //   withUnlinkedTokenReject— FIX A: reject (never skip) a MandalaToken
-  //                            output with no verified linkage.
   //   withSpentInputGuard    — FIX L: refuse a conflicting second spend of
   //                            ANY input (the engine omits spent coins from
   //                            previousCoins), healing stale self/evicted spends;
-  //                            a live input previousCoins does not list (un-spent
-  //                            after the engine's query) is a retryable 503.
-  //   withAdminChainAnchor   — admin actions must be anchored to the asset's
-  //                            chain of spends.
-  //   MandalaTopicManager    — the pinned rules.
+  //                            a live input previousCoins does not list is a
+  //                            retryable 503.
+  //   MandalaTopicManager    — the package rules (BRC-162).
   server.configureTopicManager(TOKEN_TOPIC, withVerdictCapture(
     withPersistedVerdict(
-      withUnlinkedTokenReject(
-        withSpentInputGuard(
-          withAdminChainAnchor(new MandalaTopicManager({
-            verifierWallet: mandalaWallet,
-            screeningProvider: membership,
-            adminWallet: mandalaWallet,
-            adminProtocolID: [2, 'mandala admin'] as [2, string],
-            stateStore: sharedStorage
-          }) as any, adminChainStore),
-          spentInputStore
-        ),
-        { verifierWallet: mandalaWallet }
-      ),
-      admissionStore
-    ),
+      withSpentInputGuard(
+        new MandalaTopicManager({
+          verifierWallet: mandalaWallet,
+          trustedIssuers: cfg.issuerKeys,
+          stateStore: storage,
+          engineOutputs,
+          screeningProvider: new InMemoryScreeningProvider([]),
+          // Off until the registry holds a row; then only admitted identities,
+          // trusted issuers and this overlay pass.
+          membership: registryMembership(registryStorage),
+          membershipExempt: [overlayIdentityKey]
+        }) as any,
+        spentInputStore),
+      admissionStore),
     {
       channel: submitChannel,
       // §9.4 — the snapshot is made durable here, before the engine broadcasts.
-      putPending: async (rec) => { await admissionStore.putPending?.(rec) },
-      // Every input and the token row it still has (not previousCoins, which
-      // omits a coin an interrupted attempt left marked spent).
-      snapshotRestore: snapshotRestoreFrom(async (txid, vout) => await sharedStorage.getTokenRow(txid, vout))
-    }
-  ))
-  const mandalaLookup = createMandalaLookupService(mandalaWallet, sharedStorage)
-  server.configureLookupServiceWithMongo('ls_mandala', (db) => withFeeRateFold(mandalaLookup(db), feeRateStore))
+      putPending: async rec => { await admissionStore.putPending?.(rec) },
+      snapshotRestore
+    }))
+
+  // Built by the engine inside configureEngine; the maintenance and the
+  // eviction below need the instance itself (refold, restore, purge).
+  let mandalaLookup: MandalaLookupService | undefined
+  server.configureLookupServiceWithMongo('ls_mandala', db => (mandalaLookup = createMandalaLookupService(mandalaWallet, storage)(db)))
+
   // The registry manager is wrapped for capture too, so a registry-only
   // submission that the pinned engine swallows into an empty STEAK still comes
   // back as a structured 4xx rather than an ambiguous 200. Its verdict is never
   // persisted (the record is keyed by txid alone, and persisting it would
   // poison a later, valid tm_mandala submit of the same bytes) and never
   // outranks tm_mandala's on a multi-topic submission.
-  server.configureTopicManager(REGISTRY_TOPIC, withVerdictCapture(
-    new RegistryTopicManager(mandalaWallet, registryStore) as any,
-    { channel: submitChannel, topic: REGISTRY_TOPIC }
-  ))
-  server.configureLookupService(REGISTRY_LOOKUP, createRegistryLookup(registryStore))
+  server.configureTopicManager(REGISTRY_TOPIC, withVerdictCapture(new RegistryTopicManager({
+    verifierWallet: mandalaWallet,
+    trustedIssuers: cfg.issuerKeys,
+    stateStore: storage,
+    engineOutputs,
+    registry: registryStorage
+  }) as any, { channel: submitChannel, topic: REGISTRY_TOPIC }))
+  server.configureLookupServiceWithMongo(REGISTRY_LOOKUP, db => createRegistryLookupService(registryStorage, storage)(db))
 
   server.configureEnableGASPSync(false)
   // "A failed broadcast rejects the submit" is load-bearing (the engine
@@ -287,6 +243,7 @@ const main = async (): Promise<void> => {
   // overlay-express's current default.
   server.configureEngineParams({ throwOnBroadcastFailure: true })
   await server.configureEngine(false)
+  if (mandalaLookup == null) throw new Error('ls_mandala lookup was not constructed')
   // overlay-express 2.7.3 builds a SHIP/SLAP WalletAdvertiser once the FQDN is
   // a valid https host. Mandala does not advertise (GASP sync is off), and the
   // advertiser would run babbage-storage calls at boot and SLAP lookups inside
@@ -303,6 +260,19 @@ const main = async (): Promise<void> => {
   const engineBroadcaster = (server.engine as unknown as { broadcaster?: { broadcast: (tx: any) => Promise<any> } }).broadcaster
   if (engineBroadcaster != null) withArcadeStatusParity(engineBroadcaster)
 
+  // Boot refold of every token with history, then the owner-index reconcile of
+  // both topics, inside the exclusive gate; repeated on an interval. runOnce
+  // never rejects: a failure is logged and readiness reports degraded until a
+  // later run succeeds (Review Focus 5).
+  ownerIndex = new OwnerIndexMaintenance({
+    gate,
+    lookup: mandalaLookup,
+    reconcile: async topic => await reconcileOwnerIndex({ storage, engine: engineOutputs, topic }),
+    topics: [TOKEN_TOPIC, REGISTRY_TOPIC],
+    log
+  })
+  server.registerHealthCheck(ownerIndex.healthCheck())
+
   // FIX E. Mounted BEFORE server.start(), which is where OverlayExpress
   // registers its own /arc-ingest, so this route matches first: the pinned
   // route evicts without restoring inputs. The callback token is mandatory
@@ -311,7 +281,8 @@ const main = async (): Promise<void> => {
   //
   // Gated on the same condition the pinned route uses — with no provider
   // configured it never mounts /arc-ingest at all, so there is nothing to
-  // shadow (the local demo has no Arcade).
+  // shadow (the local demo has no Arcade). NOT behind gateSubmits: the
+  // eviction quiesces submits itself through `exclusive`.
   if (cfg.arcade != null) {
     mountArcIngest(server.app as any, {
       callbackToken: cfg.arcade.callbackToken,
@@ -319,34 +290,17 @@ const main = async (): Promise<void> => {
       // unmarkSpent only while the evicted tx still holds the coin (or a
       // legacy NULL spentBy); isUnspent fails closed on an unreadable row.
       ...knexEvictionCoins(server.knex!, TOKEN_TOPIC),
-      // An idempotent upsert that re-credits the holder only when it really
-      // re-inserted the row — never storeToken's plain insert, which E11000s on
-      // every re-delivery after a partial restore (Go: RestoreTokens).
-      restoreTokenRow: mongoRestoreTokenRow(
-        lookupDb.collection('mandalaTokens') as unknown as TokenRowsCollection,
-        async (identityKey, delta) => { await sharedStorage.adjustBalance(identityKey, delta) }
-      ),
+      // Every role (value and authority) from the owner journal, credited once,
+      // and only for a coin the engine shows live again (eviction.ts).
+      restoreInput: journalRestoreInput((t, v, topic) => storage.getOwnerJournal(t, v, topic), j => mandalaLookup!.restoreInputRow(j), TOKEN_TOPIC),
       evict: async (txid, reason) =>
         await (server.engine as unknown as {
           evictAppliedTransaction: (t: string, o: { reason?: string }) => Promise<unknown>
         }).evictAppliedTransaction(txid, { reason }),
-      assetsTouchedBy: async (txid) =>
-        ((await adminHistoryCol.distinct('assetId', { txid })) as string[]).sort(),
-      // Rebuild-first: the pinned rebuildState reads every row, so replay the
-      // history minus this txid's rows with the pinned reducer (same ctx
-      // sourcing), then refold the repo-local fee rate from the identical rows
-      // — Go's RebuildStateExcluding folds the rate natively.
-      rebuildAssetStateExcluding: async (assetId, txid) => {
-        const history = (await adminHistoryCol.find({ assetId, txid: { $ne: txid } })
-          .sort({ height: 1, offset: 1, admitSeq: 1 })
-          .project({ _id: 0, txid: 1, outputIndex: 1, actionDetails: 1 })
-          .toArray()) as unknown as FeeRateHistoryEntry[]
-        await replayAssetState(assetId, history, sharedStorage as unknown as ReplayStorage)
-        await rebuildFeeRateFromHistory(feeRateStore, assetId, history)
-      },
-      purgeAdminHistory: async (txid) => {
-        await adminHistoryCol.deleteMany({ txid })
-      },
+      // Refold every token the tx has history for without it, then purge its
+      // history rows (in that order, so an interrupted run can be repeated).
+      purgeAndRefold: txid => mandalaLookup!.purgeAndRefold(txid),
+      quiesce: fn => gate.exclusive(fn),
       // No block height: the engine takes it from the proof, and throws when
       // a forwarded one differs from it.
       ingestProof: async (txid, merklePathHex) => {
@@ -369,54 +323,72 @@ const main = async (): Promise<void> => {
     priv: overlayPriv
   }) as unknown as (req: Request<{ txid: string }>, res: Response) => void)
 
+  // v3 token routes (§6.5). Each validates its token id (`<txid>_0`) first and
+  // answers 400 on a malformed one, so an old-format id never reads as "none".
+  const send = (res: Response, r: routes.RouteResult): void => { res.status(r.status).json(r.body) }
+  const publicRoute = <P>(handler: (req: Request<P>) => Promise<routes.RouteResult>) =>
+    (req: Request<P>, res: Response): void => {
+      res.header('Access-Control-Allow-Origin', '*')
+      void (async () => {
+        try {
+          send(res, await handler(req))
+        } catch (e) {
+          res.status(500).json({ error: String(e) })
+        }
+      })()
+    }
+
   // Each frozen ref carries `hasFrozenRow` (A16): whether the frozen coin
   // still has a token row, i.e. whether a reissue of it can succeed.
-  server.app.get('/admin/asset-state/:assetId', (req: Request<{ assetId: string }>, res: Response) => {
-    res.header('Access-Control-Allow-Origin', '*')
-    void (async () => {
-      try {
-        const state = await sharedStorage.getAssetState(req.params.assetId)
-        const feeRow = await feeRateStore.get(req.params.assetId)
-        res.json(await withFrozenRowFlags(withFeeRate(state, feeRow), hasTokenRow))
-      } catch (e) {
-        res.status(500).json({ error: String(e) })
-      }
-    })()
-  })
+  server.app.get('/admin/asset-state/:tokenId', publicRoute<{ tokenId: string }>(async req =>
+    await routes.assetStateResponse(req.params.tokenId, {
+      getAssetState: id => storage.getAssetState(id),
+      hasTokenRow: async (t, v) => (await storage.getTokenRow(t, v)) != null
+    })))
 
-  // Per-asset admin-auth head (A10): the newest admitted admin output of the
-  // asset by (height, offset, admitSeq), plus the BEEF to spend it. Lets an
-  // issuer whose wallet lost the auth output's bookkeeping re-attach it.
-  server.app.get('/admin/asset-auth/beef/:txid', assetAuthBeefHandler({
-    findBeef: async (txid, vout) => {
-      const engineStorage = new KnexStorage(server.knex!)
-      const out = await engineStorage.findOutput(txid, vout, 'tm_mandala', undefined, true)
-      if (out?.beef == null) return null
-      return { beef: Array.from(out.beef as number[] | Uint8Array), outputIndex: out.outputIndex }
-    }
-  }))
-  server.app.get('/admin/asset-auth/:assetId', assetAuthHeadHandler({
-    findAdminHistory: async (assetId) =>
-      await sharedStorage.findAdminHistoryByAssetId(assetId) as unknown as AdminHistoryRowLite[]
+  // The BEEF of an authority tx, so an issuer whose wallet lost the authority
+  // coin's bookkeeping can re-attach it. Registered before '/:tokenId'.
+  server.app.get('/admin/authorities/beef/:txid', publicRoute<{ txid: string }>(async req =>
+    await routes.authoritiesBeefResponse(req.params.txid, req.query.vout, {
+      findBeef: async (txid, vout) => {
+        const out = await new KnexStorage(server.knex!).findOutput(txid, vout, TOKEN_TOPIC, undefined, true)
+        if (out?.beef == null) return null
+        return { beef: Array.from(out.beef as number[] | Uint8Array), outputIndex: out.outputIndex }
+      }
+    })))
+  // The token's unspent authority coins (deploy and admin outputs).
+  server.app.get('/admin/authorities/:tokenId', publicRoute<{ tokenId: string }>(async req =>
+    await routes.authoritiesResponse(req.params.tokenId, {
+      listAuthorities: id => storage.listAuthorities(TOKEN_TOPIC, id)
+    })))
+
+  // The full history in fold order, for exports.
+  server.app.get('/admin/admin-history/:tokenId', publicRoute<{ tokenId: string }>(async req => {
+    const id = routes.tokenIdParam(req.params.tokenId)
+    if (id == null) return { status: 400, body: { error: 'invalid tokenId' } }
+    return { status: 200, body: await storage.findAdminHistory(id) }
   }))
 
-  server.app.get('/admin/admin-history/:assetId', (req: Request<{ assetId: string }>, res: Response) => {
-    res.header('Access-Control-Allow-Origin', '*')
-    void (async () => {
-      try {
-        const history = await sharedStorage.findAdminHistoryByAssetId(req.params.assetId)
-        res.json(history)
-      } catch (e) {
-        res.status(500).json({ error: String(e) })
-      }
-    })()
-  })
+  // Paged admin history (?limit=&offset=), newest-first by admit sequence, so
+  // the app's audit log streams thousands of actions in pages.
+  server.app.get('/admin/admin-history-page/:tokenId', publicRoute<{ tokenId: string }>(async req =>
+    await routes.adminHistoryPageResponse(req.params.tokenId, req.query.limit, req.query.offset, {
+      page: async (id, limit, offset) =>
+        await lookupDb.collection('mandalaAdminHistory').find({ tokenId: id }, { projection: { _id: 0 } }).sort({ admitSeq: -1 }).skip(offset).limit(limit).toArray() as unknown as AdminHistoryEntry[]
+    })))
+
+  // Issued/redeemed totals from the history deltas, deduplicated per outpoint
+  // (the Overview KPIs and the Banking reconciliation).
+  server.app.get('/admin/admin-summary/:tokenId', publicRoute<{ tokenId: string }>(async req =>
+    await routes.adminSummaryResponse(req.params.tokenId, {
+      history: id => storage.findAdminHistory(id)
+    })))
 
   server.app.options('/admin/registry', adminCors(ADMIN_CORS_ORIGINS))
   server.app.get('/admin/registry', ...adminGate, (_req: Request, res: Response) => {
     void (async () => {
       try {
-        res.json(await registryStore.list())
+        res.json(await registryStorage.list())
       } catch (e) {
         res.status(500).json({ error: String(e) })
       }
@@ -443,22 +415,28 @@ const main = async (): Promise<void> => {
   })
 
   // Overlay-wide transaction feed with linkage-proven counterparties — what
-  // the overlay operator can see. Reads the append-only linkage collection
-  // (identity per output, proven via revealSpecificKeyLinkage) and the
-  // engine's raw-tx store (amounts, input provenance). Cursor-paginated
-  // (?limit=&before=) so thousands of transactions stream in pages; see
-  // activity.ts. Indexes are ensured at boot so the newest-first sort and
-  // the paged admin-history reads never collection-scan.
+  // the overlay operator can see. Reads the package's append-only linkage
+  // collection (identity per output, proven via revealSpecificKeyLinkage) and
+  // the engine's raw-tx store (amounts, input provenance). Cursor-paginated
+  // (?limit=&before=), optionally narrowed to one token (?tokenId=); see
+  // activity.ts. The package indexes linkage by outpoint and identity only, so
+  // the newest-first sort's index is ensured here, at boot.
   const linkageCol = lookupDb.collection('mandalaLinkageRecords')
-  await Promise.all([
-    linkageCol.createIndex({ createdAt: -1 }),
-    adminHistoryCol.createIndex({ assetId: 1, admitSeq: -1 })
-  ])
+  await linkageCol.createIndex({ createdAt: -1 })
 
   server.app.options('/admin/activity', adminCors(ADMIN_CORS_ORIGINS))
   server.app.get('/admin/activity', ...adminGate, (req: Request, res: Response) => {
     void (async () => {
       try {
+        let tokenId: string | undefined
+        if (req.query.tokenId !== undefined) {
+          const id = routes.tokenIdParam(req.query.tokenId)
+          if (id == null) {
+            res.status(400).json({ error: 'invalid tokenId' })
+            return
+          }
+          tokenId = id
+        }
         const engineStorage = new KnexStorage(server.knex!)
         const page = await buildActivity({
           listLinkage: async (limit, before) =>
@@ -476,7 +454,7 @@ const main = async (): Promise<void> => {
             return new Map(records.map(r => [r.txid, r.rawTx]))
           }
         }, {
-          assetId: typeof req.query.assetId === 'string' ? req.query.assetId : undefined,
+          tokenId,
           limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined,
           before: typeof req.query.before === 'string' ? req.query.before : undefined
         })
@@ -487,70 +465,16 @@ const main = async (): Promise<void> => {
     })()
   })
 
-  // Paged admin history (?limit=&offset=), newest-first by admit sequence.
-  // The un-paged /admin/admin-history/:assetId stays for full exports; the
-  // app's audit log uses this one so thousands of actions stream in pages.
-  server.app.get('/admin/admin-history-page/:assetId', (req: Request<{ assetId: string }>, res: Response) => {
-    res.header('Access-Control-Allow-Origin', '*')
-    void (async () => {
-      try {
-        const limit = Math.min(Math.max(Number(req.query.limit ?? 100) || 100, 1), 500)
-        const offset = Math.max(Number(req.query.offset ?? 0) || 0, 0)
-        const rows = await adminHistoryCol
-          .find({ assetId: req.params.assetId }, { projection: { _id: 0 } })
-          .sort({ admitSeq: -1 })
-          .skip(offset)
-          .limit(limit)
-          .toArray()
-        res.json(rows)
-      } catch (e) {
-        res.status(500).json({ error: String(e) })
-      }
-    })()
-  })
-
-  // Aggregated issue/redeem totals — the Overview KPIs and the Banking
-  // reconciliation need whole-history sums, which must not require shipping
-  // the whole history to the client. Mongo does the sum against the
-  // (assetId, …) index.
-  server.app.get('/admin/admin-summary/:assetId', (req: Request<{ assetId: string }>, res: Response) => {
-    res.header('Access-Control-Allow-Origin', '*')
-    void (async () => {
-      try {
-        const groups = await adminHistoryCol.aggregate([
-          { $match: { assetId: req.params.assetId } },
-          // Re-admits (GASP re-sync / reorg replay) append duplicate rows for
-          // the same on-chain action with a fresh admitSeq — collapse to one
-          // per (txid, outputIndex) BEFORE summing, or totals double-count.
-          {
-            $group: {
-              _id: { txid: '$txid', outputIndex: '$outputIndex' },
-              kind: { $first: '$actionDetails.kind' },
-              amount: { $first: '$actionDetails.amount' }
-            }
-          },
-          { $group: { _id: '$kind', total: { $sum: '$amount' }, count: { $sum: 1 } } }
-        ]).toArray()
-        const byKind = new Map(groups.map(g => [g._id as string, g]))
-        // Matches the client-side sums this replaces: 'issue' and 'redeem'
-        // only ('reissue' conserves supply — it replaces frozen units).
-        res.json({
-          totalIssued: byKind.get('issue')?.total as number ?? 0,
-          totalRedeemed: byKind.get('redeem')?.total as number ?? 0,
-          actionCount: groups.reduce((a, g) => a + (g.count as number), 0)
-        })
-      } catch (e) {
-        res.status(500).json({ error: String(e) })
-      }
-    })()
-  })
-
+  // Boot refold + reconcile BEFORE the first submit is accepted (start() is
+  // where the server begins listening), then the interval.
+  await ownerIndex.runOnce()
+  ownerIndex.start(OWNER_INDEX_INTERVAL_MS)
   await server.start()
   console.log(`mandala overlay listening on ${cfg.hostingUrl}`)
 }
 
 const log = (m: string, e?: unknown): void => { if (e == null) console.log(m); else console.error(m, e) }
-const close = async (): Promise<void> => { await overlay?.close() }
+const close = async (): Promise<void> => { ownerIndex?.stop(); await overlay?.close() }
 // Drain on a signal: stop accepting work, let in-flight requests finish, close
 // knex and Mongo, then exit 0. 25s sits inside compose's 30s stop_grace_period.
 const onSignal = createShutdown({ close, exit: (code) => process.exit(code), log, deadlineMs: 25_000 })
