@@ -231,7 +231,8 @@ export interface AdmissionStore {
    * `refusedDescription`, `refusedAt`, `refusedPayloadHash`,
    * `refusedSpendTxid`), so a transaction that is admitted after an earlier
    * payload was refused stops carrying that refusal. §9.4: it also clears
-   * `pending`.
+   * `pending`. `restore` MUST be merged into the stored snapshot
+   * (`mergeRestore`), never replace it.
    */
   putAdmitted: (rec: AdmissionAdmitted) => Promise<void>
   putRefusal: (rec: AdmissionRefusal) => Promise<void>
@@ -240,6 +241,9 @@ export interface AdmissionStore {
    * §9.4 — the provisional record, written before the engine can broadcast.
    * Optional so a store that predates the amendment still type-checks; when it
    * is absent the restore snapshot only becomes durable on the way out.
+   * `restore` MUST be merged into the stored snapshot (`mergeRestore`), never
+   * replace it: a retry after a crash snapshots inputs whose token rows are
+   * already gone.
    */
   putPending?: (rec: AdmissionPending) => Promise<void>
 }

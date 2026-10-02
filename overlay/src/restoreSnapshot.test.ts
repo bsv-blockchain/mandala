@@ -220,6 +220,7 @@ describe.skipIf(!up)('crash → heal → admit → evict over the real engine an
     expect(rec?.restore?.tokenRows.map(r => `${r.txid}.${r.outputIndex}`)).toEqual([X])
 
     // Arcade rejects A: evict with the production restore path.
+    const balanceBeforeEvict = await storage.getBalance(HOLDER)
     const report = await evictWithRestore(txidA, 'REJECTED', {
       store: admissions,
       ...knexEvictionCoins(h.knex, HARNESS_TOPIC),
@@ -231,14 +232,15 @@ describe.skipIf(!up)('crash → heal → admit → evict over the real engine an
     })
     expect(report).toMatchObject({ restoredOutpoints: 1, restoredTokenRows: 1, alreadyEvicted: false })
 
-    // X is live in the engine, its token row is back, and the holder is whole:
-    // A's own output (900) was credited on admission and removed by the
-    // eviction's outputEvicted (which, like MandalaLookupService's, deletes the
-    // row without a debit), so the balance reads 900 + 1000 restored.
+    // X is live in the engine, its token row is back, and the restore credited
+    // the holder X's 1000 (the debit the crashed attempt's outputSpent made).
+    // Asserted as a delta: the evicted output's own 900 is removed by
+    // outputEvicted, which — like MandalaLookupService's — deletes the row
+    // without a debit, and this test should not pin that.
     const xRow = await h.knex('outputs').where({ txid: h.root.id('hex'), outputIndex: 0, topic: HARNESS_TOPIC }).first()
     expect(Boolean(xRow.spent)).toBe(false)
     expect(await storage.getTokenRow(h.root.id('hex'), 0)).toMatchObject({ amount: 1000, identityKey: HOLDER })
-    expect(await storage.getBalance(HOLDER)).toBe(1900)
+    expect(await storage.getBalance(HOLDER) - balanceBeforeEvict).toBe(1000)
     expect((await admissions.get(txidA))?.evictedAt).toBeDefined()
   })
 })
