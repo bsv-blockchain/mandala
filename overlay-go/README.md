@@ -56,6 +56,25 @@ the listed inputs. `internal/wiring/previous_coins_test.go` pins it. If a bump
 starts dropping spent coins (as `@bsv/overlay` 2.6 did), port the TS guard
 (`overlay/src/spentGuard.ts`: every input inspected, self-heal) first.
 
+Script rules (go-sdk v1.7.1, wire contract §11.7). go-sdk's `spv.Verify`, which
+`Engine.Submit` runs, verifies every tx version under after-Chronicle rules. TS's
+`Transaction.verify` treats a version ≤ 1 tx as not after-Chronicle, but it
+gates opcodes only on explicit flags, which it never passes. So the engines
+agree on Chronicle-only opcodes at every version. The one v1 gap is a
+SIGHASH_CHRONICLE (0x20) signature: TS refuses it and go-sdk accepts it.
+`internal/wiring/script_rules.go`'s `CheckChronicleSighashRule` closes that gap
+before `Engine.Submit` with the same `503 ERR_UNAVAILABLE` TS gives. It re-runs
+each v1 input, in the tx and in its unproven ancestors, under the pre-Chronicle
+flags and refuses only on `ErrInvalidSigHashType`. It skips any input whose
+locking script contains an epoch-divergent opcode (OP_SUBSTR, OP_LEFT,
+OP_RIGHT, OP_LSHIFTNUM, OP_RSHIFTNUM, OP_VER, OP_VERIF, OP_VERNOTIF,
+OP_2MUL, OP_2DIV) or fails to parse. A pre-Chronicle run of such a script can
+take a different path and falsely refuse a tx both stacks accept. The cost of
+skipping is the documented gap: Go admits a v1 SIGHASH_CHRONICLE signature in
+such an input. The cells live in `testdata/chronicle_sighash_vectors.json`,
+which the TS overlay's `chronicleSighashParity.test.ts` reads too. Re-check
+both when bumping go-sdk.
+
 ### `engine.TopicManager` (go-overlay-services v1.3.7)
 
 ```
