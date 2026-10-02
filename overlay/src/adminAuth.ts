@@ -19,7 +19,7 @@
  * identically to the console.
  */
 import type { Request, Response, NextFunction } from 'express'
-import { createHash, timingSafeEqual } from 'crypto'
+import { constantTimeEqual } from './secrets.js'
 
 const BEARER_PREFIX = 'Bearer '
 
@@ -28,18 +28,6 @@ export function parseBearerToken (header: string | undefined | null): string | n
   if (header == null || !header.startsWith(BEARER_PREFIX)) return null
   const token = header.slice(BEARER_PREFIX.length)
   return token === '' ? null : token
-}
-
-/**
- * Constant-time string compare. Both sides are hashed to a fixed-length
- * digest first so neither a length mismatch nor a byte mismatch in
- * `timingSafeEqual` (which requires equal-length buffers) can leak anything
- * about the configured token's length.
- */
-function constantTimeEqual (a: string, b: string): boolean {
-  const ha = createHash('sha256').update(a, 'utf8').digest()
-  const hb = createHash('sha256').update(b, 'utf8').digest()
-  return timingSafeEqual(ha, hb)
 }
 
 /**

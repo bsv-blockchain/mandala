@@ -30,9 +30,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@bsv/message-box-client": "^2.2.0",
-    "@bsv/sdk": "^2.1.6",
-    "@bsv/templates": "^1.9.0"
+    "@bsv/message-box-client": "^2.5.4",
+    "@bsv/sdk": "^2.8.11",
+    "@bsv/templates": "^1.10.3"
   },
   "devDependencies": {
     "typescript": "~5.9.3",

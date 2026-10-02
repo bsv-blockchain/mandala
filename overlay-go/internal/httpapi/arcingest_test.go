@@ -2,11 +2,13 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf16"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
@@ -70,7 +72,9 @@ func samplePathHex(t *testing.T, txid *chainhash.Hash) string {
 	return mp.Hex()
 }
 
-const sampleTxidHex = "00000000000000000000000000000000000000000000000000000000000abc"
+// A full 64-hex txid: /arc-ingest refuses anything else before touching any
+// store (as the TS route does).
+const sampleTxidHex = "0000000000000000000000000000000000000000000000000000000000000abc"
 
 func TestArcIngestBadTokenRejected(t *testing.T) {
 	h := &stubMerkleProofHandler{}
@@ -278,9 +282,11 @@ func TestArcIngestTerminalStatusBodyMatchesTheContract(t *testing.T) {
 		t.Fatalf("body = %v, missing data", body)
 	}
 	want := map[string]any{
-		"txid":              sampleTxidHex,
-		"txStatus":          "REJECTED",
-		"reason":            "fee too low",
+		"txid":     sampleTxidHex,
+		"txStatus": "REJECTED",
+		// The reason is "<txStatus> <extraInfo>", trimmed — the TS route's (and
+		// upstream overlay-express's) construction, byte-identical (§9.12).
+		"reason":            "REJECTED fee too low",
 		"restoredOutpoints": float64(2),
 		"restoredTokenRows": float64(1),
 		"alreadyEvicted":    true,
@@ -419,5 +425,125 @@ func TestArcIngestRouteAbsentWhenCallbackTokenIsEmpty(t *testing.T) {
 	health := doRequest(t, app, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if health.StatusCode != fiber.StatusOK {
 		t.Fatalf("/health = %d, want the node to keep serving everything else", health.StatusCode)
+	}
+}
+
+// Wire contract §9.12 parity with overlay/src/eviction.ts: a txid that is not
+// 64 hex characters is refused 400 with the TS message before any eviction or
+// proof ingestion runs, on the terminal and the proof path alike.
+func TestArcIngestRefusesATxidThatIsNot64Hex(t *testing.T) {
+	cases := map[string]string{
+		"too short":   strings.Repeat("ab", 31),
+		"too long":    strings.Repeat("ab", 32) + "0",
+		"not hex":     strings.Repeat("zz", 32),
+		"an outpoint": strings.Repeat("ab", 32) + ".0",
+		"padded":      " " + strings.Repeat("ab", 32),
+	}
+	for name, bad := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := &stubMerkleProofHandler{}
+			ev := &stubEvictTx{}
+			app := newArcIngestAppEvict(h, "", ev.evict)
+			for _, body := range []string{
+				`{"txid":"` + bad + `","txStatus":"REJECTED"}`,
+				`{"txid":"` + bad + `","txStatus":"MINED","merklePath":"deadbeef"}`,
+			} {
+				req := httptest.NewRequest(http.MethodPost, "/arc-ingest", strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				resp := doRequest(t, app, req)
+				if resp.StatusCode != fiber.StatusBadRequest {
+					t.Fatalf("status = %d, want 400", resp.StatusCode)
+				}
+				got := decodeJSON(t, resp)
+				if got["status"] != "error" || got["message"] != "Provider callback txid must be 64 hex characters" {
+					t.Fatalf("body = %v", got)
+				}
+			}
+			if ev.calls != 0 || h.calls != 0 {
+				t.Fatalf("evict calls = %d, proof calls = %d; want none", ev.calls, h.calls)
+			}
+		})
+	}
+}
+
+// An upper-case txid is accepted and lowercased before anything uses it, as
+// on TS — the admission record is keyed by the lowercase txid.
+func TestArcIngestLowercasesTheTxid(t *testing.T) {
+	ev := &stubEvictTx{}
+	app := newArcIngestAppEvict(&stubMerkleProofHandler{}, "", ev.evict)
+	upper := strings.ToUpper(strings.Repeat("ab", 32))
+	req := httptest.NewRequest(http.MethodPost, "/arc-ingest", strings.NewReader(`{"txid":"`+upper+`","txStatus":"REJECTED"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := doRequest(t, app, req)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(ev.gotTxids) != 1 || ev.gotTxids[0] != strings.Repeat("ab", 32) {
+		t.Fatalf("evicted %v, want the lowercase txid", ev.gotTxids)
+	}
+	data, _ := decodeJSON(t, resp)["data"].(map[string]any)
+	if data["txid"] != strings.Repeat("ab", 32) {
+		t.Fatalf("data.txid = %v, want lowercase", data["txid"])
+	}
+}
+
+// The reason is bounded to 256 UTF-16 code units, as on TS (whose engine
+// refuses a reason over 1024 UTF-8 bytes). 256 units is at most 768 bytes.
+func TestArcIngestBoundsTheReasonTo256UTF16Units(t *testing.T) {
+	for name, extra := range map[string]string{
+		"ascii":          strings.Repeat("x", 2000),
+		"astral (emoji)": strings.Repeat("\U0001F600", 1000),
+		"bmp multi-byte": strings.Repeat("é", 2000),
+	} {
+		t.Run(name, func(t *testing.T) {
+			app := newArcIngestAppEvict(&stubMerkleProofHandler{}, "", (&stubEvictTx{}).evict)
+			payload, _ := json.Marshal(map[string]string{"txid": sampleTxidHex, "txStatus": "REJECTED", "extraInfo": extra})
+			req := httptest.NewRequest(http.MethodPost, "/arc-ingest", strings.NewReader(string(payload)))
+			req.Header.Set("Content-Type", "application/json")
+			resp := doRequest(t, app, req)
+			if resp.StatusCode != fiber.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			data, _ := decodeJSON(t, resp)["data"].(map[string]any)
+			reason, _ := data["reason"].(string)
+			if !strings.HasPrefix(reason, "REJECTED ") {
+				t.Fatalf("reason = %q, want it to start with the status", reason)
+			}
+			if n := len(utf16.Encode([]rune(reason))); n > 256 {
+				t.Fatalf("reason is %d UTF-16 units, want <= 256", n)
+			}
+			if len(reason) > 1024 {
+				t.Fatalf("reason is %d UTF-8 bytes, want <= 1024", len(reason))
+			}
+		})
+	}
+}
+
+// The cut keeps a surrogate pair that ends exactly on the bound, and drops
+// only a high surrogate whose low half fell past it.
+func TestEvictionReasonCutRespectsSurrogatePairs(t *testing.T) {
+	// "R " is 2 units and each emoji 2 more, so 127 emoji end exactly on 256.
+	r := evictionReason("R", strings.Repeat("\U0001F600", 200))
+	if want := "R " + strings.Repeat("\U0001F600", 127); r != want {
+		t.Fatalf("reason = %q (%d units), want 127 whole emoji", r, len(utf16.Encode([]rune(r))))
+	}
+	if strings.ContainsRune(r, '\uFFFD') {
+		t.Fatalf("reason carries a replacement character: %q", r)
+	}
+	// Odd alignment: "RX " is 3 units, so the 256th unit is a high surrogate.
+	r = evictionReason("RX", strings.Repeat("\U0001F600", 200))
+	if want := "RX " + strings.Repeat("\U0001F600", 126); r != want {
+		t.Fatalf("reason = %q, want the split pair dropped (%d units)", r, len(utf16.Encode([]rune(r))))
+	}
+}
+
+// With no extraInfo the reason is the status alone; with neither it is empty.
+func TestArcIngestReasonWithoutExtraInfo(t *testing.T) {
+	app := newArcIngestAppEvict(&stubMerkleProofHandler{}, "", (&stubEvictTx{}).evict)
+	req := httptest.NewRequest(http.MethodPost, "/arc-ingest", strings.NewReader(`{"txid":"`+sampleTxidHex+`","txStatus":"REJECTED"}`))
+	req.Header.Set("Content-Type", "application/json")
+	data, _ := decodeJSON(t, doRequest(t, app, req))["data"].(map[string]any)
+	if data["reason"] != "REJECTED" {
+		t.Fatalf("reason = %v, want REJECTED", data["reason"])
 	}
 }

@@ -2,35 +2,35 @@
  * FIX L — the overlay refuses a conflicting second spend itself, instead of
  * leaving it to Arcade's broadcast-time race (contract §7).
  *
- * Two independent holes, both live in the pinned stack:
+ * Since `@bsv/overlay` 2.6 the engine builds `previousCoins` with
+ * `storage.findOutput(prevTxid, vout, topic, false)`, which silently DROPS an
+ * already-spent coin. A double spend therefore never shows its spent input to
+ * the manager at all, and would surface as the manager's conservation reject —
+ * a persisted, final ERR_CONSERVATION instead of ERR_INPUT_SPENT naming the
+ * competitor. So `withSpentInputGuard` inspects EVERY input of the
+ * transaction against the engine's `outputs` table, before delegating, and
+ * throws `InputSpentError` (→ 400 ERR_INPUT_SPENT, naming the competitor).
  *
- *  1. `Engine.submit` builds `previousCoins` with
- *     `storage.findOutput(prevTxid, vout, topic)` and NO `spent` filter, so an
- *     already-spent coin is merged into the manager's input set exactly like a
- *     live one. Two concurrent /submit calls spending the same coin therefore
- *     both pass validation; only Arcade's DOUBLE_SPEND_ATTEMPTED separates
- *     them, and offline settlement cannot wait for that.
- *  2. `KnexStorage.markUTXOAsSpent` is an unconditional
- *     `UPDATE outputs SET spent = true WHERE …` with no rows-affected check,
- *     so the second writer silently "wins" a row it never owned.
+ * The engine's own `KnexStorage.markUTXOAsSpent` is a compare-and-swap on
+ * `spent = false` that records the spending txid in `outputs.spentBy`, and a
+ * phase-3 storage failure now rethrows out of `Engine.submit` (→ 503
+ * ERR_UNAVAILABLE). Submissions are serialized by the engine's own lock, and
+ * the STEAK is only produced after storage is durable.
  *
- * This module closes both repo-locally:
+ * Contract §7's rescue clause is honoured in `conflictingSpend`: a coin still
+ * marked spent by a transaction whose admission record carries `evictedAt` is
+ * released and the submission refused retryably, so a client racing the FIX E
+ * restore is never told ERR_INPUT_SPENT for a spend that no longer exists. A
+ * coin left spent by an interrupted attempt of the SAME transaction is healed
+ * the same way.
  *
- *  - `withSpentInputGuard` is the ENFORCING half: it consults the live spend
- *    state of every previously-admitted input BEFORE delegating and throws
- *    `InputSpentError` (→ 400 ERR_INPUT_SPENT, naming the competitor).
- *  - `casMarkUTXOAsSpent` is the DETECTING half: installed over the engine
- *    storage's `markUTXOAsSpent`, it turns the update into a compare-and-swap
- *    on `spent = false` and reports a zero-rows-affected conflict. It cannot
- *    refuse the submission from there — the engine calls it inside its own
- *    swallowing try/catch, after the broadcast — which is exactly why the
- *    pre-delegation guard above is the enforcement point and this half is the
- *    race-narrowing + observability one.
- *
- * Contract §7's rescue clause is honoured in `conflictingSpend`: a coin marked
- * spent by a transaction whose admission record carries `evictedAt` counts as
- * LIVE, so a client racing the FIX E restore is never told ERR_INPUT_SPENT for
- * a spend that no longer exists.
+ * The guard's own read is LATER than the engine's previousCoins query (every
+ * outer wrapper runs in between), and FIX E's `unmarkSpent` is an UPDATE
+ * outside the engine's submission lock. So a coin can flip spent → live in that
+ * gap: missing from previousCoins, yet live to the guard. Delegating then hands
+ * the manager a token spend with no previous coins — a persisted, final
+ * ERR_CONSERVATION against exactly the rescue resubmit §7 protects. A live row
+ * the engine did not list is therefore refused retryably (InfraError → 503).
  */
 import { Transaction } from '@bsv/sdk'
 import type { TopicManager } from '@bsv/overlay'
@@ -45,7 +45,9 @@ export type ConsumedByEntry = string | { txid?: string, outputIndex?: number }
 
 export interface SpendState {
   spent: boolean
-  /** The outputs that consumed this coin — their txid is the competitor. */
+  /** The engine's `outputs.spentBy` — the spending txid recorded by the CAS (null on legacy rows). */
+  spentBy: string | null
+  /** The outputs that consumed this coin — fallback when spentBy is null. */
   consumedBy: ConsumedByEntry[]
 }
 
@@ -54,7 +56,19 @@ export interface SpentInputStore {
   spendStateOf: (txid: string, outputIndex: number) => Promise<SpendState | null>
   /** True when that spending txid's admission record carries `evictedAt` (FIX E). */
   wasEvicted: (txid: string) => Promise<boolean>
+  /**
+   * `UPDATE outputs SET spent=false, spentBy=NULL WHERE txid/outputIndex/topic
+   * AND spent=true AND (spentBy=spender OR spentBy IS NULL)` → rows affected.
+   */
+  releaseSpend: (txid: string, outputIndex: number, spender: string) => Promise<number>
 }
+
+export const SELF_HEAL_DESCRIPTION = (outpoint: string): string =>
+  `input ${outpoint} was left marked spent by an interrupted attempt of this transaction; released, retry`
+export const EVICTED_HEAL_DESCRIPTION = (outpoint: string, competitor: string): string =>
+  `input ${outpoint} was still marked spent by evicted transaction ${competitor}; released, retry`
+export const MOVED_DESCRIPTION = (outpoint: string): string =>
+  `input ${outpoint} was released while this submission was being evaluated; retry`
 
 /** The spending transaction id behind a `consumedBy` entry list. */
 export const spendTxidOf = (consumedBy: ConsumedByEntry[]): string | null => {
@@ -73,155 +87,78 @@ const outpointOf = (inp: { sourceTXID?: string, sourceTransaction?: Transaction,
 })
 
 /**
- * The outpoints of this transaction's PREVIOUSLY ADMITTED inputs — the coins
- * the engine resolved into `previousCoins`, i.e. the token inputs whose spend
- * state this guard has just cleared.
- */
-export const tokenInputOutpoints = (tx: Transaction, previousCoins: number[]): string[] => {
-  const out: string[] = []
-  for (const ci of previousCoins) {
-    const inp = tx.inputs[ci]
-    if (inp == null) continue
-    const { txid, vout } = outpointOf(inp)
-    if (txid !== '') out.push(`${txid}.${vout}`)
-  }
-  return out
-}
-
-// ─────────────────────── in-flight outpoints (§9.7) ─────────────────────────
-
-/** Identical on both engines — the wallet keys its retry/backoff branch on it. */
-export const IN_FLIGHT_DESCRIPTION = (outpoint: string): string =>
-  `input ${outpoint} is being spent by another submission that is still in flight; retry`
-
-/**
- * §9.7 — the in-process hold that closes the window `conflictingSpend` cannot.
- *
- * The spent-input guard reads COMMITTED state: `spent` is set by
- * `markUTXOAsSpent`, which the pinned `Engine.submit` runs in PHASE 3 — AFTER
- * it has broadcast and AFTER `onSteakReady` has already answered the client.
- * Two submissions that arrive inside that window both read `spent = false`,
- * both clear the guard, and both are admitted and broadcast; only one of them
- * can win the compare-and-swap afterwards, and by then both submitters hold a
- * 200 with a valid σ_I over conflicting spends of the same coin. That is the
- * double-spend FIX L was supposed to stop, surviving as a race.
- *
- * So a submission that CLEARS the guard immediately claims its inputs here, and
- * a concurrent submission touching a claimed outpoint gets
- * 503 ERR_UNAVAILABLE — retryable, never persisted, never a σ_I. By the time it
- * retries, the winner's compare-and-swap has run and the ordinary guard answers
- * the authoritative 400 ERR_INPUT_SPENT naming it.
- *
- * Holds are released per-outpoint by the compare-and-swap (`onMarked`) and, as
- * a leak-guard, wholesale when the request settles; the TTL sweep is the last
- * resort for a request that never reaches either (dropped connection).
- */
-export class InFlightOutpoints {
-  private readonly held = new Map<string, { txid: string, at: number }>()
-
-  constructor (
-    private readonly ttlMs: number = 60_000,
-    private readonly now: () => number = () => Date.now()
-  ) {}
-
-  private prune (): void {
-    const cutoff = this.now() - this.ttlMs
-    for (const [outpoint, entry] of this.held) {
-      if (entry.at < cutoff) this.held.delete(outpoint)
-    }
-  }
-
-  /**
-   * Claims every outpoint for `txid`, all-or-nothing. Throws `InfraError`
-   * naming the first outpoint another transaction already holds — so a partial
-   * claim never strands coins the caller was refused.
-   */
-  hold (txid: string, outpoints: string[]): void {
-    this.prune()
-    for (const outpoint of outpoints) {
-      const owner = this.held.get(outpoint)
-      if (owner != null && owner.txid !== txid) throw new InfraError(IN_FLIGHT_DESCRIPTION(outpoint))
-    }
-    const at = this.now()
-    for (const outpoint of outpoints) this.held.set(outpoint, { txid, at })
-  }
-
-  /** Released by the compare-and-swap mark-spent, which names the COIN. */
-  releaseOutpoint (outpoint: string): void {
-    this.held.delete(outpoint)
-  }
-
-  releaseAll (txid: string): void {
-    for (const [outpoint, entry] of this.held) {
-      if (entry.txid === txid) this.held.delete(outpoint)
-    }
-  }
-
-  /** Test/observability only. */
-  outpoints (): string[] {
-    this.prune()
-    return [...this.held.keys()]
-  }
-}
-
-/**
  * The first input of `tx` that a different, still-admitted transaction has
- * already spent — or null when every previously-admitted input is live.
- * `spendTxid` is '' when the competitor cannot be named from `consumedBy`
- * (the coin is still spent, so the submission is still refused).
+ * already spent — or null when every input is live.
+ *
+ * Every input, not only `previousCoins` (the engine's input indices it found
+ * as live topic coins): since @bsv/overlay 2.6 the engine omits spent coins
+ * from previousCoins, so the double spend would otherwise surface as the
+ * manager's conservation reject (a persisted final ERR_CONSERVATION).
+ * An input with no row on this topic (a fee input, a coin never admitted, or
+ * one an eviction deleted) is not a conflict this guard can prove.
+ * `spendTxid` is '' when the competitor cannot be named (the coin is still
+ * spent, so the submission is still refused).
+ *
+ * A LIVE row whose input index is not in `previousCoins` was un-spent after the
+ * engine's query (an eviction's unmarkSpent racing this submission): the
+ * manager is about to judge the spend without that coin, so it is refused
+ * retryably (InfraError → 503, never persisted) and the resubmit, which the
+ * engine will see with the coin listed, converges. `previousCoins` that is not
+ * an array lists nothing, so it fails CLOSED the same way.
+ *
+ * Two stale-spend cases are healed, then refused retryably (InfraError → 503),
+ * because the engine already built previousCoins without the coin:
+ *  - spent by THIS tx: an earlier attempt crashed between mark-spent and
+ *    insertAppliedTransaction (the engine's dupe check already proved this tx
+ *    is not applied);
+ *  - spent by an EVICTED tx whose input restore never ran.
+ *
+ * §9.5: every store call fails CLOSED through `infra()` — a guard that cannot
+ * read (or release) the state it gates on neither admits the unchecked spend
+ * nor mints a final 400 out of a storage fault.
  */
 export const conflictingSpend = async (
   tx: Transaction,
-  previousCoins: number[],
+  previousCoins: readonly number[],
   store: SpentInputStore
 ): Promise<{ outpoint: string, spendTxid: string } | null> => {
   const self = tx.id('hex')
-  for (const ci of previousCoins) {
-    const inp = tx.inputs[ci]
-    if (inp == null) continue
+  const listed = new Set<number>(Array.isArray(previousCoins) ? previousCoins : [])
+  for (const [inputIndex, inp] of tx.inputs.entries()) {
     const { txid, vout } = outpointOf(inp)
     if (txid === '') continue
-    // §9.5: a guard that cannot READ the state it gates on fails closed with a
-    // retryable 503 — it must neither admit the unchecked spend (fail open) nor
-    // mint a final 400 out of a storage fault.
     const state = await infra('the engine output store', async () => await store.spendStateOf(txid, vout))
-    // No row at all: either never indexed, or deleted by an eviction that
-    // restored this coin. Either way there is no conflict we can prove.
-    if (state == null || !state.spent) continue
-    const competitor = spendTxidOf(state.consumedBy)
-    if (competitor === self) continue
-    if (competitor != null && await infra('the admission record store', async () => await store.wasEvicted(competitor))) continue
-    return { outpoint: `${txid}.${vout}`, spendTxid: competitor ?? '' }
+    if (state == null) continue
+    const outpoint = `${txid}.${vout}`
+    if (!state.spent) {
+      if (!listed.has(inputIndex)) throw new InfraError(MOVED_DESCRIPTION(outpoint))
+      continue
+    }
+    const competitor = state.spentBy ?? spendTxidOf(state.consumedBy)
+    if (competitor === self) {
+      await infra('the engine output store', async () => await store.releaseSpend(txid, vout, self))
+      throw new InfraError(SELF_HEAL_DESCRIPTION(outpoint))
+    }
+    if (competitor != null && await infra('the admission record store', async () => await store.wasEvicted(competitor))) {
+      await infra('the engine output store', async () => await store.releaseSpend(txid, vout, competitor))
+      throw new InfraError(EVICTED_HEAL_DESCRIPTION(outpoint, competitor))
+    }
+    return { outpoint, spendTxid: competitor ?? '' }
   }
   return null
 }
 
-/**
- * Wraps a topic manager so a conflicting spend is refused before delegating,
- * and so the inputs this submission just cleared are claimed in `inFlight`
- * until its spend-mark lands (§9.7).
- */
-export const withSpentInputGuard = (
-  inner: TopicManager, store: SpentInputStore, inFlight?: InFlightOutpoints
-): TopicManager => {
+/** Wraps a topic manager so a conflicting spend is refused before delegating. */
+export const withSpentInputGuard = (inner: TopicManager, store: SpentInputStore): TopicManager => {
   const guarded: TopicManager = {
     ...inner,
     identifyAdmissibleOutputs: async (beef: number[], previousCoins: number[], offChainValues?: number[]) => {
       const tx = Transaction.fromBEEF(beef)
       const hit = await conflictingSpend(tx, previousCoins, store)
       if (hit != null) throw new InputSpentError(hit.outpoint, hit.spendTxid)
-      const txid = tx.id('hex')
-      inFlight?.hold(txid, tokenInputOutpoints(tx, previousCoins))
-      try {
-        return await (inner.identifyAdmissibleOutputs as (
-          b: number[], p: number[], o?: number[]
-        ) => Promise<{ outputsToAdmit: number[], coinsToRetain: number[] }>)(beef, previousCoins, offChainValues)
-      } catch (e) {
-        // A refused submission spends nothing, so its claim ends here rather
-        // than waiting for the request to settle.
-        inFlight?.releaseAll(txid)
-        throw e
-      }
+      return await (inner.identifyAdmissibleOutputs as (
+        b: number[], p: number[], o?: number[]
+      ) => Promise<{ outputsToAdmit: number[], coinsToRetain: number[] }>)(beef, previousCoins, offChainValues)
     }
   }
   return new Proxy(guarded, {
@@ -232,36 +169,72 @@ export const withSpentInputGuard = (
   })
 }
 
-export interface CasMarkSpentDeps {
-  /**
-   * `UPDATE outputs SET spent = true WHERE txid = ? AND outputIndex = ? AND
-   * topic = ? AND spent = false` — resolving to the number of rows affected.
-   */
-  markSpentIfUnspent: (txid: string, outputIndex: number, topic: string) => Promise<number>
-  /** Fired when the CAS affected zero rows (already spent, or row gone). */
-  onConflict?: (txid: string, outputIndex: number, topic: string) => void
-  /**
-   * Fired once the coin's spend state is settled either way — the committed
-   * `spent = true` is now visible to `conflictingSpend`, so the §9.7 in-flight
-   * claim on this outpoint has done its job and is released.
-   */
-  onMarked?: (txid: string, outputIndex: number, topic: string) => void
+/** Minimal knex surface the spent-input store needs (a knex instance satisfies it). */
+export type KnexLike = (table: string) => any
+
+// §9.5 — a guard that cannot READ the state it gates on fails CLOSED. These two
+// decoders are the only place the engine's raw row is interpreted, so each THROWS
+// on a shape it does not recognise (`infra()` in `conflictingSpend` re-badges that
+// as a retryable 503). Coercing instead is the failure mode: a garbled
+// `consumedBy` read as "no competitor" mints a final 400 ERR_INPUT_SPENT out of a
+// storage fault, and a garbled `spent` read as false admits a double spend.
+// Messages name the column and the type, never the row's contents.
+
+/** `consumedBy` as the engine writes it: a JSON array in a text column (or already an array). NULL/'null' = unconsumed. */
+const parseConsumedBy = (raw: unknown): ConsumedByEntry[] => {
+  let value: unknown = raw
+  if (typeof raw === 'string') {
+    try { value = JSON.parse(raw) } catch (e) { throw new Error('outputs.consumedBy is not valid JSON', { cause: e }) }
+  }
+  if (value == null) return []
+  if (!Array.isArray(value)) throw new Error('outputs.consumedBy is not a JSON array')
+  return value as ConsumedByEntry[]
 }
 
 /**
- * A drop-in replacement for `KnexStorage.markUTXOAsSpent` that is a
- * compare-and-swap. Deliberately total: the engine calls this inside a
- * try/catch that only logs, after the transaction has already been broadcast,
- * so throwing here would change nothing except the log line.
+ * `spentBy` as the engine's CAS writes it: the spending txid, or NULL (legacy
+ * rows, and every unspent row). '' / absent read as NULL. Anything else —
+ * a non-string, or a string that is not a txid — would name a competitor out
+ * of a storage fault, so it is a fault.
  */
-export const casMarkUTXOAsSpent = (deps: CasMarkSpentDeps) =>
-  async (txid: string, outputIndex: number, topic: string): Promise<void> => {
-    try {
-      const affected = await deps.markSpentIfUnspent(txid, outputIndex, topic)
-      if (affected === 0) deps.onConflict?.(txid, outputIndex, topic)
-    } catch (e) {
-      console.warn(`[mandala] compare-and-swap mark-spent failed for ${txid}.${outputIndex}@${topic}:`, e)
-    } finally {
-      deps.onMarked?.(txid, outputIndex, topic)
+const parseSpentBy = (raw: unknown): string | null => {
+  if (raw == null || raw === '') return null
+  if (typeof raw === 'string' && /^[0-9a-f]{64}$/i.test(raw)) return raw.toLowerCase()
+  throw new Error(`outputs.spentBy has an unexpected value of type ${typeof raw}`)
+}
+
+/** `spent` as the supported backends return a boolean column: a boolean, or integer 0/1. */
+const parseSpent = (raw: unknown): boolean => {
+  if (typeof raw === 'boolean') return raw
+  const n = typeof raw === 'bigint' ? Number(raw) : raw
+  if (n === 0 || n === 1) return n === 1
+  throw new Error(`outputs.spent has an unexpected value of type ${raw === null ? 'null' : typeof raw}`)
+}
+
+/**
+ * The production SpentInputStore: reads the engine's `outputs` table directly
+ * (KnexStorage.findOutput does not select `spentBy`).
+ *
+ * `releaseSpend` only ever un-spends a coin held by the named spender (or by
+ * an unlabelled legacy spend): a coin another transaction has since spent is
+ * never touched, so a stale heal cannot erase a live spend.
+ */
+export const knexSpentInputStore = (
+  knex: KnexLike, topic: string, wasEvicted: (txid: string) => Promise<boolean>
+): SpentInputStore => ({
+  spendStateOf: async (txid, outputIndex) => {
+    const row = await knex('outputs').where({ txid, outputIndex, topic }).first()
+    if (row == null) return null
+    return {
+      spent: parseSpent(row.spent),
+      spentBy: parseSpentBy(row.spentBy),
+      consumedBy: parseConsumedBy(row.consumedBy)
     }
-  }
+  },
+  wasEvicted,
+  releaseSpend: async (txid, outputIndex, spender) =>
+    await knex('outputs')
+      .where({ txid, outputIndex, topic, spent: true })
+      .andWhere((q: any) => q.where('spentBy', spender).orWhereNull('spentBy'))
+      .update({ spent: false, spentBy: null })
+})

@@ -11,6 +11,9 @@ services:
     ports: ["8080:8080"]
     volumes: ["overlay-data:/data"]
     depends_on: ["mongodb"]
+    # SIGTERM drains through OverlayExpress.close() with a 25s deadline
+    # (src/shutdown.ts); compose must not SIGKILL before that deadline.
+    stop_grace_period: 30s
   # Go port of `overlay` (overlay-go/). DISABLED BY DEFAULT — `overlay` (TS)
   # serves the app. Either service can serve it: they share the one real
   # database (each explicitly selects db `${NODE_NAME}_lookup_services`, i.e.

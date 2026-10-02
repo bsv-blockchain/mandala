@@ -6,61 +6,63 @@ import {
 } from '@bsv/overlay-topics'
 import { KnexStorage } from '@bsv/overlay'
 import { MerklePath, PrivateKey, ProtoWallet, WalletInterface } from '@bsv/sdk'
-import { MongoClient } from 'mongodb'
 import { config } from 'dotenv'
 import type { Request, Response } from 'express'
 import { buildActivity, LinkageRowLite } from './activity.js'
 import {
-  wrapSubmitJson, withPersistedVerdict, ensureAdmissionIndexes, TOKEN_TOPIC,
-  type AdmissionRecord, type AdmissionStore, type AppliedProof
+  wrapSubmitJson, normalizeDoubleSlash, withPersistedVerdict, ensureAdmissionIndexes, TOKEN_TOPIC,
+  type AdmissionStore, type AppliedProof
 } from './admission.js'
 import { admissionHandler } from './admissionRoute.js'
-import { SubmitSideChannel, withVerdictCapture, type AdmissionTokenRow } from './submitSideChannel.js'
+import { SubmitSideChannel, withVerdictCapture, snapshotRestoreFrom } from './submitSideChannel.js'
+import { mongoAdmissionStore } from './admissionStore.js'
 import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
-import { withSpentInputGuard, casMarkUTXOAsSpent, InFlightOutpoints, type SpentInputStore } from './spentGuard.js'
-import { mountArcIngest } from './eviction.js'
+import { withSpentInputGuard, knexSpentInputStore, type SpentInputStore } from './spentGuard.js'
+import { mountArcIngest, knexEvictionCoins, mongoRestoreTokenRow, type TokenRowsCollection } from './eviction.js'
 import { replayAssetState, type ReplayStorage } from './pinnedReducer.js'
 import { withAdminChainAnchor } from './adminChainGuard.js'
 import { assetAuthHeadHandler, assetAuthBeefHandler, withFrozenRowFlags, type AdminHistoryRowLite } from './assetAuth.js'
 import { withFeeRateFold, withFeeRate, rebuildFeeRateFromHistory, type FeeRateStore, type FeeRateRow, type FeeRateHistoryEntry } from './feeRates.js'
 import { adminAuth, adminCors, parseAdminCorsOrigins, warnIfAdminAuthDisabled } from './adminAuth.js'
+import { readBootConfig } from './bootConfig.js'
+import { createShutdown } from './shutdown.js'
+import { withArcadeStatusParity } from './arcadeParity.js'
 import {
   RegistryStore, RegistryTopicManager, createRegistryLookup,
   registryScreening, REGISTRY_TOPIC, REGISTRY_LOOKUP
 } from './registry.js'
 config()
 
-const requireEnv = (name: string): string => {
-  const v = process.env[name]
-  if (v == null || v === '') throw new Error(`Missing required environment variable: ${name}`)
-  return v
-}
+// Assigned in main() the moment the server exists, so a signal or a failed boot
+// can drain whatever has been opened so far through OverlayExpress.close().
+let overlay: OverlayExpress | undefined
 
 const main = async (): Promise<void> => {
-  const NODE_NAME = requireEnv('NODE_NAME')
-  const SERVER_PRIVATE_KEY = requireEnv('SERVER_PRIVATE_KEY')
-  const HOSTING_URL = requireEnv('HOSTING_URL')
-  const MONGO_URL = requireEnv('MONGO_URL')
-  const NETWORK = requireEnv('NETWORK')
-  if (NETWORK !== 'main' && NETWORK !== 'test') throw new Error('NETWORK must be "main" or "test"')
+  // Every boot variable is validated here, before anything is constructed: a
+  // missing or malformed value fails the boot with a message naming it, never a
+  // half-configured server. See bootConfig.ts.
+  const cfg = readBootConfig(process.env)
 
   // A13: bearer auth + narrowed CORS on the identity-bearing admin routes
   // (registry, activity, admission). Unset ADMIN_API_TOKEN is a supported
   // dev default — the routes stay open — but it must be loud, hence the one
-  // startup warning rather than a silent fallback.
-  const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN ?? ''
-  warnIfAdminAuthDisabled(ADMIN_API_TOKEN)
-  const ADMIN_CORS_ORIGINS = parseAdminCorsOrigins(process.env.ADMIN_CORS_ORIGINS, HOSTING_URL)
-  const adminGate = [adminCors(ADMIN_CORS_ORIGINS), adminAuth(ADMIN_API_TOKEN)] as const
+  // startup warning rather than a silent fallback. A set token must be a
+  // 32-byte-plus shared secret (readBootConfig), or the boot fails.
+  warnIfAdminAuthDisabled(cfg.adminApiToken)
+  const ADMIN_CORS_ORIGINS = parseAdminCorsOrigins(process.env.ADMIN_CORS_ORIGINS, cfg.hostingUrl)
+  const adminGate = [adminCors(ADMIN_CORS_ORIGINS), adminAuth(cfg.adminApiToken)] as const
 
-  const server = new OverlayExpress(NODE_NAME, SERVER_PRIVATE_KEY, HOSTING_URL)
+  // overlay-express 2.7.3 takes a bare https host here (it rejects http:// URLs
+  // and paths), hence advertisableHost rather than the HOSTING_URL as given.
+  const server = new OverlayExpress(cfg.nodeName, cfg.serverPrivateKey, cfg.advertisableHost)
+  overlay = server
   server.configurePort(8080)
-  server.configureNetwork(NETWORK)
+  server.configureNetwork(cfg.network)
 
   // With ARCADE_URL set, the overlay becomes a real network participant:
   //  - broadcasts accepted txs itself (ArcadeProvider POSTs to `${ARCADE_URL}/tx`;
-  //    engine broadcasts BEFORE folding state, and throwOnBroadcastFailure
-  //    defaults true, so a failed broadcast rejects the submit — the app then
+  //    engine broadcasts BEFORE folding state, and throwOnBroadcastFailure is set
+  //    explicitly below, so a failed broadcast rejects the submit — the app then
   //    aborts safely instead of desyncing),
   //  - refreshes merkle proofs from `${ARCADE_URL}/tx/:txid`,
   //  - runs FULL SPV: configureChaintracks installs the go-chaintracks client
@@ -68,39 +70,37 @@ const main = async (): Promise<void> => {
   //    SSE), replacing the local 'scripts only' mode.
   // Without it (local demo): validate scripts only; the wallet is the sole
   // broadcaster.
-  const ARCADE_URL = process.env.ARCADE_URL
+  //
   // FIX E, second half: eviction restores spent inputs, so an unauthenticated
-  // /arc-ingest lets anyone strand or resurrect a coin. The pinned
-  // OverlayExpress route checks the callback token only WHEN IT IS NON-EMPTY,
-  // so an unset token means no auth at all. This repo mounts its own route
-  // ahead of it (see mountArcIngest below) and refuses to mount a working one
-  // without a token.
-  const ARCADE_CALLBACK_TOKEN = process.env.ARCADE_CALLBACK_TOKEN ?? ''
-  if (ARCADE_URL != null && ARCADE_URL !== '') {
-    server.configureArcade(ARCADE_URL, { apiKey: process.env.ARCADE_API_KEY })
-    if (ARCADE_CALLBACK_TOKEN !== '') server.configureArcCallbackToken(ARCADE_CALLBACK_TOKEN)
-    // Chaintracks lives at the /chaintracks service of the same Arcade host by
-    // default, but both the host and API prefix are independently overridable.
-    const CHAINTRACKS_URL = process.env.CHAINTRACKS_URL ?? `${ARCADE_URL}/chaintracks`
-    server.configureChaintracks(CHAINTRACKS_URL, { apiPrefix: process.env.CHAINTRACKS_API_PREFIX ?? '/v2' })
+  // /arc-ingest lets anyone strand or resurrect a coin. The callback token is
+  // therefore mandatory with Arcade: readBootConfig refuses to boot without a
+  // 32-byte-plus one, overlay-express 2.7.3's start() refuses Arcade without
+  // one, and this repo's own route (mountArcIngest below) 401s every request if
+  // the token is ever empty. Chaintracks lives at the /chaintracks service of
+  // the same Arcade host by default; the host and API prefix are independently
+  // overridable. allowPrivateHosts reaches BOTH calls — it is not inherited.
+  if (cfg.arcade != null) {
+    server.configureArcade(cfg.arcade.url, { apiKey: cfg.arcade.apiKey, allowPrivateHosts: cfg.arcade.allowPrivateHosts })
+    server.configureArcCallbackToken(cfg.arcade.callbackToken)
+    server.configureChaintracks(cfg.arcade.chaintracksUrl, { apiPrefix: cfg.arcade.chaintracksApiPrefix, allowPrivateHosts: cfg.arcade.allowPrivateHosts })
   } else {
     server.configureChainTracker('scripts only')
   }
   await server.configureKnex({
     client: 'sqlite3',
-    connection: { filename: process.env.SQLITE_FILE ?? '/data/overlay.sqlite' },
+    connection: { filename: cfg.sqliteFile },
     useNullAsDefault: true
   })
-  await server.configureMongo(MONGO_URL)
+  await server.configureMongo(cfg.mongoUrl)
 
-  // OverlayExpress.configureMongo uses db `${NODE_NAME}_lookup_services` (i.e. "mandala_lookup_services").
-  // We must use that same db name so sharedStorage reads/writes the same collections.
-  const mongoClient = new MongoClient(MONGO_URL)
-  await mongoClient.connect()
-  const sharedStorage = new MandalaStorageManager(mongoClient.db(`${NODE_NAME}_lookup_services`))
+  // OverlayExpress.configureMongo owns the one Mongo client (closed by
+  // OverlayExpress.close()) and its db `${cfg.nodeName}_lookup_services`, i.e.
+  // "mandala_lookup_services". Reuse that db so sharedStorage reads/writes the
+  // same collections, and so nothing here holds a client close() cannot reach.
+  const lookupDb = server.mongoDb!
+  const sharedStorage = new MandalaStorageManager(lookupDb)
 
-  const mandalaWallet = new ProtoWallet(PrivateKey.fromHex(SERVER_PRIVATE_KEY)) as unknown as WalletInterface
-  const lookupDb = mongoClient.db(`${NODE_NAME}_lookup_services`)
+  const mandalaWallet = new ProtoWallet(PrivateKey.fromHex(cfg.serverPrivateKey)) as unknown as WalletInterface
   const registryStore = new RegistryStore(lookupDb)
   await registryStore.ensureIndexes()
 
@@ -113,84 +113,17 @@ const main = async (): Promise<void> => {
   // without the unique index the admission record is not single-valued and
   // "verdict wins" stops winning.
   await ensureAdmissionIndexes(admissionsCol)
-  const overlayPriv = PrivateKey.fromHex(SERVER_PRIVATE_KEY)
+  const overlayPriv = PrivateKey.fromHex(cfg.serverPrivateKey)
 
   // Wire-contract §4. The write is AWAITED before the /submit response is sent
   // (see admission.ts), so a client holding a 200 is guaranteed the very next
   // GET /admin/admission/:txid succeeds — the race SC-3.4/EB-2.3 describe.
-  const admissionStore: AdmissionStore = {
-    get: async (txid) =>
-      await admissionsCol.findOne({ txid }, { projection: { _id: 0 } }) as AdmissionRecord | null,
-    // §9.4 — the provisional record, written by the topic-manager wrapper
-    // before the engine can broadcast. `pending` is set ONLY on insert, so a
-    // re-submit of an already-finalized txid never downgrades its record.
-    putPending: async (rec) => {
-      await admissionsCol.updateOne(
-        { txid: rec.txid },
-        {
-          $set: {
-            topics: rec.topics,
-            ...(rec.restore != null ? { restore: rec.restore } : {})
-          },
-          $setOnInsert: { txid: rec.txid, at: rec.at, pending: true }
-        },
-        { upsert: true }
-      )
-    },
-    putAdmitted: async (rec) => {
-      await admissionsCol.updateOne(
-        { txid: rec.txid },
-        {
-          $set: {
-            topics: rec.topics,
-            outputsToAdmit: rec.outputsToAdmit,
-            admissionSignature: rec.admissionSignature,
-            admissionIdentityKey: rec.admissionIdentityKey,
-            pending: false,
-            // The pre-spend snapshot FIX E reads back at eviction time. Absent
-            // only when the topic-manager wrapper could not take it; the
-            // eviction still runs, it just restores nothing.
-            ...(rec.restore != null ? { restore: rec.restore } : {})
-          },
-          // §9.1 — an admission CLEARS the refusal fields. A transaction whose
-          // earlier payload was refused and whose corrected payload is admitted
-          // must stop carrying that refusal, or GET /admin/admission/:txid would
-          // keep serving a 400 for a transaction this overlay has just signed.
-          $unset: {
-            refusedCode: '', refusedDescription: '', refusedAt: '',
-            refusedPayloadHash: '', refusedSpendTxid: ''
-          },
-          $setOnInsert: { txid: rec.txid, at: rec.at }
-        },
-        { upsert: true }
-      )
-    },
-    putRefusal: async (rec) => {
-      // §9.1 — keyed by (txid, payloadHash). A later submission with a DIFFERENT
-      // payload overwrites these fields with its own verdict; one with the same
-      // payload is short-circuited before it ever reaches here.
-      await admissionsCol.updateOne(
-        { txid: rec.txid },
-        {
-          $set: {
-            refusedCode: rec.refusedCode,
-            refusedDescription: rec.refusedDescription,
-            refusedAt: rec.refusedAt,
-            refusedPayloadHash: rec.refusedPayloadHash
-          },
-          $setOnInsert: { txid: rec.txid, at: rec.refusedAt }
-        },
-        { upsert: true }
-      )
-    },
-    markEvicted: async (txid, at) => {
-      await admissionsCol.updateOne(
-        { txid },
-        { $set: { evictedAt: at }, $setOnInsert: { txid, at } },
-        { upsert: true }
-      )
-    }
-  }
+  //
+  // §9.4 — the restore snapshot on the record only ever grows: putPending and
+  // putAdmitted MERGE into it (mergeRestore), because a retry after a crash
+  // snapshots inputs whose token rows the crashed attempt already let the
+  // lookup delete. See admissionStore.ts.
+  const admissionStore: AdmissionStore = mongoAdmissionStore(admissionsCol)
 
   // FIX C — the engine's own durable proof that a txid went through
   // tm_mandala, independent of the Mongo record. σ_I is deterministic, so a
@@ -209,17 +142,17 @@ const main = async (): Promise<void> => {
   // restore snapshot from the same wrapper.
   const submitChannel = new SubmitSideChannel()
 
-  // §9.7 — coins claimed by a submission that has cleared the spent-input guard
-  // but whose spend-mark has not landed yet. A concurrent submit touching one
-  // gets 503 ERR_UNAVAILABLE instead of a second σ_I over the same coin.
-  const inFlight = new InFlightOutpoints()
-
-  server.app.use(wrapSubmitJson({
+  // Collapse leading '//' before any route of ours matches (2.7.3 normalizes
+  // only later, inside start(), so '//submit' would otherwise bypass σI).
+  server.app.use(normalizeDoubleSlash)
+  // Same matcher as the upstream route (case-insensitive, non-strict), so
+  // '/Submit' and '/submit/' cannot bypass the admission wrapper either.
+  // Its next() runs the edge policy and then the upstream /submit route.
+  server.app.post('/submit', wrapSubmitJson({
     priv: overlayPriv,
     store: admissionStore,
     applied: appliedProof,
-    channel: submitChannel,
-    inFlight
+    channel: submitChannel
   }) as any)
 
   // The admin chain is anchored repo-locally until the same gate ships in
@@ -261,7 +194,7 @@ const main = async (): Promise<void> => {
   // membershipHolds. Issuer keys are read live from the asset-state cache on
   // every check, so a fresh register is honoured on the next submit.
   const assetStatesCol = lookupDb.collection('mandalaAssetStates')
-  const overlayIdentityKey = PrivateKey.fromHex(SERVER_PRIVATE_KEY).toPublicKey().toString()
+  const overlayIdentityKey = PrivateKey.fromHex(cfg.serverPrivateKey).toPublicKey().toString()
   const membership = registryScreening(registryStore, [], {
     issuers: {
       issuerIdentityKeys: async () =>
@@ -271,18 +204,12 @@ const main = async (): Promise<void> => {
   })
 
   // FIX L — the live spend state of an input, and whether the transaction that
-  // spent it has since been evicted (in which case the coin counts as live).
-  const spentInputStore: SpentInputStore = {
-    spendStateOf: async (txid, outputIndex) => {
-      const out = await engineStorage().findOutput(txid, outputIndex, TOKEN_TOPIC)
-      if (out == null) return null
-      return { spent: out.spent, consumedBy: out.consumedBy ?? [] }
-    },
-    wasEvicted: async (txid) => {
-      const rec = await admissionsCol.findOne({ txid }, { projection: { evictedAt: 1 } })
-      return rec?.evictedAt != null
-    }
-  }
+  // spent it has since been evicted (in which case the guard releases the coin
+  // and the submitter retries).
+  const spentInputStore: SpentInputStore = knexSpentInputStore(server.knex!, TOKEN_TOPIC, async (txid) => {
+    const rec = await admissionsCol.findOne({ txid }, { projection: { evictedAt: 1 } })
+    return rec?.evictedAt != null
+  })
 
   // Wrapper stack for tm_mandala, outermost first. The inner four are §9.6's
   // CANONICAL GUARD ORDER, and both engines must refuse in exactly this order,
@@ -306,8 +233,11 @@ const main = async (): Promise<void> => {
   //   ── §9.6 order starts here ──
   //   withUnlinkedTokenReject— FIX A: reject (never skip) a MandalaToken
   //                            output with no verified linkage.
-  //   withSpentInputGuard    — FIX L: refuse a conflicting second spend, and
-  //                            claim the inputs in `inFlight` (§9.7).
+  //   withSpentInputGuard    — FIX L: refuse a conflicting second spend of
+  //                            ANY input (the engine omits spent coins from
+  //                            previousCoins), healing stale self/evicted spends;
+  //                            a live input previousCoins does not list (un-spent
+  //                            after the engine's query) is a retryable 503.
   //   withAdminChainAnchor   — admin actions must be anchored to the asset's
   //                            chain of spends.
   //   MandalaTopicManager    — the pinned rules.
@@ -322,8 +252,7 @@ const main = async (): Promise<void> => {
             adminProtocolID: [2, 'mandala admin'] as [2, string],
             stateStore: sharedStorage
           }) as any, adminChainStore),
-          spentInputStore,
-          inFlight
+          spentInputStore
         ),
         { verifierWallet: mandalaWallet }
       ),
@@ -333,29 +262,9 @@ const main = async (): Promise<void> => {
       channel: submitChannel,
       // §9.4 — the snapshot is made durable here, before the engine broadcasts.
       putPending: async (rec) => { await admissionStore.putPending?.(rec) },
-      snapshotRestore: async (tx, previousCoins) => {
-        const spentOutpoints: string[] = []
-        const tokenRows: AdmissionTokenRow[] = []
-        for (const ci of previousCoins) {
-          const inp = tx.inputs[ci]
-          if (inp == null) continue
-          const srcTxid = inp.sourceTXID ?? inp.sourceTransaction?.id('hex') ?? ''
-          if (srcTxid === '') continue
-          spentOutpoints.push(`${srcTxid}.${inp.sourceOutputIndex}`)
-          const row = await sharedStorage.getTokenRow(srcTxid, inp.sourceOutputIndex)
-          if (row != null) {
-            tokenRows.push({
-              txid: row.txid,
-              outputIndex: row.outputIndex,
-              assetId: row.assetId,
-              amount: row.amount,
-              identityKey: row.identityKey,
-              createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : String(row.createdAt ?? '')
-            })
-          }
-        }
-        return { spentOutpoints, tokenRows }
-      }
+      // Every input and the token row it still has (not previousCoins, which
+      // omits a coin an interrupted attempt left marked spent).
+      snapshotRestore: snapshotRestoreFrom(async (txid, vout) => await sharedStorage.getTokenRow(txid, vout))
     }
   ))
   const mandalaLookup = createMandalaLookupService(mandalaWallet, sharedStorage)
@@ -373,63 +282,50 @@ const main = async (): Promise<void> => {
   server.configureLookupService(REGISTRY_LOOKUP, createRegistryLookup(registryStore))
 
   server.configureEnableGASPSync(false)
+  // "A failed broadcast rejects the submit" is load-bearing (the engine
+  // broadcasts before folding state), so it is stated rather than left to
+  // overlay-express's current default.
+  server.configureEngineParams({ throwOnBroadcastFailure: true })
   await server.configureEngine(false)
+  // overlay-express 2.7.3 builds a SHIP/SLAP WalletAdvertiser once the FQDN is
+  // a valid https host. Mandala does not advertise (GASP sync is off), and the
+  // advertiser would run babbage-storage calls at boot and SLAP lookups inside
+  // the engine's submission lock. start() only inits it when it is a
+  // WalletAdvertiser, so clearing it is safe.
+  ;(server.engine as unknown as { advertiser?: unknown }).advertiser = undefined
 
-  // FIX L, detecting half. `KnexStorage.markUTXOAsSpent` is an unconditional
-  // UPDATE with no rows-affected check; swapping it for a compare-and-swap on
-  // `spent = false` turns a silent double-mark into a logged conflict. It
-  // cannot refuse the submission from here — the engine calls it inside its own
-  // swallowing try/catch, after the broadcast — which is why the enforcement
-  // point is withSpentInputGuard, above, and this is the race-narrowing half.
-  const engine = server.engine as unknown as { storage: Record<string, unknown> } | undefined
-  if (engine?.storage != null) {
-    engine.storage.markUTXOAsSpent = casMarkUTXOAsSpent({
-      markSpentIfUnspent: async (txid, outputIndex, topic) =>
-        await server.knex!('outputs').where({ txid, outputIndex, topic, spent: false }).update('spent', true),
-      onConflict: (txid, outputIndex, topic) => {
-        console.warn(`[mandala] spend conflict: ${txid}.${outputIndex}@${topic} was already spent (compare-and-swap affected 0 rows)`)
-        // Recorded by the COIN's outpoint — markUTXOAsSpent does not name the
-        // spending transaction. /submit matches it against the restore
-        // snapshot's spentOutpoints and answers 503 (retryable) rather than a
-        // final 400: only the manager's live-token-row guard mints
-        // ERR_INPUT_SPENT, and the retry converges on it.
-        submitChannel.noteSpendConflict(`${txid}.${outputIndex}`)
-      },
-      // §9.7 — the coin's spend state is now committed either way, so the
-      // in-flight claim on it has done its job and the next submit is answered
-      // by the ordinary spent-input guard rather than by a 503.
-      onMarked: (txid, outputIndex) => { inFlight.releaseOutpoint(`${txid}.${outputIndex}`) }
-    })
-  } else {
-    console.error('[mandala] engine storage unavailable — compare-and-swap mark-spent NOT installed (FIX L)')
-  }
+  // Go parity: overlay-go accepts every non-terminal 2xx Arcade status, but
+  // overlay-express 2.7.3 refuses the ones outside its success set (Arcade
+  // echoes SEEN_MULTIPLE_NODES / PENDING_RETRY / ... on a re-submit), failing a
+  // re-broadcast the Go overlay admits. Mandala configures Arcade only (never
+  // an ARC key), so the engine's broadcaster is the ArcadeProvider itself
+  // rather than a ProviderChainBroadcaster, and its result is the provider's.
+  const engineBroadcaster = (server.engine as unknown as { broadcaster?: { broadcast: (tx: any) => Promise<any> } }).broadcaster
+  if (engineBroadcaster != null) withArcadeStatusParity(engineBroadcaster)
 
   // FIX E. Mounted BEFORE server.start(), which is where OverlayExpress
-  // registers its own /arc-ingest, so this route matches first. With an empty
-  // ARCADE_CALLBACK_TOKEN a blocking stub is mounted instead: the pinned route
-  // (which mounts unauthenticated when the token is unset) is shadowed, the
-  // error is logged, and the server still serves everything else.
+  // registers its own /arc-ingest, so this route matches first: the pinned
+  // route evicts without restoring inputs. The callback token is mandatory
+  // whenever Arcade is configured (readBootConfig and start() both refuse
+  // Arcade without one).
   //
   // Gated on the same condition the pinned route uses — with no provider
   // configured it never mounts /arc-ingest at all, so there is nothing to
-  // shadow and nothing to warn about (the local demo has no Arcade).
-  if (ARCADE_URL != null && ARCADE_URL !== '') {
+  // shadow (the local demo has no Arcade).
+  if (cfg.arcade != null) {
     mountArcIngest(server.app as any, {
-      callbackToken: ARCADE_CALLBACK_TOKEN,
+      callbackToken: cfg.arcade.callbackToken,
       store: admissionStore,
-      unmarkSpent: async (txid, outputIndex) => {
-        await server.knex!('outputs').where({ txid, outputIndex, topic: TOKEN_TOPIC }).update('spent', false)
-      },
-      restoreTokenRow: async (row) => {
-        await sharedStorage.storeToken({
-          txid: row.txid,
-          outputIndex: row.outputIndex,
-          assetId: row.assetId,
-          amount: row.amount,
-          identityKey: row.identityKey,
-          createdAt: row.createdAt != null && row.createdAt !== '' ? new Date(row.createdAt) : new Date()
-        })
-      },
+      // unmarkSpent only while the evicted tx still holds the coin (or a
+      // legacy NULL spentBy); isUnspent fails closed on an unreadable row.
+      ...knexEvictionCoins(server.knex!, TOKEN_TOPIC),
+      // An idempotent upsert that re-credits the holder only when it really
+      // re-inserted the row — never storeToken's plain insert, which E11000s on
+      // every re-delivery after a partial restore (Go: RestoreTokens).
+      restoreTokenRow: mongoRestoreTokenRow(
+        lookupDb.collection('mandalaTokens') as unknown as TokenRowsCollection,
+        async (identityKey, delta) => { await sharedStorage.adjustBalance(identityKey, delta) }
+      ),
       evict: async (txid, reason) =>
         await (server.engine as unknown as {
           evictAppliedTransaction: (t: string, o: { reason?: string }) => Promise<unknown>
@@ -451,10 +347,12 @@ const main = async (): Promise<void> => {
       purgeAdminHistory: async (txid) => {
         await adminHistoryCol.deleteMany({ txid })
       },
-      ingestProof: async (txid, merklePathHex, blockHeight) => {
+      // No block height: the engine takes it from the proof, and throws when
+      // a forwarded one differs from it.
+      ingestProof: async (txid, merklePathHex) => {
         await (server.engine as unknown as {
-          handleNewMerkleProof: (t: string, p: MerklePath, h?: number) => Promise<unknown>
-        }).handleNewMerkleProof(txid, MerklePath.fromHex(merklePathHex), blockHeight)
+          handleNewMerkleProof: (t: string, p: MerklePath) => Promise<unknown>
+        }).handleNewMerkleProof(txid, MerklePath.fromHex(merklePathHex))
       }
     })
   }
@@ -648,7 +546,16 @@ const main = async (): Promise<void> => {
   })
 
   await server.start()
-  console.log(`mandala overlay listening on ${HOSTING_URL}`)
+  console.log(`mandala overlay listening on ${cfg.hostingUrl}`)
 }
 
-main().catch((e) => { console.error(e); process.exit(1) })
+const log = (m: string, e?: unknown): void => { if (e == null) console.log(m); else console.error(m, e) }
+const close = async (): Promise<void> => { await overlay?.close() }
+// Drain on a signal: stop accepting work, let in-flight requests finish, close
+// knex and Mongo, then exit 0. 25s sits inside compose's 30s stop_grace_period.
+const onSignal = createShutdown({ close, exit: (code) => process.exit(code), log, deadlineMs: 25_000 })
+// A failed startup exits 1 whether or not the cleanup close succeeds.
+const onStartupFailure = createShutdown({ close, exit: () => process.exit(1), log, deadlineMs: 10_000 })
+process.once('SIGTERM', () => { void onSignal('SIGTERM') })
+process.once('SIGINT', () => { void onSignal('SIGINT') })
+main().catch((e) => { console.error(e); void onStartupFailure('startup-failure') })

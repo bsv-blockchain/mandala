@@ -353,8 +353,8 @@ func (l *LookupService) Lookup(ctx context.Context, q *lookup.LookupQuestion) (*
 }
 
 // outpointAnswer builds the formula-shaped LookupAnswer the engine hydrates
-// into BEEF-bearing OutputListItems (go-overlay-services@v1.3.2
-// engine.go:734-745: any Type other than "output-list"/"freeform" runs
+// into BEEF-bearing OutputListItems (go-overlay-services@v1.3.7
+// engine.go:741-752: any Type other than "output-list"/"freeform" runs
 // hydrateFormulas over .Formulas using each Outpoint).
 func outpointAnswer(ops []Outpoint) (*lookup.LookupAnswer, error) {
 	formulas := make([]lookup.LookupFormula, 0, len(ops))

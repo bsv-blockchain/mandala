@@ -1,10 +1,12 @@
-import { describe, it, expect } from 'vitest'
+import { afterEach, describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
 import {
-  isTerminalArcStatus, evictWithRestore, arcIngestHandler, mountArcIngest,
+  isTerminalArcStatus, evictWithRestore, arcIngestHandler, mountArcIngest, knexEvictionCoins,
   type EvictionDeps
 } from './eviction.js'
 import type { AdmissionRecord, AdmissionStore } from './admission.js'
 import { isInfraError } from './submitVerdict.js'
+import { createHarness, HARNESS_TOPIC, type Harness } from './testkit/engineHarness.js'
 
 const TXID = 'ab'.repeat(32)
 const IN0 = 'cc'.repeat(32)
@@ -39,7 +41,9 @@ const deps = (rec: AdmissionRecord | null, over: Partial<EvictionDeps> = {}) => 
   }
   const d: EvictionDeps = {
     store,
-    unmarkSpent: async (txid, vout) => { order.push('unmark'); unmarked.push(`${txid}.${vout}`) },
+    // One engine row per outpoint, held by the evicted tx: each unmark affects it.
+    unmarkSpent: async (txid, vout) => { order.push('unmark'); unmarked.push(`${txid}.${vout}`); return 1 },
+    isUnspent: async () => { order.push('isUnspent'); return false },
     restoreTokenRow: async (row) => { order.push('restore'); restored.push(`${row.txid}.${row.outputIndex}`) },
     evict: async (txid, reason) => { order.push('evict'); evicted.push(`${txid}|${reason ?? ''}`); return { evictedOutputs: 1 } },
     assetsTouchedBy: async () => { order.push('assets'); return ['a.0', 'b.0'] },
@@ -223,6 +227,87 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
     expect(h.unmarked).toEqual([`${IN0}.0`])
     expect(h.rows[TXID].evictedAt).toBeTypeOf('string')
   })
+
+  // /arc-ingest runs outside Engine.submit's lock. Between a failed attempt and
+  // Arcade's retry, another tx can spend the coin (the engine's CAS sets
+  // spentBy to it and the lookup deletes the token row). Unmarking it again, or
+  // re-inserting its row, would resurrect a coin that is live-spent.
+  it('never clobbers a live spend — a coin now spent by another tx is not unmarked and gets no token row', async () => {
+    const calls: string[] = []
+    const h = deps(record(), {
+      unmarkSpent: async (txid, vout, evictedTxid) => { calls.push(`${txid}.${vout}|${evictedTxid}`); return 0 },
+      isUnspent: async () => false
+    })
+    const report = await evictWithRestore(TXID, 'REJECTED', h.d)
+    // The unmark is scoped to the evicted tx's own spend.
+    expect(calls).toEqual([`${IN0}.0|${TXID}`, `${IN0}.1|${TXID}`])
+    expect(h.restored).toEqual([])
+    expect(h.order).toContain('markEvicted')
+    expect(h.evicted).toEqual([`${TXID}|REJECTED`])
+    expect(report.restoredOutpoints).toBe(0)
+    expect(report.restoredTokenRows).toBe(0)
+  })
+
+  it('restores only the token rows of coins it could hand back', async () => {
+    const IN1 = 'dd'.repeat(32)
+    const h = deps(record({
+      restore: {
+        spentOutpoints: [`${IN0}.0`, `${IN1}.0`],
+        tokenRows: [
+          { txid: IN0, outputIndex: 0, assetId: 'a.0', amount: 100, identityKey: '02ab' },
+          { txid: IN1, outputIndex: 0, assetId: 'a.0', amount: 50, identityKey: '02ab' }
+        ]
+      }
+    }), {
+      // IN0.0 is now spent by someone else; IN1.0 was still held by the evicted tx.
+      unmarkSpent: async (txid) => txid === IN1 ? 1 : 0,
+      isUnspent: async () => false
+    })
+    const report = await evictWithRestore(TXID, 'REJECTED', h.d)
+    expect(h.restored).toEqual([`${IN1}.0`])
+    expect(report.restoredOutpoints).toBe(1)
+    expect(report.restoredTokenRows).toBe(1)
+  })
+
+  it('a retry after a partial failure still restores the token row of a coin the first attempt unmarked', async () => {
+    const spent = new Set([`${IN0}.0`, `${IN0}.1`])
+    const restored: string[] = []
+    let failRestore = true
+    const h = deps(record(), {
+      unmarkSpent: async (txid, vout) => spent.delete(`${txid}.${vout}`) ? 1 : 0,
+      isUnspent: async (txid, vout) => !spent.has(`${txid}.${vout}`),
+      restoreTokenRow: async (row) => {
+        if (failRestore) throw new Error('mongo down')
+        restored.push(`${row.txid}.${row.outputIndex}`)
+      }
+    })
+    // Attempt 1: both coins unmarked, then the token-row restore fails → 503, nothing stamped.
+    expect(isInfraError(await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e))).toBe(true)
+    expect(spent.size).toBe(0)
+    expect(h.rows[TXID].evictedAt).toBeUndefined()
+    // Attempt 2: the unmarks affect nothing (already unspent), yet the coin is
+    // live, so its token row is restored and the eviction completes.
+    failRestore = false
+    const report = await evictWithRestore(TXID, 'REJECTED', h.d)
+    expect(restored).toEqual([`${IN0}.0`])
+    expect(h.rows[TXID].evictedAt).toBe('2026-09-14T09:00:00.000Z')
+    expect(h.evicted).toEqual([`${TXID}|REJECTED`])
+    expect(report.restoredOutpoints).toBe(0)
+    expect(report.restoredTokenRows).toBe(1)
+  })
+
+  // §9.5 — an unreadable spend state is "we do not know", not "not restorable".
+  it('an unreadable spend state is an InfraError and stamps nothing', async () => {
+    const h = deps(record(), {
+      unmarkSpent: async () => 0,
+      isUnspent: async () => { throw new Error('sqlite locked') }
+    })
+    const err = await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e)
+    expect(isInfraError(err)).toBe(true)
+    expect(h.restored).toEqual([])
+    expect(h.rows[TXID].evictedAt).toBeUndefined()
+    expect(h.evicted).toEqual([])
+  })
 })
 
 // ────────────────────────────── /arc-ingest ─────────────────────────────────
@@ -257,6 +342,40 @@ describe('arcIngestHandler', () => {
     expect(h.evicted).toHaveLength(1)
   })
 
+  // Both comparisons are string equality, so this passes before and after the
+  // switch to constantTimeEqual; it pins that the swap changed only the timing.
+  it('401s a wrong token of the same length and a wrong token of another length', async () => {
+    const { h, handler } = base()
+    for (const wrong of ['sekreT', 'sekre', 'sekrets', '']) {
+      for (const headers of [{ 'x-callback-token': wrong }, { authorization: `Bearer ${wrong}` }]) {
+        const got = await runHandler(handler, { headers, body: { txid: TXID, txStatus: 'REJECTED' } })
+        expect(got.status).toBe(401)
+        expect(got.body).toEqual({ status: 'error', message: 'Unauthorized callback' })
+      }
+    }
+    expect(h.unmarked).toEqual([])
+    expect(h.evicted).toEqual([])
+  })
+
+  // Behaviourally indistinguishable from string equality, so pin the source:
+  // `.includes` / `===` on a shared secret is a timing side channel.
+  it('compares presented tokens with constantTimeEqual, never string equality', () => {
+    const src = readFileSync(new URL('./eviction.ts', import.meta.url), 'utf8')
+    const handler = src.slice(src.indexOf('export const arcIngestHandler'), src.indexOf('interface AppLike'))
+    expect(handler).toContain('.some(c => constantTimeEqual(c, deps.callbackToken))')
+    expect(handler).not.toMatch(/\.includes\(deps\.callbackToken\)/)
+  })
+
+  it('accepts the right token on x-callback-token even beside a wrong Authorization header', async () => {
+    const { h, handler } = base()
+    const got = await runHandler(handler, {
+      headers: { authorization: 'Bearer wrong!', 'x-callback-token': TOKEN },
+      body: { txid: TXID, txStatus: 'REJECTED' }
+    })
+    expect(got.status).toBe(200)
+    expect(h.evicted).toHaveLength(1)
+  })
+
   it('accepts x-callback-token: <token>', async () => {
     const { h, handler } = base()
     const got = await runHandler(handler, { headers: { 'x-callback-token': TOKEN }, body: { txid: TXID, txStatus: 'DOUBLE_SPEND_ATTEMPTED' } })
@@ -277,14 +396,84 @@ describe('arcIngestHandler', () => {
     expect(h.evicted).toEqual([])
   })
 
-  it('ingests a merkle proof and answers 200', async () => {
-    const seen: string[] = []
+  // @bsv/overlay 2.6 throws when a forwarded blockHeight differs from the
+  // proof's own, a deterministic 500 Arcade would retry forever. The engine
+  // derives the height from the proof, so the provider's is never forwarded.
+  it('ingests a merkle proof with exactly (txid, merklePathHex) and answers 200', async () => {
+    const seen: unknown[][] = []
     const h = deps(record())
-    const handler = arcIngestHandler({ ...h.d, callbackToken: TOKEN, ingestProof: async (txid, hex, height) => { seen.push(`${txid}|${hex}|${String(height)}`) } })
+    const handler = arcIngestHandler({ ...h.d, callbackToken: TOKEN, ingestProof: async (...args: unknown[]) => { seen.push(args) } })
     const got = await runHandler(handler, { headers: { 'x-callback-token': TOKEN }, body: { txid: TXID, merklePath: 'deadbeef', blockHeight: 42, txStatus: 'MINED' } })
     expect(got.status).toBe(200)
-    expect(seen).toEqual([`${TXID}|deadbeef|42`])
+    expect(seen).toStrictEqual([[TXID, 'deadbeef']])
     expect(h.evicted).toEqual([])
+  })
+
+  // The engine caps the eviction reason at 1024 UTF-8 bytes and throws past it
+  // — AFTER evictedAt is stamped, so the eviction would stick half-done. 256
+  // UTF-16 units is at most 768 bytes.
+  it('bounds the eviction reason to 256 UTF-16 units before evicting', async () => {
+    const reasons: string[] = []
+    const { handler } = base({ evict: async (_txid, reason) => { reasons.push(reason ?? ''); return {} } })
+    const got = await runHandler(handler, {
+      headers: { 'x-callback-token': TOKEN },
+      body: { txid: TXID, txStatus: 'REJECTED', extraInfo: 'x'.repeat(2000) }
+    })
+    expect(got.status).toBe(200)
+    expect(reasons).toHaveLength(1)
+    expect(reasons[0].length).toBeLessThanOrEqual(256)
+    expect(reasons[0].startsWith('REJECTED x')).toBe(true)
+    expect(got.body.data.reason).toBe(reasons[0])
+  })
+
+  it('keeps a multi-byte reason under the engine\'s 1024-byte cap, even when the cut splits a surrogate pair', async () => {
+    const reasons: string[] = []
+    const { handler } = base({ evict: async (_txid, reason) => { reasons.push(reason ?? ''); return {} } })
+    const got = await runHandler(handler, {
+      headers: { 'x-callback-token': TOKEN },
+      // 'REJECTED ' is 9 units, so the 256-unit cut lands inside an emoji.
+      body: { txid: TXID, txStatus: 'REJECTED', extraInfo: '\u{1F600}'.repeat(1000) }
+    })
+    expect(got.status).toBe(200)
+    expect(reasons[0].length).toBeLessThanOrEqual(256)
+    expect(new TextEncoder().encode(reasons[0]).byteLength).toBeLessThanOrEqual(1024)
+  })
+
+  it.each([
+    ['too short', 'ab'.repeat(31)],
+    ['too long', `${'ab'.repeat(32)}0`],
+    ['not hex', 'zz'.repeat(32)],
+    ['an outpoint', `${'ab'.repeat(32)}.0`],
+    ['padded', ` ${'ab'.repeat(32)}`]
+  ])('400s a txid that is %s before touching any store', async (_label, badTxid) => {
+    let gets = 0
+    const proofs: string[] = []
+    const h = deps(record())
+    const handler = arcIngestHandler({
+      ...h.d,
+      store: { ...h.d.store, get: async (t) => { gets++; return await h.d.store.get(t) } },
+      callbackToken: TOKEN,
+      ingestProof: async (t) => { proofs.push(t) }
+    })
+    for (const body of [
+      { txid: badTxid, txStatus: 'REJECTED' },
+      { txid: badTxid, txStatus: 'MINED', merklePath: 'deadbeef' }
+    ]) {
+      const got = await runHandler(handler, { headers: { 'x-callback-token': TOKEN }, body })
+      expect(got.status).toBe(400)
+      expect(got.body).toEqual({ status: 'error', message: 'Provider callback txid must be 64 hex characters' })
+    }
+    expect(gets).toBe(0)
+    expect(proofs).toEqual([])
+    expect(h.unmarked).toEqual([])
+    expect(h.evicted).toEqual([])
+  })
+
+  it('still accepts an uppercase txid (it is lowercased before the check)', async () => {
+    const { h, handler } = base()
+    const got = await runHandler(handler, { headers: { 'x-callback-token': TOKEN }, body: { txid: TXID.toUpperCase(), txStatus: 'REJECTED' } })
+    expect(got.status).toBe(200)
+    expect(h.evicted).toEqual([`${TXID}|REJECTED`])
   })
 
   // OverlayExpress registers bodyParser.json at the top of start(), i.e. AFTER
@@ -390,28 +579,126 @@ describe('mountArcIngest — FIX E, second half', () => {
     return { routes, post: (path: string, h: unknown) => { routes[path] = h } }
   }
 
-  it('mounts the ingest route when a callback token is configured', () => {
+  it('mounts the restoring ingest route ahead of the pinned one', async () => {
     const app = fakeApp()
     const h = deps(record())
-    const logged: string[] = []
-    expect(mountArcIngest(app as any, { ...h.d, callbackToken: 'sekret', ingestProof: async () => {} }, m => logged.push(m))).toBe(true)
-    expect(app.routes['/arc-ingest']).toBeTypeOf('function')
-    expect(logged).toEqual([])
+    expect(mountArcIngest(app as any, { ...h.d, callbackToken: 'sekret', ingestProof: async () => {} })).toBeUndefined()
+    const route = app.routes['/arc-ingest'] as any
+    expect(route).toBeTypeOf('function')
+    const got = await runHandler(route, { headers: { 'x-callback-token': 'sekret' }, body: { txid: TXID, txStatus: 'REJECTED' } })
+    expect(got.status).toBe(200)
+    expect(h.unmarked).toEqual([`${IN0}.0`, `${IN0}.1`])
   })
 
-  it('refuses to mount a working route with an empty token, logs, and keeps serving', async () => {
+  // overlay-express 2.7.3 refuses to start() with Arcade and no token, so the
+  // old blocking stub is gone. The handler itself still fails closed: an empty
+  // configured token authenticates nothing — not even an empty presented one.
+  it('with an empty token the mounted route authenticates nothing and evicts nothing', async () => {
     const app = fakeApp()
     const h = deps(record())
-    const logged: string[] = []
-    expect(mountArcIngest(app as any, { ...h.d, callbackToken: '', ingestProof: async () => {} }, m => logged.push(m))).toBe(false)
-    expect(logged.join(' ')).toMatch(/ARCADE_CALLBACK_TOKEN/)
-    // A blocking stub still occupies the path, so the pinned overlay-express
-    // route (which mounts unauthenticated when the token is empty) is shadowed
-    // and can never evict.
-    const blocker = app.routes['/arc-ingest'] as any
-    expect(blocker).toBeTypeOf('function')
-    const got = await runHandler(blocker, { body: { txid: TXID, txStatus: 'REJECTED' } })
-    expect(got.status).toBe(503)
+    mountArcIngest(app as any, { ...h.d, callbackToken: '', ingestProof: async () => {} })
+    const route = app.routes['/arc-ingest'] as any
+    expect(route).toBeTypeOf('function')
+    for (const headers of [{}, { 'x-callback-token': '' }, { authorization: 'Bearer ' }, { authorization: '' }]) {
+      const got = await runHandler(route, { headers, body: { txid: TXID, txStatus: 'REJECTED' } })
+      expect(got.status).toBe(401)
+      expect(got.body).toEqual({ status: 'error', message: 'Unauthorized callback' })
+    }
+    expect(h.unmarked).toEqual([])
     expect(h.evicted).toEqual([])
+  })
+})
+
+describe('knexEvictionCoins on the real engine schema', () => {
+  let h: Harness
+  afterEach(async () => { await h?.close() })
+
+  it('hands a coin back only from the evicted tx (or a legacy NULL spentBy), on its own topic', async () => {
+    h = await createHarness()
+    await h.submit(h.root)
+    const a = await h.spend(900)
+    expect((await h.submit(a)).refusal).toBeUndefined()
+    const root = h.root.id('hex')
+    const coin = async () => await h.knex('outputs').where({ txid: root, outputIndex: 0, topic: HARNESS_TOPIC }).first()
+    const coins = knexEvictionCoins(h.knex, HARNESS_TOPIC)
+    expect((await coin()).spentBy).toBe(a.id('hex'))
+    expect(await coins.isUnspent(root, 0)).toBe(false)
+
+    // Evicting some other tx, or on another topic, never touches A's live spend.
+    expect(await coins.unmarkSpent(root, 0, 'bb'.repeat(32))).toBe(0)
+    expect(await knexEvictionCoins(h.knex, 'tm_other').unmarkSpent(root, 0, a.id('hex'))).toBe(0)
+    expect(Boolean((await coin()).spent)).toBe(true)
+    expect((await coin()).spentBy).toBe(a.id('hex'))
+
+    // Evicting A hands the coin back and clears spentBy.
+    expect(await coins.unmarkSpent(root, 0, a.id('hex'))).toBe(1)
+    expect(Boolean((await coin()).spent)).toBe(false)
+    expect((await coin()).spentBy).toBeNull()
+    expect(await coins.isUnspent(root, 0)).toBe(true)
+    // A repeat affects nothing; the coin still reads live.
+    expect(await coins.unmarkSpent(root, 0, a.id('hex'))).toBe(0)
+
+    // A legacy spend (spentBy NULL) is handed back.
+    await h.knex('outputs').where({ txid: root, outputIndex: 0, topic: HARNESS_TOPIC }).update({ spent: true, spentBy: null })
+    expect(await coins.unmarkSpent(root, 0, a.id('hex'))).toBe(1)
+
+    // No row: nothing to unmark, and not live.
+    expect(await coins.unmarkSpent('ee'.repeat(32), 0, a.id('hex'))).toBe(0)
+    expect(await coins.isUnspent('ee'.repeat(32), 0)).toBe(false)
+  })
+
+  it('isUnspent fails closed on a spent value it cannot read', async () => {
+    h = await createHarness()
+    await h.submit(h.root)
+    const root = h.root.id('hex')
+    await h.knex('outputs').where({ txid: root, outputIndex: 0, topic: HARNESS_TOPIC }).update({ spent: 'garbled' })
+    await expect(knexEvictionCoins(h.knex, HARNESS_TOPIC).isUnspent(root, 0)).rejects.toThrow(/outputs\.spent/)
+  })
+
+  // agent12 race, end to end: attempt 1 unmarks the coin, then the token-row
+  // restore fails (503, nothing stamped). B spends the coin through the real
+  // engine before Arcade retries. The retry must leave B's spend and give the
+  // coin no token row, and the eviction still completes.
+  it('a retry after another tx spent the handed-back coin neither unmarks it nor restores its token row', async () => {
+    h = await createHarness()
+    await h.submit(h.root)
+    const a = await h.spend(900)
+    expect((await h.submit(a)).refusal).toBeUndefined()
+    const b = await h.spend(800)
+    const root = h.root.id('hex')
+    const A = a.id('hex')
+    const restored: string[] = []
+    let failRestore = true
+    const hd = deps(record({
+      txid: A,
+      restore: {
+        spentOutpoints: [`${root}.0`],
+        tokenRows: [{ txid: root, outputIndex: 0, assetId: 'a.0', amount: 100, identityKey: '02ab' }]
+      }
+    }), {
+      ...knexEvictionCoins(h.knex, HARNESS_TOPIC),
+      restoreTokenRow: async (row) => {
+        if (failRestore) throw new Error('mongo down')
+        restored.push(`${row.txid}.${row.outputIndex}`)
+      },
+      evict: async (txid, reason) => await h.engine.evictAppliedTransaction(txid, { reason })
+    })
+
+    expect(isInfraError(await evictWithRestore(A, 'REJECTED', hd.d).catch((e: unknown) => e))).toBe(true)
+    expect(hd.rows[A].evictedAt).toBeUndefined()
+
+    expect((await h.submit(b)).refusal).toBeUndefined()
+    const coin = async () => await h.knex('outputs').where({ txid: root, outputIndex: 0, topic: HARNESS_TOPIC }).first()
+    expect((await coin()).spentBy).toBe(b.id('hex'))
+
+    failRestore = false
+    const report = await evictWithRestore(A, 'REJECTED', hd.d)
+    expect(Boolean((await coin()).spent)).toBe(true)
+    expect((await coin()).spentBy).toBe(b.id('hex'))
+    expect(restored).toEqual([])
+    expect(report.restoredOutpoints).toBe(0)
+    expect(report.restoredTokenRows).toBe(0)
+    expect(hd.rows[A].evictedAt).toBeTypeOf('string')
+    expect(await h.knex('outputs').where({ txid: A })).toHaveLength(0)
   })
 })

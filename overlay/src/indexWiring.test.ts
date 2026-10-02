@@ -15,14 +15,19 @@
  * and it is paired below with a behavioural test of the same order over the real
  * guards.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest'
 import { readFileSync } from 'node:fs'
+import type { Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import OverlayExpress from '@bsv/overlay-express'
+import { initialDoubleSlashCompatibility } from '@bsv/overlay-express/security/edgePolicy.ts'
 import { Transaction, UnlockingScript, P2PKH, PrivateKey, ProtoWallet, Hash, Utils } from '@bsv/sdk'
 import { MandalaToken } from '@bsv/templates'
 import { withUnlinkedTokenReject } from './tokenLinkageGuard.js'
 import { withSpentInputGuard, type SpentInputStore } from './spentGuard.js'
 import { withAdminChainAnchor, type AdminChainStore } from './adminChainGuard.js'
 import { classifyManagerReason } from './submitVerdict.js'
+import { wrapSubmitJson, normalizeDoubleSlash, signAdmissionV2Sync } from './admission.js'
 
 const SOURCE = readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
 
@@ -56,11 +61,14 @@ describe('index.ts — tm_mandala guard order (§9.6)', () => {
   })
 
   it('passes every guard the state it gates on', () => {
-    expect(stack).toContain('spentInputStore')
+    expect(stack).toMatch(/withSpentInputGuard\([\s\S]*?\),\s*\n\s*spentInputStore\s*\n\s*\)/)
+    // The production store reads the engine's `outputs` table, not a stand-in.
+    expect(CODE).toContain('knexSpentInputStore(server.knex!, TOKEN_TOPIC')
     expect(stack).toContain('adminChainStore')
     expect(stack).toContain('admissionStore')
-    // §9.7 — the in-flight claim is the guard's, not the wrapper's, to make.
-    expect(stack).toMatch(/withSpentInputGuard\([\s\S]*?spentInputStore,\s*\n\s*inFlight/)
+    const wrap = CODE.slice(CODE.indexOf('wrapSubmitJson({'), CODE.indexOf('wrapSubmitJson({') + 400)
+    expect(wrap).toContain('channel: submitChannel')
+    expect(wrap).toContain('store: admissionStore')
   })
 
   it('wires the §9.4 provisional record on the token manager only', () => {
@@ -72,15 +80,20 @@ describe('index.ts — tm_mandala guard order (§9.6)', () => {
     expect(registry).not.toContain('withPersistedVerdict')
   })
 
-  it('gives the /submit wrapper the in-flight set so a request releases its claims', () => {
-    const wrap = CODE.slice(CODE.indexOf('wrapSubmitJson({'), CODE.indexOf('wrapSubmitJson({') + 400)
-    expect(wrap).toContain('inFlight')
-    expect(wrap).toContain('channel: submitChannel')
-    expect(wrap).toContain('store: admissionStore')
+  // FIX E — the snapshot is taken from every input and only ever merged into
+  // the record (restoreSnapshot.test.ts drives both over the real engine).
+  it('snapshots every input and stores it through the merging admission store', () => {
+    expect(CODE).toContain('const admissionStore: AdmissionStore = mongoAdmissionStore(admissionsCol)')
+    expect(stack).toContain('snapshotRestore: snapshotRestoreFrom(async (txid, vout) => await sharedStorage.getTokenRow(txid, vout))')
+    expect(stack).not.toMatch(/for \(const ci of previousCoins\)/)
   })
 
-  it('releases an in-flight claim from the compare-and-swap (§9.7)', () => {
-    expect(CODE).toMatch(/onMarked:[\s\S]*?inFlight\.releaseOutpoint/)
+  // @bsv/overlay >= 2.6's markUTXOAsSpent is itself a compare-and-swap that
+  // records spentBy (the 4th argument). Replacing it would drop spentBy, and the
+  // spent-input guard's self-heal keys on it.
+  it('leaves the engine\'s own compare-and-swap mark-spent in place', () => {
+    expect(CODE).not.toMatch(/markUTXOAsSpent\s*=/)
+    expect(CODE).not.toContain('inFlight')
   })
 })
 
@@ -108,6 +121,174 @@ describe('index.ts — boot safety (§9.9)', () => {
   })
 })
 
+describe('index.ts — boot configuration for overlay-express 2.7.3', () => {
+  it('reads every boot variable through readBootConfig, not process.env', () => {
+    expect(CODE).toContain('readBootConfig(process.env)')
+    expect(CODE).not.toContain('requireEnv')
+    // ADMIN_CORS_ORIGINS is the one console-only knob that is not in BootConfig.
+    const reads = CODE.match(/process\.env\.\w+/g) ?? []
+    expect(reads).toEqual(['process.env.ADMIN_CORS_ORIGINS'])
+    // The env a secret was validated from is the only one that may reach the server.
+    expect(CODE).not.toMatch(/HOSTING_URL|SERVER_PRIVATE_KEY|ARCADE_CALLBACK_TOKEN/)
+  })
+
+  it('constructs OverlayExpress with the canonical key and the bare https host, not the URL', () => {
+    expect(CODE).toContain('new OverlayExpress(cfg.nodeName, cfg.serverPrivateKey, cfg.advertisableHost)')
+    // The single overlay key signs sigma-I and decrypts linkage; no second key is read.
+    expect(CODE).not.toMatch(/MANDALA_\w*PRIVATE_KEY/)
+  })
+
+  it('wires Arcade with the callback token unconditionally and the private-host flag on both calls', () => {
+    const arcade = CODE.slice(CODE.indexOf('if (cfg.arcade != null) {'), CODE.indexOf('await server.configureKnex('))
+    expect(arcade).toContain('server.configureArcade(cfg.arcade.url, { apiKey: cfg.arcade.apiKey, allowPrivateHosts: cfg.arcade.allowPrivateHosts })')
+    expect(arcade).toContain('server.configureArcCallbackToken(cfg.arcade.callbackToken)')
+    expect(arcade).toContain('server.configureChaintracks(cfg.arcade.chaintracksUrl, { apiPrefix: cfg.arcade.chaintracksApiPrefix, allowPrivateHosts: cfg.arcade.allowPrivateHosts })')
+    // No `if (token !== '')` escape hatch: start() refuses Arcade without one.
+    expect(arcade).not.toMatch(/callbackToken\s*(!==|===|!=|==)/)
+    expect(arcade).toContain("server.configureChainTracker('scripts only')")
+    expect(orderOf(arcade, ['configureArcade(', 'configureArcCallbackToken(', 'configureChaintracks(']))
+      .toEqual(['configureArcade(', 'configureArcCallbackToken(', 'configureChaintracks('])
+  })
+
+  it('makes "a failed broadcast rejects the submit" explicit, before the engine is built', () => {
+    const names = ['configureEngineParams({ throwOnBroadcastFailure: true })', 'await server.configureEngine(false)']
+    for (const n of names) expect(CODE).toContain(n)
+    expect(orderOf(CODE, names)).toEqual(names)
+  })
+
+  it('turns the SHIP/SLAP advertiser off after the engine exists and before start()', () => {
+    const names = [
+      'await server.configureEngine(false)',
+      '.advertiser = undefined',
+      'await server.start()'
+    ]
+    for (const n of names) expect(CODE).toContain(n)
+    expect(orderOf(CODE, names)).toEqual(names)
+    expect(CODE).toMatch(/\(server\.engine as unknown as \{ advertiser\?: unknown \}\)\.advertiser = undefined/)
+  })
+
+  it('maps non-terminal Arcade 2xx statuses to success on the engine broadcaster, after the engine exists', () => {
+    const names = ['await server.configureEngine(false)', 'withArcadeStatusParity(engineBroadcaster)', 'await server.start()']
+    for (const n of names) expect(CODE).toContain(n)
+    expect(orderOf(CODE, names)).toEqual(names)
+    expect(CODE).toMatch(/\(server\.engine as unknown as \{ broadcaster\?: /)
+    // No broadcaster (local demo, no Arcade) is left alone, not an error.
+    expect(CODE).toContain('if (engineBroadcaster != null) withArcadeStatusParity(engineBroadcaster)')
+  })
+
+  it('mounts /arc-ingest only with Arcade, using the validated token', () => {
+    const mount = CODE.slice(CODE.indexOf('mountArcIngest('))
+    expect(CODE).toMatch(/if \(cfg\.arcade != null\) \{\s*\n\s*mountArcIngest\(/)
+    expect(mount).toContain('callbackToken: cfg.arcade.callbackToken')
+  })
+})
+
+// overlay-express 2.7.3 installs its '//' collapse and the upstream /submit
+// route inside start(), AFTER everything index.ts registers. Express routing
+// is case-insensitive and non-strict, so an exact path check, or a mount the
+// router does not share with upstream, lets '/Submit', '/submit/' or '//submit'
+// reach the upstream route with no σ_I and no admission record.
+describe('index.ts — the /submit wrapper shares the upstream route matcher', () => {
+  const MOUNT = "server.app.post('/submit', wrapSubmitJson("
+  const NORMALIZER = 'server.app.use(normalizeDoubleSlash)'
+
+  it('mounts the wrapper with app.post on /submit, never app.use', () => {
+    expect(CODE).toContain(MOUNT)
+    expect(CODE).not.toMatch(/\.use\(\s*wrapSubmitJson/)
+  })
+
+  it('collapses a leading // first, before any route of ours, the /submit wrapper included', () => {
+    expect(CODE).toContain(NORMALIZER)
+    expect(CODE.search(/server\.app\b/)).toBe(CODE.indexOf(NORMALIZER))
+    expect(orderOf(CODE, [NORMALIZER, MOUNT])).toEqual([NORMALIZER, MOUNT])
+  })
+
+  describe('over real Express routing (the app OverlayExpress builds)', () => {
+    const overlayPriv = PrivateKey.fromRandom()
+    const tx = new Transaction()
+    tx.addInput({ sourceTXID: '3d'.repeat(32), sourceOutputIndex: 0, unlockingScript: new UnlockingScript() })
+    tx.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(overlayPriv.toAddress()) })
+    const expected = signAdmissionV2Sync(overlayPriv, tx.id('hex'), [0]).admissionSignature
+    let http: Server | undefined
+    let base = ''
+
+    beforeAll(async () => {
+      vi.spyOn(console, 'log').mockImplementation(() => {})
+      const { app } = new OverlayExpress('wiring', PrivateKey.fromRandom().toHex(), 'overlay.example.com')
+      // index.ts's mount…
+      app.use(normalizeDoubleSlash)
+      app.post('/submit', wrapSubmitJson({ priv: overlayPriv }) as any)
+      // …then what start() installs later: upstream's own '//' collapse and
+      // its /submit route (here reading the body bodyParser.raw would have).
+      app.use(initialDoubleSlashCompatibility)
+      app.post('/submit', async (req: any, res: any) => {
+        const chunks: Buffer[] = []
+        for await (const c of req) chunks.push(c as Buffer)
+        req.body = Buffer.concat(chunks)
+        res.status(200).json({ tm_mandala: { outputsToAdmit: [0], coinsToRetain: [] } })
+      })
+      const listening = app.listen(0, '127.0.0.1')
+      http = listening
+      await new Promise<void>(resolve => listening.once('listening', () => resolve()))
+      base = `http://127.0.0.1:${(listening.address() as AddressInfo).port}`
+    })
+    afterAll(async () => {
+      if (http != null) await new Promise<void>(resolve => (http as Server).close(() => resolve()))
+      vi.restoreAllMocks()
+    })
+
+    it.each(['/submit', '/Submit', '/SUBMIT/', '/submit/', '//submit', '///Submit/', '//submit?x=1'])(
+      '%s reaches the upstream route only through σ_I', async path => {
+        const r = await fetch(base + path, {
+          method: 'POST',
+          headers: { 'content-type': 'application/octet-stream', 'x-topics': JSON.stringify(['tm_mandala']) },
+          body: Buffer.from(tx.toBEEF())
+        })
+        expect(r.status).toBe(200)
+        expect((await r.json()).tm_mandala.admissionSignature).toBe(expected)
+      })
+  })
+})
+
+// A signal must drain through OverlayExpress.close() (HTTP server, timers,
+// knex, Mongo) rather than kill the process mid-write, and close() can only
+// release the clients it owns — so the repo must not open a second Mongo client
+// that nothing closes.
+describe('index.ts — graceful lifecycle on OverlayExpress.close()', () => {
+  it('opens no Mongo client of its own: the lookup db is the one configureMongo built', () => {
+    expect(CODE).not.toMatch(/\bMongoClient\b/)
+    expect(CODE).not.toMatch(/from 'mongodb'/)
+    // Directly after configureMongo, the db OverlayExpress named `${name}_lookup_services`.
+    expect(CODE).toMatch(/await server\.configureMongo\(cfg\.mongoUrl\)\s*\n\s*const lookupDb = server\.mongoDb!\s*\n/)
+    expect(CODE).toContain('new MandalaStorageManager(lookupDb)')
+    expect(CODE.match(/const lookupDb\b/g)).toHaveLength(1)
+  })
+
+  it('captures the server for close() right after constructing it', () => {
+    expect(CODE).toMatch(/let overlay: OverlayExpress \| undefined/)
+    expect(CODE).toMatch(/new OverlayExpress\([^)]*\)\s*\n\s*overlay = server\s*\n/)
+    expect(CODE).toContain('await overlay?.close()')
+  })
+
+  it('drains on SIGTERM and SIGINT once each, through the idempotent shutdown', () => {
+    expect(CODE).toContain("createShutdown({ close, exit: (code) => process.exit(code), log, deadlineMs: 25_000 })")
+    expect(CODE).toContain("process.once('SIGTERM', () => { void onSignal('SIGTERM') })")
+    expect(CODE).toContain("process.once('SIGINT', () => { void onSignal('SIGINT') })")
+  })
+
+  it('a failed startup always exits 1, whether or not the cleanup close succeeds', () => {
+    expect(CODE).toContain('createShutdown({ close, exit: () => process.exit(1), log, deadlineMs: 10_000 })')
+    expect(CODE).toContain("main().catch((e) => { console.error(e); void onStartupFailure('startup-failure') })")
+    // The only direct exits are the two shutdown instances above.
+    expect(CODE.match(/process\.exit\(/g)).toHaveLength(2)
+  })
+
+  it('registers the handlers before main() starts the boot', () => {
+    const names = ["process.once('SIGTERM'", "process.once('SIGINT'", 'main().catch(']
+    expect(orderOf(CODE, names)).toEqual(names)
+  })
+})
+
 describe('index.ts — eviction rebuild (PR #11 + token-fee §2, rebuild-first)', () => {
   const deps = CODE.slice(CODE.indexOf('mountArcIngest('))
   const rebuild = deps.slice(deps.indexOf('rebuildAssetStateExcluding:'), deps.indexOf('purgeAdminHistory:'))
@@ -128,6 +309,18 @@ describe('index.ts — eviction rebuild (PR #11 + token-fee §2, rebuild-first)'
     expect(purge).not.toContain('distinct')
     const assets = deps.slice(deps.indexOf('assetsTouchedBy:'), deps.indexOf('rebuildAssetStateExcluding:'))
     expect(assets).toMatch(/adminHistoryCol\.distinct\('assetId', \{ txid \}\)[\s\S]*?\.sort\(\)/)
+  })
+
+  // §9.8's re-delivery converges only over an idempotent restore: the plain
+  // insert storeToken makes E11000s on every row an earlier attempt put back.
+  // tokenRestore.test.ts drives mongoRestoreTokenRow against a real Mongo.
+  it('restores token rows through the idempotent upsert into mandalaTokens, never storeToken', () => {
+    const restore = deps.slice(deps.indexOf('restoreTokenRow:'), deps.indexOf('evict:'))
+    expect(restore).toContain('mongoRestoreTokenRow(')
+    expect(restore).toContain("lookupDb.collection('mandalaTokens')")
+    expect(restore).toContain('sharedStorage.adjustBalance(identityKey, delta)')
+    expect(restore).not.toMatch(/\.storeToken\(/)
+    expect(CODE).not.toMatch(/sharedStorage\.storeToken\(/)
   })
 
   it('eviction.ts purges only after every rebuild (rebuild-first)', () => {
@@ -172,8 +365,9 @@ describe('§9.6 guard order — first refusal wins, over the real guards', () =>
     }), 'utf8')
 
   const spentInputs = (spent: boolean): SpentInputStore => ({
-    spendStateOf: async () => ({ spent, consumedBy: spent ? [{ txid: 'dd'.repeat(32), outputIndex: 0 }] : [] }),
-    wasEvicted: async () => false
+    spendStateOf: async () => ({ spent, spentBy: spent ? 'dd'.repeat(32) : null, consumedBy: [] }),
+    wasEvicted: async () => false,
+    releaseSpend: async () => 0
   })
 
   /** Anchors nothing, so any admin entry is unanchored. */

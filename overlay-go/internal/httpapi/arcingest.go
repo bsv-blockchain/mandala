@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"log"
 	"strings"
+	"unicode/utf16"
 
 	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -34,7 +35,7 @@ type EvictionOutcome = mandala.EvictionOutcome
 // Arcade txStatus — the Go stand-in for the TS /arc-ingest route's
 // Engine.evictAppliedTransaction (which deletes the tx's outputs and
 // notifies each lookup service via OutputEvicted). go-overlay-services
-// v1.3.2's engine exposes no eviction API, so wiring.Build assembles the
+// v1.3.7's engine exposes no eviction API, so wiring.Build assembles the
 // equivalent from the concrete enginestore + ls_mandala and threads it here.
 type EvictTx func(ctx context.Context, txid string) (EvictionOutcome, error)
 
@@ -59,7 +60,11 @@ type arcIngestBody struct {
 }
 
 // arcIngestHandler implements OverlayExpress.ts's /arc-ingest route: token
-// check, then classify by txStatus/merklePath presence.
+// check, then classify by txStatus/merklePath presence. As on the TS overlay's
+// route (overlay/src/eviction.ts), the txid is lowercased and refused 400
+// unless it is 64 hex characters, and the terminal reason is
+// "<txStatus> <extraInfo>" trimmed and bounded to 256 UTF-16 units, so the
+// §9.12 body is the same on both engines.
 //
 // A terminal txStatus evicts the applied transaction via evict (mirroring
 // the TS route's Engine.evictAppliedTransaction — a real @bsv/overlay
@@ -85,8 +90,17 @@ func arcIngestHandler(h MerkleProofHandler, callbackToken string, evict EvictTx)
 		if body.Txid == "" {
 			return errorResponse(c, fiber.StatusBadRequest, "Provider callback is missing txid")
 		}
+		// As on TS (overlay/src/eviction.ts): lowercased, then refused unless
+		// it is 64 hex characters, before any store is touched — the record
+		// is keyed by the lowercase txid, and a stamp for a txid that is no tx
+		// would otherwise be written before anything noticed.
+		body.Txid = strings.ToLower(body.Txid)
+		if !isTxidHex(body.Txid) {
+			return errorResponse(c, fiber.StatusBadRequest, "Provider callback txid must be 64 hex characters")
+		}
 
 		if arcade.IsTerminalStatus(body.TxStatus, body.ExtraInfo) {
+			reason := evictionReason(body.TxStatus, body.ExtraInfo)
 			var outcome EvictionOutcome
 			var err error
 			if evict == nil {
@@ -113,7 +127,7 @@ func arcIngestHandler(h MerkleProofHandler, callbackToken string, evict EvictTx)
 				"data": fiber.Map{
 					"txid":              body.Txid,
 					"txStatus":          body.TxStatus,
-					"reason":            body.ExtraInfo,
+					"reason":            reason,
 					"restoredOutpoints": outcome.RestoredOutpoints,
 					"restoredTokenRows": outcome.RestoredTokenRows,
 					"alreadyEvicted":    outcome.AlreadyEvicted,
@@ -145,6 +159,44 @@ func arcIngestHandler(h MerkleProofHandler, callbackToken string, evict EvictTx)
 			"message": "Transaction status updated",
 		})
 	}
+}
+
+// isTxidHex reports whether s is exactly 64 lowercase hex characters.
+func isTxidHex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// maxReasonUnits is the TS route's bound on the eviction reason: 256 UTF-16
+// code units (at most 768 UTF-8 bytes, under the TS engine's 1024-byte cap).
+const maxReasonUnits = 256
+
+// evictionReason is the terminal-status reason exactly as the TS route (and
+// upstream overlay-express) builds it — "<txStatus> <extraInfo>", trimmed —
+// then cut to maxReasonUnits UTF-16 code units, so the §9.12 body is the same
+// on both engines. One unavoidable edge: where the cut splits a surrogate
+// pair, TS keeps the lone high surrogate and Go (whose strings are UTF-8)
+// drops it.
+func evictionReason(txStatus, extraInfo string) string {
+	reason := strings.TrimSpace(txStatus + " " + extraInfo)
+	units := utf16.Encode([]rune(reason))
+	if len(units) <= maxReasonUnits {
+		return reason
+	}
+	units = units[:maxReasonUnits]
+	if last := units[len(units)-1]; last >= 0xd800 && last < 0xdc00 {
+		// a high surrogate whose low half was cut off
+		units = units[:len(units)-1]
+	}
+	return string(utf16.Decode(units))
 }
 
 // hasValidCallbackToken checks the Authorization: Bearer <token> and
