@@ -17,6 +17,14 @@ export interface HarnessOptions {
   wrap?: (guarded: TopicManager, knex: any) => TopicManager
   /** Lookup services the engine notifies (none by default). */
   lookupServices?: Record<string, LookupService>
+  /**
+   * Registers these named managers INSTEAD of the admit-all `tm_harness` stack
+   * (no spent guard or `wrap` is applied; the caller builds its own stack over
+   * the harness knex). Each is still wrapped in the refusal recorder.
+   */
+  topicManagers?: (knex: any) => Record<string, TopicManager>
+  /** The topics `submit` tags (default `[tm_harness]`). */
+  topics?: string[]
 }
 
 export const createHarness = async (opts: HarnessOptions = {}) => {
@@ -44,13 +52,18 @@ export const createHarness = async (opts: HarnessOptions = {}) => {
     knexSpentInputStore(knex, HARNESS_TOPIC, opts.wasEvicted ?? (async () => false)))
   const guarded = opts.wrap != null ? opts.wrap(spendGuarded, knex) : spendGuarded
   // Outermost recorder: the engine swallows manager throws, so capture them here.
-  const recorded = {
-    ...guarded,
-    identifyAdmissibleOutputs: async (...args: any[]) => {
-      try { return await (guarded.identifyAdmissibleOutputs as any)(...args) } catch (e) { refusals.push(e); throw e }
-    }
-  }
-  const engine = new (Engine as any)({ [HARNESS_TOPIC]: recorded }, opts.lookupServices ?? {}, storage, 'scripts only',
+  const record = (inner: TopicManager): TopicManager => new Proxy(inner, {
+    get: (target, prop, receiver) => prop === 'identifyAdmissibleOutputs'
+      ? async (...args: any[]) => {
+        try { return await (target.identifyAdmissibleOutputs as any)(...args) } catch (e) { refusals.push(e); throw e }
+      }
+      : Reflect.get(target, prop, receiver)
+  })
+  const managers: Record<string, TopicManager> = opts.topicManagers != null
+    ? Object.fromEntries(Object.entries(opts.topicManagers(knex)).map(([topic, tm]) => [topic, record(tm)]))
+    : { [HARNESS_TOPIC]: record(guarded) }
+  const topics = opts.topics ?? [HARNESS_TOPIC]
+  const engine = new (Engine as any)(managers, opts.lookupServices ?? {}, storage, 'scripts only',
     'https://harness.invalid', [], [], undefined, undefined, {})
 
   const key = PrivateKey.fromRandom()
@@ -65,10 +78,11 @@ export const createHarness = async (opts: HarnessOptions = {}) => {
     await t.sign()
     return t
   }
-  const submit = async (tx: Transaction): Promise<SubmitOutcome> => {
+  /** `offChainValues` is the engine's 4th positional argument (not a tagged-BEEF field). */
+  const submit = async (tx: Transaction, offChainValues?: number[]): Promise<SubmitOutcome> => {
     const before = refusals.length
     try {
-      const steak = await engine.submit({ beef: tx.toBEEF(), topics: [HARNESS_TOPIC] }, undefined, 'current-tx')
+      const steak = await engine.submit({ beef: tx.toBEEF(), topics }, undefined, 'current-tx', offChainValues)
       return { steak, refusal: refusals[before] }
     } catch (error) {
       return { error, refusal: refusals[before] }
