@@ -11,12 +11,16 @@
     "gen-key": "tsx src/genKey.ts",
     "test": "vitest run"
   },
+  "overrides": {
+    "@bsv/overlay": "$@bsv/overlay",
+    "@bsv/templates": "$@bsv/templates"
+  },
   "dependencies": {
     "@bsv/overlay": "^2.6.2",
     "@bsv/overlay-express": "^2.7.3",
-    "@bsv/overlay-topics": "^1.6.0",
+    "@bsv/overlay-topics": "file:vendor/bsv-overlay-topics-2.0.0.tgz",
     "@bsv/sdk": "^2.8.11",
-    "@bsv/templates": "^1.10.3",
+    "@bsv/templates": "file:vendor/bsv-templates-2.0.0.tgz",
     "dotenv": "^17.4.2",
     "knex": "^3.3.0",
     "mongodb": "^7.5.0",
