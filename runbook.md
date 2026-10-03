@@ -78,7 +78,7 @@ App treats `identityKey === VITE_OVERLAY_IDENTITY_KEY` as issuer. Overlay admin 
 | --- | --- | --- |
 | Mongo | Existing Docker `local-mongo-1` replica set. **Do not stop it.** | `127.0.0.1:27017` |
 | Overlay | **Native Node 24** (`engines: >=24 <25`), not Compose. Rebuilt from `overlay/dist` + restarted ~23:44 local (2026-09-15, wire contract v2 build; supersedes an earlier ~22:35 restart same day). | `http://localhost:8080` (`HOSTING_URL=https://deggen.ngrok.app`) |
-| overlay-go | Not running this session. Compose service in `overlay/docker-compose.yml`, published on host `:8081`. | `http://localhost:8081` |
+| overlay-go | Not running this session. Compose service in `overlay-go/docker-compose.yml`, published on host `:8081`. | `http://localhost:8081` |
 | Vite app | `app/` | `http://127.0.0.1:5173/` (`VITE_OVERLAY_URL=https://deggen.ngrok.app`) |
 | ngrok | User runs it | `https://deggen.ngrok.app` → `http://localhost:8080` |
 | MessageBox | hosted | `https://gmb.bsvblockchain.tech` |
