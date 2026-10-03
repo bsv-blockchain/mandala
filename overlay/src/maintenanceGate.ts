@@ -14,6 +14,13 @@ import type { RequestHandler } from 'express'
  *
  * An exclusive that cannot acquire within drainTimeoutMs stops waiting and
  * rejects with MaintenanceBusyError (fn is not run).
+ *
+ * A second, exclusive-only instance is the RECONCILE LOCK (Task 13): the
+ * owner-index reconciler runs beside live submits but never beside an
+ * eviction (the engine notifies outputEvicted before deleteOutput). Lock order
+ * is fixed everywhere: the reconcile lock first, then this submit gate. Never
+ * take the reconcile lock from inside a submit-gate exclusive or while holding
+ * a shared slot; submits never take it at all.
  */
 export const DEFAULT_DRAIN_TIMEOUT_MS = 60_000
 
@@ -97,3 +104,13 @@ export const gateSubmits = (gate: MaintenanceGate): RequestHandler => (req, res,
     next()
   }, next)
 }
+
+/**
+ * Holds the reconcile lock, then the submit gate's exclusive, around fn: the
+ * eviction quiesce (and the only order either lock is ever nested in). Each
+ * wait is bounded by its instance's drain timeout, so the whole acquisition
+ * gives up within the sum of the two with MaintenanceBusyError and fn not run.
+ */
+export const reconcileThenSubmitGate = (reconcileLock: MaintenanceGate, submitGate: MaintenanceGate) =>
+  async <T>(fn: () => Promise<T>): Promise<T> =>
+    await reconcileLock.exclusive(async () => await submitGate.exclusive(fn))

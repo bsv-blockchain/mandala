@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { MaintenanceGate } from './maintenanceGate.js'
-import { OwnerIndexMaintenance } from './ownerIndex.js'
+import { OwnerIndexMaintenance, OWNER_INDEX_INTERVAL_MS } from './ownerIndex.js'
 
 const mk = (over: Partial<any> = {}) => {
   const calls: string[] = []
   const deps = {
     gate: new MaintenanceGate(),
+    reconcileLock: new MaintenanceGate(),
     lookup: {
       tokenIdsWithHistory: async () => { calls.push('ids'); return ['a'.repeat(64) + '_0', 'b'.repeat(64) + '_0'] },
       rebuildState: async (id: string) => { calls.push('rebuild:' + id.slice(0, 1)) }
@@ -19,13 +20,125 @@ const mk = (over: Partial<any> = {}) => {
 }
 
 describe('OwnerIndexMaintenance', () => {
-  it('refolds every token, then reconciles each topic, inside the exclusive gate', async () => {
+  it('the interval is 30 minutes', () => {
+    expect(OWNER_INDEX_INTERVAL_MS).toBe(1_800_000)
+  })
+  it('boot run: refolds every token inside the exclusive submit gate, then reconciles each topic under the reconcile lock only', async () => {
+    const seen: string[] = []
     const { deps, calls, m } = mk()
-    const spy = vi.spyOn(deps.gate, 'exclusive')
+    deps.lookup = {
+      tokenIdsWithHistory: async () => { calls.push('ids'); return ['a'.repeat(64) + '_0', 'b'.repeat(64) + '_0'] },
+      rebuildState: async (id: string) => { calls.push('rebuild:' + id.slice(0, 1)); seen.push(`rebuild gate=${deps.gate.busy} lock=${deps.reconcileLock.busy}`) }
+    }
+    deps.reconcile = async (topic: string) => { calls.push('reconcile:' + topic); seen.push(`reconcile gate=${deps.gate.busy} lock=${deps.reconcileLock.busy}`); return { scanned: 1, repaired: 0, unrepairable: [] } }
+    const g = vi.spyOn(deps.gate, 'exclusive'); const r = vi.spyOn(deps.reconcileLock, 'exclusive')
     await m.runOnce()
     expect(calls).toEqual(['ids', 'rebuild:a', 'rebuild:b', 'reconcile:tm_mandala', 'reconcile:tm_mandala_registry'])
-    expect(spy).toHaveBeenCalledTimes(1)
+    expect(seen).toEqual([
+      'rebuild gate=true lock=true', 'rebuild gate=true lock=true',
+      'reconcile gate=false lock=true', 'reconcile gate=false lock=true'
+    ])
+    expect(g).toHaveBeenCalledTimes(1); expect(r).toHaveBeenCalledTimes(1)
+    // Lock order: the reconcile lock is taken before the submit gate.
+    expect(r.mock.invocationCallOrder[0]).toBeLessThan(g.mock.invocationCallOrder[0])
     expect((await m.healthCheck().handler()).status).toBe('ok')
+  })
+  it('interval run (after a successful refold): reconciles only, never refolds, never takes the submit gate', async () => {
+    const { deps, calls, m } = mk()
+    await m.runOnce()
+    calls.length = 0
+    const g = vi.spyOn(deps.gate, 'exclusive'); const r = vi.spyOn(deps.reconcileLock, 'exclusive')
+    await m.runOnce()
+    expect(calls).toEqual(['reconcile:tm_mandala', 'reconcile:tm_mandala_registry'])
+    expect(g).not.toHaveBeenCalled()
+    expect(r).toHaveBeenCalledTimes(1)
+    expect(m.status().lastError).toBeNull()
+    expect((await m.healthCheck().handler()).status).toBe('ok')
+  })
+  it('a failed boot refold is retried (inside the submit gate) on every run until one succeeds; then runs are reconcile-only', async () => {
+    let failRefold = true
+    const { deps, calls, m } = mk({
+      lookup: {
+        tokenIdsWithHistory: async () => { calls.push('ids'); return ['a'.repeat(64) + '_0'] },
+        rebuildState: async () => { calls.push('rebuild'); if (failRefold) throw new Error('fold') }
+      }
+    })
+    const g = vi.spyOn(deps.gate, 'exclusive')
+    await m.runOnce()
+    expect(m.status().lastError).toBe('refold failed for 1 token(s) (Error)')
+    expect(g).toHaveBeenCalledTimes(1)
+    calls.length = 0
+    await m.runOnce() // still failing: refolds again, exclusive
+    expect(calls).toEqual(['ids', 'rebuild', 'reconcile:tm_mandala', 'reconcile:tm_mandala_registry'])
+    expect(g).toHaveBeenCalledTimes(2)
+    failRefold = false; calls.length = 0
+    await m.runOnce() // succeeds: refolds once more
+    expect(calls).toEqual(['ids', 'rebuild', 'reconcile:tm_mandala', 'reconcile:tm_mandala_registry'])
+    expect(g).toHaveBeenCalledTimes(3)
+    expect(m.status().lastError).toBeNull()
+    calls.length = 0
+    await m.runOnce() // back to reconcile-only
+    expect(calls).toEqual(['reconcile:tm_mandala', 'reconcile:tm_mandala_registry'])
+    expect(g).toHaveBeenCalledTimes(3)
+  })
+  it('a failed token listing or a busy gate keeps the refold pending', async () => {
+    let failIds = true
+    const { calls, m } = mk({
+      lookup: {
+        tokenIdsWithHistory: async () => { calls.push('ids'); if (failIds) throw new Error('down'); return [] },
+        rebuildState: async () => {}
+      }
+    })
+    await m.runOnce()
+    expect(m.status().lastError).toBe('owner index run failed (Error)')
+    failIds = false; calls.length = 0
+    await m.runOnce()
+    expect(calls).toEqual(['ids', 'reconcile:tm_mandala', 'reconcile:tm_mandala_registry'])
+    calls.length = 0
+    await m.runOnce()
+    expect(calls).toEqual(['reconcile:tm_mandala', 'reconcile:tm_mandala_registry'])
+  })
+  it('a submit holding the submit gate does not block an interval reconcile', async () => {
+    const gate = new MaintenanceGate({ drainTimeoutMs: 60_000 })
+    const { calls, m } = mk({ gate })
+    await m.runOnce()
+    calls.length = 0
+    const release = await gate.enter() // an in-flight /submit
+    await m.runOnce()
+    expect(calls).toEqual(['reconcile:tm_mandala', 'reconcile:tm_mandala_registry'])
+    expect(m.status().lastError).toBeNull()
+    release()
+  })
+  it('an eviction holding the reconcile lock blocks the interval reconcile until it releases (no overlap)', async () => {
+    const { deps, calls, m } = mk()
+    await m.runOnce()
+    calls.length = 0
+    let releaseEviction!: () => void
+    let evicting = false
+    const eviction = deps.reconcileLock.exclusive(async () => { evicting = true; await new Promise<void>(r => { releaseEviction = r }); evicting = false })
+    await new Promise(r => setImmediate(r))
+    const overlap: boolean[] = []
+    deps.reconcile = async (topic: string) => { overlap.push(evicting); calls.push('reconcile:' + topic); return { scanned: 0, repaired: 0, unrepairable: [] } }
+    const run = m.runOnce()
+    await new Promise(r => setImmediate(r))
+    expect(calls).toEqual([])
+    releaseEviction(); await eviction; await run
+    expect(calls).toEqual(['reconcile:tm_mandala', 'reconcile:tm_mandala_registry'])
+    expect(overlap).toEqual([false, false])
+    expect(m.status().lastError).toBeNull()
+  })
+  it('a reconcile lock held past its drain timeout is a recorded failure, never a throw', async () => {
+    const reconcileLock = new MaintenanceGate({ drainTimeoutMs: 20 })
+    const { m, calls } = mk({ reconcileLock })
+    let release!: () => void
+    const holder = reconcileLock.exclusive(() => new Promise<void>(r => { release = r }))
+    await new Promise(r => setImmediate(r))
+    await expect(m.runOnce()).resolves.toBeUndefined()
+    expect(calls).toEqual([])
+    expect(m.status().lastError).toBe('owner index run failed (MaintenanceBusyError)')
+    release(); await holder
+    await m.runOnce()
+    expect(m.status().lastError).toBeNull()
   })
   it('reports unrepairable outpoints as degraded (not critical)', async () => {
     const { m } = mk({ reconcile: async (t: string) => ({ scanned: 2, repaired: 0, unrepairable: t === 'tm_mandala' ? ['c'.repeat(64) + '.1'] : [] }) })
@@ -68,7 +181,7 @@ describe('OwnerIndexMaintenance', () => {
     await vi.advanceTimersByTimeAsync(0)
     vi.useRealTimers()
   })
-  it('a busy gate (submits will not drain) is a recorded failure, never a throw; the next run recovers', async () => {
+  it('a busy gate (submits will not drain) during a pending refold is a recorded failure, never a throw; the next run recovers', async () => {
     const gate = new MaintenanceGate({ drainTimeoutMs: 20 })
     const { m, calls } = mk({ gate })
     const release = await gate.enter()
@@ -162,8 +275,9 @@ describe('OwnerIndexMaintenance', () => {
     const counting = () => {
       const state = { runs: 0, fail: true }
       const { m } = mk({
-        lookup: { tokenIdsWithHistory: async () => { state.runs++; return [] }, rebuildState: async () => {} },
-        reconcile: async () => { if (state.fail) throw new Error('down'); return { scanned: 0, repaired: 0, unrepairable: [] } }
+        lookup: { tokenIdsWithHistory: async () => [], rebuildState: async () => {} },
+        // Counted on the first topic: after the boot refold, runs reconcile only.
+        reconcile: async (t: string) => { if (t === 'tm_mandala') state.runs++; if (state.fail) throw new Error('down'); return { scanned: 0, repaired: 0, unrepairable: [] } }
       })
       return { m, state }
     }
@@ -240,8 +354,8 @@ describe('OwnerIndexMaintenance', () => {
       let release!: () => void
       let runs = 0
       const { m } = mk({
-        lookup: { tokenIdsWithHistory: async () => { runs++; return [] }, rebuildState: async () => {} },
-        reconcile: async () => { await new Promise<void>(r => { release = r }); throw new Error('down') }
+        lookup: { tokenIdsWithHistory: async () => [], rebuildState: async () => {} },
+        reconcile: async (t: string) => { if (t === 'tm_mandala') runs++; await new Promise<void>(r => { release = r }); throw new Error('down') }
       })
       m.start(1_000)
       await vi.advanceTimersByTimeAsync(1_000)

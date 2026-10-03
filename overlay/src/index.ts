@@ -24,7 +24,7 @@ import { readBootConfig } from './bootConfig.js'
 import { createShutdown } from './shutdown.js'
 import { withArcadeStatusParity } from './arcadeParity.js'
 import { knexEngineOutputs } from './engineOutputs.js'
-import { MaintenanceGate, gateSubmits } from './maintenanceGate.js'
+import { MaintenanceGate, gateSubmits, reconcileThenSubmitGate } from './maintenanceGate.js'
 import { OwnerIndexMaintenance, OWNER_INDEX_INTERVAL_MS } from './ownerIndex.js'
 import * as routes from './tokenRoutes.js'
 config()
@@ -105,8 +105,12 @@ const main = async (): Promise<void> => {
   // §4.2a host side: the engine's own admitted outputs, for the managers'
   // inline owner-row repair and the reconciler.
   const engineOutputs = knexEngineOutputs(server.knex!)
-  // Quiesces /submit while a refold, reconcile or eviction runs (Review Focus 2).
+  // Quiesces /submit while a refold or an eviction runs (Review Focus 2).
   const gate = new MaintenanceGate()
+  // The reconcile lock (Task 13): exclusive-only, held by every owner-index run
+  // and by eviction, so the reconciler never runs beside an eviction but does
+  // run beside submits. Always taken BEFORE the gate, never inside it.
+  const reconcileLock = new MaintenanceGate()
   const overlayIdentityKey = PrivateKey.fromHex(cfg.serverPrivateKey).toPublicKey().toString()
 
   // Wrap /submit JSON so admitted STEAKs carry σ_I, and keep a record of every
@@ -260,12 +264,15 @@ const main = async (): Promise<void> => {
   const engineBroadcaster = (server.engine as unknown as { broadcaster?: { broadcast: (tx: any) => Promise<any> } }).broadcaster
   if (engineBroadcaster != null) withArcadeStatusParity(engineBroadcaster)
 
-  // Boot refold of every token with history, then the owner-index reconcile of
-  // both topics, inside the exclusive gate; repeated on an interval. runOnce
-  // never rejects: a failure is logged and readiness reports degraded until a
-  // later run succeeds (Review Focus 5).
+  // Boot refold of every token with history (inside the exclusive gate), then
+  // the owner-index reconcile of both topics (under the reconcile lock only).
+  // The interval repeats the reconcile alone, beside live submits; a refold
+  // that failed is retried on later runs until one succeeds. runOnce never
+  // rejects: a failure is logged and readiness reports degraded until a later
+  // run succeeds (Review Focus 5).
   ownerIndex = new OwnerIndexMaintenance({
     gate,
+    reconcileLock,
     lookup: mandalaLookup,
     reconcile: async topic => await reconcileOwnerIndex({ storage, engine: engineOutputs, topic }),
     topics: [TOKEN_TOPIC, REGISTRY_TOPIC],
@@ -282,7 +289,8 @@ const main = async (): Promise<void> => {
   // Gated on the same condition the pinned route uses — with no provider
   // configured it never mounts /arc-ingest at all, so there is nothing to
   // shadow (the local demo has no Arcade). NOT behind gateSubmits: the
-  // eviction quiesces submits itself through `exclusive`.
+  // eviction quiesces submits itself, holding the reconcile lock and then the
+  // gate's `exclusive` (the fixed lock order).
   if (cfg.arcade != null) {
     mountArcIngest(server.app as any, {
       callbackToken: cfg.arcade.callbackToken,
@@ -304,7 +312,7 @@ const main = async (): Promise<void> => {
       // Refold every token the tx has history for without it, then purge its
       // history rows (in that order, so an interrupted run can be repeated).
       purgeAndRefold: txid => mandalaLookup!.purgeAndRefold(txid),
-      quiesce: fn => gate.exclusive(fn),
+      quiesce: reconcileThenSubmitGate(reconcileLock, gate),
       // No block height: the engine takes it from the proof, and throws when
       // a forwarded one differs from it.
       ingestProof: async (txid, merklePathHex) => {
@@ -475,7 +483,7 @@ const main = async (): Promise<void> => {
   })
 
   // Boot refold + reconcile BEFORE the first submit is accepted (start() is
-  // where the server begins listening), then the interval.
+  // where the server begins listening), then the reconcile-only interval.
   await ownerIndex.runOnce()
   ownerIndex.start(OWNER_INDEX_INTERVAL_MS)
   await server.start()

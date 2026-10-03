@@ -24,6 +24,7 @@ import { initialDoubleSlashCompatibility } from '@bsv/overlay-express/security/e
 import { Transaction, UnlockingScript, P2PKH, PrivateKey } from '@bsv/sdk'
 import { MANDALA_TOPIC } from '@bsv/overlay-topics'
 import { wrapSubmitJson, normalizeDoubleSlash, signAdmissionV2Sync, TOKEN_TOPIC } from './admission.js'
+import { OWNER_INDEX_INTERVAL_MS, OWNER_INDEX_RETRY_BASE_MS } from './ownerIndex.js'
 
 const SOURCE = readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
 
@@ -140,6 +141,19 @@ describe('index.ts — maintenance: quiesced /submit, owner index before start',
     expect(CODE).toContain('const gate = new MaintenanceGate()')
   })
 
+  // Task 13 — a second, exclusive-only instance: the reconcile lock, shared by
+  // the owner-index run and eviction only. Never mounted on a route.
+  it('builds a separate reconcile lock that no route is gated on', () => {
+    expect(CODE).toContain('const reconcileLock = new MaintenanceGate()')
+    expect(CODE).not.toMatch(/gateSubmits\(reconcileLock\)/)
+    expect(CODE).not.toMatch(/reconcileLock\.enter\(/)
+  })
+
+  it('pins the 30-minute reconcile interval', () => {
+    expect(OWNER_INDEX_INTERVAL_MS).toBe(1_800_000)
+    expect(OWNER_INDEX_RETRY_BASE_MS).toBe(10_000)
+  })
+
   it('runs maintenance before start, then on the interval, and reports readiness', () => {
     const boot = CODE.indexOf('await ownerIndex.runOnce()')
     const start = CODE.indexOf('await server.start()')
@@ -153,6 +167,7 @@ describe('index.ts — maintenance: quiesced /submit, owner index before start',
   it('builds the owner-index maintenance over the gate, the lookup, the reconciler and both topics', () => {
     const m = CODE.slice(CODE.indexOf('new OwnerIndexMaintenance('), CODE.indexOf('registerHealthCheck('))
     expect(m).toContain('gate,')
+    expect(m).toContain('reconcileLock,')
     expect(m).toContain('lookup: mandalaLookup')
     expect(m).toContain('reconcileOwnerIndex({ storage, engine: engineOutputs, topic })')
     expect(m).toContain('topics: [TOKEN_TOPIC, REGISTRY_TOPIC]')
@@ -374,7 +389,10 @@ describe('index.ts — eviction restores from the owner journal (BRC-162)', () =
   it('restores inputs through the journal and the lookup, refolds via purgeAndRefold, under the gate', () => {
     expect(deps).toMatch(/restoreInput: journalRestoreInput\(\(t, v, topic\) => storage\.getOwnerJournal\(t, v, topic\), j => mandalaLookup!\.restoreInputRow\(j\), TOKEN_TOPIC\)/)
     expect(deps).toContain('purgeAndRefold: txid => mandalaLookup!.purgeAndRefold(txid)')
-    expect(deps).toContain('quiesce: fn => gate.exclusive(fn)')
+    // Both locks, reconcile lock first (the order every holder uses).
+    expect(deps).toContain('quiesce: reconcileThenSubmitGate(reconcileLock, gate)')
+    expect(deps).not.toContain('quiesce: fn => gate.exclusive(fn)')
+    expect(CODE).toMatch(/import \{[^}]*\breconcileThenSubmitGate\b[^}]*\} from '\.\/maintenanceGate\.js'/)
     expect(deps).toContain('...knexEvictionCoins(server.knex!, TOKEN_TOPIC)')
   })
 

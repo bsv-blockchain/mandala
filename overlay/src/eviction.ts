@@ -91,8 +91,10 @@ export interface EvictionDeps {
    */
   purgeAndRefold: (txid: string) => Promise<string[]>
   /**
-   * Runs the whole eviction with submissions quiesced (the maintenance gate's
-   * `exclusive`). Optional; may reject with MaintenanceBusyError.
+   * Runs the whole eviction with submissions quiesced and the owner-index
+   * reconciler held off (`reconcileThenSubmitGate`: the reconcile lock, then
+   * the submit gate's `exclusive`). Optional; may reject with
+   * MaintenanceBusyError.
    */
   quiesce?: <T>(fn: () => Promise<T>) => Promise<T>
   now?: () => string

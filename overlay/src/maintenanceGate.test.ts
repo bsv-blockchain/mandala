@@ -1,8 +1,8 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import express from 'express'
-import { MaintenanceGate, MaintenanceBusyError, gateSubmits } from './maintenanceGate.js'
+import { MaintenanceGate, MaintenanceBusyError, gateSubmits, reconcileThenSubmitGate } from './maintenanceGate.js'
 
 const tick = () => new Promise(r => setImmediate(r))
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
@@ -128,5 +128,55 @@ describe('gateSubmits over real express', () => {
     fold.resolve(); await ex
     expect(ran).toBe(true)
     expect(g.busy).toBe(false)
+  })
+})
+
+// Task 13 — eviction holds BOTH the reconcile lock and the submit gate, always
+// in that order (reconcile lock first), the same order a refolding owner-index
+// run uses, so no two holders can wait on each other.
+describe('reconcileThenSubmitGate (the eviction quiesce)', () => {
+  it('acquires the reconcile lock first, then the submit gate, and runs fn under both', async () => {
+    const reconcileLock = new MaintenanceGate(); const gate = new MaintenanceGate()
+    const r = vi.spyOn(reconcileLock, 'exclusive'); const g = vi.spyOn(gate, 'exclusive')
+    let seen: [boolean, boolean] | null = null
+    const out = await reconcileThenSubmitGate(reconcileLock, gate)(async () => { seen = [reconcileLock.busy, gate.busy]; return 7 })
+    expect(out).toBe(7)
+    expect(seen).toEqual([true, true])
+    expect(r).toHaveBeenCalledTimes(1); expect(g).toHaveBeenCalledTimes(1)
+    expect(r.mock.invocationCallOrder[0]).toBeLessThan(g.mock.invocationCallOrder[0])
+    expect(reconcileLock.busy).toBe(false); expect(gate.busy).toBe(false)
+  })
+  it('does not touch the submit gate while the reconcile lock is held elsewhere', async () => {
+    const reconcileLock = new MaintenanceGate(); const gate = new MaintenanceGate()
+    const held = deferred()
+    const holder = reconcileLock.exclusive(() => held.promise)
+    await tick()
+    const g = vi.spyOn(gate, 'exclusive')
+    const ran: string[] = []
+    const ev = reconcileThenSubmitGate(reconcileLock, gate)(async () => { ran.push('evict') })
+    await tick()
+    expect(g).not.toHaveBeenCalled()
+    // A submit is not blocked by a reconcile-lock holder: the gate is untouched.
+    const rel = await gate.enter(); rel()
+    held.resolve(); await holder; await ev
+    expect(ran).toEqual(['evict'])
+  })
+  it('a reconcile lock that is not released within the drain timeout rejects MaintenanceBusyError (fn not run)', async () => {
+    const reconcileLock = new MaintenanceGate({ drainTimeoutMs: 20 }); const gate = new MaintenanceGate()
+    const held = deferred()
+    const holder = reconcileLock.exclusive(() => held.promise)
+    await tick()
+    let ran = false
+    await expect(reconcileThenSubmitGate(reconcileLock, gate)(async () => { ran = true })).rejects.toBeInstanceOf(MaintenanceBusyError)
+    expect(ran).toBe(false)
+    expect(gate.busy).toBe(false)
+    held.resolve(); await holder
+  })
+  it('a submit gate that does not drain rejects MaintenanceBusyError and frees the reconcile lock', async () => {
+    const reconcileLock = new MaintenanceGate(); const gate = new MaintenanceGate({ drainTimeoutMs: 20 })
+    const rel = await gate.enter()
+    await expect(reconcileThenSubmitGate(reconcileLock, gate)(async () => {})).rejects.toBeInstanceOf(MaintenanceBusyError)
+    expect(reconcileLock.busy).toBe(false)
+    rel()
   })
 })
