@@ -277,7 +277,9 @@ describe('/submit refusal — FIX D verdict taxonomy (contract §2)', () => {
     { reason: 'output 0: deploy signature is missing or invalid', rejectCode: 'ERR_AUTHORITY', status: 400, code: 'ERR_AUTHORITY', retryable: false, final: true },
     { reason: 'control gate rejected the transaction (paused asset or access mode)', rejectCode: 'ERR_PAUSED', status: 409, code: 'ERR_PAUSED', retryable: true, final: false },
     { reason: 'output 1: authority owner k is not a trusted issuer', rejectCode: 'ERR_UNTRUSTED', status: 409, code: 'ERR_UNTRUSTED', retryable: true, final: false },
-    { reason: 'sanctioned party involved in transfer', rejectCode: 'ERR_MEMBERSHIP', status: 409, code: 'ERR_MEMBERSHIP', retryable: true, final: false }
+    { reason: 'sanctioned party involved in transfer', rejectCode: 'ERR_MEMBERSHIP', status: 409, code: 'ERR_MEMBERSHIP', retryable: true, final: false },
+    // The package's own retryable reject (a provider or storage fault inside the manager).
+    { reason: 'screening provider unavailable', rejectCode: 'ERR_UNAVAILABLE', status: 503, code: 'ERR_UNAVAILABLE', retryable: true, final: false }
   ]
 
   for (const c of cases) {
@@ -295,6 +297,12 @@ describe('/submit refusal — FIX D verdict taxonomy (contract §2)', () => {
         status: 'error', code: c.code, retryable: c.retryable, description: c.reason, message: c.reason
       })
       expect(store.refusals.length).toBe(c.final ? 1 : 0)
+      if (c.final) {
+        expect(store.refusals[0]).toMatchObject({ txid: h.txid, refusedCode: c.code, refusedDescription: c.reason, refusedPayloadHash: EMPTY_PAYLOAD_HASH })
+        expect(store.rows[h.txid]).toMatchObject({ refusedCode: c.code, refusedPayloadHash: EMPTY_PAYLOAD_HASH })
+      } else {
+        expect(store.rows[h.txid]?.refusedCode).toBeUndefined()
+      }
     })
   }
 
