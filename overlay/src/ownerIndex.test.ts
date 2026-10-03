@@ -156,6 +156,117 @@ describe('OwnerIndexMaintenance', () => {
     await vi.advanceTimersByTimeAsync(5000)
     expect(n).toBe(after)
   })
+  // F8 — a failed run (the boot refold above all) is retried sooner than the
+  // interval: 10s, doubling, capped at the interval; a success returns to it.
+  describe('retry backoff after a failed run', () => {
+    const counting = () => {
+      const state = { runs: 0, fail: true }
+      const { m } = mk({
+        lookup: { tokenIdsWithHistory: async () => { state.runs++; return [] }, rebuildState: async () => {} },
+        reconcile: async () => { if (state.fail) throw new Error('down'); return { scanned: 0, repaired: 0, unrepairable: [] } }
+      })
+      return { m, state }
+    }
+
+    it('a failed boot run retries after 10s, not after the interval', async () => {
+      vi.useFakeTimers()
+      const { m, state } = counting()
+      await m.runOnce()
+      expect(state.runs).toBe(1)
+      m.start(300_000)
+      await vi.advanceTimersByTimeAsync(9_999)
+      expect(state.runs).toBe(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(state.runs).toBe(2)
+      m.stop()
+    })
+
+    it('doubles from 10s while runs keep failing, capped at the interval', async () => {
+      vi.useFakeTimers()
+      const { m, state } = counting()
+      await m.runOnce()
+      m.start(300_000)
+      const at: number[] = []
+      let t = 0
+      while (at.length < 7) {
+        await vi.advanceTimersByTimeAsync(1_000); t += 1_000
+        if (state.runs - 1 > at.length) at.push(t)
+      }
+      // gaps: 10s, 20s, 40s, 80s, 160s, then capped at 300s
+      expect(at.map((v, i) => v - (at[i - 1] ?? 0))).toEqual([10_000, 20_000, 40_000, 80_000, 160_000, 300_000, 300_000])
+      m.stop()
+    })
+
+    it('a success returns to the normal interval, and a later failure starts again at 10s', async () => {
+      vi.useFakeTimers()
+      const { m, state } = counting()
+      await m.runOnce()
+      m.start(300_000)
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(state.runs).toBe(2)
+      state.fail = false
+      await vi.advanceTimersByTimeAsync(20_000)
+      expect(state.runs).toBe(3)
+      expect(m.status().lastError).toBeNull()
+      await vi.advanceTimersByTimeAsync(299_999)
+      expect(state.runs).toBe(3)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(state.runs).toBe(4)
+      state.fail = true
+      await vi.advanceTimersByTimeAsync(300_000)
+      expect(state.runs).toBe(5)
+      await vi.advanceTimersByTimeAsync(9_999)
+      expect(state.runs).toBe(5)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(state.runs).toBe(6)
+      m.stop()
+    })
+
+    it('a successful boot run waits the full interval', async () => {
+      vi.useFakeTimers()
+      const { m, state } = counting()
+      state.fail = false
+      await m.runOnce()
+      m.start(300_000)
+      await vi.advanceTimersByTimeAsync(299_999)
+      expect(state.runs).toBe(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(state.runs).toBe(2)
+      m.stop()
+    })
+
+    it('stop() during an in-flight scheduled run schedules nothing after it', async () => {
+      vi.useFakeTimers()
+      let release!: () => void
+      let runs = 0
+      const { m } = mk({
+        lookup: { tokenIdsWithHistory: async () => { runs++; return [] }, rebuildState: async () => {} },
+        reconcile: async () => { await new Promise<void>(r => { release = r }); throw new Error('down') }
+      })
+      m.start(1_000)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(runs).toBe(1)
+      m.stop()
+      release()
+      await vi.advanceTimersByTimeAsync(0)
+      release?.()
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(runs).toBe(1)
+    })
+
+    it('a start() after stop() reschedules exactly one chain', async () => {
+      vi.useFakeTimers()
+      const { m, state } = counting()
+      state.fail = false
+      m.start(1_000); m.stop(); m.start(1_000); m.start(1_000)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(state.runs).toBe(1)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(state.runs).toBe(2)
+      m.stop()
+    })
+  })
+
   it('a failing first refold does not stop the second', async () => {
     const rebuilt: string[] = []
     const { m } = mk({ lookup: { tokenIdsWithHistory: async () => ['a'.repeat(64) + '_0', 'b'.repeat(64) + '_0'], rebuildState: async (id: string) => { if (id[0] === 'a') throw new Error('x'); rebuilt.push(id[0]) } } })

@@ -2,6 +2,8 @@ import type { HealthCheckDefinition } from '@bsv/overlay-express'
 import type { MaintenanceGate } from './maintenanceGate.js'
 
 export const OWNER_INDEX_INTERVAL_MS = 300_000
+/** F8 — the first retry after a failed run; doubles per consecutive failure, capped at the interval. */
+export const OWNER_INDEX_RETRY_BASE_MS = 10_000
 
 export interface OwnerIndexDeps {
   gate: MaintenanceGate
@@ -43,13 +45,24 @@ const summarize = (refoldErrors: readonly unknown[], reconcileErrors: ReadonlyAr
  * Boot refold + per-topic owner-index reconcile, repeated on an interval. Runs
  * inside the exclusive maintenance gate (refold reads then writes state and
  * must not interleave with a live fold). runOnce never rejects: a Mongo blip
- * or a busy gate is recorded, readiness reports degraded, and the next
- * interval retries (Review Focus 5).
+ * or a busy gate is recorded, readiness reports degraded, and the next run
+ * retries (Review Focus 5).
+ *
+ * Scheduling (F8) is a setTimeout chain, not setInterval: the next run is
+ * armed only once the previous one has settled, so runs never overlap. After a
+ * failed run (the boot run included, which is why start() reads the current
+ * state) the next one comes sooner: 10s, doubling per consecutive failure,
+ * capped at the interval. A successful run returns to the interval.
  */
 export class OwnerIndexMaintenance {
   private current: OwnerIndexStatus = { lastRunAt: null, lastError: null, unrepairable: [] }
   private inFlight: Promise<void> | null = null
-  private timer: ReturnType<typeof setInterval> | null = null
+  private timer: ReturnType<typeof setTimeout> | null = null
+  /** Bumped by stop(): a chain armed under an older generation never re-arms. */
+  private generation = 0
+  private intervalMs = OWNER_INDEX_INTERVAL_MS
+  /** Consecutive runs that ended with lastError set. */
+  private failures = 0
 
   constructor (private readonly deps: OwnerIndexDeps) {}
 
@@ -91,16 +104,36 @@ export class OwnerIndexMaintenance {
       this.current = { ...this.current, lastError: `owner index run failed (${errorClass(e)})` }
       try { log(`[mandala] owner index run failed: ${msg(e)}`) } catch { /* logging must not throw */ }
     }
+    this.failures = this.current.lastError == null ? 0 : this.failures + 1
+  }
+
+  /** The delay before the next scheduled run (F8). */
+  private nextDelay (): number {
+    if (this.failures === 0) return this.intervalMs
+    const backoff = OWNER_INDEX_RETRY_BASE_MS * 2 ** Math.min(this.failures - 1, 30)
+    return Math.min(backoff, this.intervalMs)
+  }
+
+  private arm (generation: number): void {
+    if (generation !== this.generation) return
+    const timer = setTimeout(() => {
+      if (this.timer === timer) this.timer = null
+      // runOnce never rejects; both arms re-arm regardless.
+      void this.runOnce().then(() => { this.arm(generation) }, () => { this.arm(generation) })
+    }, this.nextDelay())
+    timer.unref?.()
+    this.timer = timer
   }
 
   start (intervalMs: number): void {
     this.stop()
-    this.timer = setInterval(() => { void this.runOnce() }, intervalMs)
-    this.timer.unref()
+    this.intervalMs = intervalMs
+    this.arm(this.generation)
   }
 
   stop (): void {
-    if (this.timer != null) clearInterval(this.timer)
+    this.generation++
+    if (this.timer != null) clearTimeout(this.timer)
     this.timer = null
   }
 
