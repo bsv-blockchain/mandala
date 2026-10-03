@@ -109,7 +109,8 @@ const main = async (): Promise<void> => {
   const gate = new MaintenanceGate()
   // The reconcile lock (Task 13): exclusive-only, held by every owner-index run
   // and by eviction, so the reconciler never runs beside an eviction but does
-  // run beside submits. Always taken BEFORE the gate, never inside it.
+  // run beside submits. Eviction takes it BEFORE the gate; nothing takes it
+  // while holding the gate.
   const reconcileLock = new MaintenanceGate()
   const overlayIdentityKey = PrivateKey.fromHex(cfg.serverPrivateKey).toPublicKey().toString()
 
@@ -264,12 +265,11 @@ const main = async (): Promise<void> => {
   const engineBroadcaster = (server.engine as unknown as { broadcaster?: { broadcast: (tx: any) => Promise<any> } }).broadcaster
   if (engineBroadcaster != null) withArcadeStatusParity(engineBroadcaster)
 
-  // Boot refold of every token with history (inside the exclusive gate), then
-  // the owner-index reconcile of both topics (under the reconcile lock only).
-  // The interval repeats the reconcile alone, beside live submits; a refold
-  // that failed is retried on later runs until one succeeds. runOnce never
-  // rejects: a failure is logged and readiness reports degraded until a later
-  // run succeeds (Review Focus 5).
+  // Every run (boot, then each interval): refold every token with history
+  // inside the exclusive gate (package README "Boot refold"), then reconcile
+  // both topics under the reconcile lock only, beside live submits. The two
+  // steps never nest. runOnce never rejects: a failure is logged and readiness
+  // reports degraded until a later run succeeds (Review Focus 5).
   ownerIndex = new OwnerIndexMaintenance({
     gate,
     reconcileLock,
@@ -483,7 +483,7 @@ const main = async (): Promise<void> => {
   })
 
   // Boot refold + reconcile BEFORE the first submit is accepted (start() is
-  // where the server begins listening), then the reconcile-only interval.
+  // where the server begins listening), then the interval.
   await ownerIndex.runOnce()
   ownerIndex.start(OWNER_INDEX_INTERVAL_MS)
   await server.start()

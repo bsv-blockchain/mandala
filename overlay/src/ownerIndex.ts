@@ -1,15 +1,15 @@
 import type { HealthCheckDefinition } from '@bsv/overlay-express'
 import type { MaintenanceGate } from './maintenanceGate.js'
 
-/** Task 13 — the interval run reconciles only, beside live submits; 30 min. */
+/** Task 13 — every run refolds (submit gate) then reconciles (reconcile lock); 30 min. */
 export const OWNER_INDEX_INTERVAL_MS = 1_800_000
 /** F8 — the first retry after a failed run; doubles per consecutive failure, capped at the interval. */
 export const OWNER_INDEX_RETRY_BASE_MS = 10_000
 
 export interface OwnerIndexDeps {
-  /** The submit gate (shared by /submit): taken exclusive only for a refold. */
+  /** The submit gate (shared by /submit): taken exclusive for the refold step only. */
   gate: MaintenanceGate
-  /** The reconcile lock (exclusive-only, shared with eviction): held for every run. */
+  /** The reconcile lock (exclusive-only, shared with eviction): held for the reconcile step only. */
   reconcileLock: MaintenanceGate
   lookup: { tokenIdsWithHistory: () => Promise<string[]>, rebuildState: (tokenId: string) => Promise<void> }
   reconcile: (topic: string) => Promise<{ scanned: number, repaired: number, unrepairable: string[] }>
@@ -46,24 +46,29 @@ const summarize = (refoldErrors: readonly unknown[], reconcileErrors: ReadonlyAr
 }
 
 /**
- * Boot refold + per-topic owner-index reconcile; the reconcile alone repeats on
- * an interval (Task 13). runOnce never rejects: a Mongo blip or a busy lock is
- * recorded, readiness reports degraded, and the next run retries (Review
- * Focus 5).
+ * Every run, at boot and on the interval, is two steps (Task 13, revision 1):
  *
- * Every run holds the RECONCILE LOCK, which only eviction shares: the
- * reconciler is designed to run beside spends but not beside an eviction (the
- * engine notifies outputEvicted before deleteOutput). The refold
- * (rebuildState) reads then writes state and must never interleave with a live
- * fold, so it runs inside the exclusive SUBMIT GATE, taken inside the
- * reconcile lock (fixed order: reconcile lock, then submit gate; eviction uses
- * the same). The gate is released before the reconcile, so /submit only ever
- * waits for a refold.
+ * 1. Refold every token with history (rebuildState) inside the exclusive
+ *    SUBMIT GATE. The package README ("Boot refold") requires it at boot and
+ *    on the reconciler interval: a lookup error between the history append and
+ *    the fold leaves an action unfolded (a freeze or pause that does not take
+ *    effect), and only a refold repairs it. rebuildState reads then writes
+ *    state, so it must never run beside a live fold. One log line per run
+ *    gives the token count and duration.
+ * 2. Reconcile both topics under the RECONCILE LOCK only, beside live
+ *    submits: the reconciler is designed to run beside spends but not beside
+ *    an eviction (the engine notifies outputEvicted before deleteOutput), and
+ *    eviction holds this lock.
  *
- * The refold is a boot duty (README "Boot refold"): the first run refolds, and
- * every later run refolds too until one pass has refolded every token without
- * error (a failed listing or a busy gate also leaves it pending). After that,
- * runs are reconcile-only. Eviction refolds the tokens it touches itself.
+ * The two steps never nest: the refold holds only the gate, the reconcile only
+ * the lock, so no step ever holds the gate while waiting on the lock. Eviction
+ * takes the lock, then the gate (`reconcileThenSubmitGate`); with nobody
+ * waiting on the lock while holding the gate, no wait-for cycle exists.
+ *
+ * runOnce never rejects: a Mongo blip or a busy lock is recorded, readiness
+ * reports degraded, and the next run retries (Review Focus 5). A failed token
+ * listing or a busy gate fails the whole run (no reconcile that time); a
+ * per-token refold error is recorded and the reconcile still runs.
  *
  * Scheduling (F8) is a setTimeout chain, not setInterval: the next run is
  * armed only once the previous one has settled, so runs never overlap. After a
@@ -80,8 +85,6 @@ export class OwnerIndexMaintenance {
   private intervalMs = OWNER_INDEX_INTERVAL_MS
   /** Consecutive runs that ended with lastError set. */
   private failures = 0
-  /** True until one refold pass covered every token without error. */
-  private refoldPending = true
 
   constructor (private readonly deps: OwnerIndexDeps) {}
 
@@ -96,14 +99,16 @@ export class OwnerIndexMaintenance {
     return p
   }
 
-  /** Every token with history, inside the exclusive submit gate. A listing failure or a busy gate rejects. */
-  private async refold (errors: string[]): Promise<unknown[]> {
+  /** Step 1: every token with history, inside the exclusive submit gate. A listing failure or a busy gate rejects. */
+  private async refold (errors: string[], log: (m: string) => void): Promise<unknown[]> {
     return await this.deps.gate.exclusive(async () => {
+      const started = Date.now()
       const refoldErrors: unknown[] = []
       const ids = await this.deps.lookup.tokenIdsWithHistory()
       for (const id of ids) {
         try { await this.deps.lookup.rebuildState(id) } catch (e) { refoldErrors.push(e); errors.push(`refold ${id}: ${errorClass(e)}: ${msg(e)}`) }
       }
+      log(`[mandala] owner index refold: ${ids.length} token(s) in ${Date.now() - started}ms`)
       return refoldErrors
     })
   }
@@ -111,15 +116,15 @@ export class OwnerIndexMaintenance {
   private async run (): Promise<void> {
     const log = this.deps.log ?? (() => {})
     try {
+      const errors: string[] = []
+      // Step 1, submit gate only (released before step 2).
+      const refoldErrors = await this.refold(errors, log)
+      // Logged now, so a reconcile lock that never frees cannot hide them.
+      for (const er of errors.splice(0)) log(`[mandala] owner index error: ${er}`)
+      // Step 2, reconcile lock only.
       await this.deps.reconcileLock.exclusive(async () => {
-        const errors: string[] = []
         const reconcileErrors: Array<{ topic: string, error: unknown }> = []
         const unrepairable: string[] = []
-        let refoldErrors: unknown[] = []
-        if (this.refoldPending) {
-          refoldErrors = await this.refold(errors)
-          if (refoldErrors.length === 0) this.refoldPending = false
-        }
         for (const topic of this.deps.topics) {
           try {
             const r = await this.deps.reconcile(topic)
