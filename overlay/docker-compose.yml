@@ -1,3 +1,9 @@
+# TS overlay — kept as the wire-parity reference for overlay-go, NOT the
+# deployed stack. The default stack is overlay-go/docker-compose.yml (Go +
+# MongoDB only). This TS engine additionally keeps its outputs in SQLite
+# (SQLITE_FILE on the overlay-data volume). Both stacks use the same Mongo db
+# name (`${NODE_NAME}_lookup_services`) and host port 27017, so bring only one
+# up; against a shared Mongo, never run app traffic through both.
 services:
   mongodb:
     image: mongo:7
@@ -14,29 +20,6 @@ services:
     # SIGTERM drains through OverlayExpress.close() with a 25s deadline
     # (src/shutdown.ts); compose must not SIGKILL before that deadline.
     stop_grace_period: 30s
-  # Go port of `overlay` (overlay-go/). DISABLED BY DEFAULT — `overlay` (TS)
-  # serves the app. Either service can serve it: they share the one real
-  # database (each explicitly selects db `${NODE_NAME}_lookup_services`, i.e.
-  # `mandala_lookup_services`, NODE_NAME=mandala — the `/mandala` path on
-  # MONGO_URL is unused), so they are interchangeable, not additive. Don't run
-  # app traffic against both at once.
-  #
-  # To switch the app to the Go overlay:
-  #   1. Uncomment the `overlay-go` service below (and optionally comment out
-  #      the `overlay` TS service above so only one is up).
-  #   2. `docker compose up` — Go serves on host port 8081.
-  #   3. Point the frontend at it: either set `app/.env`
-  #      `VITE_OVERLAY_URL=http://localhost:8081`, or repoint the ngrok tunnel's
-  #      `addr` from `http://localhost:8080` to `http://localhost:8081`.
-  #
-  # overlay-go:
-  #   build:
-  #     context: ../overlay-go
-  #   env_file: ../overlay-go/.env
-  #   environment:
-  #     MONGO_URL: mongodb://mongodb:27017/mandala
-  #   ports: ["8081:8080"]
-  #   depends_on: ["mongodb"]
 volumes:
   mongo-data:
   overlay-data:

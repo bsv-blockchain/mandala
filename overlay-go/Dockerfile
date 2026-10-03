@@ -1,5 +1,5 @@
-# Build context is ../overlay-go relative to overlay/docker-compose.yml
-# (services: `overlay-go`, context: ../overlay-go).
+# Built by overlay-go/docker-compose.yml (local) and
+# .github/workflows/docker-publish.yml (GHCR).
 FROM golang:1.26 AS builder
 WORKDIR /src
 COPY go.mod go.sum ./

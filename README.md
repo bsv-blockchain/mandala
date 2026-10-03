@@ -9,23 +9,24 @@ Every state change is a real on-chain BSV transaction. The overlay indexes and
 enforces admissible transactions; MessageBox handles peer-to-peer handoff so
 recipients can claim what was sent.
 
-**Built on:** BRC-100 identity protocol. The TS overlay runs @bsv/overlay v2.6.2,
-@bsv/overlay-express v2.7.3, @bsv/sdk v2.8.11, @bsv/overlay-topics v1.6.0 and
-@bsv/templates v1.9.0 (requires Node 24). The app and `lib/` are still on
-@bsv/sdk v2.1.6 with @bsv/templates v1.9.0. The Go overlay (`overlay-go/`) runs
-go-overlay-services v1.3.7 and go-sdk v1.7.1 on Go 1.26.
+**Built on:** BRC-100 identity protocol. The overlay is the Go service
+(`overlay-go/`): go-overlay-services v1.3.7 and go-sdk v1.7.1 on Go 1.26, with
+MongoDB as its only datastore. The app and `lib/` are on @bsv/sdk v2.1.6 with
+@bsv/templates v1.9.0. The TS overlay (`overlay/`: @bsv/overlay v2.6.2,
+@bsv/overlay-express v2.7.3, @bsv/overlay-topics v1.6.0, Node 24) is kept only
+as the wire-parity reference for the Go port; it is not deployed.
 
 ---
 
 ## Architecture Overview
 
-- **Overlay Service** (`overlay/`): OverlayExpress instance on localhost:8080
-  running the `tm_mandala` topic manager and `ls_mandala` lookup service.
-  MongoDB stores tokens, key-linkage records, asset admin state and history;
-  SQLite caches engine transactions/outputs. Exposes custom admin read
-  endpoints (asset state, admin history, aggregated supply summary, and an
-  overlay-wide activity feed with linkage-proven counterparties).
-  A Go port lives in `overlay-go/` (see that package’s README).
+- **Overlay Service** (`overlay-go/`): Go overlay on localhost:8081 running the
+  `tm_mandala` topic manager and `ls_mandala` lookup service. MongoDB is the
+  only datastore: engine transactions/outputs/BEEF plus tokens, key-linkage
+  records, asset admin state and history (no SQLite, MySQL or Postgres).
+  Exposes custom admin read endpoints (asset state, admin history, aggregated
+  supply summary, and an overlay-wide activity feed with linkage-proven
+  counterparties). See `overlay-go/README.md`.
 - **App Frontend** (`app/`): React/Vite SPA, role-gated by wallet identity.
   - **Issuer console** (`/issuer/:section`) — sidebar sections: **Overview**
     (KPIs, admin history, register-asset strip), **Treasury** (issuer's own
@@ -47,48 +48,31 @@ go-overlay-services v1.3.7 and go-sdk v1.7.1 on Go 1.26.
 
 ### 1. Start the Overlay Service
 
-Requires Node 24 (`overlay/package.json` engines: `>=24 <25`).
+Requires Docker. Generate the overlay's identity key and configure it:
 
 ```bash
-cd overlay
-npm install
-npm run gen-key
-```
-
-npm 12 and later skip dependency install scripts unless `package.json`
-approves them. `overlay/package.json` approves the `sqlite3` install script
-(`allowScripts`), so `npm install` builds its native binding; check with
-`node -e "require('sqlite3')"`. A `sqlite3` version bump needs a fresh approval
-(see `runbook.md`).
-
-This prints:
-```
-SERVER_PRIVATE_KEY: <private_key>
-IDENTITY_PUBLIC_KEY: <public_key>
-```
-
-Save the output. Copy `.env.example` → `.env` and paste the `SERVER_PRIVATE_KEY`:
-
-```bash
+cd overlay-go
 cp .env.example .env
-# Edit .env, replace SERVER_PRIVATE_KEY with the output above
+openssl rand -hex 32
 ```
 
-Start the overlay and MongoDB:
+Paste the output into `.env` as `SERVER_PRIVATE_KEY`. Then start the overlay
+and MongoDB:
 
 ```bash
 docker compose up --build
 ```
 
+The boot log line `mandala overlay-go: ... identity=<pubkey>` prints the
+overlay's identity public key; save it for step 2.
+
 Verify it's running:
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:8081/health/ready
 ```
 
-You should get a JSON health report: HTTP 200 once the overlay is ready, 503
-before that. `curl http://localhost:8080/listTopicManagers` lists `tm_mandala`
-and `tm_mandala_registry`.
+HTTP 200 once MongoDB is reachable, 503 before that.
 
 ### 2. Start the Frontend App
 
@@ -101,8 +85,8 @@ cp .env.example .env
 ```
 
 Edit `app/.env` and set:
-- `VITE_OVERLAY_IDENTITY_KEY`: the `IDENTITY_PUBLIC_KEY` from step 1
-- `VITE_OVERLAY_URL`: `http://localhost:8080`
+- `VITE_OVERLAY_IDENTITY_KEY`: the `identity=` public key from step 1
+- `VITE_OVERLAY_URL`: `http://localhost:8081`
 - `VITE_MESSAGEBOX_URL`: `https://messagebox.babbage.systems` (or your own MessageBox instance)
 
 Run the dev server:
@@ -196,8 +180,8 @@ network knows them.
 
 ## Overlay Admin Endpoints
 
-Custom read endpoints registered by `overlay/src/index.ts` (all CORS-open for
-local development):
+Custom read endpoints registered by `overlay-go/internal/httpapi` (the
+identity-bearing ones are gated by `ADMIN_API_TOKEN` when set):
 
 | Endpoint | Purpose |
 |---|---|
@@ -205,7 +189,7 @@ local development):
 | `GET /admin/admin-history/:assetId` | Full ordered admin-action history (used for CSV export). |
 | `GET /admin/admin-history-page/:assetId?limit=&offset=` | Paged, newest-first admin history (drives the audit log UI). |
 | `GET /admin/admin-summary/:assetId` | Aggregated `totalIssued` / `totalRedeemed` / `actionCount` (drives KPI + reconciliation math without shipping the full history). |
-| `GET /admin/activity?assetId=&limit=&before=` | Cursor-paginated overlay-wide transaction feed with linkage-proven counterparties (see `overlay/src/activity.ts`). |
+| `GET /admin/activity?assetId=&limit=&before=` | Cursor-paginated overlay-wide transaction feed with linkage-proven counterparties (see `overlay-go/internal/activity`). |
 
 Mongo indexes backing the hot paths (`linkage.createdAt`,
 `adminHistory.(assetId, admitSeq)`) are created at overlay boot.
@@ -216,7 +200,7 @@ Mongo indexes backing the hot paths (`linkage.createdAt`,
 
 ### Setup
 
-- [ ] Overlay running on localhost:8080; `curl http://localhost:8080/health` returns 200.
+- [ ] Overlay running on localhost:8081; `curl http://localhost:8081/health/ready` returns 200.
 - [ ] App running on localhost:5173 with `VITE_OVERLAY_IDENTITY_KEY` set to overlay's identity pubkey.
 - [ ] Issuer wallet connected (identity key matches the overlay's).
 
@@ -257,28 +241,29 @@ Mongo indexes backing the hot paths (`linkage.createdAt`,
 
 ```bash
 cd app && npm run test        # component, lib and flow tests (Vitest)
-cd overlay && npm run test    # activity feed classifier + pagination tests
+cd overlay-go && go test ./... # overlay (Mongo-backed tests skip without a local mongod)
 ```
 
-Both suites must pass. Typecheck with `npx tsc --noEmit` in either package.
+Both suites must pass. Typecheck the app with `npx tsc --noEmit`.
 
 ---
 
 ## Environment Variables
 
-### Overlay (`overlay/.env`)
+### Overlay (`overlay-go/.env`)
+
+See `overlay-go/.env.example` for every option. Required:
 
 ```env
 NODE_NAME=mandala
-SERVER_PRIVATE_KEY=<output_from_npm_run_gen-key>
-HOSTING_URL=http://localhost:8080
+SERVER_PRIVATE_KEY=<openssl rand -hex 32>
+HOSTING_URL=http://localhost:8081
 MONGO_URL=mongodb://mongodb:27017/mandala
-NETWORK=main                # or test
-SQLITE_FILE=/data/overlay.sqlite
+NETWORK=test                # or main
 # Optional — makes the overlay a full network participant (broadcast + SPV):
 # ARCADE_URL=<arcade host>
 # ARCADE_API_KEY=<key>
-# ARCADE_CALLBACK_TOKEN=<32+ bytes; required with ARCADE_URL, and HOSTING_URL must then be an https:// origin (no path)>
+# ARCADE_CALLBACK_TOKEN=<required with ARCADE_URL; /arc-ingest is not mounted without it>
 # CHAINTRACKS_URL=<defaults to $ARCADE_URL/chaintracks>
 ```
 
@@ -288,8 +273,8 @@ sole broadcaster (local development mode).
 ### App (`app/.env`)
 
 ```env
-VITE_OVERLAY_URL=http://localhost:8080
-VITE_OVERLAY_IDENTITY_KEY=<IDENTITY_PUBLIC_KEY_from_overlay_gen-key>
+VITE_OVERLAY_URL=http://localhost:8081
+VITE_OVERLAY_IDENTITY_KEY=<identity= key from the overlay-go boot log>
 VITE_MESSAGEBOX_URL=https://messagebox.babbage.systems
 ```
 
@@ -297,11 +282,10 @@ VITE_MESSAGEBOX_URL=https://messagebox.babbage.systems
 
 ## Key Dependencies
 
-- **@bsv/sdk** `^2.8.11` in the overlay, `^2.1.6` in the app and `lib/` — core blockchain and transaction utilities.
-- **@bsv/templates** `^1.9.0` — `MandalaToken` / `MandalaAdmin` script templates. App and overlay MUST run the same version (assetId byte-order encoding must agree).
-- **@bsv/overlay** `^2.6.2` — overlay engine + Knex/Mongo storage.
-- **@bsv/overlay-express** `^2.7.3` — Express host for the overlay HTTP API.
-- **@bsv/overlay-topics** `^1.6.0` — `tm_mandala` topic manager + `ls_mandala` lookup service + `MandalaStorageManager`.
+- **go-overlay-services** `v1.3.7` / **go-sdk** `v1.7.1` — overlay engine and blockchain primitives (`overlay-go/`).
+- **mongo-driver** `v2` — the overlay's only storage driver.
+- **@bsv/sdk** `^2.1.6` in the app and `lib/` — core blockchain and transaction utilities.
+- **@bsv/templates** `^1.9.0` — `MandalaToken` / `MandalaAdmin` script templates. App and overlay MUST agree on the script encoding (assetId byte order).
 - **@bsv/identity-react** `^1.1.14` — identity resolution hooks.
 - **@bsv/message-box-client** `^2.2.0` — peer-to-peer transfer handoff.
 - **React 19 / Vite 6 / Tailwind CSS 4** — frontend stack.
@@ -320,13 +304,13 @@ VITE_MESSAGEBOX_URL=https://messagebox.babbage.systems
 
 ### App won't connect to overlay
 
-- Verify `VITE_OVERLAY_URL=http://localhost:8080`.
-- Check overlay is running: `curl http://localhost:8080/health`.
+- Verify `VITE_OVERLAY_URL=http://localhost:8081`.
+- Check overlay is running: `curl http://localhost:8081/health/ready`.
 - Clear browser cache and restart dev server.
 
 ### Issuer console not appearing
 
-- Ensure wallet identity key matches overlay's `IDENTITY_PUBLIC_KEY` (from `npm run gen-key`).
+- Ensure wallet identity key matches the overlay's `identity=` key (overlay-go boot log).
 - Check `app/.env` has correct `VITE_OVERLAY_IDENTITY_KEY`.
 
 ### `overlay rejected the transaction` after a dependency bump

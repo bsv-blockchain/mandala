@@ -1,0 +1,28 @@
+# Default local stack: the Go overlay + MongoDB. MongoDB is the overlay's only
+# datastore (engine outputs/BEEF via internal/enginestore, mandala projections
+# via internal/mandala) — no SQLite, MySQL or Postgres, and no data volume on
+# the overlay container itself.
+#
+#   cp .env.example .env   # set SERVER_PRIVATE_KEY (openssl rand -hex 32)
+#   docker compose up --build
+#
+# Serves on host port 8081 (HOSTING_URL in .env.example, VITE_OVERLAY_URL in
+# app/.env.example). The boot log prints `identity=<pubkey>` — that is the
+# app's VITE_OVERLAY_IDENTITY_KEY.
+services:
+  mongodb:
+    image: mongo:7
+    ports: ["27017:27017"]
+    volumes: ["mongo-data:/data/db"]
+  overlay-go:
+    build: .
+    env_file: .env
+    environment:
+      MONGO_URL: mongodb://mongodb:27017/mandala
+    ports: ["8081:8080"]
+    depends_on: ["mongodb"]
+    # Graceful shutdown waits up to 10s (cmd/overlay/main.go shutdownTimeout);
+    # compose must not SIGKILL before that deadline.
+    stop_grace_period: 15s
+volumes:
+  mongo-data:
