@@ -427,6 +427,11 @@ const main = async (): Promise<void> => {
   // the newest-first sort's index is ensured here, at boot.
   const linkageCol = lookupDb.collection('mandalaLinkageRecords')
   await linkageCol.createIndex({ createdAt: -1 })
+  // The paged admin-history route above reads { tokenId } newest-first by
+  // admitSeq; the package's own history indexes lead with height/txid, so
+  // without this one Mongo sorts in memory. Same §9.9 failure semantics as the
+  // linkage index: awaited, so a failure aborts the boot.
+  await lookupDb.collection('mandalaAdminHistory').createIndex({ tokenId: 1, admitSeq: -1 })
 
   server.app.options('/admin/activity', adminCors(ADMIN_CORS_ORIGINS))
   server.app.get('/admin/activity', ...adminGate, (req: Request, res: Response) => {

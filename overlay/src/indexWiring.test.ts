@@ -177,6 +177,16 @@ describe('index.ts — boot safety (§9.9)', () => {
     expect(orderOf(CODE, names)).toEqual(names)
   })
 
+  // F1 — the paged admin-history route sorts by { tokenId, admitSeq: -1 }; without
+  // this index Mongo sorts in memory and a long history hits the sort limit.
+  it('creates the admin-history page index next to the linkage index, awaited, before start', () => {
+    const line = "await lookupDb.collection('mandalaAdminHistory').createIndex({ tokenId: 1, admitSeq: -1 })"
+    expect(CODE).toContain(line)
+    const names = ["await linkageCol.createIndex({ createdAt: -1 })", line, 'await server.start()']
+    expect(orderOf(CODE, names)).toEqual(names)
+    expect(CODE).toMatch(/await linkageCol\.createIndex\(\{ createdAt: -1 \}\)\s*\n\s*await lookupDb\.collection\('mandalaAdminHistory'\)\.createIndex/)
+  })
+
   it('never swallows any other boot index creation either', () => {
     const sites = CODE.split('\n').filter(l => l.includes('createIndex('))
     expect(sites.length).toBeGreaterThan(0)
