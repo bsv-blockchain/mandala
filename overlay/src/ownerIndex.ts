@@ -35,7 +35,14 @@ const errorClass = (e: unknown): string => {
   return /^[A-Za-z_$][\w$]{0,63}$/.test(e.name) ? e.name : 'Error'
 }
 
-const classes = (es: readonly unknown[]): string => [...new Set(es.map(errorClass))].sort().join(', ')
+/** At most this many distinct classes are named; the rest are counted (F2: a bounded message). */
+const MAX_CLASSES = 5
+
+const classes = (es: readonly unknown[]): string => {
+  const all = [...new Set(es.map(errorClass))].sort()
+  const shown = all.slice(0, MAX_CLASSES).join(', ')
+  return all.length > MAX_CLASSES ? `${shown}, +${all.length - MAX_CLASSES} more` : shown
+}
 
 /** Counts and error classes only (F2): what readiness may say in public. */
 const summarize = (refoldErrors: readonly unknown[], reconcileErrors: ReadonlyArray<{ topic: string, error: unknown }>): string | null => {
@@ -115,10 +122,12 @@ export class OwnerIndexMaintenance {
 
   private async run (): Promise<void> {
     const log = this.deps.log ?? (() => {})
+    // Hoisted: a reconcile step that cannot start must not lose the refold's summary.
+    let refoldErrors: unknown[] = []
     try {
       const errors: string[] = []
       // Step 1, submit gate only (released before step 2).
-      const refoldErrors = await this.refold(errors, log)
+      refoldErrors = await this.refold(errors, log)
       // Logged now, so a reconcile lock that never frees cannot hide them.
       for (const er of errors.splice(0)) log(`[mandala] owner index error: ${er}`)
       // Step 2, reconcile lock only.
@@ -137,7 +146,9 @@ export class OwnerIndexMaintenance {
         this.current = { lastRunAt: new Date().toISOString(), lastError: summarize(refoldErrors, reconcileErrors), unrepairable }
       })
     } catch (e) {
-      this.current = { ...this.current, lastError: `owner index run failed (${errorClass(e)})` }
+      const refold = summarize(refoldErrors, [])
+      const failed = `owner index run failed (${errorClass(e)})`
+      this.current = { ...this.current, lastError: refold == null ? failed : `${failed}; ${refold}` }
       try { log(`[mandala] owner index run failed: ${msg(e)}`) } catch { /* logging must not throw */ }
     }
     this.failures = this.current.lastError == null ? 0 : this.failures + 1

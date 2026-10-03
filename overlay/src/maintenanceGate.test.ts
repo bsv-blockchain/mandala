@@ -131,9 +131,10 @@ describe('gateSubmits over real express', () => {
   })
 })
 
-// Task 13 — eviction holds BOTH the reconcile lock and the submit gate, always
-// in that order (reconcile lock first), the same order a refolding owner-index
-// run uses, so no two holders can wait on each other.
+// Task 13 — eviction is the only holder of BOTH the reconcile lock and the
+// submit gate, always in that order (reconcile lock first). The owner-index run
+// takes the gate (refold) and the lock (reconcile) one at a time, never nested,
+// so nobody holds the gate while waiting on the lock and no cycle can form.
 describe('reconcileThenSubmitGate (the eviction quiesce)', () => {
   it('acquires the reconcile lock first, then the submit gate, and runs fn under both', async () => {
     const reconcileLock = new MaintenanceGate(); const gate = new MaintenanceGate()

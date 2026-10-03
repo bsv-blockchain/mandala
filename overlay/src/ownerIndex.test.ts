@@ -133,18 +133,53 @@ describe('OwnerIndexMaintenance', () => {
     expect(overlap).toEqual([false, false])
     expect(m.status().lastError).toBeNull()
   })
-  it('a reconcile lock held past its drain timeout is a recorded failure, never a throw', async () => {
+  it('a reconcile lock held past its drain timeout is a recorded failure, never a throw; refold errors are logged before the wait', async () => {
     const reconcileLock = new MaintenanceGate({ drainTimeoutMs: 20 })
-    const { m, calls } = mk({ reconcileLock })
+    const logs: string[] = []
+    let failA = true
+    const { m, calls } = mk({
+      reconcileLock,
+      log: (l: string) => logs.push(l),
+      lookup: {
+        tokenIdsWithHistory: async () => { calls.push('ids'); return ['a'.repeat(64) + '_0', 'b'.repeat(64) + '_0'] },
+        rebuildState: async (id: string) => { calls.push('rebuild:' + id.slice(0, 1)); if (failA && id[0] === 'a') throw Object.assign(new Error('fold broke at secret-host'), { name: 'FoldError' }) }
+      }
+    })
     let release!: () => void
     const holder = reconcileLock.exclusive(() => new Promise<void>(r => { release = r }))
     await new Promise(r => setImmediate(r))
     await expect(m.runOnce()).resolves.toBeUndefined()
-    expect(calls.filter(c => c.startsWith('reconcile'))).toEqual([])
-    expect(m.status().lastError).toBe('owner index run failed (MaintenanceBusyError)')
+    // The refold step ran in full; the reconcile step never did.
+    expect(calls).toEqual(['ids', 'rebuild:a', 'rebuild:b'])
+    // The refold error reached the log although the run then failed on the lock.
+    const refoldErrorLogs = logs.filter(l => l.startsWith('[mandala] owner index error: refold ' + 'a'.repeat(64) + '_0: FoldError: fold broke at secret-host'))
+    expect(refoldErrorLogs).toHaveLength(1)
+    expect(logs.indexOf(refoldErrorLogs[0])).toBeLessThan(logs.findIndex(l => l.startsWith('[mandala] owner index run failed:')))
+    // Both failures are in the public summary: bounded, classes only.
+    expect(m.status().lastError).toBe('owner index run failed (MaintenanceBusyError); refold failed for 1 token(s) (FoldError)')
+    expect(m.status().lastError).not.toContain('secret-host')
     release(); await holder
+    failA = false
     await m.runOnce()
     expect(m.status().lastError).toBeNull()
+  })
+  it('a reconcile-lock timeout after a clean refold reports the lock failure alone', async () => {
+    const reconcileLock = new MaintenanceGate({ drainTimeoutMs: 20 })
+    const { m } = mk({ reconcileLock })
+    let release!: () => void
+    const holder = reconcileLock.exclusive(() => new Promise<void>(r => { release = r }))
+    await new Promise(r => setImmediate(r))
+    await m.runOnce()
+    expect(m.status().lastError).toBe('owner index run failed (MaintenanceBusyError)')
+    release(); await holder
+  })
+  it('the public message stays bounded however many distinct error classes the refold sees', async () => {
+    const ids = Array.from({ length: 40 }, (_, i) => String(i).padStart(64, '0') + '_0')
+    const { m } = mk({ lookup: { tokenIdsWithHistory: async () => ids, rebuildState: async (id: string) => { throw Object.assign(new Error('x'), { name: 'Err' + 'Z'.repeat(50) + id.slice(62, 64) }) } } })
+    await m.runOnce()
+    const msg = m.status().lastError!
+    expect(msg).toMatch(/^refold failed for 40 token\(s\) \(.*, \+35 more\)$/)
+    expect(msg.length).toBeLessThan(600)
   })
   it('reports unrepairable outpoints as degraded (not critical)', async () => {
     const { m } = mk({ reconcile: async (t: string) => ({ scanned: 2, repaired: 0, unrepairable: t === 'tm_mandala' ? ['c'.repeat(64) + '.1'] : [] }) })
@@ -282,7 +317,7 @@ describe('OwnerIndexMaintenance', () => {
       const state = { runs: 0, fail: true }
       const { m } = mk({
         lookup: { tokenIdsWithHistory: async () => [], rebuildState: async () => {} },
-        // Counted on the first topic: after the boot refold, runs reconcile only.
+        // Counted on the first topic's reconcile: one per run that reaches step 2.
         reconcile: async (t: string) => { if (t === 'tm_mandala') state.runs++; if (state.fail) throw new Error('down'); return { scanned: 0, repaired: 0, unrepairable: [] } }
       })
       return { m, state }
