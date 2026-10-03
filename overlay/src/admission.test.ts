@@ -319,6 +319,22 @@ describe('/submit refusal — FIX D verdict taxonomy (contract §2)', () => {
     expect(store.refusals).toHaveLength(0)
   })
 
+  // F6 — a reject from a second package copy carrying a code this overlay
+  // does not shape is untyped: 400 ERR_SHAPE, never persisted, never a 200.
+  it('a structural reject with an unshaped code answers 400 ERR_SHAPE and is NOT persisted', async () => {
+    const store = memStore()
+    const channel = new SubmitSideChannel()
+    const h = harness({ priv, store, channel })
+    await h.nexted
+    channel.noteReject(h.txid, Object.assign(new Error('a newer rule refused this'), { name: 'MandalaReject', code: 'ERR_NEW_THING', reason: 'a newer rule refused this' }))
+    h.res.json({ tm_mandala: { outputsToAdmit: [], coinsToRetain: [] } })
+    const { status, body } = await h.sent
+    expect(status).toBe(400)
+    expect(body).toEqual({ status: 'error', code: 'ERR_SHAPE', retryable: false, description: 'a newer rule refused this', message: 'a newer rule refused this' })
+    expect(store.refusals).toHaveLength(0)
+    expect(store.rows[h.txid]?.refusedCode).toBeUndefined()
+  })
+
   // Parity item 3: the record is keyed by txid alone, so persisting a
   // registry-only refusal would refuse a later, valid token submit of the same
   // bytes forever.

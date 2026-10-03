@@ -128,6 +128,10 @@ describe('typed manager codes (spec §6.3)', () => {
     const e = Object.assign(new Error('r'), { name: 'MandalaReject', code: 'ERR_FROZEN', reason: 'r' })
     expect(codeOfManagerError(e)).toBe('ERR_FROZEN')
   })
+  it('leaves a structural reject with a code this overlay does not shape untyped (F6)', () => {
+    const e = Object.assign(new Error('r'), { name: 'MandalaReject', code: 'ERR_NEW_THING', reason: 'r' })
+    expect(codeOfManagerError(e)).toBeUndefined()
+  })
   it('maps InputSpentError structurally', () => {
     expect(codeOfManagerError(new InputSpentError('a'.repeat(64) + '.0', 'b'.repeat(64)))).toBe('ERR_INPUT_SPENT')
   })

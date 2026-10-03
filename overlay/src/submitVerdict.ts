@@ -98,12 +98,18 @@ void _packageCodesAreContractCodes
  * The contract code a topic-manager throw carries STRUCTURALLY (spec §6.3), or
  * undefined. Never derived from wording: a MandalaReject carries `.code`
  * (isMandalaReject is name-based, so a second package copy still matches), and
- * the spent-input guard's InputSpentError is ERR_INPUT_SPENT by type. Anything
- * else (a package bug, an unreadable BEEF) is untyped: answered 400 ERR_SHAPE
+ * the spent-input guard's InputSpentError is ERR_INPUT_SPENT by type. A
+ * reject whose code this overlay does not shape, and anything else (a package
+ * bug, an unreadable BEEF), is untyped: answered 400 ERR_SHAPE
  * but never persisted (see admission.ts `refuse`).
  */
 export const codeOfManagerError = (e: unknown): VerdictCode | undefined => {
-  if (isMandalaReject(e)) return e.code
+  // F6 — isMandalaReject is structural, so a reject from a second package copy
+  // passes with that copy's code set. A code this overlay does not shape is
+  // untyped (400 ERR_SHAPE, unpersisted), never passed on: SHAPES has no entry
+  // for it, and the /submit path would otherwise answer from undefined. An own
+  // key, so an inherited name ('toString', '__proto__') is no code either.
+  if (isMandalaReject(e)) return Object.hasOwn(SHAPES, e.code) ? e.code : undefined
   if (e instanceof InputSpentError) return 'ERR_INPUT_SPENT'
   return undefined
 }
