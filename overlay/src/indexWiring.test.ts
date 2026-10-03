@@ -149,6 +149,15 @@ describe('index.ts — maintenance: quiesced /submit, owner index before start',
     expect(CODE).not.toMatch(/reconcileLock\.enter\(/)
   })
 
+  it('runs the engine migrations after configureEngine and before the boot owner-index run', () => {
+    const cfg = CODE.indexOf('await server.configureEngine(false)')
+    const mig = CODE.indexOf('runEngineMigrations(')
+    const boot = CODE.indexOf('await ownerIndex.runOnce()')
+    expect(cfg).toBeGreaterThan(0)
+    expect(mig).toBeGreaterThan(cfg)
+    expect(mig).toBeLessThan(boot)
+  })
+
   it('pins the 30-minute reconcile interval', () => {
     expect(OWNER_INDEX_INTERVAL_MS).toBe(1_800_000)
     expect(OWNER_INDEX_RETRY_BASE_MS).toBe(10_000)

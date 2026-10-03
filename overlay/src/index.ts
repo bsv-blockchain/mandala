@@ -23,6 +23,7 @@ import { adminAuth, adminCors, parseAdminCorsOrigins, warnIfAdminAuthDisabled } 
 import { readBootConfig } from './bootConfig.js'
 import { createShutdown } from './shutdown.js'
 import { withArcadeStatusParity } from './arcadeParity.js'
+import { runEngineMigrations } from './engineMigrations.js'
 import { knexEngineOutputs } from './engineOutputs.js'
 import { MaintenanceGate, gateSubmits, reconcileThenSubmitGate } from './maintenanceGate.js'
 import { OwnerIndexMaintenance, OWNER_INDEX_INTERVAL_MS } from './ownerIndex.js'
@@ -484,6 +485,9 @@ const main = async (): Promise<void> => {
 
   // Boot refold + reconcile BEFORE the first submit is accepted (start() is
   // where the server begins listening), then the interval.
+  // overlay-express only migrates inside start(); the boot reconcile needs the
+  // engine tables first. start()'s own migrate.latest is then a no-op.
+  await runEngineMigrations(server.knex!, server.migrationsToRun as any[])
   await ownerIndex.runOnce()
   ownerIndex.start(OWNER_INDEX_INTERVAL_MS)
   await server.start()
