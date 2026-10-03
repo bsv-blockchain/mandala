@@ -1,6 +1,16 @@
 # Mandala demo runbook (agent pickup)
 
-Last updated: 2026-09-15. TS overlay (`:8080`) rebuilt from `overlay/dist` and restarted **~23:44 local** (superseding the earlier ~22:35 restart below — this rebuild ships wire contract v2: digest v2, the `/submit` verdict taxonomy, `GET /admin/admission/:txid`, reject-not-skip, eviction restore, admission records; see "Settlement contract (2026-09-15)" below). Restart log: `/private/tmp/claude-502/-Users-personal-git-demos-mandala/1d8c5cb1-3448-49bc-b255-3df7840f24b8/scratchpad/overlay.log`. `overlay/vitest.config.ts` now scopes vitest to `src/**/*.test.ts` (excludes the stale compiled copies `npm run build` emits into `dist/`). App (`:5173`) and Mongo `local-mongo-1` already running. `overlay-go` (`:8081`) is **not** running. Registry head unchanged through this restart (`dc810603…:0`, admitSeq 2) — that sequence is now persisted in Mongo (`mandalaCounters`), so it survives a restart. Resume by continuing the identity-admin admit.
+Last updated: 2026-10-03. TS overlay (`:8080`) runs the **BRC-162 P2 build** (feat/brc162: @bsv/overlay-topics/templates 2.0.0 from vendored tarballs in overlay/vendor) on a **fresh node**: `NODE_NAME=mandala162` → Mongo db `mandala162_lookup_services`, `SQLITE_FILE=/tmp/mandala162-overlay.sqlite`. Started via `.claude/launch.json` `mandala-overlay`; boot log shows `engine migrations`, `owner index refold`, and `owner index tm_mandala: scanned …` lines, then ready. The old-format state (`mandala_lookup_services`, `/tmp/mandala-overlay.sqlite`) is untouched and obsolete. Never point the P2 build at it; there is no boot guard. `overlay/.env` pre-P2 backup: `overlay/.env.bak-premandala162`.
+
+Previous (2026-09-15): TS overlay (`:8080`) rebuilt from `overlay/dist` and restarted **~23:44 local** (superseding the earlier ~22:35 restart below — this rebuild ships wire contract v2: digest v2, the `/submit` verdict taxonomy, `GET /admin/admission/:txid`, reject-not-skip, eviction restore, admission records; see "Settlement contract (2026-09-15)" below). Restart log: `/private/tmp/claude-502/-Users-personal-git-demos-mandala/1d8c5cb1-3448-49bc-b255-3df7840f24b8/scratchpad/overlay.log`. `overlay/vitest.config.ts` now scopes vitest to `src/**/*.test.ts` (excludes the stale compiled copies `npm run build` emits into `dist/`). App (`:5173`) and Mongo `local-mongo-1` already running. `overlay-go` (`:8081`) is **not** running. Registry head unchanged through this restart (`dc810603…:0`, admitSeq 2) — that sequence is now persisted in Mongo (`mandalaCounters`), so it survives a restart. Resume by continuing the identity-admin admit.
+
+## BRC-162 P2 overlay (2026-10-03)
+
+- `MANDALA_ISSUER_KEYS` (required, JSON array of compressed identity pubkeys, lowercase) is set to `["0215643bc656ca42007faa32e94f70050f64a566ffd9e3a2ebc098389936dea57e"]`, the overlay admin identity. Boot fails if it is missing or invalid.
+- Readiness: `GET /health/ready` is **public** and includes the non-critical `mandala-owner-index` check (degraded before the first run, on error, or when rows are unrepairable). Messages carry counts and error classes only.
+- Maintenance: at boot and every 30 min, the overlay refolds all tokens with `/submit` briefly paused (log: `owner index refold: N token(s) in Xms`, watch it), then reconciles while submits keep flowing. An eviction can answer a retryable 503 if a pass exceeds 60s.
+- v3 admin routes are keyed by tokenId `<txid>_0`: `/admin/authorities/:tokenId`, `/admin/authorities/beef/:txid`, `/admin/asset-state/:tokenId`, `/admin/admin-history[-page]/:tokenId`, `/admin/admin-summary/:tokenId`. An old `txid.vout` id answers 400. `/admin/asset-auth*` is gone.
+- The wallet and the lib can't produce BRC-162 transactions until P4 (lib) and P6 (wallet). P2 is proven by `overlay/src/brc162Flow.test.ts` on the real engine.
 
 Do **not** print `SERVER_PRIVATE_KEY` (or any other hex private key) in chat.
 
@@ -75,7 +85,7 @@ App treats `identityKey === VITE_OVERLAY_IDENTITY_KEY` as issuer. Overlay admin 
 | Piece | How | URL |
 | --- | --- | --- |
 | Mongo | Existing Docker `local-mongo-1` replica set. **Do not stop it.** | `127.0.0.1:27017` |
-| Overlay | **Native Node 24** (`engines: >=24 <25`), not Compose. Rebuilt from `overlay/dist` + restarted ~23:44 local (2026-09-15, wire contract v2 build; supersedes an earlier ~22:35 restart same day). | `http://localhost:8080` (`HOSTING_URL=https://deggen.ngrok.app`) |
+| Overlay | **Native Node 24**, BRC-162 P2 build, NODE_NAME=mandala162, started via launch.json (2026-10-03). | `http://localhost:8080` (`HOSTING_URL=https://deggen.ngrok.app`) |
 | overlay-go | Not running this session. Compose service in `overlay/docker-compose.yml`, published on host `:8081`. | `http://localhost:8081` |
 | Vite app | `app/` | `http://127.0.0.1:5173/` (`VITE_OVERLAY_URL=https://deggen.ngrok.app`) |
 | ngrok | User runs it | `https://deggen.ngrok.app` → `http://localhost:8080` |
@@ -94,9 +104,10 @@ docker start local-mongo-1   # if exited
 # a trailing newline from a secret store fails it) and HOSTING_URL is an https
 # ORIGIN (no path/query/credentials; https://deggen.ngrok.app qualifies).
 # Generate a token once, e.g. `openssl rand -hex 32`, and keep it in overlay/.env.
+# P2: overlay/.env must set NODE_NAME=mandala162 and MANDALA_ISSUER_KEYS
 cd overlay
 MONGO_URL=mongodb://127.0.0.1:27017/mandala \
-SQLITE_FILE=/tmp/mandala-overlay.sqlite \
+SQLITE_FILE=/tmp/mandala162-overlay.sqlite \
 npm start
 # after code changes: npm run build && npm start  (start runs dist/index.js)
 
