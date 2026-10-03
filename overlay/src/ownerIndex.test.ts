@@ -40,7 +40,7 @@ describe('OwnerIndexMaintenance', () => {
     let fail = true
     const { m } = mk({ reconcile: async () => { if (fail) throw new Error('mongo down'); return { scanned: 0, repaired: 0, unrepairable: [] } } })
     await expect(m.runOnce()).resolves.toBeUndefined()
-    expect(m.status().lastError).toMatch(/mongo down/)
+    expect(m.status().lastError).toBe('reconcile tm_mandala failed (Error); reconcile tm_mandala_registry failed (Error)')
     expect((await m.healthCheck().handler()).status).toBe('degraded')
     fail = false; await m.runOnce()
     expect(m.status().lastError).toBeNull()
@@ -50,7 +50,7 @@ describe('OwnerIndexMaintenance', () => {
     const { calls, m } = mk({ lookup: { tokenIdsWithHistory: async () => ['a'.repeat(64) + '_0'], rebuildState: async () => { throw new Error('fold') } } })
     await m.runOnce()
     expect(calls).toContain('reconcile:tm_mandala')
-    expect(m.status().lastError).toMatch(/fold/)
+    expect(m.status().lastError).toBe('refold failed for 1 token(s) (Error)')
   })
   it('degraded before the first run completes', async () => {
     const { m } = mk()
@@ -74,23 +74,69 @@ describe('OwnerIndexMaintenance', () => {
     const release = await gate.enter()
     await expect(m.runOnce()).resolves.toBeUndefined()
     expect(calls).toEqual([])
-    expect(m.status().lastError).toMatch(/maintenance gate busy/)
+    expect(m.status().lastError).toBe('owner index run failed (MaintenanceBusyError)')
     expect((await m.healthCheck().handler()).status).toBe('degraded')
     release()
     await m.runOnce()
     expect(m.status().lastError).toBeNull()
     expect((await m.healthCheck().handler()).status).toBe('ok')
   })
-  it('bounds readiness error text for many failing refolds; full list goes to the log', async () => {
+  // F2 — /health/ready is public: its message carries counts and error classes
+  // only, never driver text (hosts, URLs, credentials). Full text is logged.
+  const mongoErr = (): Error => Object.assign(new Error('connect ECONNREFUSED mongodb://admin:hunter2@secret-host:27017 ' + 'x'.repeat(500)), { name: 'MongoNetworkError' })
+  const leaks = (s: string | null | undefined): boolean => s != null && /mongodb:|secret-host|hunter2|ECONNREFUSED|27017/.test(s)
+
+  it('the public readiness message for many failing refolds is a count and a class; full text goes to the log', async () => {
     const logs: string[] = []
     const ids = Array.from({ length: 50 }, (_, i) => String(i).padStart(64, '0') + '_0')
-    const { m } = mk({ log: (l: string) => logs.push(l), lookup: { tokenIdsWithHistory: async () => ids, rebuildState: async () => { throw new Error('mongodb://secret-host:27017 ' + 'x'.repeat(500)) } } })
+    const { m } = mk({ log: (l: string, e?: unknown) => logs.push(l + (e != null ? ` ${String(e)}` : '')), lookup: { tokenIdsWithHistory: async () => ids, rebuildState: async () => { throw mongoErr() } } })
     await m.runOnce()
     const r = await m.healthCheck().handler()
     expect(r.status).toBe('degraded')
-    expect(r.message!.length).toBeLessThan(1000)
-    expect(r.message!.startsWith('50 owner-index error(s)')).toBe(true)
-    expect(logs.filter(l => l.includes('owner index error:')).length).toBe(50)
+    expect(r.message).toBe('refold failed for 50 token(s) (MongoNetworkError)')
+    expect(leaks(r.message)).toBe(false)
+    expect(leaks(JSON.stringify(r))).toBe(false)
+    expect(leaks(m.status().lastError)).toBe(false)
+    const errorLogs = logs.filter(l => l.includes('owner index error:'))
+    expect(errorLogs.length).toBe(50)
+    expect(errorLogs.every(l => l.includes('secret-host'))).toBe(true)
+  })
+
+  it('names each failed reconcile topic with its error class, never the driver text', async () => {
+    const { m } = mk({
+      lookup: {
+        tokenIdsWithHistory: async () => ['a'.repeat(64) + '_0', 'b'.repeat(64) + '_0'],
+        rebuildState: async () => { throw mongoErr() }
+      },
+      reconcile: async (t: string) => { if (t === 'tm_mandala') throw mongoErr(); return { scanned: 0, repaired: 0, unrepairable: [] } }
+    })
+    await m.runOnce()
+    const r = await m.healthCheck().handler()
+    expect(r.message).toBe('refold failed for 2 token(s) (MongoNetworkError); reconcile tm_mandala failed (MongoNetworkError)')
+    expect(leaks(JSON.stringify(r))).toBe(false)
+  })
+
+  it('a failure before the gate (busy, or the id listing) is a class only', async () => {
+    const { m } = mk({ lookup: { tokenIdsWithHistory: async () => { throw mongoErr() }, rebuildState: async () => {} } })
+    await m.runOnce()
+    const r = await m.healthCheck().handler()
+    expect(r.message).toBe('owner index run failed (MongoNetworkError)')
+    expect(leaks(JSON.stringify(r))).toBe(false)
+  })
+
+  it('an error class that is not a plain identifier, or a non-Error throw, is never echoed', async () => {
+    const odd = Object.assign(new Error('x'), { name: 'Evil mongodb://secret-host:27017' })
+    const { m } = mk({ reconcile: async (t: string) => { if (t === 'tm_mandala') throw odd; throw 'mongodb://secret-host:27017' } }) // eslint-disable-line @typescript-eslint/no-throw-literal
+    await m.runOnce()
+    const r = await m.healthCheck().handler()
+    expect(r.message).toBe('reconcile tm_mandala failed (Error); reconcile tm_mandala_registry failed (non-Error)')
+    expect(leaks(JSON.stringify(r))).toBe(false)
+  })
+
+  it('keeps the unrepairable count message', async () => {
+    const { m } = mk({ reconcile: async (t: string) => ({ scanned: 2, repaired: 0, unrepairable: t === 'tm_mandala' ? ['c'.repeat(64) + '.1', 'd'.repeat(64) + '.0'] : [] }) })
+    await m.runOnce()
+    expect((await m.healthCheck().handler()).message).toBe('2 owner index rows unrepairable')
   })
   it('concurrent runOnce calls share the in-flight promise', async () => {
     const { m } = mk()

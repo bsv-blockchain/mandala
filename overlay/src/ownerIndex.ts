@@ -11,15 +11,33 @@ export interface OwnerIndexDeps {
   log?: (msg: string) => void
 }
 
+/** `lastError` is the public summary (counts and error classes only); the full text is logged. */
 export interface OwnerIndexStatus { lastRunAt: string | null, lastError: string | null, unrepairable: string[] }
 
 export interface OwnerIndexHealthResult { status: 'ok' | 'degraded', message?: string, details?: Record<string, unknown> }
 
-const bound = (errors: string[]): string | null => errors.length === 0
-  ? null
-  : `${errors.length} owner-index error(s): ${errors.slice(0, 3).map(e => e.slice(0, 200)).join('; ')}`
-
 const msg = (e: unknown): string => e instanceof Error ? e.message : String(e)
+
+/**
+ * The error's class name, for the PUBLIC readiness message (F2). /health/ready
+ * is unauthenticated, and a driver's message carries hosts, URLs and at times
+ * credentials, so only the class is ever published; the text goes to the log.
+ * A name that is not a plain identifier is reported as `Error`.
+ */
+const errorClass = (e: unknown): string => {
+  if (!(e instanceof Error)) return 'non-Error'
+  return /^[A-Za-z_$][\w$]{0,63}$/.test(e.name) ? e.name : 'Error'
+}
+
+const classes = (es: readonly unknown[]): string => [...new Set(es.map(errorClass))].sort().join(', ')
+
+/** Counts and error classes only (F2): what readiness may say in public. */
+const summarize = (refoldErrors: readonly unknown[], reconcileErrors: ReadonlyArray<{ topic: string, error: unknown }>): string | null => {
+  const parts: string[] = []
+  if (refoldErrors.length > 0) parts.push(`refold failed for ${refoldErrors.length} token(s) (${classes(refoldErrors)})`)
+  for (const { topic, error } of reconcileErrors) parts.push(`reconcile ${topic} failed (${errorClass(error)})`)
+  return parts.length === 0 ? null : parts.join('; ')
+}
 
 /**
  * Boot refold + per-topic owner-index reconcile, repeated on an interval. Runs
@@ -51,24 +69,26 @@ export class OwnerIndexMaintenance {
     try {
       await this.deps.gate.exclusive(async () => {
         const errors: string[] = []
+        const refoldErrors: unknown[] = []
+        const reconcileErrors: Array<{ topic: string, error: unknown }> = []
         const unrepairable: string[] = []
         const ids = await this.deps.lookup.tokenIdsWithHistory()
         for (const id of ids) {
-          try { await this.deps.lookup.rebuildState(id) } catch (e) { errors.push(`refold ${id}: ${msg(e)}`) }
+          try { await this.deps.lookup.rebuildState(id) } catch (e) { refoldErrors.push(e); errors.push(`refold ${id}: ${errorClass(e)}: ${msg(e)}`) }
         }
         for (const topic of this.deps.topics) {
           try {
             const r = await this.deps.reconcile(topic)
             unrepairable.push(...r.unrepairable)
             log(`[mandala] owner index ${topic}: scanned ${r.scanned}, repaired ${r.repaired}, unrepairable ${r.unrepairable.length}`)
-          } catch (e) { errors.push(`reconcile ${topic}: ${msg(e)}`) }
+          } catch (e) { reconcileErrors.push({ topic, error: e }); errors.push(`reconcile ${topic}: ${errorClass(e)}: ${msg(e)}`) }
         }
         for (const er of errors) log(`[mandala] owner index error: ${er}`)
         for (const o of unrepairable) log(`[mandala] owner index UNREPAIRABLE outpoint ${o}`)
-        this.current = { lastRunAt: new Date().toISOString(), lastError: bound(errors), unrepairable }
+        this.current = { lastRunAt: new Date().toISOString(), lastError: summarize(refoldErrors, reconcileErrors), unrepairable }
       })
     } catch (e) {
-      this.current = { ...this.current, lastError: bound([msg(e)]) }
+      this.current = { ...this.current, lastError: `owner index run failed (${errorClass(e)})` }
       try { log(`[mandala] owner index run failed: ${msg(e)}`) } catch { /* logging must not throw */ }
     }
   }
