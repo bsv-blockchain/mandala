@@ -2,7 +2,7 @@ import { afterEach, describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import {
   isTerminalArcStatus, evictWithRestore, arcIngestHandler, mountArcIngest, knexEvictionCoins, journalRestoreInput,
-  type EvictionDeps
+  lookupRetireOutputs, type EvictionDeps
 } from './eviction.js'
 import type { AdmissionRecord, AdmissionStore } from './admission.js'
 import { isInfraError } from './submitVerdict.js'
@@ -30,6 +30,7 @@ const deps = (rec: AdmissionRecord | null, over: Partial<EvictionDeps> = {}) => 
   const restored: string[] = []
   const evicted: string[] = []
   const refolded: string[] = []
+  const retired: string[] = []
   const rows: Record<string, AdmissionRecord> = rec != null ? { [rec.txid]: rec } : {}
   const order: string[] = []
   const store: AdmissionStore = {
@@ -45,11 +46,12 @@ const deps = (rec: AdmissionRecord | null, over: Partial<EvictionDeps> = {}) => 
     isUnspent: async () => { order.push('isUnspent'); return false },
     restoreInput: vi.fn(async (txid: string, vout: number) => { order.push('restore'); restored.push(`${txid}.${vout}`); return true }),
     evict: async (txid, reason) => { order.push('evict'); evicted.push(`${txid}|${reason ?? ''}`); return { evictedOutputs: 1 } },
+    retireOutputs: vi.fn(async (txid: string) => { order.push('retire'); retired.push(txid); return 0 }),
     purgeAndRefold: vi.fn(async (txid: string) => { order.push('refold'); refolded.push(txid); return [TOKEN_A] }),
     now: () => '2026-09-14T09:00:00.000Z',
     ...over
   }
-  return { d, unmarked, restored, evicted, refolded, rows, order }
+  return { d, unmarked, restored, evicted, refolded, retired, rows, order }
 }
 
 describe('isTerminalArcStatus', () => {
@@ -82,7 +84,8 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
     expect(h.restored).toEqual([`${IN0}.0`, `${IN0}.1`])
     expect(h.rows[TXID].evictedAt).toBe('2026-09-14T09:00:00.000Z')
     expect(h.evicted).toEqual([`${TXID}|REJECTED`])
-    expect(h.order).toEqual(['unmark', 'unmark', 'restore', 'restore', 'markEvicted', 'evict', 'refold'])
+    expect(h.order).toEqual(['unmark', 'unmark', 'restore', 'restore', 'markEvicted', 'evict', 'retire', 'refold'])
+    expect(h.retired).toEqual([TXID])
     expect(h.refolded).toEqual([TXID])
     expect(report.restoredOutpoints).toBe(2)
     expect(report.restoredTokenRows).toBe(2)
@@ -142,12 +145,57 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
   it('purgeAndRefold runs after evict, even when alreadyEvicted', async () => {
     const h = deps(record())
     await evictWithRestore(TXID, 'REJECTED', h.d)
-    expect(h.order.slice(-2)).toEqual(['evict', 'refold'])
+    expect(h.order.slice(-3)).toEqual(['evict', 'retire', 'refold'])
     const again = deps(record({ evictedAt: '2026-09-13T00:00:00.000Z' }))
     const rep = await evictWithRestore(TXID, 'REJECTED', again.d)
     expect(rep.alreadyEvicted).toBe(true)
-    expect(again.order).toEqual(['markEvicted', 'evict', 'refold'])
+    expect(again.order).toEqual(['markEvicted', 'evict', 'retire', 'refold'])
     expect(again.refolded).toEqual([TXID])
+  })
+
+  // F4 — Engine.evictAppliedTransaction swallows a lookup's outputEvicted
+  // failure and deletes the outputs anyway, which would orphan the tx's own
+  // token/authority rows (and their balance credit). The host retires them
+  // itself, between evict and refold, on every run.
+  it('retires the evicted tx\'s own index rows after evict and before refold, and reports the count', async () => {
+    const h = deps(record(), { retireOutputs: vi.fn(async () => { return 3 }) })
+    const rep = await evictWithRestore(TXID, 'REJECTED', h.d)
+    expect(h.d.retireOutputs).toHaveBeenCalledWith(TXID)
+    expect(h.d.retireOutputs).toHaveBeenCalledTimes(1)
+    expect(rep.retiredRows).toBe(3)
+  })
+
+  it('a retireOutputs failure is a retryable InfraError and the refold is not reached', async () => {
+    const h = deps(record(), { retireOutputs: vi.fn(async () => { throw new Error('mongo down') }) })
+    const err = await evictWithRestore(TXID, 'REJECTED', h.d).catch((e: unknown) => e)
+    expect(isInfraError(err)).toBe(true)
+    expect((err as Error).message).toMatch(/retry/)
+    expect(h.evicted).toEqual([`${TXID}|REJECTED`])
+    expect(h.refolded).toEqual([])
+  })
+
+  it('still retires on the alreadyEvicted path, so a retry converges', async () => {
+    const h = deps(record({ evictedAt: '2026-09-13T00:00:00.000Z' }))
+    const rep = await evictWithRestore(TXID, 'REJECTED', h.d)
+    expect(rep.alreadyEvicted).toBe(true)
+    expect(h.retired).toEqual([TXID])
+    expect(h.order).toEqual(['markEvicted', 'evict', 'retire', 'refold'])
+  })
+
+  it('lookupRetireOutputs evicts each indexed outpoint once, always probes vout 0 (deploy metadata), and counts rows', async () => {
+    const seen: string[] = []
+    const retire = lookupRetireOutputs(async () => [2, 0, 2, 5], async (t, v) => { seen.push(`${t}.${v}`) })
+    expect(await retire(TXID)).toBe(3)
+    expect(seen).toEqual([`${TXID}.0`, `${TXID}.2`, `${TXID}.5`])
+    const none: string[] = []
+    const retireNone = lookupRetireOutputs(async () => [], async (t, v) => { none.push(`${t}.${v}`) })
+    expect(await retireNone(TXID)).toBe(0)
+    expect(none).toEqual([`${TXID}.0`])
+  })
+
+  it('lookupRetireOutputs propagates a finder or lookup failure (the caller makes it an InfraError)', async () => {
+    await expect(lookupRetireOutputs(async () => { throw new Error('find') }, async () => {})(TXID)).rejects.toThrow('find')
+    await expect(lookupRetireOutputs(async () => [1], async () => { throw new Error('take') })(TXID)).rejects.toThrow('take')
   })
 
   it('a purgeAndRefold failure is a retryable InfraError', async () => {
@@ -174,11 +222,12 @@ describe('evictWithRestore — FIX E (contract §5)', () => {
       ...h.d, quiesce,
       restoreInput: wrap('restore', h.d.restoreInput),
       evict: wrap('evict', h.d.evict),
+      retireOutputs: wrap('retire', h.d.retireOutputs),
       purgeAndRefold: wrap('refold', h.d.purgeAndRefold)
     }
     await evictWithRestore(TXID, 'REJECTED', d)
     expect(quiesceCalls).toBe(1)
-    expect(seen).toEqual(['enter', 'restore', 'restore', 'evict', 'refold', 'exit'])
+    expect(seen).toEqual(['enter', 'restore', 'restore', 'evict', 'retire', 'refold', 'exit'])
   })
 
   it('a quiesce that rejects with MaintenanceBusyError becomes a retryable InfraError and runs nothing', async () => {

@@ -23,8 +23,9 @@
  * unmarked.
  *
  * Order (contract §5): unmark spent → restore owner rows from the journal →
- * stamp `evictedAt` → delete the evicted outputs as today → `purgeAndRefold`
- * (drop the tx's history rows and refold the tokens they touched). Everything
+ * stamp `evictedAt` → delete the evicted outputs as today → retire the evicted
+ * tx's own index rows (`retireOutputs`, below) → `purgeAndRefold` (drop the
+ * tx's history rows and refold the tokens they touched). Everything
  * is idempotent, so a 503 retry after any failure redoes the sequence and
  * converges. `evictedAt` lands BEFORE the deletion so a /submit racing the
  * callback already sees the 410 verdict rather than re-admitting the same
@@ -74,6 +75,16 @@ export interface EvictionDeps {
   restoreInput: (txid: string, vout: number) => Promise<boolean>
   /** `engine.evictAppliedTransaction(txid, { reason })`. */
   evict: (txid: string, reason?: string) => Promise<unknown>
+  /**
+   * Remove the evicted tx's OWN token/authority index rows (debiting a value
+   * row's owner) that are still present after `evict`. The engine swallows a
+   * lookup's `outputEvicted` failure and deletes the outputs anyway, so without
+   * this a failed notification leaves a phantom row and balance credit that
+   * nothing repairs (the engine outputs it would be checked against are gone).
+   * Returns the number of rows found. A missing row is a no-op; MUST be
+   * idempotent. Runs on every attempt, alreadyEvicted included.
+   */
+  retireOutputs: (txid: string) => Promise<number>
   /**
    * The package's `purgeAndRefold(txid)`: drop the history rows the evicted tx
    * produced and refold every token they touched. Idempotent.
@@ -127,11 +138,53 @@ export const journalRestoreInput = (
   return journal == null ? false : await restoreInputRow(journal)
 }
 
+/**
+ * The production `retireOutputs`: every vout of `txid` that still has an index
+ * row (`findIndexedVouts`), each handed to the lookup's own `outputEvicted`
+ * (which takes the value row and debits its owner, or else the authority row,
+ * and drops the deploy metadata at vout 0). Vout 0 is always probed, so deploy
+ * metadata whose delete failed in the engine's notification is dropped too;
+ * on a vout with no row `outputEvicted` is a no-op. Returns the number of
+ * distinct vouts that had a row.
+ */
+export const lookupRetireOutputs = (
+  findIndexedVouts: (txid: string) => Promise<number[]>,
+  outputEvicted: (txid: string, vout: number) => Promise<void>
+): EvictionDeps['retireOutputs'] => async (txid) => {
+  const found = [...new Set(await findIndexedVouts(txid))]
+  const vouts = [...new Set([0, ...found])].sort((a, b) => a - b)
+  for (const vout of vouts) await outputEvicted(txid, vout)
+  return found.length
+}
+
+interface DbLike {
+  collection: (name: string) => {
+    find: (filter: object, options?: object) => { toArray: () => Promise<unknown[]> }
+  }
+}
+
+/**
+ * The vouts of `txid` with a row in the package's value or authority index.
+ * The package exposes no find-by-txid, so this reads its two collections
+ * directly (both are indexed on `{ txid, outputIndex }`); every mutation still
+ * goes through the package (`outputEvicted`).
+ */
+export const mongoIndexedVouts = (db: DbLike) => async (txid: string): Promise<number[]> => {
+  const query = async (name: string): Promise<number[]> =>
+    (await db.collection(name).find({ txid }, { projection: { _id: 0, outputIndex: 1 } }).toArray())
+      .map(r => (r as { outputIndex?: unknown }).outputIndex)
+      .filter((v): v is number => Number.isInteger(v) && (v as number) >= 0)
+  const [tokens, authorities] = await Promise.all([query('mandalaTokens'), query('mandalaAuthorities')])
+  return [...new Set([...tokens, ...authorities])]
+}
+
 export interface EvictionReport {
   txid: string
   reason?: string
   restoredOutpoints: number
   restoredTokenRows: number
+  /** The evicted tx's own index rows still present after `evict` (not in the §9.12 body). */
+  retiredRows: number
   alreadyEvicted: boolean
   engine: unknown
 }
@@ -219,6 +272,17 @@ export const evictWithRestore = async (
 
     const engine = await deps.evict(txid, reason)
 
+    // F4 — the engine swallowed any outputEvicted failure above and deleted the
+    // outputs regardless; retire whatever index rows of this tx survived. Before
+    // the refold, so it never folds against a phantom row. Not gated on
+    // alreadyEvicted, so a retry after a failure here converges.
+    let retiredRows: number
+    try {
+      retiredRows = await deps.retireOutputs(txid)
+    } catch (e) {
+      throw new InfraError(`could not retire the index rows of ${txid}; retry`, e)
+    }
+
     // The evicted tx's committed actions never happened: purge its history rows
     // and refold every token they touched. NOT gated on alreadyEvicted — a repeat
     // callback must repair a head stuck behind an older eviction. Idempotent, so
@@ -228,7 +292,7 @@ export const evictWithRestore = async (
     } catch (e) {
       throw new InfraError(`could not refold the tokens touched by ${txid}; retry`, e)
     }
-    return { txid, reason, restoredOutpoints, restoredTokenRows, alreadyEvicted, engine }
+    return { txid, reason, restoredOutpoints, restoredTokenRows, retiredRows, alreadyEvicted, engine }
   }
   if (deps.quiesce == null) return await run()
   try {

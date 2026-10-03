@@ -18,7 +18,7 @@ import { admissionHandler } from './admissionRoute.js'
 import { SubmitSideChannel, withVerdictCapture, snapshotRestore } from './submitSideChannel.js'
 import { mongoAdmissionStore } from './admissionStore.js'
 import { withSpentInputGuard, knexSpentInputStore, type SpentInputStore } from './spentGuard.js'
-import { mountArcIngest, knexEvictionCoins, journalRestoreInput } from './eviction.js'
+import { mountArcIngest, knexEvictionCoins, journalRestoreInput, lookupRetireOutputs, mongoIndexedVouts } from './eviction.js'
 import { adminAuth, adminCors, parseAdminCorsOrigins, warnIfAdminAuthDisabled } from './adminAuth.js'
 import { readBootConfig } from './bootConfig.js'
 import { createShutdown } from './shutdown.js'
@@ -297,6 +297,10 @@ const main = async (): Promise<void> => {
         await (server.engine as unknown as {
           evictAppliedTransaction: (t: string, o: { reason?: string }) => Promise<unknown>
         }).evictAppliedTransaction(txid, { reason }),
+      // F4 — the engine swallows a failed outputEvicted and deletes the outputs
+      // anyway; whatever index rows of the tx survived are retired here, through
+      // the package's own outputEvicted (takes the row, debits once).
+      retireOutputs: lookupRetireOutputs(mongoIndexedVouts(lookupDb), (t, v) => mandalaLookup!.outputEvicted(t, v)),
       // Refold every token the tx has history for without it, then purge its
       // history rows (in that order, so an interrupted run can be repeated).
       purgeAndRefold: txid => mandalaLookup!.purgeAndRefold(txid),

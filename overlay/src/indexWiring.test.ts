@@ -368,6 +368,12 @@ describe('index.ts — eviction restores from the owner journal (BRC-162)', () =
     expect(deps).toContain('...knexEvictionCoins(server.knex!, TOKEN_TOPIC)')
   })
 
+  // F4 — the evicted tx's own index rows, retired through the package lookup.
+  it('retires the evicted tx\'s own index rows through the lookup\'s outputEvicted', () => {
+    expect(deps).toContain('retireOutputs: lookupRetireOutputs(mongoIndexedVouts(lookupDb), (t, v) => mandalaLookup!.outputEvicted(t, v))')
+    expect(CODE).toMatch(/import \{[^}]*\blookupRetireOutputs\b[^}]*\bmongoIndexedVouts\b[^}]*\} from '\.\/eviction\.js'/)
+  })
+
   it('drops the 1.x restore deps', () => {
     for (const gone of ['restoreTokenRow', 'assetsTouchedBy', 'rebuildAssetStateExcluding', 'purgeAdminHistory', 'mongoRestoreTokenRow'])
       expect(CODE).not.toContain(gone)

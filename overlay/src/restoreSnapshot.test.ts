@@ -14,7 +14,7 @@ import { MandalaStorageManager, MandalaLookupService } from '@bsv/overlay-topics
 import { MerklePath, P2PKH, ProtoWallet, Transaction } from '@bsv/sdk'
 import { mongoAdmissionStore } from './admissionStore.js'
 import { snapshotRestore } from './submitSideChannel.js'
-import { evictWithRestore, journalRestoreInput, knexEvictionCoins } from './eviction.js'
+import { evictWithRestore, journalRestoreInput, knexEvictionCoins, lookupRetireOutputs, mongoIndexedVouts } from './eviction.js'
 import { createHarness, HARNESS_TOPIC, type Harness } from './testkit/engineHarness.js'
 import { connectTestMongo, mongoAvailable, type TestMongo } from './testkit/mongo.js'
 
@@ -125,6 +125,14 @@ describe.skipIf(!up)('eviction restores value and authority inputs from the owne
     const b = await h.spend(300, r, 2)
     expect((await h.submit(b)).refusal).toBeUndefined()
 
+    // F4 — A's OWN output row, as the lookup indexed it at admission (under a
+    // separate holder with its own credit). The harness engine has no lookup
+    // service, so its eviction leaves the row behind exactly as a swallowed
+    // outputEvicted failure would.
+    const PAYEE = '03' + 'ab'.repeat(32)
+    await storage.storeTokenIfAbsent({ txid: A, outputIndex: 0, tokenId: TOKEN, amount: 400, identityKey: PAYEE, createdAt })
+    await storage.adjustBalance(PAYEE, 400)
+
     await admissions.putAdmitted({
       txid: A, topics: [HARNESS_TOPIC], outputsToAdmit: [0], admissionSignature: 's', admissionIdentityKey: 'k',
       at: new Date().toISOString(), restore: snapshotRestore(a)
@@ -138,10 +146,14 @@ describe.skipIf(!up)('eviction restores value and authority inputs from the owne
         TM
       ),
       evict: async (txid: string, reason?: string) => await h!.engine.evictAppliedTransaction(txid, { reason }),
+      retireOutputs: lookupRetireOutputs(mongoIndexedVouts(mongo.db), async (t, v) => await lookup.outputEvicted(t, v)),
       purgeAndRefold: async (txid: string) => await lookup.purgeAndRefold(txid)
     }
     const report = await evictWithRestore(A, 'REJECTED', deps)
-    expect(report).toMatchObject({ restoredOutpoints: 2, restoredTokenRows: 2, alreadyEvicted: false })
+    expect(report).toMatchObject({ restoredOutpoints: 2, restoredTokenRows: 2, alreadyEvicted: false, retiredRows: 1 })
+    // The evicted tx's own row is gone and its credit debited exactly once.
+    expect(await storage.getTokenRow(A, 0)).toBeNull()
+    expect(await storage.getBalance(PAYEE)).toBe(0)
     expect(await storage.getTokenRow(R, 0)).toMatchObject({ amount: 1000, identityKey: HOLDER })
     expect(await storage.getAuthorityRow(R, 1)).toMatchObject({ tokenId: TOKEN, identityKey: HOLDER })
     expect(await storage.getTokenRow(R, 2)).toBeNull()
@@ -149,8 +161,10 @@ describe.skipIf(!up)('eviction restores value and authority inputs from the owne
 
     // A repeat callback restores nothing again and credits nothing again.
     const again = await evictWithRestore(A, 'REJECTED', deps)
-    expect(again).toMatchObject({ restoredTokenRows: 0, alreadyEvicted: true })
+    expect(again).toMatchObject({ restoredTokenRows: 0, alreadyEvicted: true, retiredRows: 0 })
     expect(await storage.getBalance(HOLDER)).toBe(1000)
+    expect(await storage.getBalance(PAYEE)).toBe(0)
+    expect(await storage.getTokenRow(A, 0)).toBeNull()
     expect(await storage.getTokenRow(R, 2)).toBeNull()
   })
 })
