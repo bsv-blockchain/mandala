@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/sirdeggen/mandala/overlay-go/internal/httpapi"
 	"github.com/sirdeggen/mandala/overlay-go/internal/wiring"
 )
@@ -61,9 +62,15 @@ func run() error {
 	if app.ArcadeEnabled {
 		arcadeState = "on"
 	}
+	// wiring.Build already parsed SERVER_PRIVATE_KEY, so this cannot fail.
+	// The identity key is what app/.env VITE_OVERLAY_IDENTITY_KEY must hold.
+	priv, err := ec.PrivateKeyFromHex(cfg.ServerPrivKeyHex)
+	if err != nil {
+		return fmt.Errorf("SERVER_PRIVATE_KEY: %w", err)
+	}
 	log.Printf(
-		"mandala overlay-go: node=%s network=%s arcade=%s mongo_db=%s",
-		cfg.NodeName, cfg.Network, arcadeState, app.Mongo.Name(),
+		"mandala overlay-go: node=%s network=%s arcade=%s mongo_db=%s identity=%s",
+		cfg.NodeName, cfg.Network, arcadeState, app.Mongo.Name(), priv.PubKey().ToDERHex(),
 	)
 
 	fiberApp := httpapi.New(app)

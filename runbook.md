@@ -1,5 +1,7 @@
 # Mandala demo runbook (agent pickup)
 
+> **Stack decision (2026-10-03):** the overlay is `overlay-go/` (Go, MongoDB only — no SQLite/MySQL/Postgres), started with `cd overlay-go && docker compose up` on `:8081`. The TS `overlay/` notes below describe the earlier live setup and the parity reference only.
+
 Last updated: 2026-10-03. TS overlay (`:8080`) runs the **BRC-162 P2 build** (feat/brc162: @bsv/overlay-topics/templates 2.0.0 from vendored tarballs in overlay/vendor) on a **fresh node**: `NODE_NAME=mandala162` → Mongo db `mandala162_lookup_services`, `SQLITE_FILE=/tmp/mandala162-overlay.sqlite`. Started via `.claude/launch.json` `mandala-overlay`; boot log shows `engine migrations`, `owner index refold`, and `owner index tm_mandala: scanned …` lines, then ready. The old-format state (`mandala_lookup_services`, `/tmp/mandala-overlay.sqlite`) is untouched and obsolete. Never point the P2 build at it; there is no boot guard. `overlay/.env` pre-P2 backup: `overlay/.env.bak-premandala162`.
 
 Previous (2026-09-15): TS overlay (`:8080`) rebuilt from `overlay/dist` and restarted **~23:44 local** (superseding the earlier ~22:35 restart below — this rebuild ships wire contract v2: digest v2, the `/submit` verdict taxonomy, `GET /admin/admission/:txid`, reject-not-skip, eviction restore, admission records; see "Settlement contract (2026-09-15)" below). Restart log: `/private/tmp/claude-502/-Users-personal-git-demos-mandala/1d8c5cb1-3448-49bc-b255-3df7840f24b8/scratchpad/overlay.log`. `overlay/vitest.config.ts` now scopes vitest to `src/**/*.test.ts` (excludes the stale compiled copies `npm run build` emits into `dist/`). App (`:5173`) and Mongo `local-mongo-1` already running. `overlay-go` (`:8081`) is **not** running. Registry head unchanged through this restart (`dc810603…:0`, admitSeq 2) — that sequence is now persisted in Mongo (`mandalaCounters`), so it survives a restart. Resume by continuing the identity-admin admit.
@@ -86,7 +88,7 @@ App treats `identityKey === VITE_OVERLAY_IDENTITY_KEY` as issuer. Overlay admin 
 | --- | --- | --- |
 | Mongo | Existing Docker `local-mongo-1` replica set. **Do not stop it.** | `127.0.0.1:27017` |
 | Overlay | **Native Node 24**, BRC-162 P2 build, NODE_NAME=mandala162, started via launch.json (2026-10-03). | `http://localhost:8080` (`HOSTING_URL=https://deggen.ngrok.app`) |
-| overlay-go | Not running this session. Compose service in `overlay/docker-compose.yml`, published on host `:8081`. | `http://localhost:8081` |
+| overlay-go | Not running this session. Compose service in `overlay-go/docker-compose.yml`, published on host `:8081`. | `http://localhost:8081` |
 | Vite app | `app/` | `http://127.0.0.1:5173/` (`VITE_OVERLAY_URL=https://deggen.ngrok.app`) |
 | ngrok | User runs it | `https://deggen.ngrok.app` → `http://localhost:8080` |
 | MessageBox | hosted | `https://gmb.bsvblockchain.tech` |
