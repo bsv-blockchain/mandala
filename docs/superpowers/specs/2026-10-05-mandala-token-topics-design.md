@@ -199,3 +199,26 @@ The same registrar over `server.engine.managers` / `lookupServices`, which are p
 - Per-token trusted-issuer sets. One `MANDALA_ISSUER_KEYS` per operator.
 - Persisting registrar state; it is rebuilt at boot.
 - Unregistering a token topic at runtime. Allowlist changes take effect on restart.
+
+## 14. Amendment A1 (2026-10-05): single-overlay Q3; σI per topic; persistence; token list
+
+Found while mapping the Go overlay for Q3 (fact base: `docs/superpowers/plans/2026-10-05-q3-facts/`, especially `gaps.md` G1–G7, G19). User decisions on 2026-10-05.
+
+**A1.1 Cross-operator sync is deferred (supersedes §1 success criterion, §6.1 steps 5–6, §6.2.3, §6.4, the two-node test in §11).**
+- An overlay verifies an output's owner by decrypting its envelope linkage with its own `SERVER_PRIVATE_KEY`. GASP (TS `OverlayGASPStorage.finalizeGraph`, Go `gasp-storage.go submitBeef`) carries no off-chain values, so every synced Mandala output is refused at layer B (`noLinkage`). Even with the envelope, a second operator cannot decrypt linkages encrypted to another overlay's key.
+- go-overlay-services v1.3.7 discovers SHIP peers only for `tm_ship`/`tm_slap`, and Go has no Advertiser or SHIP/SLAP host.
+- Therefore Q3 delivers token topics on **one overlay**: registry, per-token topics, KYC rename, registrar with allowlist, boot union, deploy hook, maintenance and eviction per topic. The registrar registers managers and lookups only; it does not touch `SyncConfiguration`, does not call `SyncAdvertisements` and runs no GASP. GASP stays off.
+- Cross-operator hosting needs a new trust rule (for example: admit a synced transaction when a trusted peer overlay's σI covers it; or multi-recipient linkage). That is a separate design, **Q3b**, after Q3.
+- New Q3 success criterion: one Go overlay that follows every token admits a deploy (both topics), an issue, a transfer and a two-token transfer; an allowlisted overlay refuses submits naming an unlisted token topic with 400 `ERR_SHAPE`; a restart re-registers every token from the boot union.
+
+**A1.2 σI per topic (supersedes §9 bullet 1).** One admission record per txid holds a per-topic map `topic → {outputsToAdmit, admissionSignature}` plus `admissionIdentityKey`. The σI digest becomes v3 and binds the topic: `SHA-256("mandala-admit:v3:" + topic + ":" + txid + ":" + join(sorted unique outputsToAdmit, ","))`. Each STEAK entry for `tm_mandala` and every `tm_<id>` carries its own σI. `GET /admin/admission/:txid` returns the map. This is a wire-contract v3 change (P7) and the lib verifies per topic (P4).
+
+**A1.3 Persisted refusals.** A final refusal (the `FINAL_CODES` set) is persisted when the refusing topic is `tm_mandala` or any `tm_<id>`. `tm_mandala_kyc` refusals stay unpersisted, as today. `ErrUnknownTopic` is never persisted, and the host checks every named topic with `HasTopicManager` **before** writing the provisional admission record, so an unhosted topic leaves nothing behind.
+
+**A1.4 Token list.** `GET /admin/tokens` is **public** (deploys are on chain), CORS `*` like the other token routes. It is the only wire for the registry list; `/lookup` stays outputs-only. §8's "token list comes from `ls_mandala`" now reads "from `GET /admin/tokens`".
+
+**A1.5 Smaller rulings.**
+- The Go codec and generic rules live in `internal/brc162`.
+- `MANDALA_TOKEN_ALLOWLIST` error strings are defined by the Q3 plan (no TS reference exists yet; Q4 copies them).
+- `/admin/registry` and `/admin/registry/beef/:txid` keep their URLs and read `tm_mandala_kyc`. `/admin/authorities/beef/:txid` finds the output across topics (it has no tokenId) and serves it only when the output is a token output on a `tm_<id>` topic.
+- Go boots Q3 on a fresh `NODE_NAME` (old-format state stays untouched, as in P2).
