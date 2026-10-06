@@ -7,3 +7,4 @@ dist/
 /fuelkeeper/fuelkeeper
 /fuelkeeper/*.sqlite*
 /fuelkeeper/fuelkeeper-infra.yaml
+overlay-go/.q3-launch.local.sh
