@@ -175,6 +175,54 @@ func TestAppliedTopicsListsEveryTopicOfATxid(t *testing.T) {
 	}
 }
 
+// V-12: AppliedTopics filters on {txid} alone, which the unique {topic, txid} index cannot serve
+// (a compound index needs its leading field), so New must also create a plain {txid: 1} index or
+// every call is a scan of a collection that grows one document per (topic, tx) forever.
+func TestNewStoreIndexesAppliedTransactionsByTxid(t *testing.T) {
+	ctx := context.Background()
+	st := readerStore(t)
+	cur, err := st.applied.Indexes().List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var specs []struct {
+		Key    bson.D `bson:"key"`
+		Unique bool   `bson:"unique"`
+	}
+	if err := cur.All(ctx, &specs); err != nil {
+		t.Fatal(err)
+	}
+	keyed := func(spec bson.D, fields ...string) bool {
+		if len(spec) != len(fields) {
+			return false
+		}
+		for i, e := range spec {
+			if e.Key != fields[i] || fmt.Sprint(e.Value) != "1" {
+				return false
+			}
+		}
+		return true
+	}
+	var haveTxid, haveUniqueTopicTxid bool
+	for _, spec := range specs {
+		switch {
+		case keyed(spec.Key, "txid"):
+			haveTxid = true
+			if spec.Unique {
+				t.Fatalf("the {txid:1} index must not be unique: one txid has a record per topic (%v)", specs)
+			}
+		case keyed(spec.Key, "topic", "txid"):
+			haveUniqueTopicTxid = spec.Unique
+		}
+	}
+	if !haveTxid {
+		t.Fatalf("engineAppliedTransactions has no {txid:1} index, so AppliedTopics scans the collection: %v", specs)
+	}
+	if !haveUniqueTopicTxid {
+		t.Fatalf("the unique {topic:1, txid:1} dupe-gate index must stay: %v", specs)
+	}
+}
+
 func TestOutputBeefWhereChoosesTheAcceptedTopic(t *testing.T) {
 	ctx := context.Background()
 	st := readerStore(t)

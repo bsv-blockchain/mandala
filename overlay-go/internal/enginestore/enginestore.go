@@ -68,6 +68,9 @@ func New(db *mongo.Database) (*Store, error) {
 	}
 	if _, err := s.applied.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "topic", Value: 1}, {Key: "txid", Value: 1}}, Options: uniq},
+		// AppliedTopics and DeleteAppliedTransactionsByTxid filter on txid alone; the compound
+		// index above cannot serve a predicate that skips its leading field (V-12).
+		{Keys: bson.D{{Key: "txid", Value: 1}}},
 	}); err != nil {
 		return nil, fmt.Errorf("engine store: index creation failed on %s: %w", "engineAppliedTransactions", err)
 	}
