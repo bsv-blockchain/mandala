@@ -91,7 +91,7 @@ App treats `identityKey === VITE_OVERLAY_IDENTITY_KEY` as issuer. Overlay admin 
 | overlay-go | Not running this session. Compose service in `overlay-go/docker-compose.yml`, published on host `:8081`. | `http://localhost:8081` |
 | Vite app | `app/` | `http://127.0.0.1:5173/` (`VITE_OVERLAY_URL=https://deggen.ngrok.app`) |
 | ngrok | User runs it | `https://deggen.ngrok.app` → `http://localhost:8080` |
-| MessageBox | hosted | `https://gmb.bsvblockchain.tech` |
+| MessageBox | hosted | `https://messagebox.bsvblockchain.tech` |
 | Network | main / Arcade | real mainnet txs |
 
 **Do not** `docker compose up` from repo root (no compose file there). Compose lives at `overlay/docker-compose.yml` and the overlay container cannot talk to this replica set (`mongodb://mongodb:27017` vs advertised `127.0.0.1:27017`). Native overlay + host Mongo is the working setup.

@@ -69,5 +69,5 @@ jobs:
           build-args: |
             VITE_OVERLAY_URL=${{ vars.VITE_OVERLAY_URL || 'https://mandala-test-overlay.bsvblockchain.tech' }}
             VITE_OVERLAY_IDENTITY_KEY=${{ vars.VITE_OVERLAY_IDENTITY_KEY || '0215643bc656ca42007faa32e94f70050f64a566ffd9e3a2ebc098389936dea57e' }}
-            VITE_MESSAGEBOX_URL=${{ vars.VITE_MESSAGEBOX_URL || 'https://gmb.bsvblockchain.tech' }}
+            VITE_MESSAGEBOX_URL=${{ vars.VITE_MESSAGEBOX_URL || 'https://messagebox.bsvblockchain.tech' }}
             VITE_ADMIN_API_TOKEN=${{ vars.VITE_ADMIN_API_TOKEN || '' }}
