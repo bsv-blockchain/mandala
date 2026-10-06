@@ -38,8 +38,8 @@ type Decoded struct {
 	TokenID          *[32]byte // natural (internal) byte order; nil for a deploy
 	Amount           uint64
 	Payload          []byte // meaningful only when HasPayload
-	HasPayload       bool   // an OP_0 payload is present and empty
-	PayloadCanonical bool   // true when there is no payload
+	HasPayload       bool   // a payload push + OP_DROP follows OP_2DROP (an empty OP_0 payload counts: present and empty)
+	PayloadCanonical bool   // true when the payload uses the minimal push opcode for its bytes (or there is no payload)
 	RestChunks       []Chunk
 	RestPubKeyHash   []byte // 20 bytes iff RestChunks is exactly OP_DUP OP_HASH160 <0x14 push of 20> OP_EQUALVERIFY OP_CHECKSIG
 }
@@ -268,7 +268,7 @@ type LockParams struct {
 	TokenID    string // "" = deploy (OP_0 id)
 	Amount     uint64
 	PubKeyHash []byte // must be 20 bytes
-	Payload    []byte
+	Payload    []byte // ignored unless HasPayload is true (TS payload?: undefined parity)
 	HasPayload bool
 }
 

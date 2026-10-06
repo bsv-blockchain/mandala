@@ -92,10 +92,26 @@ func readPushLength(op byte, b []byte, pos int) (n, newPos int, hasLength bool) 
 	case opPushData2:
 		return at(pos) | at(pos+1)<<8, min(pos+2, length), pos+1 < length
 	case opPushData4:
-		return at(pos) | at(pos+1)<<8 | at(pos+2)<<16 | at(pos+3)<<24, min(pos+4, length), pos+3 < length
+		// TS reads the four bytes as a uint32 (>>> 0). Assemble them as uint32 and
+		// compare with the bytes left before converting to int, so a top byte >= 0x80
+		// cannot wrap negative on 32-bit builds.
+		v := uint32(at(pos)) | uint32(at(pos+1))<<8 | uint32(at(pos+2))<<16 | uint32(at(pos+3))<<24
+		newPos = min(pos+4, length)
+		return pushData4Length(v, length-newPos), newPos, pos+3 < length
 	default: // 0x01..0x4b: direct push
 		return int(op), pos, true
 	}
+}
+
+// pushData4Length converts a PUSHDATA4 length to an int without wrapping on
+// 32-bit builds. A length above the bytes left (left >= 0) can never be
+// satisfied, so it becomes left+1: ParseChunks then takes the truncated-push
+// path (end = length, end-pos != n), exactly as the TS uint32 length does.
+func pushData4Length(v uint32, left int) int {
+	if uint64(v) > uint64(left) {
+		return left + 1
+	}
+	return int(v)
 }
 
 func copyRange(b []byte, start, end int) []byte {

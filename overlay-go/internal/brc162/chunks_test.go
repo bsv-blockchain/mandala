@@ -25,6 +25,7 @@ func TestParseChunks(t *testing.T) {
 		{"PUSHDATA1 short data", "4c0501", []Chunk{{Op: 0x4c, Data: []byte{0x01}, InvalidLength: true}}},
 		{"PUSHDATA2 half length", "4d01", []Chunk{{Op: 0x4d, Data: []byte{}, InvalidLength: true}}},
 		{"PUSHDATA4 short length", "4e010000", []Chunk{{Op: 0x4e, Data: []byte{}, InvalidLength: true}}},
+		{"PUSHDATA4 length 0xffffffff with one data byte", "4effffffff01", []Chunk{{Op: 0x4e, Data: []byte{0x01}, InvalidLength: true}}},
 		{"OP_RETURN at depth 0 swallows the rest", "006a0102", []Chunk{{Op: 0x00}, {Op: 0x6a, Data: []byte{0x01, 0x02}}}},
 		{"OP_RETURN as last byte", "6a", []Chunk{{Op: 0x6a, Data: []byte{}}}},
 		{"OP_RETURN inside IF is plain", "636a68", []Chunk{{Op: 0x63}, {Op: 0x6a}, {Op: 0x68}}},
@@ -38,6 +39,37 @@ func TestParseChunks(t *testing.T) {
 				t.Fatalf("ParseChunks(%s) = %+v\nwant %+v", c.hex, got, c.want)
 			}
 		})
+	}
+}
+
+// A 64-bit host cannot reproduce the 32-bit wrap through ParseChunks, so this pins
+// the conversion itself: every result is non-negative, fits an int32 (the 32-bit int
+// range) and an over-long length becomes left+1 (the truncated-push path).
+func TestPushData4LengthNeverWraps(t *testing.T) {
+	for _, c := range []struct {
+		v    uint32
+		left int
+		want int
+	}{
+		{0, 0, 0},
+		{1, 0, 1},
+		{1, 1, 1},
+		{5, 5, 5},
+		{6, 5, 6},
+		{0x7fffffff, 0, 1},
+		{0x80000000, 0, 1},
+		{0x80000000, 7, 8},
+		{0xffffffff, 0, 1},
+		{0xffffffff, 1, 2},
+		{0xffffffff, 0x7ffffffe, 0x7fffffff},
+	} {
+		got := pushData4Length(c.v, c.left)
+		if got != c.want {
+			t.Errorf("pushData4Length(%#x, %d) = %d, want %d", c.v, c.left, got, c.want)
+		}
+		if got < 0 || int(int32(got)) != got {
+			t.Errorf("pushData4Length(%#x, %d) = %d does not fit a non-negative int32", c.v, c.left, got)
+		}
 	}
 }
 
