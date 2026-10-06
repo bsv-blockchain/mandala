@@ -1,9 +1,0 @@
-{
-  "name": "mandala-go-vectors",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@bsv/sdk": "2.1.6",
-    "@bsv/templates": "^1.9.0"
-  }
-}
