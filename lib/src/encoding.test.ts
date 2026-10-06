@@ -15,7 +15,7 @@ describe('encodeLinkagePayload', () => {
       inputs: [],
       outputs: [{ index: 0, linkage: {
         prover: 'aa', verifier: 'bb', counterparty: 'cc',
-        protocolID: [2, 'mandala token'], keyID: 'k',
+        protocolID: [2, 'p mandala token'], keyID: 'k',
         encryptedLinkage: [1, 2, 3], encryptedLinkageProof: [4, 5], proofType: 0
       } }],
       admin: [{ index: 1, details: 'a16469737375' }]

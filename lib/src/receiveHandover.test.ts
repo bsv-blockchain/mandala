@@ -59,7 +59,7 @@ const body = (over: Record<string, unknown> = {}): any => ({
   sender: '02' + 'cd'.repeat(32),
   senderMode: 'blinded',
   keyID: 'xfer-1',
-  protocolID: [2, 'mandala token'],
+  protocolID: [2, 'p mandala token'],
   transaction: TIP0.toAtomicBEEF(true),
   outputIndex: 0,
   linkage: [{ txid: TIP0.id('hex'), payload: [1, 1] }],

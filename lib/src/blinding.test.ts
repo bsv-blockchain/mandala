@@ -69,7 +69,7 @@ describe('sender identity blinding (A′ = A + rG)', () => {
   })
 
   it('invoiceNumber matches BRC-43', () => {
-    expect(invoiceNumber(FT_PROTOCOL, 'k1')).toBe('2-mandala token-k1')
+    expect(invoiceNumber(FT_PROTOCOL, 'k1')).toBe('2-p mandala token-k1')
   })
 
   it('sampleBlindingFactor is a 32-byte scalar', () => {

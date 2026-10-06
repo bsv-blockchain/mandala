@@ -39,7 +39,7 @@ var (
 )
 
 // FTProtocol is the one protocol every Mandala token output derives under (D §5.1a).
-var FTProtocol = wallet.Protocol{SecurityLevel: wallet.SecurityLevelEveryAppAndCounterparty, Protocol: "mandala token"}
+var FTProtocol = wallet.Protocol{SecurityLevel: wallet.SecurityLevelEveryAppAndCounterparty, Protocol: "p mandala token"}
 
 // deployProtocol is D §5.3's deploy-signature protocol.
 var deployProtocol = wallet.Protocol{SecurityLevel: wallet.SecurityLevelEveryAppAndCounterparty, Protocol: "mandala deploy"}

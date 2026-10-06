@@ -46,7 +46,7 @@ const message = (body: object = {}): any => ({
     sender: '02' + 'cd'.repeat(32),
     senderMode: 'blinded',
     keyID: 'xfer-1',
-    protocolID: [2, 'mandala token'],
+    protocolID: [2, 'p mandala token'],
     transaction: TX_BEEF,
     outputIndex: MY_INDEX,
     ...body

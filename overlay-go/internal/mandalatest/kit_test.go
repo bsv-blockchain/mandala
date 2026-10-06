@@ -165,7 +165,7 @@ func probe(t *testing.T, b *Built) envelopeProbe {
 
 func TestEnvelopeShapeAndKeyOrder(t *testing.T) {
 	d := Deploy(t, Issuer, "USD")
-	if !bytes.HasPrefix(d.OffChain, []byte(`{"inputs":[],"outputs":[{"index":0,"linkage":{"prover":"`+Issuer.Identity+`","verifier":"`+Overlay.Identity+`","counterparty":"`+Issuer.Identity+`","protocolID":[2,"mandala token"],"keyID":"out-0","encryptedLinkage":[`)) {
+	if !bytes.HasPrefix(d.OffChain, []byte(`{"inputs":[],"outputs":[{"index":0,"linkage":{"prover":"`+Issuer.Identity+`","verifier":"`+Overlay.Identity+`","counterparty":"`+Issuer.Identity+`","protocolID":[2,"p mandala token"],"keyID":"out-0","encryptedLinkage":[`)) {
 		t.Fatalf("deploy envelope prefix: %s", d.OffChain)
 	}
 	if !bytes.Contains(d.OffChain, []byte(`],"admin":[],"deploySig":"`)) {

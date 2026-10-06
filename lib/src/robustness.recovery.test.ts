@@ -158,7 +158,7 @@ describe('receive verification', () => {
   it('acks and drops a message whose transaction does not parse (poisoned)', async () => {
     const mbc = mkMbc([{
       messageId: 'm1',
-      body: { assetId, amount: '25', sender: '02ab', keyID: 'k', protocolID: [2, 'mandala token'], transaction: [1, 2, 3], outputIndex: 0 }
+      body: { assetId, amount: '25', sender: '02ab', keyID: 'k', protocolID: [2, 'p mandala token'], transaction: [1, 2, 3], outputIndex: 0 }
     }])
     const wallet = mkWallet()
     const { accepted, failed } = await receiveTokens({ wallet: wallet as any, messageBoxClient: mbc })
@@ -182,7 +182,7 @@ describe('receive verification', () => {
 
     const mbc = mkMbc([{
       messageId: 'm2',
-      body: { assetId, amount: '25', sender: '02ab', keyID: 'k', protocolID: [2, 'mandala token'], transaction: atomic, outputIndex: 0 }
+      body: { assetId, amount: '25', sender: '02ab', keyID: 'k', protocolID: [2, 'p mandala token'], transaction: atomic, outputIndex: 0 }
     }])
     const wallet = mkWallet({
       internalizeAction: vi.fn().mockRejectedValue(new Error('output already exists in basket'))
@@ -204,7 +204,7 @@ describe('receive verification', () => {
 
     const mbc = mkMbc([{
       messageId: 'm3',
-      body: { assetId, amount: '1000000', sender: '02ab', keyID: 'k', protocolID: [2, 'mandala token'], transaction: atomic, outputIndex: 0 }
+      body: { assetId, amount: '1000000', sender: '02ab', keyID: 'k', protocolID: [2, 'p mandala token'], transaction: atomic, outputIndex: 0 }
     }])
     const wallet = mkWallet()
     const { accepted, failed } = await receiveTokens({ wallet: wallet as any, messageBoxClient: mbc })

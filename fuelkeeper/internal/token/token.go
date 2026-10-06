@@ -19,8 +19,8 @@ import (
 const MaxSafeAmount = int64(9007199254740991)
 
 // FTProtocol is the BRC-42 protocol every Mandala token key is derived under
-// (lib/src/constants.ts FT_PROTOCOL = [2, 'mandala token']).
-var FTProtocol = sdk.Protocol{SecurityLevel: sdk.SecurityLevelEveryAppAndCounterparty, Protocol: "mandala token"}
+// (lib/src/constants.ts FT_PROTOCOL = [2, 'p mandala token']).
+var FTProtocol = sdk.Protocol{SecurityLevel: sdk.SecurityLevelEveryAppAndCounterparty, Protocol: "p mandala token"}
 
 var assetIDRe = regexp.MustCompile(`^[0-9a-f]{64}\.[0-9]+$`)
 

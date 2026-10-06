@@ -146,7 +146,7 @@ describe('transferTokens({ mode: "handover" }) — sending never contacts the ov
       sender: SENDER_BLINDED,
       senderMode: 'blinded',
       outputIndex: 0,
-      protocolID: [2, 'mandala token']
+      protocolID: [2, 'p mandala token']
     })
     expect(body.transaction).toEqual(TIP_BEEF)
     expect(body.admissions).toEqual([

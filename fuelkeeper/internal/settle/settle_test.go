@@ -187,11 +187,11 @@ func TestSettle_InternalizesEveryRowAndMarksSettled(t *testing.T) {
 		require.Equal(t, []string{"mandala", "fee", assetID}, out.InsertionRemittance.Tags)
 		var got ci
 		require.NoError(t, json.Unmarshal([]byte(out.InsertionRemittance.CustomInstructions), &got))
-		require.Equal(t, []any{float64(2), "mandala token"}, got.ProtocolID)
+		require.Equal(t, []any{float64(2), "p mandala token"}, got.ProtocolID)
 		require.Equal(t, "fee-"+row.Outpoint, got.KeyID)
 		require.Equal(t, requesters[i], got.Counterparty)
 		require.Equal(t, row.Requester, got.Counterparty)
-		require.True(t, strings.HasPrefix(out.InsertionRemittance.CustomInstructions, `{"protocolID":[2,"mandala token"],"keyID":`),
+		require.True(t, strings.HasPrefix(out.InsertionRemittance.CustomInstructions, `{"protocolID":[2,"p mandala token"],"keyID":`),
 			"field order matches the lib: %s", out.InsertionRemittance.CustomInstructions)
 	}
 

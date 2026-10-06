@@ -18,7 +18,7 @@ import { deployDigest, encodeAdminDetails, encodeEnvelope, MANDALA_TOPIC } from 
 import type { EngineOutputReader, MandalaEnvelope, SpecificLinkage } from '@bsv/overlay-topics'
 
 export const codec = new Bsv21Binary()
-export const FT: WalletProtocol = [2, 'mandala token']
+export const FT: WalletProtocol = [2, 'p mandala token']
 
 export const keyOf = (hex: string): string => PrivateKey.fromHex(hex).toPublicKey().toString()
 
