@@ -69,7 +69,7 @@ type App struct {
 	// compensation (prepareSubmitCompensation). Always set: the snapshot is also what the admission record keeps for
 	// a later eviction.
 	PrepareSubmitCompensation func(ctx context.Context, beef []byte, topics []string) (compensate func(context.Context) error, restore *mandala.RestoreSnapshot, err error)
-	// EvictTx is the /arc-ingest terminal-status eviction. Nil until Task 21.
+	// EvictTx is the /arc-ingest terminal-status eviction (evictTx). Always set.
 	EvictTx func(ctx context.Context, txid string) (mandala.EvictionOutcome, error)
 	// AppliedAdmissionProof maps every topic with an engine applied record for txid to its admitted vouts.
 	AppliedAdmissionProof func(ctx context.Context, txid string) (map[string][]uint32, error)
@@ -240,6 +240,7 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 		ArcadeEnabled:             cfg.ArcadeURL != "",
 		ArcadeCallbackToken:       cfg.ArcadeCallbackToken,
 		PrepareSubmitCompensation: prepareSubmitCompensation(es, store),
+		EvictTx:                   evictTx(evictDeps{es: es, store: store, quiesce: maintenance.ReconcileThenSubmit(reconcileLock, gate)}),
 		AppliedAdmissionProof:     appliedAdmissionProof(es),
 		FindRawTxs:                findRawTxs(es),
 		OutputBeefWhere:           es.OutputBeefWhere,
