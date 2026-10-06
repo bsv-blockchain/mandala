@@ -5,11 +5,13 @@ package mandala
 // needs no Mongo: the layer, manager, lookup, vector and reconciler tests.
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -21,8 +23,8 @@ import (
 	mt "github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
 )
 
-// memStore implements StateStore, RepairUndoStore and KYCClaims in memory. Rows read back with
-// createdAt = time.Unix(0, 0) (storeOver's new Date(0)).
+// memStore implements StateStore, RepairUndoStore, SweepStore and KYCClaims in memory. Rows read
+// back with createdAt = time.Unix(0, 0) (storeOver's new Date(0)).
 type memStore struct {
 	mu          sync.Mutex
 	tokens      []TokenRecord
@@ -37,6 +39,7 @@ type memStore struct {
 var (
 	_ StateStore      = (*memStore)(nil)
 	_ RepairUndoStore = (*memStore)(nil)
+	_ SweepStore      = (*memStore)(nil)
 	_ KYCClaims       = (*memStore)(nil)
 )
 
@@ -258,6 +261,56 @@ func (m *memStore) CirculatingSupply(_ context.Context, tokenID string) (*big.In
 		}
 	}
 	return sum, nil
+}
+
+// FindTokensByTokenID mirrors Store.FindTokensByTokenID: the token's value rows minus its evicted
+// outpoints, in (txid, outputIndex) order, skip then limit (0 = all).
+func (m *memStore) FindTokensByTokenID(_ context.Context, tokenID string, limit, skip int64) ([]TokenRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.fail("FindTokensByTokenID"); err != nil {
+		return nil, err
+	}
+	evicted := map[string]bool{}
+	if st, ok := m.states[tokenID]; ok {
+		for _, op := range st.EvictedOutpoints {
+			evicted[strings.ToLower(op)] = true
+		}
+	}
+	rows := []TokenRecord{}
+	for _, r := range m.tokens {
+		if r.TokenID == tokenID && !evicted[strings.ToLower(fmt.Sprintf("%s.%d", r.Txid, r.OutputIndex))] {
+			rows = append(rows, r)
+		}
+	}
+	slices.SortFunc(rows, func(a, b TokenRecord) int {
+		return cmp.Or(strings.Compare(a.Txid, b.Txid), cmp.Compare(a.OutputIndex, b.OutputIndex))
+	})
+	rows = rows[min(int(skip), len(rows)):]
+	if limit > 0 {
+		rows = rows[:min(int(limit), len(rows))]
+	}
+	return rows, nil
+}
+
+// ListAuthorities mirrors Store.ListAuthorities: the token's authority rows on topic in (txid,
+// outputIndex) order.
+func (m *memStore) ListAuthorities(_ context.Context, topic, tokenID string) ([]AuthorityRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.fail("ListAuthorities"); err != nil {
+		return nil, err
+	}
+	rows := []AuthorityRecord{}
+	for _, r := range m.authorities {
+		if r.Topic == topic && r.TokenID == tokenID {
+			rows = append(rows, r)
+		}
+	}
+	slices.SortFunc(rows, func(a, b AuthorityRecord) int {
+		return cmp.Or(strings.Compare(a.Txid, b.Txid), cmp.Compare(a.OutputIndex, b.OutputIndex))
+	})
+	return rows, nil
 }
 
 func (m *memStore) KYCRegistryTokenID(context.Context) (string, bool, error) {
