@@ -8,13 +8,16 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 
 	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/overlay"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/arcade"
+	"github.com/sirdeggen/mandala/overlay-go/internal/maintenance"
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 	"github.com/sirdeggen/mandala/overlay-go/internal/wiring"
 )
@@ -442,4 +445,181 @@ func readVarInt(r *bytes.Reader) (uint64, error) {
 	default:
 		return uint64(first), nil
 	}
+}
+
+// ---- /submit host rules (Task 23: TT §6.2.2 with V-1 and V-2) and the maintenance gate (step 0) ----------------
+
+// TokenRegistrar is the deploy hook's registrar.
+type TokenRegistrar interface {
+	Ensure(tokenID string) (bool, error) // *wiring.TokenTopics
+}
+
+var _ TokenRegistrar = (*wiring.TokenTopics)(nil)
+
+// DeployPrecheck is App.Registry.IdentifyAdmissibleOutputs(ctx, beef, txid, nil): tm_mandala's own rules for
+// <txid>_0 as a dry run (no journal, no spend guard, no previous coins). ctx must carry the off-chain values.
+type DeployPrecheck func(ctx context.Context, beef *transaction.Beef, txid *chainhash.Hash) (overlay.AdmittanceInstructions, error)
+
+// SubmitGate is the shared side of the maintenance gate.
+type SubmitGate interface {
+	Enter(ctx context.Context) (release func(), err error) // *maintenance.Gate
+}
+
+var _ SubmitGate = (*maintenance.Gate)(nil)
+
+// registryPrecheck adapts the tm_mandala manager to DeployPrecheck. A deploy spends no token coin, so the dry run
+// gets no previous coins.
+func registryPrecheck(r *mandala.TokenRegistryTopicManager) DeployPrecheck {
+	return func(ctx context.Context, beef *transaction.Beef, txid *chainhash.Hash) (overlay.AdmittanceInstructions, error) {
+		return r.IdentifyAdmissibleOutputs(ctx, beef, txid, nil)
+	}
+}
+
+// hostRuleVerdict reads a row Task 20's verdict table must hold. A missing row (a programming error, pinned by
+// TestHostRuleVerdictRowsExist) degrades to a retryable 503 rather than a panic in the request path.
+func hostRuleVerdict(code mandala.Code) Verdict {
+	if v, ok := VerdictForCode(code); ok {
+		return v
+	}
+	return Verdict{Code: string(code), HTTP: fiber.StatusServiceUnavailable, Retryable: true}
+}
+
+// submitGateMiddleware is /submit step 0: one shared slot of the maintenance gate for the whole request (host
+// rules, known-verdict path, Submit and finalize). The owner-index refold and eviction take the exclusive side, so
+// they never run beside a submit, and a waiting exclusive section holds new submits back (writer preference).
+// Lock order (Global Constraints): this shared slot is taken BEFORE the registrar mutex (Ensure, in
+// submitHostRulesMiddleware) and released after it; Ensure never waits on the gate; the gate is not re-entrant.
+func submitGateMiddleware(g SubmitGate) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if c.Method() != fiber.MethodPost {
+			return c.Next()
+		}
+		release, err := g.Enter(c.UserContext())
+		if err != nil {
+			return verdictResponse(c, hostRuleVerdict(mandala.CodeUnavailable), "maintenance gate unavailable: "+err.Error(), "")
+		}
+		defer release()
+		return c.Next()
+	}
+}
+
+// hostRules are the deploy hook's dependencies.
+type hostRules struct {
+	submitter Submitter
+	registrar TokenRegistrar
+	precheck  DeployPrecheck
+	rec       AdmissionRecorder // nil: a precheck refusal is answered but not persisted
+}
+
+// submitHostRulesMiddleware runs /submit steps 2a and 2b for submits that name tm_mandala. It re-reads X-Topics,
+// the CompactSize framing and the BEEF itself and hands every malformed request to the core handler (c.Next), so
+// Task 20's steps 1-2 keep their answers and the wire order is 1-2 → 2a → 2b → 3-10.
+func submitHostRulesMiddleware(h hostRules) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if c.Method() != fiber.MethodPost {
+			return c.Next()
+		}
+		topics, ok := hostRuleTopics(c.Get("X-Topics"))
+		if !ok || !slices.Contains(topics, mandala.MandalaTopic) {
+			return c.Next()
+		}
+		beef, offChain, ok := hostRuleSplitBody(c)
+		if !ok {
+			return c.Next()
+		}
+		parsed, txHash, err := hostRuleParseBeef(beef)
+		if err != nil {
+			return c.Next() // txidErr != nil: neither rule applies
+		}
+		txid := txHash.String()
+
+		// 2a. Pairing (V-1). A deploy names tm_mandala AND tm_<own txid> (TT T5). Anything else naming tm_mandala is
+		// either a deploy whose coin would never enter its own topic (unissuable token, permanent registry record) or
+		// a token tx whose tm_mandala entry retains no coin and deletes the registry's engine doc (G8, G16).
+		if !slices.Contains(topics, "tm_"+txid) {
+			return verdictResponse(c, hostRuleVerdict(mandala.CodeShape),
+				"X-Topics naming tm_mandala must also name tm_"+txid, "")
+		}
+
+		// 2b. Deploy hook (V-2): register tm_<txid> only after tm_mandala's own rules (trusted issuer, deploySig,
+		// shape) admit vout 0, so junk deploys cannot grow the topic set or the lookup fan-out (G18).
+		tokenID, ok := mandala.DeployTokenOf(topics, txid)
+		if !ok || h.submitter.HasTopicManager("tm_"+txid) {
+			return c.Next()
+		}
+		ctx := mandala.WithOffChainValues(c.UserContext(), offChain)
+		admit, err := h.precheck(ctx, parsed, txHash)
+		if err != nil {
+			sv := VerdictForSubmitError(err)
+			if sv.Persistable() && h.rec != nil {
+				if perr := h.rec.MarkRefused(ctx, mandala.Refusal{
+					Txid:        txid,
+					Code:        sv.Verdict.Code,
+					Description: sv.Description,
+					SpendTxid:   sv.SpendTxid,
+					PayloadHash: mandala.PayloadHashHex(offChain),
+					Topic:       sv.Topic,
+				}); perr != nil {
+					log.Printf("submit: persisting the registry verdict %s for %s failed: %v", sv.Verdict.Code, txid, perr)
+				}
+			}
+			return verdictResponse(c, sv.Verdict, sv.Description, sv.SpendTxid)
+		}
+		if !slices.Equal(admit.OutputsToAdmit, []uint32{0}) {
+			return c.Next() // no deploy at vout 0: the step-3 pre-check answers unknown-topic: tm_<txid>
+		}
+		// Shared gate slot held (step 0) → registrar mutex (inside Ensure). A false result (allowlisted out) falls
+		// through to the pre-check, which answers 400 unknown-topic: tm_<txid> and writes nothing.
+		if _, err := h.registrar.Ensure(tokenID); err != nil {
+			return verdictResponse(c, hostRuleVerdict(mandala.CodeUnavailable), "token topic registration failed: "+err.Error(), "")
+		}
+		return c.Next()
+	}
+}
+
+// hostRuleTopics parses X-Topics as the core does (a JSON array of strings); ok is false when the core would refuse it.
+func hostRuleTopics(header string) ([]string, bool) {
+	if header == "" {
+		return nil, false
+	}
+	var topics []string
+	if err := json.Unmarshal([]byte(header), &topics); err != nil {
+		return nil, false
+	}
+	return topics, true
+}
+
+// hostRuleSplitBody splits the body exactly as the core's step 2 (canonical CompactSize BEEF length, then the
+// off-chain values); ok is false when the core would refuse the framing.
+func hostRuleSplitBody(c *fiber.Ctx) (beef, offChain []byte, ok bool) {
+	body := c.Body()
+	if c.Get("x-includes-off-chain-values") != "true" {
+		return body, nil, true
+	}
+	r := bytes.NewReader(body)
+	n, err := readVarInt(r)
+	if err != nil {
+		return nil, nil, false
+	}
+	consumed := len(body) - r.Len()
+	if n > uint64(len(body)-consumed) {
+		return nil, nil, false
+	}
+	end := consumed + int(n)
+	return body[consumed:end], body[end:], true
+}
+
+// hostRuleParseBeef is the core's txid derivation (transaction.ParseBeef: the atomic subject, else the parsed tx).
+func hostRuleParseBeef(beef []byte) (*transaction.Beef, *chainhash.Hash, error) {
+	b, tx, txid, err := transaction.ParseBeef(beef)
+	if err != nil {
+		return nil, nil, err
+	}
+	if txid == nil && tx != nil {
+		txid = tx.TxID()
+	}
+	if b == nil || txid == nil {
+		return nil, nil, errors.New("txid not in beef")
+	}
+	return b, txid, nil
 }

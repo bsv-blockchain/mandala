@@ -33,6 +33,8 @@ func New(app *wiring.App) *fiber.App {
 		WithAdminCORSOrigins(app.AdminCORSOrigins),
 		WithAdmissionStore(app.Store, app.AppliedAdmissionProof),
 		WithBroadcastCompensation(app.PrepareSubmitCompensation),
+		WithDeployHook(app.Tokens, registryPrecheck(app.Registry)),
+		WithSubmitGate(app.Gate),
 	}
 	if app.ServerPrivKeyHex != "" {
 		if s, err := mandala.NewECAdmissionSigner(app.ServerPrivKeyHex); err == nil {
@@ -70,6 +72,9 @@ type serverOptions struct {
 	adminAPIToken       string
 	adminCORSOrigins    []string
 	readiness           Readiness
+	submitGate          SubmitGate     // WithSubmitGate (Task 23)
+	tokenRegistrar      TokenRegistrar // WithDeployHook (Task 23)
+	deployPrecheck      DeployPrecheck // WithDeployHook (Task 23)
 }
 
 // ServerOption customizes newServer without changing its required parameters.
@@ -118,6 +123,21 @@ func WithAdminCORSOrigins(origins []string) ServerOption {
 	return func(o *serverOptions) { o.adminCORSOrigins = origins }
 }
 
+// WithDeployHook mounts the /submit host rules (steps 2a and 2b): the pairing rule (V-1) and the deploy hook that
+// registers tm_<txid> after tm_mandala's dry run admits vout 0 (V-2). Unset, neither runs (stub tests); New(app)
+// always sets it.
+func WithDeployHook(reg TokenRegistrar, precheck DeployPrecheck) ServerOption {
+	return func(o *serverOptions) {
+		o.tokenRegistrar = reg
+		o.deployPrecheck = precheck
+	}
+}
+
+// WithSubmitGate holds one shared slot of g for every POST /submit (step 0). Unset, submits are not gated.
+func WithSubmitGate(g SubmitGate) ServerOption {
+	return func(o *serverOptions) { o.submitGate = g }
+}
+
 // newServer assembles the Fiber app from narrow interfaces so tests can stub every dependency.
 func newServer(submitter Submitter, lookuper Lookuper, store AdminStore, ping Pinger, opts ...ServerOption) *fiber.App {
 	var o serverOptions
@@ -127,6 +147,17 @@ func newServer(submitter Submitter, lookuper Lookuper, store AdminStore, ping Pi
 
 	f := fiber.New(fiber.Config{BodyLimit: bodyLimit})
 	f.Use(corsMiddleware(o.adminCORSOrigins))
+	if o.submitGate != nil {
+		f.Use("/submit", submitGateMiddleware(o.submitGate))
+	}
+	if o.tokenRegistrar != nil && o.deployPrecheck != nil && submitter != nil {
+		f.Use("/submit", submitHostRulesMiddleware(hostRules{
+			submitter: submitter,
+			registrar: o.tokenRegistrar,
+			precheck:  o.deployPrecheck,
+			rec:       o.admissionRecorder, // the field WithAdmissionStore sets (Task 20)
+		}))
+	}
 
 	registerSubmitRoutes(f, submitDeps{
 		submitter: submitter,
