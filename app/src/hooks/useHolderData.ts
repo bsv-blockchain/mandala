@@ -1,6 +1,5 @@
+import { decodeValue } from '@bsv/mandala'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { LockingScript } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
 import { useWallet } from '../context/WalletContext'
 import { BASKET } from '@bsv/mandala/constants'
 import { loadHistory, HistoryRow } from '@bsv/mandala/history'
@@ -51,8 +50,8 @@ export function useHolderData() {
       const totals = new Map<string, number>()
       for (const o of res.outputs) {
         try {
-          const d = MandalaToken.decode(LockingScript.fromHex(o.lockingScript as string))
-          totals.set(d.assetId, (totals.get(d.assetId) ?? 0) + d.amount)
+          const d = decodeValue(o.lockingScript as string)
+          if (d != null) totals.set(d.tokenId, (totals.get(d.tokenId) ?? 0) + d.amount)
         } catch { /* not a mandala FT */ }
       }
 

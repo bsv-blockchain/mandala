@@ -1,3 +1,4 @@
+import { decodeValue } from '@bsv/mandala'
 import { useEffect, useState } from 'react'
 import { AlertTriangle, ShieldOff } from 'lucide-react'
 import { useWallet } from '../../context/WalletContext'
@@ -5,8 +6,6 @@ import { BASKET } from '@bsv/mandala/constants'
 import { useAssetState } from '../../hooks/useAssetState'
 import { useHolderData } from '../../hooks/useHolderData'
 import { formatCurrency } from '@bsv/mandala/amount'
-import { LockingScript } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
 
 interface Props {
   assetId: string
@@ -47,8 +46,8 @@ export default function AlertBanners({ assetId }: Props) {
           const opStr = o.outpoint as string
           if (!frozenSet.has(opStr)) continue
           try {
-            const decoded = MandalaToken.decode(LockingScript.fromHex(o.lockingScript as string))
-            if (decoded.assetId === assetId) total += decoded.amount
+            const decoded = decodeValue(o.lockingScript as string, assetId)
+            if (decoded != null) total += decoded.amount
           } catch { /* not a mandala output */ }
         }
         if (!cancelled) setFrozenAmount(total)
