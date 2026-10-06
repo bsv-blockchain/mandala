@@ -7,6 +7,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -113,6 +114,53 @@ func (f *flowApp) deploy(t *testing.T, sym string) (*mandalatest.Built, string) 
 	topic := f.ensure(t, dep)
 	f.mustPost(t, dep, mandala.MandalaTopic, topic)
 	return dep, topic
+}
+
+// kycAdmitIdentity is a registry admin transaction spending src.vout (the registry authority) into one issuer-owned
+// authority output committing to admitIdentity(identityKey).
+func kycAdmitIdentity(t *testing.T, src *mandalatest.Built, vout uint32, registryID, identityKey string) *mandalatest.Built {
+	t.Helper()
+	details, err := mandala.EncodeAdminDetails(mandala.AdminDetails{Kind: "admitIdentity", IdentityKey: identityKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mandalatest.Build(t, []mandalatest.In{{Src: src, Vout: vout}}, []mandalatest.Out{{Owner: mandalatest.Issuer,
+		Prover: mandalatest.Issuer, TokenID: registryID, Payload: mandalatest.AdmPayload(sha256.Sum256(details)), HasPayload: true,
+		Details: details}}, nil)
+}
+
+// V-17 (final review §C5) on the production stack: the KYC topic is wired with the conflicting-spend guard. Two admin
+// transactions spend the registry authority coin; the second answers 400 ERR_INPUT_SPENT naming the first, final and
+// with spendTxid on the wire (it used to be a retryable 503 "owner index unavailable", forever), on every retry, and
+// nothing is persisted for it.
+func TestSubmitKYCDoubleSpendIsInputSpent(t *testing.T) {
+	f := newFlowApp(t, "mandala3_test_submit_flow_kyc_double")
+	reg := mandalatest.Build(t, nil, []mandalatest.Out{{Owner: mandalatest.Issuer, Prover: mandalatest.Issuer,
+		Payload: mandalatest.DeployPayload("KYC", 0, "Mandala registry"), HasPayload: true}}, &mandalatest.Issuer)
+	regID := reg.Txid + "_0"
+	f.mustPost(t, reg, mandala.KYCTopic)
+	first := kycAdmitIdentity(t, reg, 0, regID, mandalatest.Holder.Identity)
+	f.mustPost(t, first, mandala.KYCTopic)
+
+	second := kycAdmitIdentity(t, reg, 0, regID, mandalatest.Receiver.Identity)
+	// The guard runs before the envelope (the KYC guard order amendment): a malformed envelope does not mask it.
+	malformed := *second
+	malformed.OffChain = []byte("[]")
+	for attempt, b := range []*mandalatest.Built{second, second, &malformed} {
+		status, body := f.post(t, b, mandala.KYCTopic)
+		if status != http.StatusBadRequest || body["code"] != "ERR_INPUT_SPENT" || body["retryable"] != false ||
+			body["spendTxid"] != first.Txid || body["description"] != "input "+reg.Txid+".0: already spent by "+first.Txid {
+			t.Fatalf("attempt %d: %d %v", attempt+1, status, body)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if rec, err := f.app.Store.GetAdmission(ctx, second.Txid); err != nil || (rec != nil && rec.RefusedCode != "") {
+		t.Fatalf("record of the refused double spend = %+v (%v), want no refusal persisted", rec, err)
+	}
+	if ok, err := f.app.Store.KYCAdmitted(ctx, mandalatest.Receiver.Identity); err != nil || ok {
+		t.Fatalf("the refused admit was applied: %v, %v", ok, err)
+	}
 }
 
 // A1.2: a deploy carries σI on both entries, bound to their topics; duplicate X-Topics collapse to one entry.

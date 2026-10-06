@@ -82,7 +82,7 @@ func (g *doubleClickGate) MarkUTXOsAsSpent(ctx context.Context, ops []*transacti
 // reconcile repaired.
 func flowMaintenance(t *testing.T, f *engineFlow, tokenID, topic string) int {
 	t.Helper()
-	if _, err := SweepOwnerIndex(f.ctx, SweepDeps{Store: f.store, Engine: f.es, TokenIDs: []string{tokenID}}); err != nil {
+	if _, err := SweepOwnerIndex(f.ctx, SweepDeps{Store: f.store, Engine: f.es, Spends: flowSpends{es: f.es}, Applied: f.es, TokenIDs: []string{tokenID}}); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 	if _, err := f.store.RebuildBalances(f.ctx); err != nil {

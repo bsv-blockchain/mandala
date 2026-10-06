@@ -20,12 +20,14 @@ type KYCTopicDeps struct {
 	Store          StateStore
 	Engine         EngineOutputReader
 	Claims         KYCClaims
+	Spends         SpendChecker                         // nil = no conflicting-spend guard (V-17; production wires the token topics' checker)
 	OnOwnerRepair  func(outpoint string, inserted bool) // nil = LogOwnerRepair(KYCTopic)
 }
 
 // KYCTopicManager is tm_mandala_kyc (Q2/mandala-registry/RegistryTopicManager.ts): the identity
-// registry chain as its own authority deployment. Layers A-C (unscoped, registry kinds, no value
-// outputs), the first trusted deploy wins, then the journal. No layer D, no spend guard.
+// registry chain as its own authority deployment. The token topics' conflicting-spend guard first
+// (V-17), then layers A-C (unscoped, registry kinds, no value outputs), the first trusted deploy
+// wins, then the journal. No layer D.
 type KYCTopicManager struct {
 	deps    KYCTopicDeps
 	trusted map[string]bool
@@ -62,6 +64,13 @@ func (m *KYCTopicManager) identify(ctx context.Context, beef *transaction.Beef, 
 		return none, fmt.Errorf("%s: transaction %s not found in beef", KYCTopic, txid)
 	}
 	txidHex := txid.String()
+	// V-17: a double spend of the registry authority is a final ERR_INPUT_SPENT naming the competitor,
+	// checked before the envelope as on the token topics; the transaction's own mark passes.
+	if m.deps.Spends != nil {
+		if err := requireUnspent(ctx, m.deps.Spends, KYCTopic, tx, txidHex, previousCoins); err != nil {
+			return none, err
+		}
+	}
 	env, err := DecodeEnvelope(OffChainValuesFrom(ctx))
 	if err != nil {
 		return none, err
@@ -81,7 +90,7 @@ func (m *KYCTopicManager) identify(ctx context.Context, beef *transaction.Beef, 
 		return none, err
 	}
 	inputOwners, err := ResolveInputOwners(ctx, inputs, env, InputOwnerDeps{
-		Store: m.deps.Store, Engine: m.deps.Engine, Verifier: m.deps.Verifier, Topic: KYCTopic, OnRepair: m.deps.OnOwnerRepair,
+		Store: m.deps.Store, Engine: m.deps.Engine, Verifier: m.deps.Verifier, Topic: KYCTopic, Txid: txidHex, OnRepair: m.deps.OnOwnerRepair,
 	})
 	if err != nil {
 		return none, err

@@ -969,26 +969,70 @@ func (s *Store) FindAdmittedOutput(ctx context.Context, txid string, vout uint32
 	if doc.Spent {
 		return nil, 0, false, nil
 	}
-	if len(doc.Beef) == 0 {
-		return nil, 0, false, fmt.Errorf("enginestore: %s.%d on %s has no stored BEEF", txid, vout, topic)
+	script, satoshis, err := storedOutputScript(doc.Beef, txid, vout, topic)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return script, satoshis, true, nil
+}
+
+// AdmittedOutputState is FindAdmittedOutput without the spent filter, in one read of the output document: the
+// locking script of (topic, txid.vout) from its stored BEEF, spent or not, whether it is marked spent, and the
+// transaction that marked it (spendTxid, "" while unspent); found=false only when no document exists. The same
+// BEEF faults are errors. It backs the §4.2a repair's self-spend rule (V-16): a coin marked spent by the very
+// transaction being validated is still that transaction's to spend. Not part of engine.Storage.
+func (s *Store) AdmittedOutputState(ctx context.Context, txid string, vout uint32, topic string) ([]byte, bool, string, bool, error) {
+	var doc struct {
+		Spent     bool   `bson:"spent"`
+		SpendTxid string `bson:"spendTxid"`
+		Beef      []byte `bson:"beef"`
+	}
+	err := s.outputs.FindOne(ctx,
+		bson.D{
+			{Key: "topic", Value: topic},
+			{Key: "txid", Value: txid},
+			{Key: "outputIndex", Value: vout},
+		},
+		options.FindOne().SetProjection(bson.D{{Key: "spent", Value: 1}, {Key: "spendTxid", Value: 1}, {Key: "beef", Value: 1}}),
+	).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, false, "", false, nil
+	}
+	if err != nil {
+		return nil, false, "", false, err
+	}
+	script, _, err := storedOutputScript(doc.Beef, txid, vout, topic)
+	if err != nil {
+		return nil, false, "", false, err
+	}
+	if !doc.Spent {
+		return script, false, "", true, nil
+	}
+	return script, true, doc.SpendTxid, true, nil
+}
+
+// storedOutputScript decodes output vout of txid from an output document's stored BEEF (fail closed on any fault).
+func storedOutputScript(beefBytes []byte, txid string, vout uint32, topic string) ([]byte, uint64, error) {
+	if len(beefBytes) == 0 {
+		return nil, 0, fmt.Errorf("enginestore: %s.%d on %s has no stored BEEF", txid, vout, topic)
 	}
 	h, err := chainhash.NewHashFromHex(txid)
 	if err != nil {
-		return nil, 0, false, fmt.Errorf("enginestore: bad txid %q: %w", txid, err)
+		return nil, 0, fmt.Errorf("enginestore: bad txid %q: %w", txid, err)
 	}
-	beef, err := transaction.NewBeefFromBytes(doc.Beef)
+	beef, err := transaction.NewBeefFromBytes(beefBytes)
 	if err != nil {
-		return nil, 0, false, fmt.Errorf("enginestore: stored BEEF for %s.%d on %s unparseable: %w", txid, vout, topic, err)
+		return nil, 0, fmt.Errorf("enginestore: stored BEEF for %s.%d on %s unparseable: %w", txid, vout, topic, err)
 	}
 	tx := beef.FindTransactionByHash(h)
 	if tx == nil {
-		return nil, 0, false, fmt.Errorf("enginestore: stored BEEF for %s.%d on %s does not carry the transaction", txid, vout, topic)
+		return nil, 0, fmt.Errorf("enginestore: stored BEEF for %s.%d on %s does not carry the transaction", txid, vout, topic)
 	}
 	if int(vout) >= len(tx.Outputs) || tx.Outputs[vout].LockingScript == nil {
-		return nil, 0, false, fmt.Errorf("enginestore: stored transaction %s has no output %d", txid, vout)
+		return nil, 0, fmt.Errorf("enginestore: stored transaction %s has no output %d", txid, vout)
 	}
 	out := tx.Outputs[vout]
-	return append([]byte(nil), out.LockingScript.Bytes()...), out.Satoshis, true, nil
+	return append([]byte(nil), out.LockingScript.Bytes()...), out.Satoshis, nil
 }
 
 // ListUnspentAdmittedOutputs pages the unspent outputs of topic by the keyset (txid, outputIndex)

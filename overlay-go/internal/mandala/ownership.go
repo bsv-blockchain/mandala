@@ -3,14 +3,17 @@ package mandala
 // Layer B (D §4.2, §4.2a; TS ownership.ts, F/ts-layers §2): who owns each token output and each
 // spent token input. An output's owner is proven by its envelope linkage. An input's owner is its
 // stored owner row; a missing or disagreeing row is repaired inline from the append-only owner
-// journal when the engine still holds the exact source output, and anything unrepairable is the
-// retryable ERR_UNAVAILABLE, never a final refusal.
+// journal when the engine still holds the exact source output (unspent, or spent by the transaction
+// under validation itself, V-16), and anything unrepairable is the retryable ERR_UNAVAILABLE, never
+// a final refusal. A source coin another transaction holds is that conflicting spend's final
+// ERR_INPUT_SPENT, not an index fault.
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
@@ -32,6 +35,7 @@ type InputOwnerDeps struct {
 	Engine   EngineOutputReader
 	Verifier LinkageVerifier
 	Topic    string                               // the journal/engine topic of the coins (tm_<id> or tm_mandala_kyc)
+	Txid     string                               // the transaction under validation: its own spend mark on Topic reads admitted (V-16)
 	OnRepair func(outpoint string, inserted bool) // never nil here; managers default it to LogOwnerRepair(<topic>); nil falls back to that too
 }
 
@@ -141,33 +145,67 @@ func ownStoredOwner(ctx context.Context, in brc162.Input, s StateStore) (string,
 	return "", false, nil
 }
 
+// ownEngineOutput is the engine side of the §4.2a repair, read from one output document. The source coin is
+// admitted when the engine holds it on d.Topic unspent, or marked spent there by d.Txid itself (V-16): the engine
+// marks a transaction's inputs spent and runs every lookup's OutputSpent (which takes their owner rows) before it
+// broadcasts and writes the applied record, so a fault or crash in between leaves exactly that state, and only a
+// resubmit of the same transaction can pass the conflicting-spend guard over it. The script then comes from the
+// spent document. other names a different transaction holding the coin: a conflicting spend, never an index
+// fault. A spent document with no recorded spender is neither.
+func ownEngineOutput(ctx context.Context, in brc162.Input, d InputOwnerDeps) (script []byte, admitted bool, other string, err error) {
+	script, spent, spender, found, err := d.Engine.AdmittedOutputState(ctx, in.SourceTxid, in.SourceVout, d.Topic)
+	if err != nil || !found {
+		return nil, false, "", err
+	}
+	switch {
+	case !spent:
+		return script, true, "", nil
+	case spender == "":
+		return nil, false, "", nil
+	case d.Txid != "" && strings.EqualFold(spender, d.Txid):
+		return script, true, "", nil
+	default:
+		return nil, false, spender, nil
+	}
+}
+
 // ownRepairedOwner is D §4.2a rule 3: rebuild the row from the journal when the engine admitted this
-// exact output (raw script bytes, R9) on this topic; take an inserted row back if the engine spent
-// the coin meanwhile.
+// exact output (raw script bytes, R9) on this topic — unspent, or spent by the transaction under
+// validation (V-16); take an inserted row back if the engine lost the coin meanwhile. A coin another
+// transaction holds is that transaction's conflicting spend (ERR_INPUT_SPENT), never a retryable
+// index fault.
 func ownRepairedOwner(ctx context.Context, in brc162.Input, d InputOwnerDeps) (string, error) {
 	journal, err := d.Store.GetOwnerJournal(ctx, in.SourceTxid, in.SourceVout, d.Topic)
 	if err != nil {
 		return "", rStoreUnavailable("the owner index", err)
 	}
-	script, _, found, err := d.Engine.FindAdmittedOutput(ctx, in.SourceTxid, in.SourceVout, d.Topic)
+	script, admitted, other, err := ownEngineOutput(ctx, in, d)
 	if err != nil {
 		return "", rStoreUnavailable("the owner index", err)
 	}
-	if journal == nil || !found || !journalAgrees(journal, in.TokenID, in.SourceRole, in.Amount) || !bytes.Equal(script, in.Source) {
+	if other != "" {
+		return "", rInputSpent(in.Outpoint, other)
+	}
+	if journal == nil || !admitted || !journalAgrees(journal, in.TokenID, in.SourceRole, in.Amount) || !bytes.Equal(script, in.Source) {
 		return "", rOwnerIndexUnavailable(in.Outpoint)
 	}
 	inserted, err := d.Store.RepairOwnerRow(ctx, *journal)
 	if err != nil {
 		return "", rStoreWriteUnavailable("the owner index", err)
 	}
+	// A row repaired for a self-spent coin stays: this transaction's own OutputSpent (engine step 7, which
+	// every non-dupe submit runs) takes it again, so the insert's credit and that take's debit cancel.
 	if inserted {
-		_, _, still, err := d.Engine.FindAdmittedOutput(ctx, in.SourceTxid, in.SourceVout, d.Topic)
+		_, still, other, err := ownEngineOutput(ctx, in, d)
 		if err != nil {
 			return "", rStoreUnavailable("the owner index", err)
 		}
 		if !still {
 			if err := TakeBackRepair(ctx, d.Store, in.SourceTxid, in.SourceVout, journal.Role); err != nil {
 				return "", rStoreWriteUnavailable("the owner index", err)
+			}
+			if other != "" {
+				return "", rInputSpent(in.Outpoint, other)
 			}
 			return "", rOwnerIndexUnavailable(in.Outpoint)
 		}

@@ -79,7 +79,7 @@ the signatures later tasks should code against verbatim. `TopicManager`,
 v1.3.7.
 
 `Engine.Submit` builds `previousCoins` with `Storage.FindOutputs(..., spent=nil)`, so a coin another transaction
-already spent is still listed. The token topic manager's conflicting-spend guard inspects exactly those coins
+already spent is still listed. The token and KYC topic managers' conflicting-spend guard inspects exactly those coins
 (`internal/wiring/previous_coins_test.go` pins it). A token topic retains only the inputs it classifies as its
 own token's; the engine deletes any other previous coin of that topic (pinned in
 `internal/wiring/engine_contract_test.go`).

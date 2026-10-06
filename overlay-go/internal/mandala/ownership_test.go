@@ -173,7 +173,7 @@ func newRepairFixture(t *testing.T) *repairFixture {
 }
 
 func (f *repairFixture) deps(t *testing.T, s StateStore) InputOwnerDeps {
-	return InputOwnerDeps{Store: s, Engine: f.engine, Verifier: overlayVerifier(t), Topic: f.topic,
+	return InputOwnerDeps{Store: s, Engine: f.engine, Verifier: overlayVerifier(t), Topic: f.topic, Txid: f.tr.Txid,
 		OnRepair: func(op string, inserted bool) {
 			what := "corrected"
 			if inserted {
@@ -280,6 +280,108 @@ func TestRepairTakesTheRowBackWhenTheEngineSpentTheCoin(t *testing.T) {
 	g.store.failNext("TakeToken", errStoreDown)
 	_, err = g.resolve(t, spendRaceStore{memStore: g.store, engine: g.engine, op: g.op})
 	requireReject(t, err, CodeUnavailable, "the owner index could not be written; retry")
+}
+
+// V-16 (final review §C2-§C4, §C7-§C10, §C18): the engine marks a transaction's inputs spent and runs every lookup's
+// OutputSpent (which takes their rows) before it broadcasts and writes the applied record, so a fault or crash in
+// between leaves the coin marked spent by that very transaction, its row gone and no applied record. The resubmit's
+// repair reads that coin as admitted (its script from the spent document) under the same journal and byte checks, and
+// keeps the repaired row for the resubmit's own OutputSpent to take, so the insert's credit and that debit cancel.
+func TestRepairTreatsACoinSpentByTheTransactionItselfAsAdmitted(t *testing.T) {
+	for _, spender := range []func(f *repairFixture) string{
+		func(f *repairFixture) string { return f.tr.Txid },
+		func(f *repairFixture) string { return strings.ToUpper(f.tr.Txid) }, // EqualFold, as the spend guard
+	} {
+		f := newRepairFixture(t)
+		f.engine.spend(f.op, spender(f))
+		owners, err := f.resolve(t, f.store)
+		if err != nil || owners[0] != mt.Holder.Identity {
+			t.Fatalf("owners %v err %v", owners, err)
+		}
+		if strings.Join(f.repairs, ";") != f.op+" inserted" || f.store.balance(mt.Holder.Identity) != 100 {
+			t.Fatalf("repairs %v balance %d", f.repairs, f.store.balance(mt.Holder.Identity))
+		}
+		if row, _ := f.store.GetTokenRow(context.Background(), f.is.Txid, 1); row == nil || row.IdentityKey != mt.Holder.Identity {
+			t.Fatalf("the repaired row of a self-spent coin was not kept: %+v", row)
+		}
+	}
+	// The same checks as for an unspent coin.
+	for name, setup := range map[string]func(f *repairFixture){
+		"journal missing":       func(f *repairFixture) { f.store.owners = nil },
+		"journal disagrees":     func(f *repairFixture) { f.store.owners[0].Amount = 99 },
+		"engine script differs": func(f *repairFixture) { f.engine.coins[f.op] = append([]byte{0x51}, f.engine.coins[f.op]...) },
+		"spent on another topic": func(f *repairFixture) {
+			f.engine.topic = KYCTopic
+		},
+		"spent with no recorded spender": func(f *repairFixture) { f.engine.spend(f.op, "") },
+	} {
+		f := newRepairFixture(t)
+		f.engine.spend(f.op, f.tr.Txid)
+		setup(f)
+		_, err := f.resolve(t, f.store)
+		requireReject(t, err, CodeUnavailable, "owner index unavailable for "+f.op)
+		if len(f.repairs) != 0 || f.store.balance(mt.Holder.Identity) != 0 {
+			t.Fatalf("%s: repairs %v balance %d", name, f.repairs, f.store.balance(mt.Holder.Identity))
+		}
+	}
+}
+
+// markRaceStore marks the coin spent by spender in the engine right after the repair inserts its row.
+type markRaceStore struct {
+	*memStore
+	engine  *memEngine
+	op      string
+	spender string
+}
+
+func (s markRaceStore) RepairOwnerRow(ctx context.Context, j OwnerRecord) (bool, error) {
+	inserted, err := s.memStore.RepairOwnerRow(ctx, j)
+	s.engine.spend(s.op, s.spender)
+	return inserted, err
+}
+
+// The post-insert re-read applies the same rule: a mark by the transaction itself (a concurrent submit of the same
+// bytes) keeps the row; a mark by another transaction takes it back.
+func TestRepairReReadAppliesTheSelfSpendRule(t *testing.T) {
+	f := newRepairFixture(t)
+	if _, err := f.resolve(t, markRaceStore{memStore: f.store, engine: f.engine, op: f.op, spender: f.tr.Txid}); err != nil {
+		t.Fatalf("a self mark between the insert and the re-read: %v", err)
+	}
+	if row, _ := f.store.GetTokenRow(context.Background(), f.is.Txid, 1); row == nil || f.store.balance(mt.Holder.Identity) != 100 {
+		t.Fatalf("row %+v balance %d: the repaired row must stay", row, f.store.balance(mt.Holder.Identity))
+	}
+
+	g := newRepairFixture(t)
+	other := strings.Repeat("cd", 32)
+	_, err := g.resolve(t, markRaceStore{memStore: g.store, engine: g.engine, op: g.op, spender: other})
+	if rej := requireReject(t, err, CodeInputSpent, "input "+g.op+": already spent by "+other); rej.SpendTxid != other {
+		t.Fatalf("SpendTxid = %q, want %s", rej.SpendTxid, other)
+	}
+	if row, _ := g.store.GetTokenRow(context.Background(), g.is.Txid, 1); row != nil || g.store.balance(mt.Holder.Identity) != 0 || len(g.repairs) != 0 {
+		t.Fatalf("row %+v balance %d repairs %v: the repaired row must be taken back", row, g.store.balance(mt.Holder.Identity), g.repairs)
+	}
+}
+
+// Final review §C5 / FW2 item 3: a coin another transaction marked spent is that transaction's conflicting spend, a
+// final ERR_INPUT_SPENT naming it whatever the index says, never the retryable "owner index unavailable" (defence in
+// depth behind the conflicting-spend guard, for any path that reaches the repair).
+func TestRepairAnswersInputSpentForAnotherTransactionsSpend(t *testing.T) {
+	other := strings.Repeat("cd", 32)
+	for name, setup := range map[string]func(f *repairFixture){
+		"journal agrees":  func(*repairFixture) {},
+		"journal missing": func(f *repairFixture) { f.store.owners = nil },
+	} {
+		f := newRepairFixture(t)
+		f.engine.spend(f.op, other)
+		setup(f)
+		_, err := f.resolve(t, f.store)
+		if rej := requireReject(t, err, CodeInputSpent, "input "+f.op+": already spent by "+other); rej.SpendTxid != other {
+			t.Fatalf("%s: SpendTxid = %q, want %s", name, rej.SpendTxid, other)
+		}
+		if row, _ := f.store.GetTokenRow(context.Background(), f.is.Txid, 1); row != nil || len(f.repairs) != 0 || f.store.balance(mt.Holder.Identity) != 0 {
+			t.Fatalf("%s: row %+v repairs %v balance %d", name, row, f.repairs, f.store.balance(mt.Holder.Identity))
+		}
+	}
 }
 
 func TestOwnerIndexFaultsAreTypedUnavailable(t *testing.T) {

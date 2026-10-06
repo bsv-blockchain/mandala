@@ -3,6 +3,8 @@ package mandala
 import (
 	"context"
 	"errors"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/bsv-blockchain/go-sdk/overlay"
@@ -26,15 +28,24 @@ func kycAction(t *testing.T, src *mandalatest.Built, vout uint32, registryID str
 
 func kycRun(t *testing.T, b *mandalatest.Built, st *memStore, prev []uint32) (overlay.AdmittanceInstructions, error) {
 	t.Helper()
+	return kycRunWith(t, b, st, prev, nil)
+}
+
+func kycRunWith(t *testing.T, b *mandalatest.Built, st *memStore, prev []uint32, mod func(*KYCTopicDeps)) (overlay.AdmittanceInstructions, error) {
+	t.Helper()
 	beef, txid, tx := mgrParse(t, b)
-	m, err := NewKYCTopicManager(KYCTopicDeps{
+	d := KYCTopicDeps{
 		Verifier:       overlayVerifier(t),
 		TrustedIssuers: []string{mandalatest.Issuer.Identity},
 		Store:          st,
 		Engine:         engineFor(KYCTopic, tx, prev),
 		Claims:         st,
 		OnOwnerRepair:  func(string, bool) {},
-	})
+	}
+	if mod != nil {
+		mod(&d)
+	}
+	m, err := NewKYCTopicManager(d)
 	if err != nil {
 		t.Fatalf("kyc manager: %v", err)
 	}
@@ -119,6 +130,58 @@ func TestKYCManagerRetainsPreviousCoinsAsGiven(t *testing.T) {
 	if !found {
 		t.Fatalf("the action's authority was not journaled under %s: %+v", KYCTopic, st.owners)
 	}
+}
+
+// V-17 (final review §C5): tm_mandala_kyc runs the token topics' conflicting-spend guard, first and before the
+// envelope. A registry authority coin another transaction marked spent is a final ERR_INPUT_SPENT naming it, not a
+// retryable 503; the transaction's own mark (its resubmit) passes; a store fault is the D-16 ERR_UNAVAILABLE.
+func TestKYCManagerConflictingSpendGuard(t *testing.T) {
+	other := strings.Repeat("99", 32)
+	setup := func(t *testing.T) (*memStore, *mandalatest.Built, *mandalatest.Built) {
+		st := newMemStore()
+		reg := kycDeploy(t, "Mandala registry")
+		mgrSeed(t, st, reg, KYCTopic)
+		id := brc162.DeployTokenID(reg.Txid, 0)
+		st.setClaim(id)
+		return st, reg, kycAction(t, reg, 0, id, AdminDetails{Kind: "admitIdentity", IdentityKey: mandalatest.Holder.Identity})
+	}
+	t.Run("spent by another transaction", func(t *testing.T) {
+		st, reg, act := setup(t)
+		spends := &mgrSpends{spentBy: map[string]string{reg.Txid + ".0": other}}
+		_, err := kycRunWith(t, act, st, []uint32{0}, func(d *KYCTopicDeps) { d.Spends = spends })
+		if rej := mgrRefusal(t, err, CodeInputSpent, "input "+reg.Txid+".0: already spent by "+other, KYCTopic); rej.SpendTxid != other {
+			t.Fatalf("SpendTxid = %q, want %q", rej.SpendTxid, other)
+		}
+		if !slices.Equal(spends.topics, []string{KYCTopic}) {
+			t.Fatalf("SpentBy asked topics %v", spends.topics)
+		}
+	})
+	t.Run("spent by itself", func(t *testing.T) {
+		st, reg, act := setup(t)
+		spends := &mgrSpends{spentBy: map[string]string{reg.Txid + ".0": strings.ToUpper(act.Txid)}}
+		got, err := kycRunWith(t, act, st, []uint32{0}, func(d *KYCTopicDeps) { d.Spends = spends })
+		mgrAdmit(t, got, err, []uint32{0}, []uint32{0})
+	})
+	t.Run("store fault", func(t *testing.T) {
+		st, _, act := setup(t)
+		boom := errors.New("boom")
+		_, err := kycRunWith(t, act, st, []uint32{0}, func(d *KYCTopicDeps) { d.Spends = &mgrSpends{err: boom} })
+		mgrRefusal(t, err, CodeUnavailable, "the engine output store could not be read; retry", KYCTopic)
+		if !errors.Is(err, boom) {
+			t.Fatalf("cause lost: %v", err)
+		}
+	})
+	t.Run("before the envelope", func(t *testing.T) {
+		st, reg, act := setup(t)
+		malformed := *act
+		malformed.OffChain = []byte("[]")
+		spends := &mgrSpends{spentBy: map[string]string{reg.Txid + ".0": other}}
+		_, err := kycRunWith(t, &malformed, st, []uint32{0}, func(d *KYCTopicDeps) { d.Spends = spends })
+		mgrRefusal(t, err, CodeInputSpent, "input "+reg.Txid+".0: already spent by "+other, KYCTopic)
+		// without the guard the envelope refuses first
+		_, err = kycRun(t, &malformed, st, []uint32{0})
+		mgrRefusal(t, err, CodeShape, "Mandala payload must be an object", KYCTopic)
+	})
 }
 
 func TestKYCManagerConstructorAndMetaData(t *testing.T) {

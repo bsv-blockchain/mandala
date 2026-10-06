@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/bsv-blockchain/go-sdk/transaction"
@@ -195,32 +196,52 @@ func reconcileRowAgrees(ctx context.Context, s ReconcileStore, txid string, vout
 
 // SweepStore is the slice of the store the sweep lists and takes back.
 type SweepStore interface {
-	FindTokensByTokenID(ctx context.Context, tokenID string, limit, skip int64) ([]TokenRecord, error)
+	ListTokenRowsByTokenID(ctx context.Context, tokenID string, limit, skip int64) ([]TokenRecord, error)
 	ListAuthorities(ctx context.Context, topic, tokenID string) ([]AuthorityRecord, error)
 	RepairUndoStore
+}
+
+// AppliedTopicsReader lists every topic with an engine applied record for txid (*enginestore.Store).
+type AppliedTopicsReader interface {
+	AppliedTopics(ctx context.Context, txid string) ([]string, error)
 }
 
 // SweepDeps configures one sweep.
 type SweepDeps struct {
 	Store     SweepStore
 	Engine    EngineOutputReader
-	TokenIDs  []string // the registered tokens (TokenTopics.Registered); no other token's rows are read or taken
-	BatchSize int      // page size of the engine listing and the value rows: 0 -> DefaultReconcileBatch; < 0 -> error
+	Spends    SpendChecker        // required: who marked a dead row's coin spent on its topic ("" = no document, or an evicted spender)
+	Applied   AppliedTopicsReader // required: whether that spender is committed on the row's topic
+	TokenIDs  []string            // the registered tokens (TokenTopics.Registered); no other token's rows are read or taken
+	BatchSize int                 // page size of the engine listing and the value rows: 0 -> DefaultReconcileBatch; < 0 -> error
 }
 
-var errSweepBatchSize = errors.New("sweepOwnerIndex: batchSize must be a positive integer")
+var (
+	errSweepBatchSize = errors.New("sweepOwnerIndex: batchSize must be a positive integer")
+	errSweepDeps      = errors.New("sweepOwnerIndex: Spends and Applied are required")
+)
 
 // SweepOwnerIndex is the other half of the index invariant ruling V-13 maintains: ReconcileOwnerIndex puts back the
 // row of an unspent admitted output, the sweep takes back a row whose output is not one. A row can outlive its coin
 // when a repair's insert (or its take-back) faults while a conflicting spend lands; nothing else would ever remove it,
 // and CirculatingSupply and RebuildBalances would count it. For each token in d.TokenIDs (never tm_mandala, never
 // tm_mandala_kyc) it lists the unspent admitted outpoints of the token's own topic tm_<deploy txid>, then takes back,
-// through TakeBackRepair, every value row (FindTokensByTokenID, so a reissued outpoint in the asset state's
-// evictedOutpoints keeps its row) and every authority row on that topic (ListAuthorities) whose outpoint is not
-// listed; a value row's owner is debited. Rows of a listed outpoint stay whatever the asset state says. Every row is
-// listed before the first take, so the caller must hold the maintenance gate's exclusive section: no submit or
-// eviction may change the engine or the rows meanwhile. It returns the number of rows taken (before a fault, if
-// any); every engine or store fault propagates and the caller reruns.
+// through TakeBackRepair, every value row of the token (ListTokenRowsByTokenID: a plain {tokenId} listing, so a dead
+// row is seen even when its outpoint is in the asset state's evictedOutpoints) and every authority row on that topic
+// (ListAuthorities) whose outpoint is not listed; a value row's owner is debited. Rows of a listed outpoint stay
+// whatever the asset state says (a reissued coin that is still live keeps its row).
+//
+// One kind of unlisted row is not dead (final review §C11): a row whose coin is marked spent on tm_<id> by a
+// transaction that has no engine applied record ON tm_<id> and was never evicted. That spend is not committed on this
+// topic — the engine marks inputs spent (step 7) before its lookups take their rows, broadcasts and writes the applied
+// record last, so a fault or crash in between leaves exactly this — and the transaction's resubmit, which only the
+// conflicting-spend guard's self rule lets through, still spends the coin through the row. Taking it would turn a
+// recoverable state into a locked coin. The check is per topic, not "applied anywhere": a two-token transaction
+// applied on tm_A whose tm_B commit faulted holds tm_B's coins uncommitted. Such rows are kept.
+//
+// Every row is listed before the first take, so the caller must hold the maintenance gate's exclusive section: no
+// submit or eviction may change the engine or the rows meanwhile. It returns the number of rows taken (before a fault,
+// if any); every engine or store fault propagates and the caller reruns.
 func SweepOwnerIndex(ctx context.Context, d SweepDeps) (int, error) {
 	limit := d.BatchSize
 	if limit == 0 {
@@ -228,6 +249,9 @@ func SweepOwnerIndex(ctx context.Context, d SweepDeps) (int, error) {
 	}
 	if limit < 0 {
 		return 0, errSweepBatchSize
+	}
+	if d.Spends == nil || d.Applied == nil {
+		return 0, errSweepDeps
 	}
 	taken := 0
 	for _, tokenID := range d.TokenIDs {
@@ -247,23 +271,46 @@ func SweepOwnerIndex(ctx context.Context, d SweepDeps) (int, error) {
 		if err != nil {
 			return taken, err
 		}
-		for _, op := range values {
-			if err := TakeBackRepair(ctx, d.Store, op.Txid, op.OutputIndex, brc162.RoleValue); err != nil {
+		for _, r := range authorities {
+			if !live[sweepKey(r.Txid, r.OutputIndex)] {
+				values = append(values, sweepRow{Outpoint: Outpoint{Txid: r.Txid, OutputIndex: r.OutputIndex}, role: brc162.RoleAuthority})
+			}
+		}
+		for _, r := range values {
+			pending, err := sweepUncommittedSpend(ctx, d, topic, r.Txid, r.OutputIndex)
+			if err != nil {
 				return taken, err
 			}
-			taken++
-		}
-		for _, r := range authorities {
-			if live[sweepKey(r.Txid, r.OutputIndex)] {
+			if pending {
 				continue
 			}
-			if err := TakeBackRepair(ctx, d.Store, r.Txid, r.OutputIndex, brc162.RoleAuthority); err != nil {
+			if err := TakeBackRepair(ctx, d.Store, r.Txid, r.OutputIndex, r.role); err != nil {
 				return taken, err
 			}
 			taken++
 		}
 	}
 	return taken, nil
+}
+
+// sweepRow is one unlisted row: its outpoint and the role TakeBackRepair takes it by.
+type sweepRow struct {
+	Outpoint
+	role brc162.Role
+}
+
+// sweepUncommittedSpend reports whether the coin of (txid, vout) is marked spent on topic by a transaction that is not
+// committed on topic: a spender the checker names (an evicted one reads live, so "") with no applied record there.
+func sweepUncommittedSpend(ctx context.Context, d SweepDeps, topic, txid string, vout uint32) (bool, error) {
+	spender, err := d.Spends.SpentBy(ctx, topic, txid, vout)
+	if err != nil || spender == "" {
+		return false, err
+	}
+	applied, err := d.Applied.AppliedTopics(ctx, spender)
+	if err != nil {
+		return false, err
+	}
+	return !slices.Contains(applied, topic), nil
 }
 
 // sweepKey is "<lowercase txid>.<vout>", the form reconcileLabel gives an engine outpoint.
@@ -294,18 +341,18 @@ func sweepUnspent(ctx context.Context, e EngineOutputReader, topic string, limit
 	}
 }
 
-// sweepValueRows pages the token's value rows and keeps the outpoints that are not live. Nothing is taken while it
-// pages, so the skip offsets stay valid.
-func sweepValueRows(ctx context.Context, s SweepStore, tokenID string, limit int, live map[string]bool) ([]Outpoint, error) {
-	var dead []Outpoint
+// sweepValueRows pages every value row of the token and keeps the outpoints that are not live. Nothing is taken while
+// it pages, so the skip offsets stay valid.
+func sweepValueRows(ctx context.Context, s SweepStore, tokenID string, limit int, live map[string]bool) ([]sweepRow, error) {
+	var dead []sweepRow
 	for skip := int64(0); ; {
-		page, err := s.FindTokensByTokenID(ctx, tokenID, int64(limit), skip)
+		page, err := s.ListTokenRowsByTokenID(ctx, tokenID, int64(limit), skip)
 		if err != nil {
 			return nil, err
 		}
 		for _, r := range page {
 			if !live[sweepKey(r.Txid, r.OutputIndex)] {
-				dead = append(dead, Outpoint{Txid: r.Txid, OutputIndex: r.OutputIndex})
+				dead = append(dead, sweepRow{Outpoint: Outpoint{Txid: r.Txid, OutputIndex: r.OutputIndex}, role: brc162.RoleValue})
 			}
 		}
 		if len(page) < limit {

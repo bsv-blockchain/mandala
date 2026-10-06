@@ -85,7 +85,7 @@ func (m *TokenTopicManager) identify(ctx context.Context, beef *transaction.Beef
 	}
 	txidHex := txid.String()
 	if journal && m.deps.Spends != nil {
-		if err := m.requireUnspent(ctx, tx, txidHex, previousCoins); err != nil {
+		if err := requireUnspent(ctx, m.deps.Spends, m.topic, tx, txidHex, previousCoins); err != nil {
 			return fail(err)
 		}
 	}
@@ -112,7 +112,7 @@ func (m *TokenTopicManager) identify(ctx context.Context, beef *transaction.Beef
 		return fail(err)
 	}
 	inputOwners, err := ResolveInputOwners(ctx, v.Inputs, v.Env, InputOwnerDeps{
-		Store: m.deps.Store, Engine: m.deps.Engine, Verifier: m.deps.Verifier, Topic: m.topic, OnRepair: m.deps.OnOwnerRepair,
+		Store: m.deps.Store, Engine: m.deps.Engine, Verifier: m.deps.Verifier, Topic: m.topic, Txid: txidHex, OnRepair: m.deps.OnOwnerRepair,
 	})
 	if err != nil {
 		return fail(err)
@@ -143,9 +143,10 @@ func (m *TokenTopicManager) identify(ctx context.Context, beef *transaction.Beef
 	}, nil
 }
 
-// requireUnspent is the conflicting-spend guard (D-6): a previous coin of this topic already marked
-// spent by another transaction refuses; the transaction's own mark (an idempotent resubmit) does not.
-func (m *TokenTopicManager) requireUnspent(ctx context.Context, tx *transaction.Transaction, self string, previousCoins []uint32) error {
+// requireUnspent is the conflicting-spend guard (D-6), shared by every token topic and tm_mandala_kyc
+// (V-17): a previous coin of topic already marked spent by another transaction refuses; the
+// transaction's own mark (an idempotent resubmit) does not.
+func requireUnspent(ctx context.Context, spends SpendChecker, topic string, tx *transaction.Transaction, self string, previousCoins []uint32) error {
 	for _, vin := range previousCoins {
 		if int(vin) >= len(tx.Inputs) {
 			continue
@@ -155,7 +156,7 @@ func (m *TokenTopicManager) requireUnspent(ctx context.Context, tx *transaction.
 		if src == "" {
 			continue
 		}
-		spender, err := m.deps.Spends.SpentBy(ctx, m.topic, src, in.SourceTxOutIndex)
+		spender, err := spends.SpentBy(ctx, topic, src, in.SourceTxOutIndex)
 		if err != nil {
 			return rStoreUnavailable("the engine output store", err)
 		}

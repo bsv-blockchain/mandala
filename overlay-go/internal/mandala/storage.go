@@ -320,6 +320,18 @@ func (s *Store) FindTokensByTokenID(ctx context.Context, tokenID string, limit, 
 	return storeAll[TokenRecord](ctx, cur, err)
 }
 
+// ListTokenRowsByTokenID pages every value row of the token in (txid, outputIndex) order, evicted
+// outpoints included (a plain {tokenId} filter, unlike FindTokensByTokenID); limit 0 = all. The
+// V-13 sweep reads it, so a dead row is seen whatever the asset state lists.
+func (s *Store) ListTokenRowsByTokenID(ctx context.Context, tokenID string, limit, skip int64) ([]TokenRecord, error) {
+	opts := options.Find().SetSort(storeAsc("txid", "outputIndex")).SetSkip(skip).SetProjection(bson.D{{Key: "_id", Value: 0}})
+	if limit > 0 {
+		opts = opts.SetLimit(limit)
+	}
+	cur, err := s.tokens.Find(ctx, bson.D{{Key: "tokenId", Value: tokenID}}, opts)
+	return storeAll[TokenRecord](ctx, cur, err)
+}
+
 // CirculatingSupply sums the token's live value rows exactly (big.Int, so past 2^53 too).
 func (s *Store) CirculatingSupply(ctx context.Context, tokenID string) (*big.Int, error) {
 	filter, err := s.liveTokenFilter(ctx, tokenID)

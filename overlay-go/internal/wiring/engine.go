@@ -184,6 +184,7 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 		return fail(err)
 	}
 
+	spends := spendChecker(es, store)
 	deps := mandala.TokenTopicDeps{
 		Verifier:         verifier,
 		TrustedIssuers:   cfg.IssuerKeys,
@@ -192,7 +193,7 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 		Engine:           es,
 		Screening:        mandala.NoSanctions{},
 		Membership:       mandala.KYCMembership{Store: store},
-		Spends:           spendChecker(es, store),
+		Spends:           spends,
 	}
 	registry, err := mandala.NewTokenRegistryTopicManager(deps)
 	if err != nil {
@@ -204,6 +205,7 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 		Store:          store,
 		Engine:         es,
 		Claims:         store,
+		Spends:         spends, // V-17: the token topics' conflicting-spend guard
 	})
 	if err != nil {
 		return fail(fmt.Errorf("wiring: %s: %w", mandala.KYCTopic, err))
@@ -244,7 +246,7 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 		Topics: ownerIndexTopics(tokens),
 		Logf:   log.Printf,
 		SweepOwnerIndex: func(ctx context.Context) (int, error) {
-			return mandala.SweepOwnerIndex(ctx, mandala.SweepDeps{Store: store, Engine: es, TokenIDs: tokens.Registered()})
+			return mandala.SweepOwnerIndex(ctx, mandala.SweepDeps{Store: store, Engine: es, Spends: spends, Applied: es, TokenIDs: tokens.Registered()})
 		},
 		RebuildBalances: store.RebuildBalances,
 	})

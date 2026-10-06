@@ -293,6 +293,30 @@ func (m *memStore) FindTokensByTokenID(_ context.Context, tokenID string, limit,
 	return rows, nil
 }
 
+// ListTokenRowsByTokenID mirrors Store.ListTokenRowsByTokenID: every value row of the token, evicted
+// outpoints included, in (txid, outputIndex) order.
+func (m *memStore) ListTokenRowsByTokenID(_ context.Context, tokenID string, limit, skip int64) ([]TokenRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.fail("ListTokenRowsByTokenID"); err != nil {
+		return nil, err
+	}
+	rows := []TokenRecord{}
+	for _, r := range m.tokens {
+		if r.TokenID == tokenID {
+			rows = append(rows, r)
+		}
+	}
+	slices.SortFunc(rows, func(a, b TokenRecord) int {
+		return cmp.Or(strings.Compare(a.Txid, b.Txid), cmp.Compare(a.OutputIndex, b.OutputIndex))
+	})
+	rows = rows[min(int(skip), len(rows)):]
+	if limit > 0 {
+		rows = rows[:min(int(limit), len(rows))]
+	}
+	return rows, nil
+}
+
 // ListAuthorities mirrors Store.ListAuthorities: the token's authority rows on topic in (txid,
 // outputIndex) order.
 func (m *memStore) ListAuthorities(_ context.Context, topic, tokenID string) ([]AuthorityRecord, error) {
@@ -327,10 +351,11 @@ func (m *memStore) KYCRegistryTokenID(context.Context) (string, bool, error) {
 
 // memEngine answers FindAdmittedOutput for a fixed set of coins on one topic (satoshis 1).
 type memEngine struct {
-	mu    sync.Mutex
-	topic string
-	coins map[string][]byte // "<txid>.<vout>" -> locking script bytes
-	fail  error
+	mu      sync.Mutex
+	topic   string
+	coins   map[string][]byte // "<txid>.<vout>" -> locking script bytes
+	spentBy map[string]string // "<txid>.<vout>" -> the transaction that marked the coin spent (the document stays)
+	fail    error
 }
 
 var _ EngineOutputReader = (*memEngine)(nil)
@@ -359,6 +384,48 @@ func (e *memEngine) forget(outpoint string) {
 	delete(e.coins, outpoint)
 }
 
+// spend marks a coin spent by spender, keeping its document (MarkUTXOsAsSpent): FindAdmittedOutput
+// reads it absent, AdmittedOutputState reads it spent by spender.
+func (e *memEngine) spend(outpoint, spender string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.spentBy == nil {
+		e.spentBy = map[string]string{}
+	}
+	e.spentBy[outpoint] = spender
+}
+
+// SpentBy is the conflicting-spend guard's view of the same coins (no eviction).
+func (e *memEngine) SpentBy(_ context.Context, topic, txid string, vout uint32) (string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.fail != nil {
+		return "", e.fail
+	}
+	if topic != e.topic {
+		return "", nil
+	}
+	return e.spentBy[fmt.Sprintf("%s.%d", txid, vout)], nil
+}
+
+func (e *memEngine) AdmittedOutputState(_ context.Context, txid string, vout uint32, topic string) ([]byte, bool, string, bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.fail != nil {
+		return nil, false, "", false, e.fail
+	}
+	if topic != e.topic {
+		return nil, false, "", false, nil
+	}
+	op := fmt.Sprintf("%s.%d", txid, vout)
+	s, ok := e.coins[op]
+	if !ok {
+		return nil, false, "", false, nil
+	}
+	by, spent := e.spentBy[op]
+	return append([]byte(nil), s...), spent, by, true, nil
+}
+
 func (e *memEngine) FindAdmittedOutput(_ context.Context, txid string, vout uint32, topic string) ([]byte, uint64, bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -368,8 +435,9 @@ func (e *memEngine) FindAdmittedOutput(_ context.Context, txid string, vout uint
 	if topic != e.topic {
 		return nil, 0, false, nil
 	}
-	s, ok := e.coins[fmt.Sprintf("%s.%d", txid, vout)]
-	if !ok {
+	op := fmt.Sprintf("%s.%d", txid, vout)
+	s, ok := e.coins[op]
+	if _, spent := e.spentBy[op]; !ok || spent {
 		return nil, 0, false, nil
 	}
 	return append([]byte(nil), s...), 1, true, nil

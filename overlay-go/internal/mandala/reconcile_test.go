@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/overlay"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
@@ -79,6 +80,12 @@ func (e *keysetEngine) FindAdmittedOutput(_ context.Context, txid string, vout u
 	}
 	s, ok := e.scripts[op]
 	return s, 1, ok, nil
+}
+
+// AdmittedOutputState reads a listed output as unspent (the reconciler and the sweep never call it).
+func (e *keysetEngine) AdmittedOutputState(ctx context.Context, txid string, vout uint32, topic string) ([]byte, bool, string, bool, error) {
+	s, _, ok, err := e.FindAdmittedOutput(ctx, txid, vout, topic)
+	return s, false, "", ok, err
 }
 
 func (e *keysetEngine) ListUnspentAdmittedOutputs(_ context.Context, topic string, after *transaction.Outpoint, limit int) ([]transaction.Outpoint, error) {
@@ -356,11 +363,47 @@ func (m topicEngines) FindAdmittedOutput(ctx context.Context, txid string, vout 
 	return nil, 0, false, nil
 }
 
+func (m topicEngines) AdmittedOutputState(ctx context.Context, txid string, vout uint32, topic string) ([]byte, bool, string, bool, error) {
+	if e := m[topic]; e != nil {
+		return e.AdmittedOutputState(ctx, txid, vout, topic)
+	}
+	return nil, false, "", false, nil
+}
+
 func (m topicEngines) ListUnspentAdmittedOutputs(ctx context.Context, topic string, after *transaction.Outpoint, limit int) ([]transaction.Outpoint, error) {
 	if e := m[topic]; e != nil {
 		return e.ListUnspentAdmittedOutputs(ctx, topic, after, limit)
 	}
 	return nil, nil
+}
+
+// sweepSpends is the sweep's spend-state view in memory: spentBy["<topic>|<txid>.<vout>"] names the transaction that
+// marked the coin spent on topic, applied[txid] the topics that transaction is committed on. The zero value says no
+// coin is marked spent.
+type sweepSpends struct {
+	spentBy    map[string]string
+	applied    map[string][]string
+	spentErr   error
+	appliedErr error
+}
+
+var (
+	_ SpendChecker        = sweepSpends{}
+	_ AppliedTopicsReader = sweepSpends{}
+)
+
+func (s sweepSpends) SpentBy(_ context.Context, topic, txid string, vout uint32) (string, error) {
+	if s.spentErr != nil {
+		return "", s.spentErr
+	}
+	return s.spentBy[fmt.Sprintf("%s|%s.%d", topic, txid, vout)], nil
+}
+
+func (s sweepSpends) AppliedTopics(_ context.Context, txid string) ([]string, error) {
+	if s.appliedErr != nil {
+		return nil, s.appliedErr
+	}
+	return s.applied[txid], nil
 }
 
 // V-13: the sweep takes back every value and authority row of a registered token whose coin the engine does not list
@@ -383,10 +426,13 @@ func TestSweepOwnerIndexTakesThePhantomRowsOfRegisteredTokens(t *testing.T) {
 	// Phantoms (not listed): an authority row and a value row.
 	st.putAuthority(AuthorityRecord{Txid: reconcileHex("2"), OutputIndex: 0, Topic: topicA, TokenID: tokA, IdentityKey: issuer})
 	st.putToken(TokenRecord{Txid: reconcileHex("2"), OutputIndex: 1, TokenID: tokA, Amount: 25, IdentityKey: holder})
-	// A reissued outpoint (asset state evictedOutpoints) keeps its row: FindTokensByTokenID leaves it out.
+	// Reissued outpoints (asset state evictedOutpoints): the sweep lists them too (a plain {tokenId} listing), so a
+	// dead one is taken; one whose coin the engine still lists keeps its row.
 	st.putToken(TokenRecord{Txid: reconcileHex("3"), OutputIndex: 0, TokenID: tokA, Amount: 5, IdentityKey: holder})
+	engA.add(t, reconcileHex("3"), 1, reconcileScript(t, tokA, 6))
+	st.putToken(TokenRecord{Txid: reconcileHex("3"), OutputIndex: 1, TokenID: tokA, Amount: 6, IdentityKey: holder})
 	reissued := DefaultAssetState(tokA, nil)
-	reissued.EvictedOutpoints = []string{reconcileHex("3") + ".0"}
+	reissued.EvictedOutpoints = []string{reconcileHex("3") + ".0", reconcileHex("3") + ".1"}
 	st.putState(reissued)
 	// Token A's id on another topic (KYC): only tm_A's authority rows are swept.
 	st.putAuthority(AuthorityRecord{Txid: reconcileHex("4"), OutputIndex: 0, Topic: KYCTopic, TokenID: tokA, IdentityKey: issuer})
@@ -401,14 +447,14 @@ func TestSweepOwnerIndexTakesThePhantomRowsOfRegisteredTokens(t *testing.T) {
 	st.putToken(TokenRecord{Txid: reconcileHex("7"), OutputIndex: 0, TokenID: tokU, Amount: 9, IdentityKey: holder})
 	st.putAuthority(AuthorityRecord{Txid: reconcileHex("7"), OutputIndex: 1, Topic: topicU, TokenID: tokU, IdentityKey: issuer})
 
-	if err := st.AdjustBalance(ctx, holder, 40+25+5+3+7+9); err != nil {
+	if err := st.AdjustBalance(ctx, holder, 40+25+5+6+3+7+9); err != nil {
 		t.Fatal(err)
 	}
-	taken, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, TokenIDs: []string{tokA, tokB}, BatchSize: 1})
-	if err != nil || taken != 3 {
-		t.Fatalf("sweep = %d (%v), want 3 rows taken", taken, err)
+	taken, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, Spends: sweepSpends{}, Applied: sweepSpends{}, TokenIDs: []string{tokA, tokB}, BatchSize: 1})
+	if err != nil || taken != 4 {
+		t.Fatalf("sweep = %d (%v), want 4 rows taken", taken, err)
 	}
-	if got, want := st.balance(holder), int64(40+5+3+9); got != want {
+	if got, want := st.balance(holder), int64(40+6+3+9); got != want {
 		t.Fatalf("holder balance = %d, want %d (each phantom value row debited once)", got, want)
 	}
 	for _, c := range []struct {
@@ -421,7 +467,8 @@ func TestSweepOwnerIndexTakesThePhantomRowsOfRegisteredTokens(t *testing.T) {
 		{reconcileHex("1"), 1, true, true},
 		{reconcileHex("2"), 0, false, false},
 		{reconcileHex("2"), 1, true, false},
-		{reconcileHex("3"), 0, true, true},
+		{reconcileHex("3"), 0, true, false},
+		{reconcileHex("3"), 1, true, true},
 		{reconcileHex("4"), 0, false, true},
 		{reconcileHex("5"), 0, true, true},
 		{reconcileHex("6"), 0, true, false},
@@ -442,8 +489,8 @@ func TestSweepOwnerIndexTakesThePhantomRowsOfRegisteredTokens(t *testing.T) {
 	}
 
 	// A rerun takes nothing.
-	again, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, TokenIDs: []string{tokA, tokB}})
-	if err != nil || again != 0 || st.balance(holder) != 40+5+3+9 {
+	again, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, Spends: sweepSpends{}, Applied: sweepSpends{}, TokenIDs: []string{tokA, tokB}})
+	if err != nil || again != 0 || st.balance(holder) != 40+6+3+9 {
 		t.Fatalf("rerun = %d (%v), balance %d; want nothing taken", again, err, st.balance(holder))
 	}
 }
@@ -465,7 +512,7 @@ func TestSweepOwnerIndexFaultsAndGuards(t *testing.T) {
 		break_ func(*keysetEngine, *memStore)
 	}{
 		{"listing", func(e *keysetEngine, _ *memStore) { e.listErr = boom }},
-		{"value rows", func(_ *keysetEngine, s *memStore) { s.failNext("FindTokensByTokenID", boom) }},
+		{"value rows", func(_ *keysetEngine, s *memStore) { s.failNext("ListTokenRowsByTokenID", boom) }},
 		{"authority rows", func(_ *keysetEngine, s *memStore) { s.failNext("ListAuthorities", boom) }},
 		{"value take", func(_ *keysetEngine, s *memStore) { s.failNext("TakeToken", boom) }},
 		{"debit", func(_ *keysetEngine, s *memStore) { s.failNext("AdjustBalance", boom) }},
@@ -473,32 +520,100 @@ func TestSweepOwnerIndexFaultsAndGuards(t *testing.T) {
 	} {
 		eng, st := setup()
 		c.break_(eng, st)
-		if _, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, TokenIDs: []string{tokA}}); !errors.Is(err, boom) {
+		if _, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, Spends: sweepSpends{}, Applied: sweepSpends{}, TokenIDs: []string{tokA}}); !errors.Is(err, boom) {
 			t.Errorf("%s fault: err = %v, want it propagated", c.name, err)
+		}
+	}
+	// The spend-state reads of a dead row's coin: a fault is never read as "not spent".
+	marked := sweepSpends{spentBy: map[string]string{topicA + "|" + reconcileHex("2") + ".1": reconcileHex("c")}}
+	for name, sp := range map[string]sweepSpends{
+		"spend state":    {spentErr: boom},
+		"applied topics": {spentBy: marked.spentBy, appliedErr: boom},
+	} {
+		eng, st := setup()
+		if _, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, Spends: sp, Applied: sp, TokenIDs: []string{tokA}}); !errors.Is(err, boom) {
+			t.Errorf("%s fault: err = %v, want it propagated", name, err)
+		}
+		if len(st.tokens) != 1 {
+			t.Errorf("%s fault: the value row was taken", name)
 		}
 	}
 
 	eng, st := setup()
 	eng.stuck = true
-	_, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, TokenIDs: []string{tokA}, BatchSize: 1})
+	_, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, Spends: sweepSpends{}, Applied: sweepSpends{}, TokenIDs: []string{tokA}, BatchSize: 1})
 	if want := "sweepOwnerIndex: the engine listing did not advance past " + reconcileHex("1") + ".0"; err == nil || err.Error() != want {
 		t.Fatalf("stuck listing: err = %v, want %q", err, want)
 	}
-	if _, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, TokenIDs: []string{tokA}, BatchSize: -1}); err == nil ||
+	if _, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, Spends: sweepSpends{}, Applied: sweepSpends{}, TokenIDs: []string{tokA}, BatchSize: -1}); err == nil ||
 		err.Error() != "sweepOwnerIndex: batchSize must be a positive integer" {
 		t.Fatalf("negative batch: err = %v", err)
 	}
-	if _, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, TokenIDs: []string{reconcileHex("a")}}); err == nil ||
+	if _, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, Spends: sweepSpends{}, Applied: sweepSpends{}, TokenIDs: []string{reconcileHex("a")}}); err == nil ||
 		err.Error() != "not a canonical Mandala token id: "+reconcileHex("a") {
 		t.Fatalf("non-canonical token id: err = %v", err)
+	}
+	for name, d := range map[string]SweepDeps{
+		"no Spends":  {Store: st, Engine: eng, Applied: sweepSpends{}, TokenIDs: []string{tokA}},
+		"no Applied": {Store: st, Engine: eng, Spends: sweepSpends{}, TokenIDs: []string{tokA}},
+	} {
+		if _, err := SweepOwnerIndex(ctx, d); err == nil || err.Error() != "sweepOwnerIndex: Spends and Applied are required" {
+			t.Fatalf("%s: err = %v", name, err)
+		}
 	}
 	if st.balance(mandalatest.Holder.Identity) != 0 || len(st.tokens) != 1 || len(st.authorities) != 1 {
 		t.Fatal("a refused sweep took rows")
 	}
 }
 
-// On the real stores: a coin the engine marked spent and a coin the engine never held both lose their value and
-// authority rows (the value rows debited), live and reissued rows stay, an unregistered token's rows stay.
+// Final review §C11: a row whose coin is marked spent on its own topic by a transaction with no applied record ON that
+// topic (and not evicted, which the spend checker already reads as live) is not a phantom: the spend is uncommitted
+// there and the transaction's resubmit still spends the coin through the row. The rule is per topic: a spender
+// committed only on another topic is uncommitted here. A committed spender's coin, and a coin with no document, are
+// dead.
+func TestSweepOwnerIndexKeepsARowWhoseSpendIsUncommittedOnItsTopic(t *testing.T) {
+	ctx := context.Background()
+	tokA, topicA, topicB := reconcileHex("a")+"_0", "tm_"+reconcileHex("a"), "tm_"+reconcileHex("b")
+	holder, issuer := mandalatest.Holder.Identity, mandalatest.Issuer.Identity
+	eng, st := newKeysetEngine(topicA), newMemStore()
+	pending, committed, elsewhere := reconcileHex("c"), reconcileHex("d"), reconcileHex("e")
+	sp := sweepSpends{
+		spentBy: map[string]string{
+			topicA + "|" + reconcileHex("1") + ".0": pending,   // authority, spender uncommitted: kept
+			topicA + "|" + reconcileHex("1") + ".1": pending,   // value, spender uncommitted: kept
+			topicA + "|" + reconcileHex("2") + ".1": committed, // value, spender applied on tm_A: taken
+			topicA + "|" + reconcileHex("3") + ".1": elsewhere, // value, spender applied on tm_B only: kept
+			topicB + "|" + reconcileHex("4") + ".1": pending,   // marked on another topic only: no mark on tm_A, taken
+		},
+		applied: map[string][]string{committed: {topicA, topicB}, elsewhere: {topicB}},
+	}
+	st.putAuthority(AuthorityRecord{Txid: reconcileHex("1"), OutputIndex: 0, Topic: topicA, TokenID: tokA, IdentityKey: issuer})
+	for i, amount := range map[string]Amount{"1": 10, "2": 20, "3": 30, "4": 40, "5": 50} {
+		st.putToken(TokenRecord{Txid: reconcileHex(i), OutputIndex: 1, TokenID: tokA, Amount: amount, IdentityKey: holder})
+	}
+	if err := st.AdjustBalance(ctx, holder, 150); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := SweepOwnerIndex(ctx, SweepDeps{Store: st, Engine: eng, Spends: sp, Applied: sp, TokenIDs: []string{tokA}})
+	if err != nil || taken != 3 {
+		t.Fatalf("sweep = %d (%v), want 3 rows taken (2.1, 4.1, 5.1)", taken, err)
+	}
+	if got := st.balance(holder); got != 10+30 {
+		t.Fatalf("holder balance = %d, want %d", got, 10+30)
+	}
+	if row, err := st.GetAuthorityRow(ctx, reconcileHex("1"), 0); err != nil || row == nil {
+		t.Fatalf("the authority row of an uncommitted spend was taken: %+v, %v", row, err)
+	}
+	for i, kept := range map[string]bool{"1": true, "2": false, "3": true, "4": false, "5": false} {
+		if row, err := st.GetTokenRow(ctx, reconcileHex(i), 1); err != nil || (row != nil) != kept {
+			t.Errorf("%s.1: row %+v (%v), want kept=%v", reconcileHex(i)[:8], row, err, kept)
+		}
+	}
+}
+
+// On the real stores: a coin a committed transaction spent and a coin the engine never held both lose their value and
+// authority rows (the value rows debited), as does a dead reissued row; live rows (reissued or not) and an
+// unregistered token's rows stay.
 func TestSweepOwnerIndexOnTheRealStores(t *testing.T) {
 	db := testmongo.DB(t, "mandala3_test_reconcile_sweep")
 	ctx := context.Background()
@@ -538,6 +653,10 @@ func TestSweepOwnerIndexOnTheRealStores(t *testing.T) {
 		if err := es.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *spend.src.Tx.TxID(), Index: spend.vout}}, topic, spend.spender.Tx.TxID()); err != nil {
 			t.Fatal(err)
 		}
+		// committed: the engine's applied record is its last write
+		if err := es.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: spend.spender.Tx.TxID(), Topic: topic}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	now := time.Now()
@@ -556,7 +675,7 @@ func TestSweepOwnerIndexOnTheRealStores(t *testing.T) {
 		{Txid: tr.Txid, OutputIndex: 0, TokenID: tokenID, Amount: 30, IdentityKey: holder, CreatedAt: now},           // live
 		{Txid: tr.Txid, OutputIndex: 1, TokenID: tokenID, Amount: 70, IdentityKey: holder, CreatedAt: now},           // live
 		{Txid: reconcileHex("9"), OutputIndex: 0, TokenID: tokenID, Amount: 11, IdentityKey: holder, CreatedAt: now}, // absent: taken
-		{Txid: reconcileHex("7"), OutputIndex: 0, TokenID: tokenID, Amount: 5, IdentityKey: holder, CreatedAt: now},  // absent but reissued: kept
+		{Txid: reconcileHex("7"), OutputIndex: 0, TokenID: tokenID, Amount: 5, IdentityKey: holder, CreatedAt: now},  // absent and reissued: taken
 		{Txid: reconcileHex("8"), OutputIndex: 0, TokenID: tokU, Amount: 13, IdentityKey: holder, CreatedAt: now},    // unregistered
 	} {
 		if _, err := store.StoreTokenIfAbsent(ctx, r); err != nil {
@@ -564,7 +683,7 @@ func TestSweepOwnerIndexOnTheRealStores(t *testing.T) {
 		}
 	}
 	reissued := DefaultAssetState(tokenID, nil)
-	reissued.EvictedOutpoints = []string{reconcileHex("7") + ".0"}
+	reissued.EvictedOutpoints = []string{reconcileHex("7") + ".0", tr.Txid + ".0"} // tr.0 is live: kept
 	if err := store.PutAssetState(ctx, reissued); err != nil {
 		t.Fatal(err)
 	}
@@ -572,12 +691,13 @@ func TestSweepOwnerIndexOnTheRealStores(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	taken, err := SweepOwnerIndex(ctx, SweepDeps{Store: store, Engine: es, TokenIDs: []string{tokenID}, BatchSize: 2})
-	if err != nil || taken != 4 {
-		t.Fatalf("sweep = %d (%v), want 4 rows taken", taken, err)
+	spends := flowSpends{es: es}
+	taken, err := SweepOwnerIndex(ctx, SweepDeps{Store: store, Engine: es, Spends: spends, Applied: es, TokenIDs: []string{tokenID}, BatchSize: 2})
+	if err != nil || taken != 5 {
+		t.Fatalf("sweep = %d (%v), want 5 rows taken", taken, err)
 	}
-	if bal, _ := store.GetBalance(ctx, holder); bal != 30+70+5+13 {
-		t.Fatalf("holder balance = %d, want %d", bal, 30+70+5+13)
+	if bal, _ := store.GetBalance(ctx, holder); bal != 30+70+13 {
+		t.Fatalf("holder balance = %d, want %d", bal, 30+70+13)
 	}
 	for _, c := range []struct {
 		txid  string
@@ -593,7 +713,7 @@ func TestSweepOwnerIndexOnTheRealStores(t *testing.T) {
 		{tr.Txid, 0, true, true},
 		{tr.Txid, 1, true, true},
 		{reconcileHex("9"), 0, true, false},
-		{reconcileHex("7"), 0, true, true},
+		{reconcileHex("7"), 0, true, false},
 		{reconcileHex("8"), 0, true, true},
 	} {
 		var present bool
@@ -615,8 +735,8 @@ func TestSweepOwnerIndexOnTheRealStores(t *testing.T) {
 		}
 	}
 
-	again, err := SweepOwnerIndex(ctx, SweepDeps{Store: store, Engine: es, TokenIDs: []string{tokenID}})
-	if bal, _ := store.GetBalance(ctx, holder); err != nil || again != 0 || bal != 30+70+5+13 {
+	again, err := SweepOwnerIndex(ctx, SweepDeps{Store: store, Engine: es, Spends: spends, Applied: es, TokenIDs: []string{tokenID}})
+	if bal, _ := store.GetBalance(ctx, holder); err != nil || again != 0 || bal != 30+70+13 {
 		t.Fatalf("rerun = %d (%v), balance %d; want nothing taken", again, err, bal)
 	}
 }

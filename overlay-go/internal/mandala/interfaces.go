@@ -35,6 +35,10 @@ type EngineOutputReader interface {
 	// FindAdmittedOutput: a spent or absent output reads found=false; a BEEF decode fault is an
 	// error (fail closed).
 	FindAdmittedOutput(ctx context.Context, txid string, vout uint32, topic string) (lockingScript []byte, satoshis uint64, found bool, err error)
+	// AdmittedOutputState reads the same document in one read without the spent filter: its script
+	// (spent or not), whether it is spent and by which transaction ("" while unspent); found=false
+	// only when absent; a BEEF fault is an error. The §4.2a repair reads it (V-16 self-spend rule).
+	AdmittedOutputState(ctx context.Context, txid string, vout uint32, topic string) (lockingScript []byte, spent bool, spendTxid string, found bool, err error)
 	// ListUnspentAdmittedOutputs pages {topic, spent:false} by the keyset (txid, outputIndex)
 	// ascending, strictly after `after` (nil = from the start).
 	ListUnspentAdmittedOutputs(ctx context.Context, topic string, after *transaction.Outpoint, limit int) ([]transaction.Outpoint, error)

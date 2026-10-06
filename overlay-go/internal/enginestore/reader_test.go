@@ -88,6 +88,47 @@ func TestFindAdmittedOutputFailsClosedOnACorruptBEEF(t *testing.T) {
 	}
 }
 
+// V-16: AdmittedOutputState reads the same document without the spent filter: the script of a spent output too, and
+// its spender; found=false only for no document; the same BEEF faults are errors, spent or not.
+func TestAdmittedOutputStateReadsSpentOutputsAndTheirSpender(t *testing.T) {
+	ctx := context.Background()
+	st := readerStore(t)
+	tx := scriptTx(0x13, []byte{0x51}, []byte{0x00, 0x00, 0x6d, 0x76, 0xa9})
+	txid := tx.TxID()
+	if err := st.InsertOutputs(ctx, tokenTopicA, txid, []uint32{0, 1}, nil, beefFor(t, tx), nil); err != nil {
+		t.Fatal(err)
+	}
+	spender, _ := chainhash.NewHashFromHex(strings.Repeat("cd", 32))
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(txid, 1)}, tokenTopicA, spender); err != nil {
+		t.Fatal(err)
+	}
+	if s, spent, by, found, err := st.AdmittedOutputState(ctx, txid.String(), 0, tokenTopicA); err != nil || !found || spent || by != "" || !bytes.Equal(s, []byte{0x51}) {
+		t.Fatalf("unspent output 0: %x %v %q %v %v", s, spent, by, found, err)
+	}
+	if s, spent, by, found, err := st.AdmittedOutputState(ctx, txid.String(), 1, tokenTopicA); err != nil || !found || !spent || by != spender.String() ||
+		!bytes.Equal(s, []byte{0x00, 0x00, 0x6d, 0x76, 0xa9}) {
+		t.Fatalf("spent output 1: %x %v %q %v %v", s, spent, by, found, err)
+	}
+	if _, _, found, err := st.FindAdmittedOutput(ctx, txid.String(), 1, tokenTopicA); err != nil || found {
+		t.Fatalf("FindAdmittedOutput must still read the spent output absent: %v %v", found, err)
+	}
+	for name, c := range map[string]struct {
+		vout  uint32
+		topic string
+	}{"another topic": {1, tokenTopicB}, "an unadmitted vout": {7, tokenTopicA}} {
+		if s, spent, by, found, err := st.AdmittedOutputState(ctx, txid.String(), c.vout, c.topic); err != nil || found || spent || by != "" || s != nil {
+			t.Fatalf("%s: %x %v %q %v %v, want absent", name, s, spent, by, found, err)
+		}
+	}
+	if _, err := st.outputs.UpdateOne(ctx, bson.D{{Key: "txid", Value: txid.String()}, {Key: "outputIndex", Value: 1}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "beef", Value: []byte{0x01, 0x02}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, found, err := st.AdmittedOutputState(ctx, txid.String(), 1, tokenTopicA); err == nil || found {
+		t.Fatalf("a spent output's corrupt BEEF: found=%v err=%v, want an error", found, err)
+	}
+}
+
 func TestListUnspentAdmittedOutputsKeysetNeverSkipsASibling(t *testing.T) {
 	ctx := context.Background()
 	st := readerStore(t)
