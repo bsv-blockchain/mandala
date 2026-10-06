@@ -8,6 +8,7 @@ package wiring
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
@@ -61,6 +62,8 @@ type App struct {
 	Registry      *mandala.TokenRegistryTopicManager
 	Gate          *maintenance.Gate
 	ReconcileLock *maintenance.Gate
+	// OwnerIndex runs the boot and interval refold + reconcile and answers the readiness check.
+	OwnerIndex *OwnerIndexMaintenance
 
 	ArcadeEnabled       bool
 	ArcadeCallbackToken string
@@ -227,16 +230,35 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 
 	gate := maintenance.NewGate(maintenance.DefaultDrainTimeout)
 	reconcileLock := maintenance.NewGate(maintenance.DefaultDrainTimeout)
+	tokens := NewTokenTopics(eng, cfg.TokenAllowlist, cfg.TokenAllowlistSet, tokenTopicFactory(deps, verifier, store))
+	ownerIndex := NewOwnerIndexMaintenance(OwnerIndexDeps{
+		Gate:                gate,
+		ReconcileLock:       reconcileLock,
+		TokenIDsWithHistory: store.TokenIDsWithHistory,
+		RebuildState: func(ctx context.Context, tokenID string) error {
+			return mandala.RebuildState(ctx, store, tokenID, "")
+		},
+		Reconcile: func(ctx context.Context, topic string) (mandala.ReconcileResult, error) {
+			return mandala.ReconcileOwnerIndex(ctx, mandala.ReconcileDeps{Store: store, Engine: es, Topic: topic})
+		},
+		Topics: ownerIndexTopics(tokens),
+		Logf:   log.Printf,
+		SweepOwnerIndex: func(ctx context.Context) (int, error) {
+			return mandala.SweepOwnerIndex(ctx, mandala.SweepDeps{Store: store, Engine: es, TokenIDs: tokens.Registered()})
+		},
+		RebuildBalances: store.RebuildBalances,
+	})
 	app := &App{
 		Engine:                    eng,
 		Store:                     store,
 		EngineStore:               es,
 		Verifier:                  verifier,
 		Mongo:                     db,
-		Tokens:                    NewTokenTopics(eng, cfg.TokenAllowlist, cfg.TokenAllowlistSet, tokenTopicFactory(deps, verifier, store)),
+		Tokens:                    tokens,
 		Registry:                  registry,
 		Gate:                      gate,
 		ReconcileLock:             reconcileLock,
+		OwnerIndex:                ownerIndex,
 		ArcadeEnabled:             cfg.ArcadeURL != "",
 		ArcadeCallbackToken:       cfg.ArcadeCallbackToken,
 		PrepareSubmitCompensation: prepareSubmitCompensation(es, store),
@@ -251,23 +273,31 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 	return app, nil
 }
 
-// Start runs the boot union (TT §6.2.1): it registers every token in the union of the registry records and the token
-// topics of the owner journal (allowlist permitting), before the overlay listens. Any read or registration fault fails
-// boot rather than serving unknown-topic for every token. It then runs the registry's boot repair (Q2
-// restoreMissingRecords, D-21), so a hosted token whose ls_mandala record write was lost is back on GET /admin/tokens
-// before submissions start; its fault fails boot too.
+// Start runs the boot union (TT §6.2.1), then the registry's boot repair (D-21), then the boot refold + reconcile over
+// the topics it registered (before the overlay listens), then arms the 30-minute interval. A boot-union or repair
+// fault fails boot; an owner-index fault only degrades readiness.
 func (a *App) Start(ctx context.Context) error {
 	if _, err := a.Tokens.Boot(ctx, a.Store.AllRegistryTokenIDs, journalTokenIDs(a.Store)); err != nil {
 		return fmt.Errorf("wiring: start: %w", err)
 	}
-	if _, err := mandala.NewTokenRegistryLookupService(a.Verifier, a.Store).RestoreMissingRecords(ctx); err != nil {
+	restored, err := mandala.NewTokenRegistryLookupService(a.Verifier, a.Store).RestoreMissingRecords(ctx)
+	if err != nil {
 		return fmt.Errorf("wiring: start: restore registry records: %w", err)
 	}
+	if len(restored) > 0 {
+		log.Printf("wiring: restored %d lost token registry record(s): %v", len(restored), restored)
+	}
+	a.OwnerIndex.RunOnce(ctx)
+	a.OwnerIndex.Start(OwnerIndexInterval)
 	return nil
 }
 
-// Close stops the App's background work. It never disconnects Mongo; the caller owns the client.
-func (a *App) Close() {}
+// Close stops the owner-index interval. It never disconnects Mongo; the caller owns the client.
+func (a *App) Close() {
+	if a.OwnerIndex != nil {
+		a.OwnerIndex.Stop()
+	}
+}
 
 // tokenTopicFactory builds one token's manager and lookup on the shared store with the shared deps (one spend checker,
 // one trusted set, one membership provider for every token topic).

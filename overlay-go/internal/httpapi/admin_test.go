@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
@@ -128,52 +127,6 @@ func TestAssetAuthRoutesAreGone(t *testing.T) {
 		if body := decodeJSON(t, resp); resp.StatusCode != 404 || body["code"] != "ERR_ROUTE_NOT_FOUND" {
 			t.Fatalf("%s: %d %v", path, resp.StatusCode, body)
 		}
-	}
-}
-
-func TestHealth_OK(t *testing.T) {
-	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil)
-	for _, path := range []string{"/health", "/health/live", "/health/ready"} {
-		t.Run(path, func(t *testing.T) {
-			resp := doRequest(t, app, httptest.NewRequest(http.MethodGet, path, nil))
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("status = %d, want 200 (body: %s)", resp.StatusCode, readRawBody(t, resp))
-			}
-			if body := decodeJSON(t, resp); body["status"] != "ok" {
-				t.Fatalf("body = %v, want status:ok", body)
-			}
-		})
-	}
-}
-
-func TestHealthReady_PingFailureIs503(t *testing.T) {
-	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, func(context.Context) error { return errors.New("mongo down") })
-	resp := doRequest(t, app, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
-	}
-	if body := decodeJSON(t, resp); body["status"] != "error" {
-		t.Fatalf("body = %v, want status:error", body)
-	}
-}
-
-func TestHealthReady_TimeoutBeforeBlockingPing(t *testing.T) {
-	blockingPinger := func(ctx context.Context) error {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(10 * time.Second):
-			return nil
-		}
-	}
-	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, blockingPinger)
-	start := time.Now()
-	resp := doRequest(t, app, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("handler took %v, want < 5s (the 2 s ping timeout is not applied)", elapsed)
 	}
 }
 

@@ -41,6 +41,9 @@ func New(app *wiring.App) *fiber.App {
 			log.Printf("httpapi: admission signer unavailable, admitted submits will carry no σI: %v", err)
 		}
 	}
+	if app.OwnerIndex != nil {
+		opts = append(opts, WithReadiness(app.OwnerIndex.Readiness))
+	}
 	if app.ArcadeEnabled {
 		var evict EvictTx
 		if app.EvictTx != nil {
@@ -66,6 +69,7 @@ type serverOptions struct {
 	outputBeefWhere     OutputBeefWhereFunc
 	adminAPIToken       string
 	adminCORSOrigins    []string
+	readiness           Readiness
 }
 
 // ServerOption customizes newServer without changing its required parameters.
@@ -134,7 +138,7 @@ func newServer(submitter Submitter, lookuper Lookuper, store AdminStore, ping Pi
 	registerLookupRoutes(f, lookuper)
 	registerAdminRoutes(f, store, o.outputBeefWhere, o.adminAPIToken)
 	registerAdmissionRoute(f, o.admissionRecorder, o.appliedProof, o.admissionSigner, o.adminAPIToken)
-	registerHealthRoutes(f, ping)
+	registerHealthRoutes(f, ping, o.readiness)
 	if o.arcadeEnabled {
 		// An unauthenticated /arc-ingest would let anyone trigger an eviction: refuse to mount it without a token.
 		if o.arcCallbackToken == "" {

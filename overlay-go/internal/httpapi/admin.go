@@ -27,9 +27,6 @@ type OutputBeefWhereFunc func(ctx context.Context, txid string, vout uint32, acc
 // registryTxNotFound is shared with overlay/src/index.ts.
 const registryTxNotFound = "registry tx not in overlay storage"
 
-// Pinger proves Mongo connectivity for /health/ready.
-type Pinger func(ctx context.Context) error
-
 // registerAdminRoutes wires the KYC registry routes (A1.5: same URLs, tm_mandala_kyc). /admin/registry is gated;
 // its BEEF recovery route is public.
 func registerAdminRoutes(f *fiber.App, store AdminStore, beefWhere OutputBeefWhereFunc, adminToken string) {
@@ -175,30 +172,6 @@ func beefWhereHandler(where OutputBeefWhereFunc, accept func(topic string) bool,
 			nums[i] = uint16(b)
 		}
 		return c.Status(fiber.StatusOK).JSON(fiber.Map{"beef": nums, "outputIndex": vout})
-	}
-}
-
-// registerHealthRoutes wires /health, /health/live (the process is up) and /health/ready (Mongo ping).
-func registerHealthRoutes(f *fiber.App, ping Pinger) {
-	f.Get("/health", healthOKHandler)
-	f.Get("/health/live", healthOKHandler)
-	f.Get("/health/ready", healthReadyHandler(ping))
-}
-
-func healthOKHandler(c *fiber.Ctx) error {
-	return c.Status(fiber.StatusOK).JSON(fiber.Map{"status": "ok"})
-}
-
-func healthReadyHandler(ping Pinger) fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		if ping != nil {
-			ctx, cancel := context.WithTimeout(c.UserContext(), 2*time.Second)
-			defer cancel()
-			if err := ping(ctx); err != nil {
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"status": "error"})
-			}
-		}
-		return c.Status(fiber.StatusOK).JSON(fiber.Map{"status": "ok"})
 	}
 }
 
