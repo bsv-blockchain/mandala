@@ -24,7 +24,7 @@ const (
 	TokensCollection        = "mandalaTokens"
 	AuthoritiesCollection   = "mandalaAuthorities"
 	LinkageCollection       = "mandalaLinkageRecords"
-	BalancesCollection      = "mandalaBalances"
+	BalancesCollection      = "mandalaBalances" // derived from mandalaTokens; RebuildBalances heals a missed credit or debit
 	MetadataCollection      = "mandalaMetadata"
 	AssetStatesCollection   = "mandalaAssetStates"
 	AdminHistoryCollection  = "mandalaAdminHistory"
@@ -73,7 +73,8 @@ func storeAsc(fields ...string) bson.D {
 
 // NewStore builds the store and creates every index eagerly. Unlike TS CollectionIndexes (which
 // logs and continues, F/ts-storage §2.4) any failure aborts boot: the unique indexes are what make
-// the journal, the value index and the admission record single-valued under concurrency.
+// the journal, the value index, the admin history, the linkage records and the admission record
+// single-valued under concurrency.
 func NewStore(db *mongo.Database) (*Store, error) {
 	s := &Store{
 		owners:        db.Collection(OwnersCollection),
@@ -99,14 +100,14 @@ func NewStore(db *mongo.Database) (*Store, error) {
 		{s.tokens, TokensCollection, mongo.IndexModel{Keys: storeAsc("identityKey")}},
 		{s.authorities, AuthoritiesCollection, mongo.IndexModel{Keys: storeAsc("txid", "outputIndex"), Options: uniq()}},
 		{s.authorities, AuthoritiesCollection, mongo.IndexModel{Keys: storeAsc("topic", "tokenId")}},
-		{s.linkage, LinkageCollection, mongo.IndexModel{Keys: storeAsc("txid", "outputIndex")}},
+		{s.linkage, LinkageCollection, mongo.IndexModel{Keys: storeAsc("txid", "outputIndex"), Options: uniq()}},
 		{s.linkage, LinkageCollection, mongo.IndexModel{Keys: storeAsc("identityKey")}},
 		{s.linkage, LinkageCollection, mongo.IndexModel{Keys: bson.D{{Key: "createdAt", Value: -1}}}}, // activity paging; NO TTL
 		{s.balances, BalancesCollection, mongo.IndexModel{Keys: storeAsc("identityKey"), Options: uniq()}},
 		{s.metadata, MetadataCollection, mongo.IndexModel{Keys: storeAsc("tokenId"), Options: uniq()}},
 		{s.states, AssetStatesCollection, mongo.IndexModel{Keys: storeAsc("tokenId"), Options: uniq()}},
 		{s.history, AdminHistoryCollection, mongo.IndexModel{Keys: storeAsc("tokenId", "height", "offset", "admitSeq")}},
-		{s.history, AdminHistoryCollection, mongo.IndexModel{Keys: storeAsc("tokenId", "txid", "outputIndex")}},
+		{s.history, AdminHistoryCollection, mongo.IndexModel{Keys: storeAsc("tokenId", "txid", "outputIndex"), Options: uniq()}},
 		{s.history, AdminHistoryCollection, mongo.IndexModel{Keys: storeAsc("txid")}},
 		{s.history, AdminHistoryCollection, mongo.IndexModel{Keys: bson.D{{Key: "tokenId", Value: 1}, {Key: "admitSeq", Value: -1}}}},
 		{s.tokenRegistry, TokenRegistryCollection, mongo.IndexModel{Keys: storeAsc("tokenId"), Options: uniq()}},
@@ -411,7 +412,10 @@ func (s *Store) ListAuthorities(ctx context.Context, topic, tokenID string) ([]A
 // {createdAt}} and credits the owner's balance only when this call inserted; a deploy or authority
 // journal upserts mandalaAuthorities {$set {topic, tokenId, identityKey}, $setOnInsert {createdAt}}
 // and never credits. It never writes the journal. Concurrent repairs of one outpoint credit once:
-// only the upsert that inserted sees no prior document.
+// only the upsert that inserted sees no prior document. The row and the credit are two writes: a
+// credit that fails (or a crash between them) is not retried, since a retry finds the row and
+// corrects it without crediting. RebuildBalances heals that missed credit at the next maintenance
+// run.
 func (s *Store) RepairOwnerRow(ctx context.Context, journal OwnerRecord) (bool, error) {
 	coll, set := s.authorities, bson.D{
 		{Key: "topic", Value: journal.Topic},
@@ -452,7 +456,9 @@ func (s *Store) RepairOwnerRow(ctx context.Context, journal OwnerRecord) (bool, 
 
 // ---- balances ----
 
-// AdjustBalance adds delta to the identity's balance ($inc, upsert).
+// AdjustBalance adds delta to the identity's balance ($inc, upsert). Balances are a derived index
+// of mandalaTokens, written apart from the row they follow: a credit or debit missed between the
+// row write and this $inc is healed by RebuildBalances at the next maintenance run.
 func (s *Store) AdjustBalance(ctx context.Context, identityKey string, delta int64) error {
 	_, err := s.balances.UpdateOne(ctx, bson.D{{Key: "identityKey", Value: identityKey}},
 		bson.D{{Key: "$inc", Value: bson.D{{Key: "balance", Value: delta}}}}, options.UpdateOne().SetUpsert(true))
@@ -470,11 +476,114 @@ func (s *Store) GetBalance(ctx context.Context, identityKey string) (int64, erro
 	return int64(rec.Balance), nil
 }
 
+// BalanceRebuild is what one RebuildBalances run did.
+type BalanceRebuild struct {
+	Changed int      // balance documents written: created, corrected or set to 0
+	Unsafe  []string // sorted identity keys whose sum exceeds MaxSafeAmount; their documents are left as they are
+}
+
+// RebuildBalances recomputes mandalaBalances from mandalaTokens. Balances are a derived index of
+// mandalaTokens: storing a value row credits its owner once, and every debit (TakeBackRepair, and
+// takeRow on a spend, an eviction or RetireOutputs) follows a TakeToken that deleted the row. Rows
+// are deleted, never flagged, so an identity's balance is the sum of amount over every
+// mandalaTokens row it owns, across tokens. A reissued outpoint (asset state evictedOutpoints) keeps
+// its row and no path debits it, so it counts here, although CirculatingSupply leaves it out.
+//
+// An identity with a balance document but no rows is set to 0 and keeps its document; one with
+// rows but no document gets one; a document whose stored balance (int32, int64 or double) already
+// equals the sum is not rewritten, and one that does not decode is. A balance is written as a BSON
+// double through Amount, the amount shape of D §6.6. A sum above MaxSafeAmount (possible only
+// across tokens) is not written, because GetBalance could not read such a double back, and it never
+// fails the run: its identity key is returned in Unsafe for the caller to log. A row whose amount
+// does not decode fails the run, as it fails CirculatingSupply.
+//
+// It reads every row and then writes, so the caller must hold the maintenance gate's exclusive
+// section: no balance writer may run beside it (Task 22 runs it in owner-index maintenance).
+func (s *Store) RebuildBalances(ctx context.Context) (BalanceRebuild, error) {
+	res := BalanceRebuild{Unsafe: []string{}}
+	sums := map[string]*big.Int{}
+	cur, err := s.tokens.Find(ctx, bson.D{}, options.Find().
+		SetProjection(bson.D{{Key: "_id", Value: 0}, {Key: "identityKey", Value: 1}, {Key: "amount", Value: 1}}))
+	if err != nil {
+		return res, err
+	}
+	defer cur.Close(ctx)
+	for cur.Next(ctx) {
+		var row struct {
+			IdentityKey string `bson:"identityKey"`
+			Amount      Amount `bson:"amount"`
+		}
+		if err := cur.Decode(&row); err != nil {
+			return res, err
+		}
+		sum, ok := sums[row.IdentityKey]
+		if !ok {
+			sum = new(big.Int)
+			sums[row.IdentityKey] = sum
+		}
+		sum.Add(sum, big.NewInt(int64(row.Amount)))
+	}
+	if err := cur.Err(); err != nil {
+		return res, err
+	}
+
+	type storedBalance struct {
+		IdentityKey string        `bson:"identityKey"`
+		Balance     bson.RawValue `bson:"balance"`
+	}
+	bcur, err := s.balances.Find(ctx, bson.D{}, options.Find().
+		SetProjection(bson.D{{Key: "_id", Value: 0}, {Key: "identityKey", Value: 1}, {Key: "balance", Value: 1}}))
+	docs, err := storeAll[storedBalance](ctx, bcur, err)
+	if err != nil {
+		return res, err
+	}
+	stored := make(map[string]bson.RawValue, len(docs))
+	for _, d := range docs {
+		stored[d.IdentityKey] = d.Balance
+		if _, ok := sums[d.IdentityKey]; !ok {
+			sums[d.IdentityKey] = new(big.Int) // a document with no rows left: its balance is 0
+		}
+	}
+
+	keys := make([]string, 0, len(sums))
+	for k := range sums {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	maxSafe := new(big.Int).SetUint64(MaxSafeAmount)
+	for _, key := range keys {
+		sum := sums[key]
+		if sum.CmpAbs(maxSafe) > 0 {
+			res.Unsafe = append(res.Unsafe, key)
+			continue
+		}
+		if raw, ok := stored[key]; ok {
+			var have Amount
+			if have.UnmarshalBSONValue(byte(raw.Type), raw.Value) == nil && int64(have) == sum.Int64() {
+				continue // already right: not rewritten
+			}
+		}
+		if err := storeUpsertSet(ctx, s.balances, bson.D{{Key: "identityKey", Value: key}},
+			bson.D{{Key: "balance", Value: Amount(sum.Int64())}}); err != nil {
+			return res, err
+		}
+		res.Changed++
+	}
+	return res, nil
+}
+
 // ---- linkage records (last write wins; read by activity) ----
 
-// StoreLinkage upserts the linkage record of an outpoint ($set: the last write wins).
+// StoreLinkage upserts the linkage record of an outpoint ($set: the last write wins). The key is
+// unique (unlike TS, R8): an exact-equality upsert on a unique key is idempotent, so concurrent
+// stores of one outpoint keep one record. A store that still loses the insert race with E11000
+// re-runs once as an update of the record that won.
 func (s *Store) StoreLinkage(ctx context.Context, r LinkageRecord) error {
-	return storeUpsertSet(ctx, s.linkage, storeOutpoint(r.Txid, r.OutputIndex), r)
+	err := storeUpsertSet(ctx, s.linkage, storeOutpoint(r.Txid, r.OutputIndex), r)
+	if mongo.IsDuplicateKeyError(err) {
+		err = storeUpsertSet(ctx, s.linkage, storeOutpoint(r.Txid, r.OutputIndex), r)
+	}
+	return err
 }
 
 // ListLinkage lists linkage records newest first, at most limit, created at or before `before`.
@@ -578,8 +687,10 @@ func (s *Store) PutAssetStateIfAbsent(ctx context.Context, st AssetAdminState) (
 // ---- admin history ----
 
 // AppendAdminHistory appends the entry unless (tokenId, txid, outputIndex) already has one: true
-// iff this call inserted. The key index is not unique (TS parity): two truly concurrent first
-// writes could both insert, so readers of the summary dedupe by (txid, outputIndex).
+// iff this call inserted. The key index is unique, a deliberate divergence from TS (whose index is
+// not): Go submits are not serialised (R8), so two same-txid submits can append one action at once,
+// and the unique key is what keeps the append first-write-wins. The loser's E11000 reads as
+// inserted=false, so Task 16 recordAction folds the action once.
 func (s *Store) AppendAdminHistory(ctx context.Context, e AdminHistoryEntry) (bool, error) {
 	return storeInsertIfAbsent(ctx, s.history, bson.D{
 		{Key: "tokenId", Value: e.TokenID}, {Key: "txid", Value: e.Txid}, {Key: "outputIndex", Value: e.OutputIndex},

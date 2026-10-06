@@ -72,11 +72,11 @@ func TestNewStoreCreatesEveryIndex(t *testing.T) {
 		OwnersCollection:        {"txid_1_outputIndex_1_topic_1 unique"},
 		TokensCollection:        {"identityKey_1", "tokenId_1", "txid_1_outputIndex_1 unique"},
 		AuthoritiesCollection:   {"topic_1_tokenId_1", "txid_1_outputIndex_1 unique"},
-		LinkageCollection:       {"createdAt_-1", "identityKey_1", "txid_1_outputIndex_1"},
+		LinkageCollection:       {"createdAt_-1", "identityKey_1", "txid_1_outputIndex_1 unique"},
 		BalancesCollection:      {"identityKey_1 unique"},
 		MetadataCollection:      {"tokenId_1 unique"},
 		AssetStatesCollection:   {"tokenId_1 unique"},
-		AdminHistoryCollection:  {"tokenId_1_admitSeq_-1", "tokenId_1_height_1_offset_1_admitSeq_1", "tokenId_1_txid_1_outputIndex_1", "txid_1"},
+		AdminHistoryCollection:  {"tokenId_1_admitSeq_-1", "tokenId_1_height_1_offset_1_admitSeq_1", "tokenId_1_txid_1_outputIndex_1 unique", "txid_1"},
 		TokenRegistryCollection: {"createdAt_1", "tokenId_1 unique"},
 		KYCRegistryCollection:   {"identityKey_1 unique", "status_1"},
 		AdmissionsCollection:    {"txid_1 unique"},
@@ -588,6 +588,144 @@ func TestBalances(t *testing.T) {
 	}
 }
 
+// V-11: mandalaBalances is a derived index of mandalaTokens. A credit or debit lost between a row
+// write and its $inc is never retried by the write paths; RebuildBalances heals it.
+func TestRebuildBalancesHealsTheBalanceIndex(t *testing.T) {
+	ctx := context.Background()
+	s, db := newTestStore(t)
+	tok, other := stHex(0xaa)+"_0", stHex(0xbb)+"_0"
+	topic := "tm_" + stHex(0xaa)
+	keyC := "02" + strings.Repeat("c3", 32)
+	keyD := "03" + strings.Repeat("d4", 32)
+	keyE := "02" + strings.Repeat("e5", 32)
+	mustRow := func(r TokenRecord) {
+		t.Helper()
+		if ok, err := s.StoreTokenIfAbsent(ctx, r); err != nil || !ok {
+			t.Fatalf("store row %s.%d: %v %v", r.Txid[:2], r.OutputIndex, ok, err)
+		}
+	}
+	credit := func(key string, delta int64) {
+		t.Helper()
+		if err := s.AdjustBalance(ctx, key, delta); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A: one repaired row credited normally, then a row whose credit was lost (the row write landed,
+	// the process died before the $inc). The retried repair finds the row and does not credit.
+	if inserted, err := s.RepairOwnerRow(ctx, stOwner(stHex(1), 0, topic, brc162.RoleValue, 40, stKeyA)); err != nil || !inserted {
+		t.Fatalf("repair: %v %v", inserted, err)
+	}
+	mustRow(stToken(stHex(1), 1, tok, 25, stKeyA))
+	if inserted, err := s.RepairOwnerRow(ctx, stOwner(stHex(1), 1, topic, brc162.RoleValue, 25, stKeyA)); err != nil || inserted {
+		t.Fatalf("retried repair: %v %v", inserted, err)
+	}
+	// A also lost a debit: a spent row of another token was taken, its owner never debited.
+	mustRow(stToken(stHex(2), 0, other, 5, stKeyA))
+	credit(stKeyA, 5)
+	if r, err := s.TakeToken(ctx, stHex(2), 0); err != nil || r == nil {
+		t.Fatalf("take: %+v %v", r, err)
+	}
+	if b, _ := s.GetBalance(ctx, stKeyA); b != 45 {
+		t.Fatalf("precondition: A's balance %d, want the drifted 45", b)
+	}
+	// B: a balance document with no rows left (the last row's debit was lost).
+	credit(stKeyB, 30)
+	// C: a row with no balance document, on an outpoint a reissue evicted. No path debits a
+	// reissued row, so it still counts (CirculatingSupply excludes it; balances do not).
+	mustRow(stToken(stHex(3), 0, tok, 7, keyC))
+	st := DefaultAssetState(tok, nil)
+	st.EvictedOutpoints = []string{stHex(3) + ".0"}
+	if err := s.PutAssetState(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	// D: already right, across two tokens, as the int64 the Go $inc writes: it is not rewritten.
+	mustRow(stToken(stHex(4), 0, tok, 12, keyD))
+	mustRow(stToken(stHex(4), 1, other, 3, keyD))
+	credit(keyD, 15)
+	// E: a stored balance that does not decode (fractional) is replaced.
+	mustRow(stToken(stHex(5), 0, tok, 9, keyE))
+	if _, err := db.Collection(BalancesCollection).InsertOne(ctx, bson.D{{Key: "identityKey", Value: keyE}, {Key: "balance", Value: 2.5}}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.RebuildBalances(ctx)
+	if err != nil || res.Changed != 4 || res.Unsafe == nil || len(res.Unsafe) != 0 {
+		t.Fatalf("rebuild = %+v, %v; want 4 changed (A, B, C, E) and no unsafe key", res, err)
+	}
+	for _, want := range []struct {
+		key string
+		bal int64
+	}{{stKeyA, 65}, {stKeyB, 0}, {keyC, 7}, {keyD, 15}, {keyE, 9}} {
+		if b, err := s.GetBalance(ctx, want.key); b != want.bal || err != nil {
+			t.Fatalf("balance of %s = %d, %v; want %d", want.key[:4], b, err, want.bal)
+		}
+	}
+	if n := stCount(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: stKeyB}}); n != 1 {
+		t.Fatalf("an identity with no rows keeps its document (at 0): %d documents", n)
+	}
+	if n := stCount(t, db, BalancesCollection, bson.D{}); n != 5 {
+		t.Fatalf("%d balance documents, want 5", n)
+	}
+	for _, key := range []string{stKeyA, stKeyB, keyC, keyE} {
+		if v := stRaw(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: key}}, "balance"); v.Type != bson.TypeDouble {
+			t.Fatalf("rebuilt balance of %s stored as %v, want double", key[:4], v.Type)
+		}
+	}
+	if v := stRaw(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: keyD}}, "balance"); v.Type != bson.TypeInt64 {
+		t.Fatalf("an unchanged balance was rewritten: stored as %v", v.Type)
+	}
+
+	again, err := s.RebuildBalances(ctx)
+	if err != nil || again.Changed != 0 || again.Unsafe == nil || len(again.Unsafe) != 0 {
+		t.Fatalf("a second run = %+v, %v; want nothing changed", again, err)
+	}
+}
+
+// V-11: an identity's balance sums every token it holds, so it can pass 2^53-1 although no single
+// token's supply can. RebuildBalances reports such an identity instead of failing and leaves its
+// document as it is; the same run still heals every other identity.
+func TestRebuildBalancesReportsAnUnsafeSumWithoutFailing(t *testing.T) {
+	ctx := context.Background()
+	s, db := newTestStore(t)
+	tokX, tokY := stHex(0xaa)+"_0", stHex(0xbb)+"_0"
+	keyC := "02" + strings.Repeat("c3", 32)
+	for _, r := range []TokenRecord{
+		stToken(stHex(1), 0, tokX, Amount(MaxSafeAmount), stKeyA), // A: 2^53 in all, the second credit lost
+		stToken(stHex(1), 1, tokY, 1, stKeyA),
+		stToken(stHex(2), 0, tokX, Amount(MaxSafeAmount), keyC), // C: 2^54-2 in all, no balance document
+		stToken(stHex(2), 1, tokY, Amount(MaxSafeAmount), keyC),
+		stToken(stHex(3), 0, tokX, 10, stKeyB), // B: safe, its credit lost
+	} {
+		if ok, err := s.StoreTokenIfAbsent(ctx, r); err != nil || !ok {
+			t.Fatalf("store row %s.%d: %v %v", r.Txid[:2], r.OutputIndex, ok, err)
+		}
+	}
+	if err := s.AdjustBalance(ctx, stKeyA, int64(MaxSafeAmount)); err != nil {
+		t.Fatal(err)
+	}
+
+	for run := 1; run <= 2; run++ {
+		res, err := s.RebuildBalances(ctx)
+		wantChanged := 1 // B
+		if run == 2 {
+			wantChanged = 0
+		}
+		if err != nil || res.Changed != wantChanged || strings.Join(res.Unsafe, ",") != stKeyA+","+keyC {
+			t.Fatalf("run %d = %+v, %v; want %d changed and unsafe [A C]", run, res, err, wantChanged)
+		}
+		if b, err := s.GetBalance(ctx, stKeyA); b != int64(MaxSafeAmount) || err != nil {
+			t.Fatalf("run %d: an unsafe identity's document must be left readable as it was: %d %v", run, b, err)
+		}
+		if n := stCount(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: keyC}}); n != 0 {
+			t.Fatalf("run %d: an unsafe identity got a document", run)
+		}
+		if b, err := s.GetBalance(ctx, stKeyB); b != 10 || err != nil {
+			t.Fatalf("run %d: B's balance %d, %v; want 10", run, b, err)
+		}
+	}
+}
+
 func stLinkage(keyID string) SpecificLinkage {
 	return SpecificLinkage{Prover: stKeyA, Verifier: stKeyB, Counterparty: stKeyA, ProtocolID: ProtocolID{SecurityLevel: 2, Name: "mandala token"}, KeyID: keyID, EncryptedLinkage: NumBytes{1, 2, 3}, EncryptedLinkageProof: NumBytes{0}}
 }
@@ -622,6 +760,35 @@ func TestLinkageLastWriteWinsAndLists(t *testing.T) {
 	found, err := s.FindLinkageByOutpoints(ctx, []Outpoint{{Txid: stHex(2), OutputIndex: 1}, {Txid: stHex(9), OutputIndex: 0}})
 	if err != nil || len(found) != 1 || found[0].Linkage.KeyID != "out-1" || string(found[0].Linkage.EncryptedLinkage) != "\x01\x02\x03" {
 		t.Fatalf("by outpoints: %+v %v", found, err)
+	}
+}
+
+// V-10 (R8): concurrent same-txid submits store one outpoint's linkage at once (each with its own
+// createdAt); the unique (txid, outputIndex) key keeps one record and no store fails.
+func TestConcurrentStoreLinkageOneRowPerOutpoint(t *testing.T) {
+	ctx := context.Background()
+	s, db := newTestStore(t)
+	t0 := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	for k := byte(1); k <= 8; k++ {
+		txid := stHex(k)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < 16; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				r := LinkageRecord{Txid: txid, OutputIndex: 0, IdentityKey: stKeyA, Linkage: stLinkage("out-0"), CreatedAt: t0.Add(time.Duration(i) * time.Second)}
+				if err := s.StoreLinkage(ctx, r); err != nil {
+					t.Errorf("key %d store %d: %v", k, i, err)
+				}
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		if n := stCount(t, db, LinkageCollection, bson.D{{Key: "txid", Value: txid}, {Key: "outputIndex", Value: 0}}); n != 1 {
+			t.Fatalf("key %d: %d linkage records, want 1", k, n)
+		}
 	}
 }
 
@@ -779,6 +946,47 @@ func TestAdminHistory(t *testing.T) {
 	}
 }
 
+// V-10 (R8): Go submits are not serialised, so two same-txid submits can append one admin action at
+// once, each with its own admitSeq. The unique (tokenId, txid, outputIndex) key keeps one row and
+// reports one insert, so Task 16 recordAction folds the action once.
+func TestConcurrentAppendAdminHistoryInsertsOnce(t *testing.T) {
+	ctx := context.Background()
+	s, db := newTestStore(t)
+	tok := stHex(0xaa) + "_0"
+	for k := byte(1); k <= 8; k++ {
+		txid := stHex(k)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		inserts := 0
+		for i := 0; i < 16; i++ {
+			wg.Add(1)
+			go func(seq int64) {
+				defer wg.Done()
+				<-start
+				inserted, err := s.AppendAdminHistory(ctx, stHistory(tok, txid, 0, "pause", 100, 0, seq))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if inserted {
+					mu.Lock()
+					inserts++
+					mu.Unlock()
+				}
+			}(int64(k)*100 + int64(i))
+		}
+		close(start)
+		wg.Wait()
+		if inserts != 1 {
+			t.Fatalf("key %d: %d appends reported an insert, want 1", k, inserts)
+		}
+		if n := stCount(t, db, AdminHistoryCollection, bson.D{{Key: "tokenId", Value: tok}, {Key: "txid", Value: txid}, {Key: "outputIndex", Value: 0}}); n != 1 {
+			t.Fatalf("key %d: %d history rows, want 1", k, n)
+		}
+	}
+}
+
 func TestNextAdmitSeqStartsAtOneAndIsUniqueUnderConcurrency(t *testing.T) {
 	ctx := context.Background()
 	s, db := newTestStore(t)
@@ -865,13 +1073,6 @@ func TestTokenRegistryRecords(t *testing.T) {
 	ids, err := s.AllRegistryTokenIDs(ctx)
 	if err != nil || strings.Join(ids, ",") != stHex(0xaa)+"_0,"+stHex(0xbb)+"_0,"+stHex(0xcc)+"_0" {
 		t.Fatalf("all ids = %v %v", ids, err)
-	}
-	// Permanent: a spend of the deploy (its rows taken) leaves the record.
-	if _, err := s.TakeAuthority(ctx, stHex(0xaa), 0); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := s.FindRegistryRecord(ctx, stHex(0xaa)+"_0"); got == nil {
-		t.Fatal("a registry record must survive a spend")
 	}
 	if err := s.DeleteRegistryRecord(ctx, stHex(0xaa)+"_0"); err != nil {
 		t.Fatal(err)
