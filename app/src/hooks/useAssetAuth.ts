@@ -12,23 +12,24 @@ export const assetAuthKey = (assetId: string) => ['asset-auth', assetId] as cons
  * never answered from the cache: a re-attach must see the head as it stands.
  */
 export function useAssetAuth(assetId: string) {
+  const { identityKey } = useWallet()
   return useQuery({
-    queryKey: assetAuthKey(assetId),
+    queryKey: [...assetAuthKey(assetId), identityKey],
     enabled: assetId !== '',
     staleTime: 0,
-    queryFn: async (): Promise<OverlayAssetAuth | null> => fetchAssetAuthHead(assetId)
+    queryFn: async (): Promise<OverlayAssetAuth | null> => fetchAssetAuthHead(assetId, identityKey ?? undefined)
   })
 }
 
 /** Put the overlay's live admin-auth UTXO for an asset back in this wallet's basket. */
 export function useReattachAssetAuth() {
-  const { wallet } = useWallet()
+  const { wallet, identityKey } = useWallet()
   const qc = useQueryClient()
   const invalidateAdminAssets = useInvalidateAdminAssets()
   return useMutation({
     mutationFn: async (assetId: string) => {
       if (wallet == null) throw new Error('Wallet not ready')
-      return recoverAdminAuth({ wallet: wallet as any, assetId })
+      return recoverAdminAuth({ wallet: wallet as any, assetId, issuerIdentityKey: identityKey ?? undefined })
     },
     onSuccess: asset => {
       toast.success(

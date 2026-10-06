@@ -135,7 +135,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
       identityKey: identityKey!,
       messageBoxClient: messageBoxClient ?? undefined
     })
-    advanceAdminAuth(args.asset.assetId, res.nextAuthOutpoint, args.details)
+    advanceAdminAuth(args.asset.assetId, res.nextAuthOutpoint, res.nextAuthKeyID)
     return res
   }, [wallet, identityKey, messageBoxClient, advanceAdminAuth])
 
@@ -175,9 +175,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
     await submitAction({
       asset: asset!,
       details: withReason({
-        kind: isPaused ? 'unpause' : 'pause',
-        assetId: asset!.assetId,
-        priorOutpoint: asset!.authOutpoint
+        kind: isPaused ? 'unpause' : 'pause'
       }, reason)
     })
     toast.success(isPaused ? 'Asset unpaused' : 'Asset paused')
@@ -192,7 +190,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
     if (!fields.ok) { toast.error(fields.reason); return }
     await submitAction({
       asset: asset!,
-      details: withReason({ kind: 'freezeOutput', assetId: asset!.assetId, outpoint: op, priorOutpoint: asset!.authOutpoint }, reason)
+      details: withReason({ kind: 'freezeOutput', outpoint: op }, reason)
     })
     toast.success(`Output ${op.slice(0, 16)}… frozen`)
     setFreezeOutpoint('')
@@ -207,7 +205,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
     if (!fields.ok) { toast.error(fields.reason); return }
     await submitAction({
       asset: asset!,
-      details: withReason({ kind: 'unfreezeOutput', assetId: asset!.assetId, outpoint: op, priorOutpoint: asset!.authOutpoint }, reason)
+      details: withReason({ kind: 'unfreezeOutput', outpoint: op }, reason)
     })
     toast.success(`Output ${op.slice(0, 16)}… unfrozen`)
     setSelectedFreezeRef('')
@@ -223,7 +221,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
     if (!fields.ok) { toast.error(fields.reason); return }
     await submitAction({
       asset: asset!,
-      details: withReason({ kind, assetId: asset!.assetId, identityKey: key, priorOutpoint: asset!.authOutpoint }, reason)
+      details: withReason({ kind, identityKey: key }, reason)
     })
     const labels: Record<string, string> = { blockIdentity: 'Blocked', unblockIdentity: 'Unblocked', allowIdentity: 'Allowlisted', unallowIdentity: 'Removed from allowlist' }
     toast.success(`${labels[kind]} ${key.slice(0, 12)}…`)
@@ -238,7 +236,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
   const handleSetAccessMode = () => void run('accessMode', async () => {
     await submitAction({
       asset: asset!,
-      details: withReason({ kind: 'setAccessMode', assetId: asset!.assetId, mode: newAccessMode, priorOutpoint: asset!.authOutpoint }, reason)
+      details: withReason({ kind: 'setAccessMode', mode: newAccessMode }, reason)
     })
     toast.success(`Access mode set to ${newAccessMode}`)
   })
@@ -258,7 +256,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
       feeRatePerKb,
       reason
     })
-    advanceAdminAuth(asset!.assetId, res.nextAuthOutpoint, res.nextAuthDetails)
+    advanceAdminAuth(asset!.assetId, res.nextAuthOutpoint, res.nextAuthKeyID)
     toast.success(feeRatePerKb === null ? 'Issuer-paid fees disabled' : `Fee rate set to ${feeRatePerKb} units/KB`)
   })
 
@@ -282,11 +280,8 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
       asset: asset!,
       details: withReason({
         kind: 'reissue',
-        assetId: asset!.assetId,
         outpoint: op,
-        amount,
-        recipient,
-        priorOutpoint: asset!.authOutpoint
+        recipient
       }, reason),
       ftOutput: { recipient, amount }
     })

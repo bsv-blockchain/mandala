@@ -82,7 +82,7 @@ export function useIssuerMutations() {
     onSuccess: (r, { asset, amount }) => {
       // Advance the cached auth chain immediately — a second action before the
       // background refetch lands must not read the spent prior.
-      advanceAdminAuth(asset.assetId, r.nextAuthOutpoint, r.nextAuthDetails)
+      advanceAdminAuth(asset.assetId, r.nextAuthOutpoint, r.nextAuthKeyID)
       toast.success(`Issued ${formatAmount(amount, Number(asset.metadata?.decimals) || 0)} ${asset.label}`)
     },
     onError: (e, _v, ctx) => {
@@ -129,7 +129,7 @@ export function useIssuerMutations() {
       }
     },
     onSuccess: (r, { asset, amount }) => {
-      advanceAdminAuth(asset.assetId, r.nextAuthOutpoint, r.nextAuthDetails)
+      advanceAdminAuth(asset.assetId, r.nextAuthOutpoint, r.nextAuthKeyID)
       toast.success(`Redeemed (burned) ${formatAmount(amount, Number(asset.metadata?.decimals) || 0)} ${asset.label}`)
     },
     onError: e => {

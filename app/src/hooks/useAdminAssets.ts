@@ -25,17 +25,17 @@ export function useInvalidateAdminAssets() {
  * Advance an asset's admin-auth chain in the cache the moment an action
  * commits. The background refetch eventually agrees, but until it lands a
  * second action would read the SPENT prior from the cache and die with
- * StaleAdminAuthError — this closes that gap. authDetails must advance with
+ * StaleAdminAuthError — this closes that gap. authKeyID must advance with
  * the outpoint (the next unlock derives from them).
  */
 export function useAdvanceAdminAuth() {
   const qc = useQueryClient()
   const { identityKey } = useWallet()
-  return (assetId: string, nextAuthOutpoint: string, nextAuthDetails?: AdminAsset['authDetails']) => {
+  return (assetId: string, nextAuthOutpoint: string, nextAuthKeyID?: string) => {
     qc.setQueryData<AdminAsset[]>(adminAssetsKey(identityKey), prev =>
       prev?.map(a =>
         a.assetId === assetId
-          ? { ...a, authOutpoint: nextAuthOutpoint, authDetails: nextAuthDetails ?? a.authDetails }
+          ? { ...a, authOutpoint: nextAuthOutpoint, authKeyID: nextAuthKeyID ?? a.authKeyID }
           : a
       )
     )

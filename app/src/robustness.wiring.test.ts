@@ -100,9 +100,7 @@ describe('robustness wiring (shipped source)', () => {
     expect(mut).toContain('mockKycRevoke')
     expect(libReg).toContain('registryFlight.run')
     expect(libReg).toContain('nextRegistryPlan')
-    expect(libReg).toContain('buildRegistrySpendArgs')
-    expect(libReg).toContain('priorOutpoint: live.authOutpoint')
-    expect(libReg).toMatch(/inputs:\s*\[\{\s*outpoint: p\.priorOutpoint/)
+    expect(libReg).toContain('runAuthorityTx')
   })
 
   it('useIssuerMutations wraps register in registerFlight and pre-gates amounts', () => {
@@ -202,7 +200,7 @@ describe('robustness wiring (shipped source)', () => {
     expect(sendIdx).toBeGreaterThan(putIdx)
     expect(assets).toContain('notifyRemove(')
     expect(assets).toContain("senderMode: 'unblinded'")
-    expect(assets).toContain('outputIndex: 0')
+    expect(assets).toContain('outputIndex: res.valueIndices[0]')
     const rc = src('components/issuer/RegulatoryControls.tsx')
     expect(rc).toContain('notified')
     expect(rc).toMatch(/recipient notification pending/i)
@@ -216,7 +214,7 @@ describe('robustness wiring (shipped source)', () => {
     const globalFn = assets.slice(assets.indexOf('export async function submitGlobalAdminAction'))
     expect(globalFn).toContain('withAdminAuthGates(')
     expect(globalFn).toContain('withIntent(')
-    expect(globalFn).toContain('assertSpendablePrior(')
+    expect(globalFn).toContain('spendableBeef(')
   })
 
   it('D3c: the three journals persist only through the injected storage adapter', () => {
@@ -242,7 +240,7 @@ describe('robustness wiring (shipped source)', () => {
 
   it("D3c: the 'accepted' commit-point write is awaited before the background broadcast", () => {
     const s = lib('overlay.ts')
-    const put = s.indexOf("await journalPut({ txid: signed.txid, stage: 'accepted'")
+    const put = s.indexOf("await journalPut({\n    txid: signed.txid,\n    stage: 'accepted'")
     const broadcast = s.indexOf('broadcastAcceptedTx(wallet, signed.txid)')
     expect(put).toBeGreaterThan(-1)
     expect(broadcast).toBeGreaterThan(put)
