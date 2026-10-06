@@ -3,18 +3,47 @@
 Go port of the Mandala BSV overlay service (replaces the TS `overlay/` service).
 Module path: `github.com/sirdeggen/mandala/overlay-go`.
 
-Status: full port. `cmd/overlay/main.go` is the real entrypoint (env-driven
-config, `wiring.Build`, graceful shutdown); the engine (topic manager
-`tm_mandala` + lookup service `ls_mandala`, pinned `go-overlay-services`) is
-wired up behind a hand-written Fiber HTTP layer that reproduces the TS
-overlay's admin endpoints, `/submit`, `/lookup`, `/arc-ingest`, CORS, and
-error shapes. Package layout: `internal/mandala` (domain logic — topic
-manager, lookup service, verifier, admin wallet, Mongo store),
-`internal/enginestore` (the in-repo `engine.Storage` Mongo implementation),
-`internal/wiring` (assembles Mongo + mandala + engine into one `App`),
-`internal/httpapi` (the Fiber server and routes), `internal/activity`
-(the `/admin/activity` feed), and `internal/arcade` (optional Arcade
-broadcaster/chaintracks client — see §10 of `docs/PROJECT-STATE.md`).
+Status: BRC-162 with Mandala token topics on one overlay (Q3). `cmd/overlay/main.go` is the entrypoint
+(env config, `wiring.Build`, the boot via `App.Start`, graceful shutdown). The pinned `go-overlay-services`
+engine runs three kinds of topic behind a hand-written Fiber HTTP layer that keeps the TS overlay's wire shapes:
+`tm_mandala` (the token registry), one `tm_<deployTxid>` per token, and `tm_mandala_kyc` (the identity registry).
+GASP, SHIP/SLAP advertising and cross-operator sync are off (design A1.1); token topics are registered in memory
+by `wiring.TokenTopics` at boot and by the `/submit` deploy hook.
+
+## Topics, routes and environment
+
+| Topic | Lookup | Admits |
+|---|---|---|
+| `tm_mandala` | `ls_mandala` | Deploys only: vout 0 of a deploy by a trusted issuer with a valid deploySig. The registry record is permanent. |
+| `tm_<deployTxid>` | `ls_<deployTxid>` | One token's deploy, authority and value outputs under BRC-162 layers A–D, the owner journal and §4.2a repair. |
+| `tm_mandala_kyc` | `ls_mandala_kyc` | The identity registry: one authority chain that admits and revokes identities. |
+
+A deploy is one submit naming `["tm_mandala", "tm_<own txid>"]`; any other submit naming `tm_mandala` is refused
+(400 `ERR_SHAPE`). A token transaction names one `tm_<id>` per token it touches; a KYC action names
+`["tm_mandala_kyc"]`. Each `tm_mandala` / `tm_<id>` STEAK entry with admitted outputs carries its own σI
+(digest v3 binds the topic).
+
+| Route | Access | Notes |
+|---|---|---|
+| `POST /submit` | public | Holds a maintenance-gate slot; pairing rule and deploy hook; typed verdicts; an unhosted topic answers 400 `unknown-topic: <name>`. |
+| `POST /lookup` | public | Outputs only. |
+| `GET /admin/tokens?limit&skip` | public | The registry list with a `hosted` flag (`limit` 1–100, `skip` 0–100000). |
+| `GET /admin/authorities/:tokenId`, `/admin/asset-state/:tokenId`, `/admin/admin-history/:tokenId`, `/admin/admin-history-page/:tokenId?limit&offset`, `/admin/admin-summary/:tokenId` | public | 400 `invalid tokenId`; 404 `token not hosted`. |
+| `GET /admin/authorities/beef/:txid?vout=` | public | Served only from a `tm_<id>` copy. |
+| `GET /admin/registry/beef/:txid?vout=` | public | KYC registry outputs. |
+| `GET /admin/registry`, `/admin/activity?tokenId&limit&before`, `/admin/admission/:txid?payloadHash=` | `ADMIN_API_TOKEN` | Narrowed CORS. |
+| `POST /arc-ingest` | Arcade callback token | Mounted only with Arcade and a non-empty token. |
+| `GET /health`, `/health/live`, `/health/ready` | public | Readiness includes the `mandala-owner-index` check. |
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `NODE_NAME` | yes | Database `<NODE_NAME>_lookup_services`. Use a fresh name (e.g. `mandala_q3`); never `mandala` or `mandala162`. |
+| `SERVER_PRIVATE_KEY` | yes | The overlay key: decrypts linkage, signs σI. |
+| `HOSTING_URL`, `MONGO_URL`, `NETWORK` | yes | `NETWORK` is `main` or `test`; the `MONGO_URL` path is ignored. |
+| `MANDALA_ISSUER_KEYS` | yes | JSON array of trusted issuer identity keys. |
+| `MANDALA_TOKEN_ALLOWLIST` | no | JSON array of deploy txids to host; unset follows every token, `[]` hosts none. |
+| `PORT` | no | Listen port, default `8080`. |
+| `ARCADE_*`, `CHAINTRACKS_*`, `ADMIN_API_TOKEN`, `ADMIN_CORS_ORIGINS` | no | See `.env.example`. |
 
 ## Toolchain
 
@@ -49,12 +78,11 @@ the signatures later tasks should code against verbatim. `TopicManager`,
 `LookupService`, `Config`, `Storage` and `Output` are identical in v1.3.2 and
 v1.3.7.
 
-`Engine.Submit` builds `previousCoins` with `Storage.FindOutputs(..., spent=nil)`,
-so a coin another transaction already spent is still listed (tm_mandala retains
-every previous coin). The FIX L spend guard depends on that: it inspects only
-the listed inputs. `internal/wiring/previous_coins_test.go` pins it. If a bump
-starts dropping spent coins (as `@bsv/overlay` 2.6 did), port the TS guard
-(`overlay/src/spentGuard.ts`: every input inspected, self-heal) first.
+`Engine.Submit` builds `previousCoins` with `Storage.FindOutputs(..., spent=nil)`, so a coin another transaction
+already spent is still listed. The token topic manager's conflicting-spend guard inspects exactly those coins
+(`internal/wiring/previous_coins_test.go` pins it). A token topic retains only the inputs it classifies as its
+own token's; the engine deletes any other previous coin of that topic (pinned in
+`internal/wiring/engine_contract_test.go`).
 
 Script rules (go-sdk v1.7.1, wire contract §11.7). go-sdk's `spv.Verify`, which
 `Engine.Submit` runs, verifies every tx version under after-Chronicle rules. TS's
@@ -338,13 +366,16 @@ strategy**, not the `sync.Map` fallback.
 ```
 overlay-go/
   go.mod
-  cmd/overlay/main.go        — entrypoint: env config, wiring.Build, graceful shutdown
-  internal/mandala/          — domain logic: topic manager, lookup service, verifier,
-                                admin wallet, admin-state reducer, Mongo store
+  cmd/overlay/main.go        — entrypoint: env config, wiring.Build, App.Start, graceful shutdown
+  internal/brc162/           — generic BRC-162: TS-parity chunker, binary codec, strict CBOR, token ledger
+  internal/mandala/          — Mandala policy: topics, envelope, layers B–D, managers, lookups, §6.6 store,
+                                σI v3 admission record, fold/refold, reconciler, KYC registry
+  internal/mandalatest/      — importable test kit: parties, BEEF/envelope builders, deploy/issue/transfer flows
+  internal/maintenance/      — the shared/exclusive maintenance gate
   internal/enginestore/      — in-repo engine.Storage Mongo implementation
-  internal/wiring/           — assembles Mongo + mandala + engine into one App
-  internal/httpapi/          — Fiber HTTP server: /submit, /lookup, /arc-ingest,
-                                admin routes, CORS, error shapes
+  internal/wiring/           — Build: engine, TokenTopics registrar, boot union, eviction, owner-index maintenance
+  internal/httpapi/          — Fiber server: /submit (host rules, typed verdicts), /lookup, admin and token routes
   internal/activity/         — the /admin/activity feed
   internal/arcade/           — optional Arcade broadcaster + chaintracks client
+  internal/testmongo/        — Mongo test databases (dropped before and after)
 ```
