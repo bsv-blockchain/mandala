@@ -6,7 +6,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/overlay/lookup"
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
 
 func registerLookupRoutes(f *fiber.App, l Lookuper) {
@@ -60,8 +60,8 @@ func lookupHandler(l Lookuper) fiber.Handler {
 // LookupResolver expects; hence this local mirror rather than marshaling
 // the SDK type directly (same lesson as submitHandler's wireAdmittance).
 type wireOutput struct {
-	Beef        mandalav2.NumBytes `json:"beef"`
-	OutputIndex uint32             `json:"outputIndex"`
+	Beef        mandala.NumBytes `json:"beef"`
+	OutputIndex uint32           `json:"outputIndex"`
 }
 
 // wireLookupAnswer mirrors the TS LookupAnswer wire shape.
@@ -86,7 +86,7 @@ func answerToWire(answer *lookup.LookupAnswer) wireLookupAnswer {
 			continue
 		}
 		outputs = append(outputs, wireOutput{
-			Beef:        mandalav2.NumBytes(o.Beef),
+			Beef:        mandala.NumBytes(o.Beef),
 			OutputIndex: o.OutputIndex,
 		})
 	}

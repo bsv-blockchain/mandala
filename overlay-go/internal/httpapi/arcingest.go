@@ -13,7 +13,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/arcade"
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
 
 // MerkleProofHandler is the narrow slice of *engine.Engine that POST
@@ -29,7 +29,7 @@ var _ MerkleProofHandler = (*engine.Engine)(nil)
 // EvictionOutcome is the /arc-ingest terminal-status report (wire contract
 // §9.12); it is declared in the domain package because wiring, which produces
 // it, cannot import this one.
-type EvictionOutcome = mandalav2.EvictionOutcome
+type EvictionOutcome = mandala.EvictionOutcome
 
 // EvictTx removes an applied transaction from the overlay on a terminal
 // Arcade txStatus — the Go stand-in for the TS /arc-ingest route's

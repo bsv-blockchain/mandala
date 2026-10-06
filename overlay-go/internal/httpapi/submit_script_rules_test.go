@@ -1,10 +1,8 @@
 package httpapi
 
-// POST /submit's script-rules parity with the TS overlay: a version-1 tx
-// carrying a SIGHASH_CHRONICLE signature (directly, or in an unproven
-// ancestor) is refused 503 ERR_UNAVAILABLE before any state is touched. The
-// vectors are the ones overlay/src/chronicleSighashParity.test.ts reads: each
-// records what @bsv/sdk does with the same bytes.
+// POST /submit's script-rules parity with the TS overlay: a version-1 tx carrying a SIGHASH_CHRONICLE signature
+// (directly, or in an unproven ancestor) is refused 503 ERR_UNAVAILABLE before any state is touched. The vectors are
+// the ones overlay/src/chronicleSighashParity.test.ts reads.
 
 import (
 	"context"
@@ -18,7 +16,9 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/overlay"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
+	"github.com/sirdeggen/mandala/overlay-go/internal/testmongo"
 	"github.com/sirdeggen/mandala/overlay-go/internal/wiring"
 )
 
@@ -63,10 +63,6 @@ func TestSubmit_ChronicleSighashRuleMatchesTSVerdicts(t *testing.T) {
 				WithBroadcastCompensation(comp.prepare))
 
 			resp := doRequest(t, app, submitBeefReq(raw))
-
-			// The handler-level check refuses exactly where TS refuses, minus
-			// the named open corner (the engine admits it; see
-			// wiring.CheckChronicleSighashRule).
 			if refused := !v.TSVerifies && v.KnownGap == ""; refused {
 				if resp.StatusCode != http.StatusServiceUnavailable {
 					t.Fatalf("status = %d, want 503", resp.StatusCode)
@@ -78,17 +74,9 @@ func TestSubmit_ChronicleSighashRuleMatchesTSVerdicts(t *testing.T) {
 				if d, _ := body["description"].(string); !strings.Contains(d, "SIGHASH_CHRONICLE") {
 					t.Fatalf("description = %q", d)
 				}
-				// No side effect of any kind: not submitted, no snapshot, no
-				// provisional or final record, and nothing persisted as a verdict.
-				if stub.gotCtx != nil {
-					t.Fatal("a refused tx must not reach Engine.Submit")
-				}
-				if comp.prepareCalls != 0 {
-					t.Fatal("a refused tx must not take a pre-spend snapshot")
-				}
-				if len(rec.provisional) != 0 || len(rec.recorded) != 0 || rec.refusalCalls != 0 {
-					t.Fatalf("a refused tx must leave no record: provisional=%d recorded=%d refusals=%d",
-						len(rec.provisional), len(rec.recorded), rec.refusalCalls)
+				if stub.gotCtx != nil || comp.prepareCalls != 0 || len(rec.provisional) != 0 || len(rec.recorded) != 0 || rec.refusalCalls != 0 {
+					t.Fatalf("a refused tx must leave no trace: submit=%v prepare=%d provisional=%d recorded=%d refusals=%d",
+						stub.gotCtx != nil, comp.prepareCalls, len(rec.provisional), len(rec.recorded), rec.refusalCalls)
 				}
 				return
 			}
@@ -102,9 +90,8 @@ func TestSubmit_ChronicleSighashRuleMatchesTSVerdicts(t *testing.T) {
 	}
 }
 
-// A tx this node admitted before the rule existed still resolves from its
-// record: the check runs after the known-verdict path, so it can never turn an
-// admitted tx's idempotent resubmit into a refusal.
+// A tx the engine already applied on every named topic still resolves from state: the script check runs after the
+// known-verdict path, so it never turns an admitted tx's idempotent resubmit into a refusal.
 func TestSubmit_ChronicleSighashRuleDoesNotOverrideAnAdmittedRecord(t *testing.T) {
 	var raw []byte
 	for _, v := range loadChronicleVectors(t) {
@@ -124,43 +111,43 @@ func TestSubmit_ChronicleSighashRuleDoesNotOverrideAnAdmittedRecord(t *testing.T
 		t.Fatal(err)
 	}
 	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid: txid, Topics: []string{tokenTopic}, OutputsToAdmit: []uint32{0},
-		AdmissionSignature: "stale", AdmissionIdentityKey: "02stale", At: "2026-01-01T00:00:00.000Z",
+	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+		Txid: txid, Topics: []string{testTopicA},
+		Admissions:           map[string]mandala.TopicAdmission{testTopicA: {OutputsToAdmit: []uint32{0}, AdmissionSignature: "3044stale"}},
+		AdmissionIdentityKey: "02stale", At: "2026-01-01T00:00:00.000Z",
 	}}
-	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
+	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proofOf(map[string][]uint32{testTopicA: {0}})))
 
 	resp := doRequest(t, app, submitBeefReq(raw))
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 from the admitted record", resp.StatusCode)
+		t.Fatalf("status = %d, want 200 from the applied record", resp.StatusCode)
 	}
 	if stub.gotCtx != nil {
 		t.Fatal("a dupe must not reach Engine.Submit")
 	}
 }
 
-// The production stack end to end: wiring.Build (real engine, real Mongo
-// stores, scripts-only chain tracker) behind New(app). A script the TS engine
-// refuses answers 503 ERR_UNAVAILABLE here; one it admits gets past the script
-// stage and is answered by tm_mandala (a plain P2PKH spend has no token
-// output, so 200 with nothing to admit). The named open corner is the one
-// vector where Go answers 200 although TS refuses.
+// The production stack end to end: wiring.Build (real engine, real Mongo, scripts-only SPV) behind New(app). A script
+// TS refuses answers 503 here; one it admits gets past the script stage. The submits name tm_mandala_kyc on purpose:
+// these plain P2PKH spends carry no token output, so the KYC manager admits {[], []}, whereas naming tm_mandala alone
+// would be refused by Task 23's pairing rule before the script stage. Do not change the topic back.
 func TestSubmit_ChronicleSighashRuleOnTheProductionStack(t *testing.T) {
-	testAdminDB(t) // skips when Mongo is unreachable; any Build error after it is a real failure
+	testmongo.DB(t, "mandala3_test_httpapi_chronicle_lookup_services")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	app, err := wiring.Build(ctx, wiring.Config{
-		NodeName:         "mandala_go_chronicle_e2e",
-		ServerPrivKeyHex: admissionPrivHex,
+		NodeName:         "mandala3_test_httpapi_chronicle",
+		ServerPrivKeyHex: mandalatest.Overlay.PrivHex(),
 		HostingURL:       "http://localhost:8080",
 		MongoURL:         "mongodb://localhost:27017",
 		Network:          "test",
+		IssuerKeys:       []string{mandalatest.Issuer.Identity},
 	})
 	if err != nil {
 		t.Fatalf("wiring.Build: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = app.Mongo.Drop(context.Background())
+		app.Close()
 		_ = app.Mongo.Client().Disconnect(context.Background())
 	})
 	srv := New(app)
@@ -171,9 +158,8 @@ func TestSubmit_ChronicleSighashRuleOnTheProductionStack(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			resp := doRequest(t, srv, submitBeefReq(raw))
-			wantRefused := !v.TSVerifies && v.KnownGap == ""
-			if wantRefused {
+			resp := doRequest(t, srv, submitTopicsReq(raw, mandala.KYCTopic))
+			if wantRefused := !v.TSVerifies && v.KnownGap == ""; wantRefused {
 				if resp.StatusCode != http.StatusServiceUnavailable {
 					t.Fatalf("status = %d, want 503 (TS refuses these bytes)", resp.StatusCode)
 				}

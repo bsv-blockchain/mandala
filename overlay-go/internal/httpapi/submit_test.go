@@ -16,7 +16,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
 
 // varintBytes encodes n as a Bitcoin VarInt, the inverse of readVarInt —
@@ -43,12 +43,12 @@ func varintBytes(n uint64) []byte {
 	}
 }
 
-// stubSubmitter is a Submitter test double: it records what it was called
-// with and returns canned results, so tests never need a real engine or
-// Mongo.
+// stubSubmitter is a Submitter test double: it records what it was called with and returns canned results, so tests
+// never need a real engine or Mongo. A nil hasTopic hosts every topic.
 type stubSubmitter struct {
-	steak overlay.Steak
-	err   error
+	steak    overlay.Steak
+	err      error
+	hasTopic func(name string) bool
 
 	gotCtx  context.Context
 	gotTB   overlay.TaggedBEEF
@@ -60,6 +60,13 @@ func (s *stubSubmitter) Submit(ctx context.Context, tb overlay.TaggedBEEF, mode 
 	s.gotTB = tb
 	s.gotMode = mode
 	return s.steak, s.err
+}
+
+func (s *stubSubmitter) HasTopicManager(name string) bool {
+	if s.hasTopic == nil {
+		return true
+	}
+	return s.hasTopic(name)
 }
 
 func doRequest(t *testing.T, app *fiber.App, req *http.Request) *http.Response {
@@ -345,33 +352,35 @@ func TestSubmit_NoOffChainValuesFlag_WholeBodyIsBeef(t *testing.T) {
 	}
 }
 
-func TestSubmit_CtxThreadsDecodedPayload(t *testing.T) {
-	offChain := []byte(`{"inputs":[{"index":0,"linkage":{"prover":"p","verifier":"v","counterparty":"c","protocolID":[2,"mandala token"],"keyID":"k","encryptedLinkage":[1,2],"encryptedLinkageProof":[3,4],"proofType":0}}],"outputs":[]}`)
-	beef := []byte{0xde, 0xad, 0xbe, 0xef}
+// The envelope travels raw: httpapi never decodes it (F/p2-parity row 6b). The managers read the exact bytes from ctx
+// and the lookups from TaggedBEEF.OffChainValues, so even bytes that are not JSON reach the engine untouched.
+func TestSubmit_CtxCarriesTheRawOffChainValues(t *testing.T) {
+	for _, offChain := range [][]byte{
+		[]byte(`{"inputs":[],"outputs":[{"index":0,"linkage":{"prover":"p"}}],"admin":[]}`),
+		[]byte(`{not json`),
+	} {
+		beef := []byte{0xde, 0xad, 0xbe, 0xef}
+		var wire bytes.Buffer
+		wire.Write(varintBytes(uint64(len(beef))))
+		wire.Write(beef)
+		wire.Write(offChain)
 
-	var wire bytes.Buffer
-	wire.Write(varintBytes(uint64(len(beef))))
-	wire.Write(beef)
-	wire.Write(offChain)
+		stub := &stubSubmitter{steak: overlay.Steak{}}
+		app := newServer(stub, nil, nil, nil)
+		req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(wire.Bytes()))
+		req.Header.Set("X-Topics", `["tm_mandala"]`)
+		req.Header.Set("x-includes-off-chain-values", "true")
 
-	stub := &stubSubmitter{steak: overlay.Steak{}}
-	app := newServer(stub, nil, nil, nil)
-
-	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(wire.Bytes()))
-	req.Header.Set("X-Topics", `["tm_mandala"]`)
-	req.Header.Set("x-includes-off-chain-values", "true")
-
-	resp := doRequest(t, app, req)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body: %s)", resp.StatusCode, readRawBody(t, resp))
-	}
-
-	if stub.gotCtx == nil {
-		t.Fatal("Submit was called with a nil ctx")
-	}
-	payload := mandalav2.PayloadFromContext(stub.gotCtx)
-	if len(payload.Inputs) != 1 {
-		t.Fatalf("payload.Inputs = %d, want 1 (payload: %+v)", len(payload.Inputs), payload)
+		resp := doRequest(t, app, req)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body: %s)", resp.StatusCode, readRawBody(t, resp))
+		}
+		if got := mandala.OffChainValuesFrom(stub.gotCtx); !bytes.Equal(got, offChain) {
+			t.Fatalf("ctx off-chain values = %q, want the raw %q", got, offChain)
+		}
+		if !bytes.Equal(stub.gotTB.OffChainValues, offChain) {
+			t.Fatalf("TaggedBEEF.OffChainValues = %q, want %q", stub.gotTB.OffChainValues, offChain)
+		}
 	}
 }
 
@@ -424,13 +433,10 @@ func TestSubmit_SuccessReturnsBareSteak(t *testing.T) {
 	}
 }
 
-// FIX D: an engine error that is NOT a topic-manager verdict (here, an
-// unknown topic) is a dependency/infrastructure fault and must answer 503
-// ERR_UNAVAILABLE, retryable — never a permanent 400. The old handler
-// returned 400 for every Submit error uniformly, which is exactly the
-// unsoundness that let a Mongo blip look like "this transaction is invalid".
+// A dependency fault (neither a manager verdict nor the engine's unknown-topic sentinel) is 503 ERR_UNAVAILABLE,
+// retryable: a Mongo blip must never look like "this transaction is invalid".
 func TestSubmit_NonVerdictEngineErrorIs503Unavailable(t *testing.T) {
-	stub := &stubSubmitter{err: errors.New("unknown-topic")}
+	stub := &stubSubmitter{err: errors.New("mongo down")}
 	app := newServer(stub, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader([]byte{0x01}))
@@ -441,11 +447,8 @@ func TestSubmit_NonVerdictEngineErrorIs503Unavailable(t *testing.T) {
 		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
 	body := decodeJSON(t, resp)
-	if body["status"] != "error" || body["code"] != CodeUnavailable || body["retryable"] != true {
-		t.Fatalf("body = %v, want ERR_UNAVAILABLE retryable", body)
-	}
-	if body["description"] != "unknown-topic" {
-		t.Fatalf("description = %v, want %q", body["description"], "unknown-topic")
+	if body["status"] != "error" || body["code"] != CodeUnavailable || body["retryable"] != true || body["description"] != "mongo down" {
+		t.Fatalf("body = %v, want ERR_UNAVAILABLE retryable \"mongo down\"", body)
 	}
 }
 
@@ -496,21 +499,23 @@ func TestUnknownRoute404(t *testing.T) {
 
 // --- broadcast-failure compensation (Task: engine marks spent before broadcast) ---
 
-// stubCompensation is a PrepareSubmitCompensation double: prepare records
-// the beef it saw and hands back a compensate closure that records calls.
+// stubCompensation is a PrepareSubmitCompensation double: prepare records the beef and topics it saw and hands back a
+// compensate closure that records calls.
 type stubCompensation struct {
 	prepareErr    error
 	compensateErr error
-	restore       *mandalav2.RestoreSnapshot
+	restore       *mandala.RestoreSnapshot
 
 	prepareCalls    int
 	compensateCalls int
 	gotBeef         []byte
+	gotTopics       []string
 }
 
-func (s *stubCompensation) prepare(_ context.Context, beef []byte) (func(context.Context) error, *mandalav2.RestoreSnapshot, error) {
+func (s *stubCompensation) prepare(_ context.Context, beef []byte, topics []string) (func(context.Context) error, *mandala.RestoreSnapshot, error) {
 	s.prepareCalls++
 	s.gotBeef = append([]byte(nil), beef...)
+	s.gotTopics = append([]string(nil), topics...)
 	if s.prepareErr != nil {
 		return nil, nil, s.prepareErr
 	}
@@ -546,6 +551,9 @@ func TestSubmit_BroadcastFailureRunsCompensation(t *testing.T) {
 	}
 	if !bytes.Equal(comp.gotBeef, beef) {
 		t.Fatalf("prepare beef = %v, want %v", comp.gotBeef, beef)
+	}
+	if len(comp.gotTopics) != 1 || comp.gotTopics[0] != "tm_mandala" {
+		t.Fatalf("prepare topics = %v, want the named topics [tm_mandala]", comp.gotTopics)
 	}
 	if comp.compensateCalls != 1 {
 		t.Fatalf("compensate calls = %d, want 1", comp.compensateCalls)

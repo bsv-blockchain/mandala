@@ -1,9 +1,11 @@
 package httpapi
 
+// A1.3: what is persisted, keyed by (txid, payloadHash) and the refusing topic, and why a holder of the bytes cannot
+// poison a transaction by submitting it stripped of its envelope.
+
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -12,94 +14,27 @@ import (
 	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
 	"github.com/bsv-blockchain/go-sdk/overlay"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/testmongo"
 )
 
-// Wire contract §9.1 — payload-scoped final verdicts.
-//
-// The txid does NOT commit to the off-chain linkage payload. Before this rule,
-// a persisted refusal was keyed by txid alone, so anyone holding the BEEF
-// could submit it stripped of its payload, earn a permanent ERR_LINKAGE, and
-// leave the legitimate holder's correct submission answered from the record
-// without ever reaching the engine. The transaction was dead for everyone,
-// forever, at the cost of one unauthenticated request.
-
-// payloadAwareSubmitter mirrors the one thing about the real tm_mandala
-// manager that matters here: the verdict is a function of the OFF-CHAIN
-// payload threaded onto ctx (topic_manager.go's guard 1 rejects a token output
-// with no linkage entry), not of the BEEF bytes.
+// payloadAwareSubmitter stands in for a token manager: the bytes without an envelope are refused (typed, final, on
+// its topic); with one they admit output 0.
 type payloadAwareSubmitter struct {
+	topic string
 	calls int
 }
 
-func (p *payloadAwareSubmitter) Submit(ctx context.Context, _ overlay.TaggedBEEF, _ engine.SumbitMode, _ engine.OnSteakReady) (overlay.Steak, error) {
+func (p *payloadAwareSubmitter) HasTopicManager(string) bool { return true }
+
+func (p *payloadAwareSubmitter) Submit(_ context.Context, tb overlay.TaggedBEEF, _ engine.SumbitMode, _ engine.OnSteakReady) (overlay.Steak, error) {
 	p.calls++
-	pl := mandalav2.PayloadFromContext(ctx)
-	if pl == nil || len(pl.Outputs) == 0 {
-		return overlay.Steak{}, &mandalav2.RejectError{
-			Topic: tokenTopic,
-			Err:   errors.New("output 0: MandalaToken-decodable output with no verified linkage"),
-		}
+	if len(tb.OffChainValues) == 0 {
+		return nil, &mandala.RejectError{Code: mandala.CodeLinkage, Reason: "output 0: token output with no verified linkage", Topic: p.topic}
 	}
-	return overlay.Steak{tokenTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}}}, nil
+	return overlay.Steak{p.topic: {OutputsToAdmit: []uint32{0}, CoinsToRetain: []uint32{}}}, nil
 }
 
-// memRecorder is a faithful in-memory AdmissionRecorder with the store's real
-// semantics: refusals are scoped to a payload hash and overwritten by a later
-// one, an admission clears them, and a provisional row never clobbers an
-// admission.
-type memRecorder struct {
-	rows map[string]*mandalav2.AdmissionRecord
-}
-
-func newMemRecorder() *memRecorder {
-	return &memRecorder{rows: map[string]*mandalav2.AdmissionRecord{}}
-}
-
-func (m *memRecorder) GetAdmission(_ context.Context, txid string) (*mandalav2.AdmissionRecord, error) {
-	return m.rows[txid], nil
-}
-
-func (m *memRecorder) RecordAdmission(_ context.Context, rec mandalav2.AdmissionRecord) error {
-	cur := m.rows[rec.Txid]
-	if rec.Pending {
-		if cur != nil && cur.AdmissionSignature != "" {
-			return nil
-		}
-		row := rec
-		m.rows[rec.Txid] = &row
-		return nil
-	}
-	row := rec
-	row.Pending = false
-	if cur != nil && cur.Restore != nil && row.Restore == nil {
-		row.Restore = cur.Restore
-	}
-	m.rows[rec.Txid] = &row
-	return nil
-}
-
-func (m *memRecorder) MarkRefused(_ context.Context, r mandalav2.Refusal) error {
-	cur := m.rows[r.Txid]
-	if cur != nil && (cur.AdmissionSignature != "" || cur.EvictedAt != "") {
-		return nil
-	}
-	row := mandalav2.AdmissionRecord{Txid: r.Txid}
-	if cur != nil {
-		row = *cur
-	}
-	row.RefusedCode = r.Code
-	row.RefusedDescription = r.Description
-	row.RefusedSpendTxid = r.SpendTxid
-	row.RefusedPayloadHash = r.PayloadHash
-	m.rows[r.Txid] = &row
-	return nil
-}
-
-var _ AdmissionRecorder = (*memRecorder)(nil)
-
-// framedSubmitBody builds the wire framing /submit expects when
-// x-includes-off-chain-values is set: varint(len(beef)) || beef || offChain.
 func framedSubmitBody(beef, offChain []byte) []byte {
 	var b bytes.Buffer
 	b.Write(varintBytes(uint64(len(beef))))
@@ -108,130 +43,110 @@ func framedSubmitBody(beef, offChain []byte) []byte {
 	return b.Bytes()
 }
 
-func TestSubmit_StrippedPayloadCannotPoisonTheTxid(t *testing.T) {
-	beef, txid := submitBeef(t, 0x42)
-	sub := &payloadAwareSubmitter{}
-	rec := newMemRecorder()
-	app := newServer(sub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
-
-	// (1) The attacker submits the same BEEF with no off-chain values at all.
-	attack := doRequest(t, app, submitBeefReq(beef))
-	if attack.StatusCode != http.StatusBadRequest {
-		t.Fatalf("attacker submit status = %d, want 400", attack.StatusCode)
-	}
-	if body := decodeJSON(t, attack); body["code"] != CodeLinkage {
-		t.Fatalf("attacker submit body = %v, want ERR_LINKAGE", body)
-	}
-	row := rec.rows[txid]
-	if row == nil || row.RefusedCode != CodeLinkage {
-		t.Fatalf("expected the refusal to be persisted, got %+v", row)
-	}
-	if row.RefusedPayloadHash != mandalav2.PayloadHashHex(nil) {
-		t.Fatalf("refusal payloadHash = %q, want the empty-payload hash", row.RefusedPayloadHash)
-	}
-
-	// (2) The legitimate holder submits the identical BEEF with the correct
-	// linkage payload. It must reach the engine and be admitted with σ_I.
-	payload, err := json.Marshal(mandalav2.LinkagePayload{
-		Outputs: []mandalav2.IndexedLinkage{{Index: 0, Linkage: &mandalav2.SpecificLinkage{}}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	callsBefore := sub.calls
-	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(framedSubmitBody(beef, payload)))
-	req.Header.Set("X-Topics", `["tm_mandala"]`)
+func framedTopicsReq(beef, offChain []byte, topic string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(framedSubmitBody(beef, offChain)))
+	req.Header.Set("X-Topics", `["`+topic+`"]`)
 	req.Header.Set("x-includes-off-chain-values", "true")
-	resp := doRequest(t, app, req)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("honest submit status = %d, want 200 (body %s)", resp.StatusCode, readRawBody(t, resp))
-	}
-	if sub.calls == callsBefore {
-		t.Fatal("the honest submit was answered from the poisoned record without reaching the engine")
-	}
-	body := decodeJSON(t, resp)
-	tm, _ := body[tokenTopic].(map[string]any)
-	if tm == nil || tm["admissionSignature"] == "" {
-		t.Fatalf("honest submit did not earn σ_I: %v", body)
-	}
-	want, _, err := testSigner(t).SignAdmission(txid, []uint32{0})
+	return req
+}
+
+// On the real v3 store: the refusal of the stripped bytes binds to the empty payload only; the genuine payload
+// admits, clears it, and from then on the stripped bytes replay the admission (D-8) instead of being refused.
+func TestSubmit_StrippedPayloadCannotPoisonTheTxid(t *testing.T) {
+	store, err := mandala.NewStore(testmongo.DB(t, "mandala3_test_httpapi_poisoning"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tm["admissionSignature"] != want {
-		t.Fatalf("admissionSignature = %v, want %s", tm["admissionSignature"], want)
+	ctx := context.Background()
+	beef, txid := submitBeef(t, 0x31)
+	sub := &payloadAwareSubmitter{topic: testTopicA}
+	applied := map[string][]uint32{}
+	proof := func(context.Context, string) (map[string][]uint32, error) {
+		out := map[string][]uint32{}
+		for k, v := range applied {
+			out[k] = v
+		}
+		return out, nil
+	}
+	app := newServer(sub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(store, proof))
+	envelope := []byte(`{"inputs":[],"outputs":[],"admin":[]}`)
+
+	if resp := doRequest(t, app, submitBeefReq(beef)); resp.StatusCode != 400 {
+		t.Fatalf("stripped: status %d, want 400", resp.StatusCode)
+	}
+	rec, err := store.GetAdmission(ctx, txid)
+	if err != nil || rec == nil || rec.RefusedCode != CodeLinkage || rec.RefusedPayloadHash != emptyPayloadHash() || rec.RefusedTopic != testTopicA {
+		t.Fatalf("stripped refusal record = %+v (%v), want ERR_LINKAGE for the empty payload on tm_<A>", rec, err)
 	}
 
-	// (3) The admission cleared the refusal, so even the attacker's stripped
-	// payload now reads as admitted rather than replaying the old 400.
-	after := rec.rows[txid]
-	if after.RefusedCode != "" || after.RefusedPayloadHash != "" {
-		t.Fatalf("the admission did not clear the refusal: %+v", after)
+	if resp := doRequest(t, app, submitBeefReq(beef)); resp.StatusCode != 400 || sub.calls != 1 {
+		t.Fatalf("stripped again: status %d, engine calls %d; want 400 from the record", resp.StatusCode, sub.calls)
 	}
-	replay := doRequest(t, app, submitBeefReq(beef))
-	if replay.StatusCode != http.StatusOK {
-		t.Fatalf("post-admission replay status = %d, want 200", replay.StatusCode)
+
+	resp := doRequest(t, app, framedTopicsReq(beef, envelope, testTopicA))
+	if resp.StatusCode != http.StatusOK || sub.calls != 2 {
+		t.Fatalf("genuine payload: status %d, engine calls %d (%s)", resp.StatusCode, sub.calls, readRawBody(t, resp))
+	}
+	rec, err = store.GetAdmission(ctx, txid)
+	if err != nil || rec == nil || !rec.Admitted() || rec.RefusedCode != "" || len(rec.Admissions[testTopicA].OutputsToAdmit) != 1 {
+		t.Fatalf("after the genuine payload: %+v (%v), want an admitted record with the refusal cleared", rec, err)
+	}
+
+	applied[testTopicA] = []uint32{0} // the engine now holds tm_<A>'s applied record
+	if resp := doRequest(t, app, submitBeefReq(beef)); resp.StatusCode != http.StatusOK || sub.calls != 2 {
+		t.Fatalf("stripped after admission: status %d, engine calls %d; want a 200 replay", resp.StatusCode, sub.calls)
 	}
 }
 
-// Finding 8 / §9.6 — every state serveKnownVerdict answers from belongs to
-// tm_mandala. A registry-only submit of an already-admitted txid must reach
-// the registry manager instead of being short-circuited by the token topic's
-// record.
-func TestSubmit_RegistryOnlySubmitOfAnAdmittedTxidStillReachesTheEngine(t *testing.T) {
-	beef, txid := submitBeef(t, 0x43)
-	stub := &stubSubmitter{steak: overlay.Steak{
-		mandalav2.RegistryTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
-	}}
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid:                 txid,
-		Topics:               []string{tokenTopic},
-		OutputsToAdmit:       []uint32{0},
-		AdmissionSignature:   "3044stored",
-		AdmissionIdentityKey: "02stored",
-		At:                   "2026-01-01T00:00:00.000Z",
-	}}
-	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
-
-	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(beef))
-	req.Header.Set("X-Topics", `["`+mandalav2.RegistryTopic+`"]`)
-	resp := doRequest(t, app, req)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readRawBody(t, resp))
+// The A1.3 matrix: only typed, final refusals by tm_mandala or a tm_<id> are persisted, with the refusing topic.
+func TestSubmit_PersistenceFollowsA13(t *testing.T) {
+	beef, txid := submitBeef(t, 0x32)
+	own := "tm_" + txid
+	reject := func(code mandala.Code, reason, topic string) *mandala.RejectError {
+		return &mandala.RejectError{Code: code, Reason: reason, Topic: topic}
 	}
-	if stub.gotCtx == nil {
-		t.Fatal("a registry-only submit was answered from the tm_mandala admission record")
+	cases := []struct {
+		name      string
+		topics    []string
+		err       error
+		status    int
+		code      string
+		persisted *mandala.RejectError
+	}{
+		{"conservation on a token topic", []string{testTopicA}, reject(mandala.CodeConservation, "token x_0: value in 1 != value out 2 without an authority", testTopicA), 400, CodeConservation,
+			reject(mandala.CodeConservation, "token x_0: value in 1 != value out 2 without an authority", testTopicA)},
+		{"malformed envelope on a token topic", []string{testTopicA}, reject(mandala.CodeShape, "Mandala payload must be an object", testTopicA), 400, CodeShape,
+			reject(mandala.CodeShape, "Mandala payload must be an object", testTopicA)},
+		{"authority on the registry", []string{mandala.MandalaTopic, own}, reject(mandala.CodeAuthority, "output 0: deploy requires a valid deploySig over this txid", mandala.MandalaTopic), 400, CodeAuthority,
+			reject(mandala.CodeAuthority, "output 0: deploy requires a valid deploySig over this txid", mandala.MandalaTopic)},
+		{"shape on KYC", []string{mandala.KYCTopic}, reject(mandala.CodeShape, "tm_mandala_registry: registration chain already exists; register is genesis-only", mandala.KYCTopic), 400, CodeShape, nil},
+		{"untrusted", []string{testTopicA}, reject(mandala.CodeUntrusted, "output 0: owner 02aa is not a trusted issuer", testTopicA), 409, CodeUntrusted, nil},
+		{"paused", []string{testTopicA}, reject(mandala.CodePaused, "token x_0 is paused", testTopicA), 409, CodePaused, nil},
+		{"input spent", []string{testTopicA}, &mandala.RejectError{Code: mandala.CodeInputSpent, Reason: "input y.0: already spent by z", Topic: testTopicA, SpendTxid: "z"}, 400, CodeInputSpent, nil},
+		{"typed unavailable", []string{testTopicA}, reject(mandala.CodeUnavailable, "owner index unavailable for y.0", testTopicA), 503, CodeUnavailable, nil},
+		{"untyped manager fault", []string{testTopicA}, &mandala.RejectError{Reason: "txid not in BEEF", Topic: testTopicA}, 400, CodeShape, nil},
+		{"engine unknown topic", []string{testTopicA}, engine.ErrUnknownTopic, 400, CodeShape, nil},
+		{"dependency fault", []string{testTopicA}, errors.New("mongo down"), 503, CodeUnavailable, nil},
 	}
-	body := decodeJSON(t, resp)
-	if _, has := body[mandalav2.RegistryTopic]; !has {
-		t.Fatalf("body = %v, want the registry topic's own STEAK entry", body)
-	}
-	if _, has := body[tokenTopic]; has {
-		t.Fatalf("body = %v, want no tm_mandala entry for a registry-only submit", body)
-	}
-	// And it must not have written a token admission record either.
-	if len(rec.recorded) != 0 || len(rec.provisional) != 0 {
-		t.Fatalf("a registry-only submit touched the token admission record: %+v %+v", rec.recorded, rec.provisional)
-	}
-}
-
-// An evicted txid resubmitted to tm_mandala is still 410 — the short-circuit
-// is narrowed to the token topic, not removed.
-func TestSubmit_TokenSubmitOfAnEvictedTxidIsStill410(t *testing.T) {
-	beef, txid := submitBeef(t, 0x44)
-	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid: txid, EvictedAt: "2026-02-03T04:05:06.000Z",
-	}}
-	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
-
-	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(beef))
-	req.Header.Set("X-Topics", `["`+mandalav2.RegistryTopic+`","tm_mandala"]`)
-	resp := doRequest(t, app, req)
-	if resp.StatusCode != http.StatusGone {
-		t.Fatalf("status = %d, want 410", resp.StatusCode)
-	}
-	if stub.gotCtx != nil {
-		t.Fatal("an evicted txid must not be resubmitted to the engine")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &stubAdmissionStore{}
+			app := newServer(&stubSubmitter{err: tc.err}, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
+			resp := doRequest(t, app, submitTopicsReq(beef, tc.topics...))
+			body := decodeJSON(t, resp)
+			if resp.StatusCode != tc.status || body["code"] != tc.code {
+				t.Fatalf("answer %d %v, want %d %s", resp.StatusCode, body, tc.status, tc.code)
+			}
+			if tc.persisted == nil {
+				if rec.refusalCalls != 0 {
+					t.Fatalf("persisted %+v, want nothing", rec.refusals)
+				}
+				return
+			}
+			want := mandala.Refusal{Txid: txid, Code: string(tc.persisted.Code), Description: tc.persisted.Reason, PayloadHash: emptyPayloadHash(), Topic: tc.persisted.Topic}
+			if len(rec.refusals) != 1 || rec.refusals[0] != want {
+				t.Fatalf("persisted %+v, want exactly %+v", rec.refusals, want)
+			}
+		})
 	}
 }

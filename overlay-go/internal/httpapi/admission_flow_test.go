@@ -1,15 +1,23 @@
 package httpapi
 
+// σI per topic (A1.2), the per-topic admission record and the known-verdict rule (D-8) on a stub Submitter. These
+// stubs and helpers are shared by the other httpapi tests. Stub tests never name tm_mandala without tm_<own txid>, so
+// Task 23's pairing rule leaves them untouched.
+
 import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
+	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/overlay"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
@@ -17,16 +25,23 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
 
-// Arbitrary valid secp256k1 private key (test-only), shared by the signer
-// fixtures below.
+// Arbitrary valid secp256k1 private key (test-only) for the stub signer.
 const admissionPrivHex = "1e99423a4ed27608a15a2616a2b0e9e52ced330ac530edcc32c8ffc6a526aedd"
 
-func testSigner(t *testing.T) *ECAdmissionSigner {
+const vectorTxid = "3f0c9a1b2d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8"
+
+// Two token topics the stub submitter hosts (a nil hasTopic hosts every name).
+var (
+	testTopicA = "tm_" + strings.Repeat("a", 64)
+	testTopicB = "tm_" + strings.Repeat("b", 64)
+)
+
+func testSigner(t *testing.T) *mandala.ECAdmissionSigner {
 	t.Helper()
-	s, err := NewECAdmissionSigner(admissionPrivHex)
+	s, err := mandala.NewECAdmissionSigner(admissionPrivHex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,24 +57,15 @@ func testIdentityKey(t *testing.T) string {
 	return hex.EncodeToString(priv.PubKey().Compressed())
 }
 
-// submitBeef builds a minimal but genuinely parseable BEEF so the handler can
-// derive a txid (every txid-keyed path — dupe, verdict, σ_I — depends on it).
+// submitBeef builds a minimal, parseable BEEF so the handler derives a txid (every txid-keyed path depends on it).
 func submitBeef(t *testing.T, fill byte) ([]byte, string) {
 	t.Helper()
-	raw := make([]byte, 32)
-	for i := range raw {
-		raw[i] = fill
-	}
-	srcID, err := chainhash.NewHash(raw)
+	srcID, err := chainhash.NewHash(bytes.Repeat([]byte{fill}, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
 	tx := transaction.NewTransaction()
-	tx.AddInput(&transaction.TransactionInput{
-		SourceTXID:       srcID,
-		SourceTxOutIndex: 0,
-		UnlockingScript:  &script.Script{},
-	})
+	tx.AddInput(&transaction.TransactionInput{SourceTXID: srcID, SourceTxOutIndex: 0, UnlockingScript: &script.Script{}})
 	tx.AddOutput(&transaction.TransactionOutput{Satoshis: 1, LockingScript: &script.Script{}})
 	beef, err := tx.AtomicBEEF(true)
 	if err != nil {
@@ -68,28 +74,22 @@ func submitBeef(t *testing.T, fill byte) ([]byte, string) {
 	return beef, tx.TxID().String()
 }
 
-// stubAdmissionStore is an AdmissionRecorder double that records every call,
-// so tests can assert both the wire answer and the side effects (or their
-// absence).
+// stubAdmissionStore records every call so tests can assert both the wire answer and the side effects.
 type stubAdmissionStore struct {
-	record *mandalav2.AdmissionRecord
+	record *mandala.AdmissionRecord
 	getErr error
-	// recordErr fails the FINALIZE write; provisionalErr fails the §9.4
-	// provisional one. They are separate so a test can break exactly one.
+	// recordErr fails the FINALIZE write; provisionalErr fails the provisional one.
 	recordErr      error
 	provisionalErr error
 
-	getCalls int
-	// recorded holds finalizing writes; provisional holds the pending ones,
-	// so "did this submit record an admission?" stays a question about the
-	// finalize.
-	recorded     []mandalav2.AdmissionRecord
-	provisional  []mandalav2.AdmissionRecord
-	refusals     []mandalav2.AdmissionRecord
+	getCalls     int
+	recorded     []mandala.AdmissionRecord // finalizing writes
+	provisional  []mandala.AdmissionRecord // pending writes
+	refusals     []mandala.Refusal
 	refusalCalls int
 }
 
-func (s *stubAdmissionStore) GetAdmission(_ context.Context, txid string) (*mandalav2.AdmissionRecord, error) {
+func (s *stubAdmissionStore) GetAdmission(_ context.Context, txid string) (*mandala.AdmissionRecord, error) {
 	s.getCalls++
 	if s.getErr != nil {
 		return nil, s.getErr
@@ -100,7 +100,7 @@ func (s *stubAdmissionStore) GetAdmission(_ context.Context, txid string) (*mand
 	return nil, nil
 }
 
-func (s *stubAdmissionStore) RecordAdmission(_ context.Context, rec mandalav2.AdmissionRecord) error {
+func (s *stubAdmissionStore) RecordAdmission(_ context.Context, rec mandala.AdmissionRecord) error {
 	if rec.Pending {
 		if s.provisionalErr != nil {
 			return s.provisionalErr
@@ -115,221 +115,178 @@ func (s *stubAdmissionStore) RecordAdmission(_ context.Context, rec mandalav2.Ad
 	return nil
 }
 
-func (s *stubAdmissionStore) MarkRefused(_ context.Context, r mandalav2.Refusal) error {
+func (s *stubAdmissionStore) MarkRefused(_ context.Context, r mandala.Refusal) error {
 	s.refusalCalls++
-	s.refusals = append(s.refusals, mandalav2.AdmissionRecord{
-		Txid: r.Txid, RefusedCode: r.Code, RefusedDescription: r.Description,
-		RefusedSpendTxid: r.SpendTxid, RefusedPayloadHash: r.PayloadHash,
-	})
+	s.refusals = append(s.refusals, r)
 	return nil
 }
 
 var _ AdmissionRecorder = (*stubAdmissionStore)(nil)
 
-// emptyPayloadHash is the §9.1 identity of a submit carrying no off-chain
-// values — what every submitBeefReq below sends.
-func emptyPayloadHash() string { return mandalav2.PayloadHashHex(nil) }
+// emptyPayloadHash is the payload identity of a submit carrying no off-chain values.
+func emptyPayloadHash() string { return mandala.PayloadHashHex(nil) }
 
-func submitBeefReq(beef []byte) *http.Request {
+func submitTopicsReq(beef []byte, topics ...string) *http.Request {
+	raw, _ := json.Marshal(topics)
 	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(beef))
-	req.Header.Set("X-Topics", `["tm_mandala"]`)
+	req.Header.Set("X-Topics", string(raw))
 	return req
 }
 
-// --- FIX A/B: σ_I binds to the tm_mandala admitted output set ---
+func submitBeefReq(beef []byte) *http.Request { return submitTopicsReq(beef, testTopicA) }
 
-func TestSubmit_SignsDigestV2OverTheTmMandalaSet(t *testing.T) {
-	beef, txid := submitBeef(t, 0x11)
-	stub := &stubSubmitter{steak: overlay.Steak{
-		tokenTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{2, 0}},
-	}}
-	rec := &stubAdmissionStore{}
-	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
-
-	resp := doRequest(t, app, submitBeefReq(beef))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+// proofOf is an applied proof over a fixed topic -> vouts map (a nil map: nothing applied).
+func proofOf(m map[string][]uint32) AppliedAdmissionProof {
+	return func(context.Context, string) (map[string][]uint32, error) {
+		out := make(map[string][]uint32, len(m))
+		for k, v := range m {
+			out[k] = v
+		}
+		return out, nil
 	}
-	body := decodeJSON(t, resp)
-	tm, ok := body[tokenTopic].(map[string]any)
+}
+
+func entryOf(t *testing.T, body map[string]any, topic string) map[string]any {
+	t.Helper()
+	e, ok := body[topic].(map[string]any)
 	if !ok {
-		t.Fatalf("body = %v, missing tm_mandala", body)
+		t.Fatalf("body has no %s entry: %v", topic, body)
 	}
-	sigHex, _ := tm["admissionSignature"].(string)
-	if sigHex == "" {
-		t.Fatalf("no admissionSignature on an admitting submit: %v", tm)
+	return e
+}
+
+func outputsOf(t *testing.T, e map[string]any) []uint32 {
+	t.Helper()
+	raw, ok := e["outputsToAdmit"].([]any)
+	if !ok {
+		t.Fatalf("entry without outputsToAdmit: %v", e)
 	}
-	if got, _ := tm["admissionIdentityKey"].(string); got != testIdentityKey(t) {
-		t.Fatalf("admissionIdentityKey = %q", got)
+	out := make([]uint32, len(raw))
+	for i, v := range raw {
+		out[i] = uint32(v.(float64))
 	}
-	// The signature must verify against the SORTED admitted set, not the
-	// bare txid and not the engine's ordering.
-	digest, err := AdmissionDigestV2(txid, []uint32{0, 2})
-	if err != nil {
-		t.Fatal(err)
+	return out
+}
+
+// requireSigma asserts e carries a σI by identity over (topic, txid, outs) that verifies under topic and under none
+// of the other named topics.
+func requireSigma(t *testing.T, e map[string]any, identity, topic, txid string, outs []uint32, others ...string) {
+	t.Helper()
+	sig, _ := e["admissionSignature"].(string)
+	ident, _ := e["admissionIdentityKey"].(string)
+	if sig == "" || ident != identity {
+		t.Fatalf("entry %v: want a σI by %s", e, identity)
 	}
-	der, err := hex.DecodeString(sigHex)
-	if err != nil {
-		t.Fatal(err)
+	if ok, err := mandala.VerifyAdmission(topic, txid, outs, sig, ident); err != nil || !ok {
+		t.Fatalf("σI does not verify under %s over %v: %v", topic, outs, err)
 	}
-	sig, err := ec.FromDER(der)
-	if err != nil {
-		t.Fatal(err)
-	}
-	priv, _ := ec.PrivateKeyFromHex(admissionPrivHex)
-	if !sig.Verify(digest[:], priv.PubKey()) {
-		t.Fatal("σ_I does not verify against admissionDigestV2(txid, sorted outputsToAdmit)")
+	for _, other := range others {
+		if ok, _ := mandala.VerifyAdmission(other, txid, outs, sig, ident); ok {
+			t.Fatalf("the σI of %s also verifies under %s (digest v3 must bind the topic)", topic, other)
+		}
 	}
 }
 
-// A registry-only admission never yields a token σ_I, and σ_I never rides on
-// a topic it does not speak for.
-func TestSubmit_RegistryOnlyAdmissionGetsNoSignature(t *testing.T) {
-	beef, _ := submitBeef(t, 0x12)
+func requireNoSigma(t *testing.T, e map[string]any) {
+	t.Helper()
+	if _, has := e["admissionSignature"]; has {
+		t.Fatalf("entry %v must carry no σI", e)
+	}
+	if _, has := e["admissionIdentityKey"]; has {
+		t.Fatalf("entry %v must carry no admissionIdentityKey", e)
+	}
+}
+
+func admissionKeys(rec mandala.AdmissionRecord) []string {
+	keys := make([]string, 0, len(rec.Admissions))
+	for k := range rec.Admissions {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func TestSubmit_SignsEachSigmaTopicEntryWithItsOwnDigest(t *testing.T) {
+	beef, txid := submitBeef(t, 0x11)
+	own := "tm_" + txid
 	stub := &stubSubmitter{steak: overlay.Steak{
-		mandalav2.RegistryTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
-		tokenTopic:              &overlay.AdmittanceInstructions{OutputsToAdmit: nil},
+		mandala.MandalaTopic: {OutputsToAdmit: []uint32{0}},
+		own:                  {OutputsToAdmit: []uint32{0}},
+		mandala.KYCTopic:     {OutputsToAdmit: []uint32{0}},
 	}}
 	rec := &stubAdmissionStore{}
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
 
-	req := submitBeefReq(beef)
-	req.Header.Set("X-Topics", `["tm_mandala","`+mandalav2.RegistryTopic+`"]`)
-	resp := doRequest(t, app, req)
+	resp := doRequest(t, app, submitTopicsReq(beef, mandala.MandalaTopic, own, mandala.KYCTopic))
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+		t.Fatalf("status = %d, want 200 (%s)", resp.StatusCode, readRawBody(t, resp))
 	}
 	body := decodeJSON(t, resp)
-	reg, _ := body[mandalav2.RegistryTopic].(map[string]any)
-	if reg == nil {
-		t.Fatalf("body = %v", body)
+	reg, tok := entryOf(t, body, mandala.MandalaTopic), entryOf(t, body, own)
+	requireSigma(t, reg, testIdentityKey(t), mandala.MandalaTopic, txid, []uint32{0}, own)
+	requireSigma(t, tok, testIdentityKey(t), own, txid, []uint32{0}, mandala.MandalaTopic)
+	if reg["admissionSignature"] == tok["admissionSignature"] {
+		t.Fatal("a deploy's two σI must differ (digest v3 binds the topic)")
 	}
-	if _, has := reg["admissionSignature"]; has {
-		t.Fatalf("a registry admission carried a token σ_I: %v", reg)
+	requireNoSigma(t, entryOf(t, body, mandala.KYCTopic))
+
+	if len(rec.provisional) != 1 || !reflect.DeepEqual(rec.provisional[0].Topics, []string{mandala.MandalaTopic, own, mandala.KYCTopic}) {
+		t.Fatalf("provisional = %+v", rec.provisional)
 	}
-	if len(rec.recorded) != 0 {
-		t.Fatalf("a registry-only admission wrote a token admission record: %+v", rec.recorded)
+	if len(rec.recorded) != 1 {
+		t.Fatalf("finalize writes = %d, want 1", len(rec.recorded))
+	}
+	final := rec.recorded[0]
+	// admissionKeys sorts, and every "tm_<hex>" sorts before "tm_mandala".
+	if got, want := admissionKeys(final), []string{own, mandala.MandalaTopic}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("finalized admissions = %v, want %v (never KYC)", got, want)
+	}
+	if final.AdmissionIdentityKey != testIdentityKey(t) || final.Admissions[own].AdmissionSignature != tok["admissionSignature"] {
+		t.Fatalf("finalized record %+v does not hold the σI sent on the wire", final)
 	}
 }
 
-// --- wire contract §4: the record is written before the 200 is sent ---
-
-func TestSubmit_RecordsAdmissionSynchronouslyWithRestoreSnapshot(t *testing.T) {
-	beef, txid := submitBeef(t, 0x13)
-	stub := &stubSubmitter{steak: overlay.Steak{
-		tokenTopic:              &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
-		mandalav2.RegistryTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{1}},
-	}}
+func TestSubmit_KYCOnlySubmitIsNeitherSignedNorRecorded(t *testing.T) {
+	beef, _ := submitBeef(t, 0x12)
+	stub := &stubSubmitter{steak: overlay.Steak{mandala.KYCTopic: {OutputsToAdmit: []uint32{0}}}}
 	rec := &stubAdmissionStore{}
-	snapshot := &mandalav2.RestoreSnapshot{
-		SpentOutpoints: []string{"aa.0"},
-		TokenRows:      []mandalav2.TokenRow{{Txid: "aa", OutputIndex: 0, AssetID: "a.0", Amount: 100}},
-	}
-	comp := &stubCompensation{restore: snapshot}
-	app := newServer(stub, nil, nil, nil,
-		WithAdmissionSigner(testSigner(t)),
-		WithAdmissionStore(rec, nil),
-		WithBroadcastCompensation(comp.prepare))
+	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proofOf(nil)))
 
-	resp := doRequest(t, app, submitBeefReq(beef))
+	resp := doRequest(t, app, submitTopicsReq(beef, mandala.KYCTopic))
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readRawBody(t, resp))
+		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if len(rec.recorded) != 1 {
-		t.Fatalf("recorded %d admissions, want exactly 1 written before the response", len(rec.recorded))
-	}
-	got := rec.recorded[0]
-	if got.Txid != txid {
-		t.Fatalf("recorded txid = %s, want %s", got.Txid, txid)
-	}
-	if len(got.OutputsToAdmit) != 1 || got.OutputsToAdmit[0] != 0 {
-		t.Fatalf("recorded outputsToAdmit = %v, want the tm_mandala set", got.OutputsToAdmit)
-	}
-	if len(got.Topics) != 2 {
-		t.Fatalf("recorded topics = %v, want every admitting topic", got.Topics)
-	}
-	if got.AdmissionSignature == "" || got.AdmissionIdentityKey == "" {
-		t.Fatalf("recorded admission without σ_I: %+v", got)
-	}
-	if got.Restore == nil || len(got.Restore.TokenRows) != 1 {
-		t.Fatalf("recorded admission without the pre-spend restore snapshot: %+v", got.Restore)
-	}
-	// §9.4: the provisional row came FIRST and already carried the snapshot,
-	// so a crash inside Submit still leaves the coins recoverable.
-	if len(rec.provisional) != 1 {
-		t.Fatalf("wrote %d provisional records, want exactly 1 before Submit", len(rec.provisional))
-	}
-	prov := rec.provisional[0]
-	if prov.Txid != txid || !prov.Pending {
-		t.Fatalf("provisional record = %+v", prov)
-	}
-	if prov.Restore == nil || len(prov.Restore.TokenRows) != 1 {
-		t.Fatalf("provisional record has no restore snapshot: %+v", prov)
-	}
-	if len(prov.OutputsToAdmit) != 0 || prov.AdmissionSignature != "" {
-		t.Fatalf("a provisional record must not claim an admission: %+v", prov)
+	requireNoSigma(t, entryOf(t, decodeJSON(t, resp), mandala.KYCTopic))
+	if rec.getCalls != 0 || len(rec.provisional) != 0 || len(rec.recorded) != 0 {
+		t.Fatalf("a KYC-only submit touched the admission record: get=%d provisional=%d recorded=%d", rec.getCalls, len(rec.provisional), len(rec.recorded))
 	}
 }
 
-// §9.4 — a crash between the provisional write and the finalize leaves a
-// pending row; the next submit of those bytes finds the engine's applied proof
-// and finalizes it, rather than re-submitting or answering 404 forever.
-func TestSubmit_DupeFinalizesAPendingRecordFromTheAppliedProof(t *testing.T) {
-	beef, txid := submitBeef(t, 0x21)
-	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid:    txid,
-		Topics:  []string{tokenTopic},
-		Pending: true,
-		Restore: &mandalav2.RestoreSnapshot{SpentOutpoints: []string{"aa.0"}},
-	}}
-	proof := func(context.Context, string) (bool, []uint32, error) { return true, []uint32{0, 2}, nil }
-	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof))
+func TestSubmit_ProvisionalAndFinalRecordsCarryTheRestoreSnapshot(t *testing.T) {
+	beef, txid := submitBeef(t, 0x13)
+	restore := &mandala.RestoreSnapshot{SpentOutpoints: []string{strings.Repeat("cd", 32) + ".1"}}
+	comp := &stubCompensation{restore: restore}
+	stub := &stubSubmitter{steak: overlay.Steak{testTopicA: {OutputsToAdmit: []uint32{0}}}}
+	rec := &stubAdmissionStore{}
+	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil), WithBroadcastCompensation(comp.prepare))
 
-	resp := doRequest(t, app, submitBeefReq(beef))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readRawBody(t, resp))
+	if resp := doRequest(t, app, submitBeefReq(beef)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if stub.gotCtx != nil {
-		t.Fatal("an engine-proven dupe must not reach Engine.Submit again")
+	if !reflect.DeepEqual(comp.gotTopics, []string{testTopicA}) {
+		t.Fatalf("prepare got topics %v, want the named topics", comp.gotTopics)
 	}
-	if len(rec.recorded) != 1 {
-		t.Fatalf("the pending record was not finalized: %+v", rec.recorded)
+	if len(rec.provisional) != 1 || !rec.provisional[0].Pending || rec.provisional[0].Txid != txid || rec.provisional[0].Restore != restore {
+		t.Fatalf("provisional = %+v, want one pending write carrying the snapshot", rec.provisional)
 	}
-	got := rec.recorded[0]
-	if got.Txid != txid || got.Pending || len(got.OutputsToAdmit) != 2 || got.AdmissionSignature == "" {
-		t.Fatalf("finalized record = %+v", got)
+	if len(rec.recorded) != 1 || rec.recorded[0].Restore != restore || rec.recorded[0].Pending {
+		t.Fatalf("finalize = %+v, want the snapshot kept on the final record", rec.recorded)
 	}
 }
 
-// §9.4 — if the finalize cannot be written the client must not be handed a
-// signature it cannot look up: 503, and the retry lands on the dupe path.
-func TestSubmit_DupeFinalizeFailureIs503(t *testing.T) {
-	beef, txid := submitBeef(t, 0x22)
-	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{
-		record:    &mandalav2.AdmissionRecord{Txid: txid, Pending: true},
-		recordErr: errors.New("mongo down"),
-	}
-	proof := func(context.Context, string) (bool, []uint32, error) { return true, []uint32{0}, nil }
-	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof))
-
-	resp := doRequest(t, app, submitBeefReq(beef))
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
-	}
-	if body := decodeJSON(t, resp); body["code"] != CodeUnavailable || body["retryable"] != true {
-		t.Fatalf("body = %v", body)
-	}
-}
-
-// §9.4 — the provisional write is what makes the restore snapshot durable, so
-// a failure there must stop the submit BEFORE the engine mutates anything.
-func TestSubmit_ProvisionalRecordWriteFailureIs503AndSkipsSubmit(t *testing.T) {
-	beef, _ := submitBeef(t, 0x23)
-	stub := &stubSubmitter{steak: overlay.Steak{
-		tokenTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
-	}}
+func TestSubmit_ProvisionalWriteFailureIs503AndSkipsSubmit(t *testing.T) {
+	beef, _ := submitBeef(t, 0x14)
+	stub := &stubSubmitter{steak: overlay.Steak{testTopicA: {OutputsToAdmit: []uint32{0}}}}
 	rec := &stubAdmissionStore{provisionalErr: errors.New("mongo down")}
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
 
@@ -337,377 +294,339 @@ func TestSubmit_ProvisionalRecordWriteFailureIs503AndSkipsSubmit(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
-	if body := decodeJSON(t, resp); body["code"] != CodeUnavailable || body["retryable"] != true {
+	if body := decodeJSON(t, resp); body["code"] != CodeUnavailable || body["description"] != "provisional admission record write failed: mongo down" {
 		t.Fatalf("body = %v", body)
 	}
 	if stub.gotCtx != nil {
-		t.Fatal("Submit ran without a durable restore snapshot")
+		t.Fatal("Submit must not run without a durable provisional record")
 	}
 }
 
-// A client holding a 200 must be able to GET the record immediately. If the
-// record cannot be written, the 200 would be a promise the overlay cannot
-// keep — answer 503 instead and let the retry land on the dupe path.
-func TestSubmit_RecordWriteFailureIs503(t *testing.T) {
-	beef, _ := submitBeef(t, 0x14)
-	stub := &stubSubmitter{steak: overlay.Steak{
-		tokenTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
-	}}
+func TestSubmit_FinalizeWriteFailureIs503(t *testing.T) {
+	beef, _ := submitBeef(t, 0x15)
+	stub := &stubSubmitter{steak: overlay.Steak{testTopicA: {OutputsToAdmit: []uint32{0}}}}
 	rec := &stubAdmissionStore{recordErr: errors.New("mongo down")}
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
 
 	resp := doRequest(t, app, submitBeefReq(beef))
 	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
+		t.Fatalf("status = %d, want 503 rather than a σI the overlay has no record of", resp.StatusCode)
 	}
-	if body := decodeJSON(t, resp); body["code"] != CodeUnavailable || body["retryable"] != true {
+	if body := decodeJSON(t, resp); body["description"] != "admission record write failed: mongo down" {
 		t.Fatalf("body = %v", body)
 	}
 }
 
-// --- FIX C/D: the idempotent dupe path and "verdict wins" ---
-
-func TestSubmit_DupeOfAdmittedTxidReSignsWithoutSideEffects(t *testing.T) {
-	beef, txid := submitBeef(t, 0x15)
-	stub := &stubSubmitter{steak: overlay.Steak{}}
-	comp := &stubCompensation{}
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid:                 txid,
-		Topics:               []string{tokenTopic},
-		OutputsToAdmit:       []uint32{0, 2},
-		AdmissionSignature:   "stale-signature",
-		AdmissionIdentityKey: "02stale",
-		At:                   "2026-01-01T00:00:00.000Z",
+// D-8 on stubs: the record alone never answers; a 200 replay needs an engine applied record for EVERY named topic,
+// and a retry naming one more topic reaches Submit, signs both and finalizes both.
+func TestSubmit_KnownVerdictNeedsEveryNamedTopicApplied(t *testing.T) {
+	beef, txid := submitBeef(t, 0x16)
+	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+		Txid: txid, Topics: []string{testTopicA},
+		Admissions:           map[string]mandala.TopicAdmission{testTopicA: {OutputsToAdmit: []uint32{0}, AdmissionSignature: "3044stale"}},
+		AdmissionIdentityKey: "02stale", At: "2026-10-05T00:00:00.000Z",
 	}}
-	app := newServer(stub, nil, nil, nil,
-		WithAdmissionSigner(testSigner(t)),
-		WithAdmissionStore(rec, nil),
-		WithBroadcastCompensation(comp.prepare))
+	stub := &stubSubmitter{steak: overlay.Steak{
+		testTopicA: {},
+		testTopicB: {OutputsToAdmit: []uint32{1}, CoinsToRetain: []uint32{1}},
+	}}
+	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proofOf(map[string][]uint32{testTopicA: {0}})))
 
-	resp := doRequest(t, app, submitBeefReq(beef))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	resp := doRequest(t, app, submitTopicsReq(beef, testTopicA))
+	if resp.StatusCode != http.StatusOK || stub.gotCtx != nil {
+		t.Fatalf("covered submit: status %d, reached Submit %v; want a 200 replay without Submit", resp.StatusCode, stub.gotCtx != nil)
 	}
-	if stub.gotCtx != nil {
-		t.Fatal("a dupe must not reach Engine.Submit")
-	}
-	if comp.prepareCalls != 0 {
-		t.Fatal("a dupe must not take a new pre-spend snapshot")
+	replay := decodeJSON(t, resp)
+	a := entryOf(t, replay, testTopicA)
+	requireSigma(t, a, testIdentityKey(t), testTopicA, txid, []uint32{0}, testTopicB)
+	if retain, _ := a["coinsToRetain"].([]any); retain == nil || len(retain) != 0 {
+		t.Fatalf("replay coinsToRetain = %v, want []", a["coinsToRetain"])
 	}
 	if len(rec.recorded) != 0 {
-		t.Fatal("a dupe must not rewrite the admission record")
+		t.Fatalf("a replay of a topic the record already holds must not write: %+v", rec.recorded)
+	}
+
+	resp = doRequest(t, app, submitTopicsReq(beef, testTopicA, testTopicB))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("uncovered submit: status %d (%s)", resp.StatusCode, readRawBody(t, resp))
+	}
+	if stub.gotCtx == nil || !reflect.DeepEqual(stub.gotTB.Topics, []string{testTopicA, testTopicB}) {
+		t.Fatal("a submit naming a topic the engine has not applied must reach Submit")
 	}
 	body := decodeJSON(t, resp)
-	tm, _ := body[tokenTopic].(map[string]any)
-	if tm == nil {
-		t.Fatalf("body = %v", body)
+	if got := outputsOf(t, entryOf(t, body, testTopicA)); !reflect.DeepEqual(got, []uint32{0}) {
+		t.Fatalf("skipped-as-applied tm_<A> entry outputs = %v, want [0] from the record", got)
 	}
-	admits, _ := tm["outputsToAdmit"].([]any)
-	if len(admits) != 2 || admits[0].(float64) != 0 || admits[1].(float64) != 2 {
-		t.Fatalf("outputsToAdmit = %v, want the recorded set", tm["outputsToAdmit"])
+	requireSigma(t, entryOf(t, body, testTopicA), testIdentityKey(t), testTopicA, txid, []uint32{0}, testTopicB)
+	requireSigma(t, entryOf(t, body, testTopicB), testIdentityKey(t), testTopicB, txid, []uint32{1}, testTopicA)
+	if len(rec.recorded) != 1 || !reflect.DeepEqual(admissionKeys(rec.recorded[0]), []string{testTopicA, testTopicB}) {
+		t.Fatalf("finalize = %+v, want both topics", rec.recorded)
 	}
-	// Freshly signed, not the stale stored string.
-	want, _, err := testSigner(t).SignAdmission(txid, []uint32{0, 2})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tm["admissionSignature"] != want {
-		t.Fatalf("admissionSignature = %v, want a fresh σ_I %s", tm["admissionSignature"], want)
+	if len(rec.provisional) != 1 || !reflect.DeepEqual(rec.provisional[0].Topics, []string{testTopicA, testTopicB}) {
+		t.Fatalf("provisional = %+v, want one write naming both topics", rec.provisional)
 	}
 }
 
-// The set on the wire is the canonical set that was signed: a stored record
-// carrying duplicate indexes serves them collapsed, so a verifier never
-// checks σ_I against a set the signer did not use.
-func TestSubmit_DupePathServesTheCanonicalOutputSet(t *testing.T) {
-	beef, txid := submitBeef(t, 0x1c)
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid:                 txid,
-		OutputsToAdmit:       []uint32{2, 0, 2},
-		AdmissionSignature:   "stale",
-		AdmissionIdentityKey: "02stale",
-		At:                   "2026-01-01T00:00:00.000Z",
-	}}
-	app := newServer(&stubSubmitter{}, nil, nil, nil,
-		WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
-
-	resp := doRequest(t, app, submitBeefReq(beef))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	tm, _ := decodeJSON(t, resp)[tokenTopic].(map[string]any)
-	admits, _ := tm["outputsToAdmit"].([]any)
-	if len(admits) != 2 || admits[0].(float64) != 0 || admits[1].(float64) != 2 {
-		t.Fatalf("outputsToAdmit = %v, want the canonical [0 2]", tm["outputsToAdmit"])
-	}
-	want, _, _ := testSigner(t).SignAdmission(txid, []uint32{0, 2})
-	if tm["admissionSignature"] != want {
-		t.Fatalf("admissionSignature = %v, want the canonical-set σ_I", tm["admissionSignature"])
-	}
-}
-
-// FIX C proper: no admission record at all, but the ENGINE's applied-
-// transaction store proves the txid went through tm_mandala. Sign anyway,
-// deriving outputsToAdmit from the engine's own stored outputs.
-func TestSubmit_DupeFromAppliedProofWithNoRecord(t *testing.T) {
-	beef, txid := submitBeef(t, 0x16)
-	stub := &stubSubmitter{steak: overlay.Steak{}}
+// A lost record: the engine's proof covers every named topic, so the replay re-signs each σ-topic and finalizes them.
+func TestSubmit_ReplayFinalizesMissingEntriesFromTheAppliedProof(t *testing.T) {
+	beef, txid := submitBeef(t, 0x17)
+	own := "tm_" + txid
+	stub := &stubSubmitter{}
 	rec := &stubAdmissionStore{}
-	var askedFor string
-	proof := func(_ context.Context, id string) (bool, []uint32, error) {
-		askedFor = id
-		return true, []uint32{3, 1}, nil
+	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)),
+		WithAdmissionStore(rec, proofOf(map[string][]uint32{mandala.MandalaTopic: {0}, own: {0}})))
+
+	resp := doRequest(t, app, submitTopicsReq(beef, mandala.MandalaTopic, own))
+	if resp.StatusCode != http.StatusOK || stub.gotCtx != nil {
+		t.Fatalf("status %d, reached Submit %v; want a replay", resp.StatusCode, stub.gotCtx != nil)
+	}
+	body := decodeJSON(t, resp)
+	requireSigma(t, entryOf(t, body, mandala.MandalaTopic), testIdentityKey(t), mandala.MandalaTopic, txid, []uint32{0}, own)
+	requireSigma(t, entryOf(t, body, own), testIdentityKey(t), own, txid, []uint32{0}, mandala.MandalaTopic)
+	// admissionKeys sorts ("tm_<hex>" < "tm_mandala"); Topics keeps the X-Topics order.
+	if len(rec.recorded) != 1 || !reflect.DeepEqual(admissionKeys(rec.recorded[0]), []string{own, mandala.MandalaTopic}) ||
+		!reflect.DeepEqual(rec.recorded[0].Topics, []string{mandala.MandalaTopic, own}) {
+		t.Fatalf("finalize = %+v", rec.recorded)
+	}
+	if len(rec.provisional) != 0 {
+		t.Fatal("a replay writes no provisional record")
+	}
+}
+
+// D-20 / R8: a same-txid submit that read step 4 before a concurrent one committed, then met the engine's dupe gate
+// after it (check-then-act, F/gos-engine §5 row 5a), gets empty STEAK entries for an admitted transaction. The handler
+// re-reads the applied proof once and answers those topics like the known path: outputs from the proof, σI re-signed,
+// finalized. A fault on that read is 503, retryable: a retry replays from step 4.
+func TestSubmit_DupeGateRaceAnswersFromTheReReadProof(t *testing.T) {
+	beef, txid := submitBeef(t, 0x21)
+	own := "tm_" + txid
+	stub := &stubSubmitter{steak: overlay.Steak{mandala.MandalaTopic: {}, own: {}}}
+	rec := &stubAdmissionStore{}
+	calls := 0
+	var reReadErr error
+	proof := func(context.Context, string) (map[string][]uint32, error) {
+		calls++
+		if calls == 1 {
+			return map[string][]uint32{}, nil // step 4: the other submit has not committed yet
+		}
+		if reReadErr != nil {
+			return nil, reReadErr
+		}
+		return map[string][]uint32{mandala.MandalaTopic: {0}, own: {0}}, nil // after Submit: it has
 	}
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof))
 
-	resp := doRequest(t, app, submitBeefReq(beef))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	resp := doRequest(t, app, submitTopicsReq(beef, mandala.MandalaTopic, own))
+	if resp.StatusCode != http.StatusOK || stub.gotCtx == nil {
+		t.Fatalf("status %d, reached Submit %v; want 200 after Submit (%s)", resp.StatusCode, stub.gotCtx != nil, readRawBody(t, resp))
 	}
-	if askedFor != txid {
-		t.Fatalf("applied proof asked for %q, want %q", askedFor, txid)
-	}
-	if stub.gotCtx != nil {
-		t.Fatal("an engine-proven dupe must not reach Engine.Submit")
+	if calls != 2 {
+		t.Fatalf("applied proof read %d times, want 2 (step 4, then once after Submit)", calls)
 	}
 	body := decodeJSON(t, resp)
-	tm, _ := body[tokenTopic].(map[string]any)
-	admits, _ := tm["outputsToAdmit"].([]any)
-	if len(admits) != 2 || admits[0].(float64) != 1 || admits[1].(float64) != 3 {
-		t.Fatalf("outputsToAdmit = %v, want [1 3] ascending", tm["outputsToAdmit"])
+	for _, topic := range []string{mandala.MandalaTopic, own} {
+		if got := outputsOf(t, entryOf(t, body, topic)); !reflect.DeepEqual(got, []uint32{0}) {
+			t.Fatalf("%s outputs = %v, want [0] from the re-read proof", topic, got)
+		}
 	}
-	want, _, _ := testSigner(t).SignAdmission(txid, []uint32{1, 3})
-	if tm["admissionSignature"] != want {
-		t.Fatalf("admissionSignature = %v, want %s", tm["admissionSignature"], want)
+	requireSigma(t, entryOf(t, body, mandala.MandalaTopic), testIdentityKey(t), mandala.MandalaTopic, txid, []uint32{0}, own)
+	requireSigma(t, entryOf(t, body, own), testIdentityKey(t), own, txid, []uint32{0}, mandala.MandalaTopic)
+	want := []string{mandala.MandalaTopic, own}
+	sort.Strings(want)
+	if len(rec.recorded) != 1 || !reflect.DeepEqual(admissionKeys(rec.recorded[0]), want) {
+		t.Fatalf("finalize = %+v, want one write holding both topics", rec.recorded)
+	}
+
+	// The same race with a failing re-read: 503, nothing finalized.
+	calls, reReadErr = 0, errors.New("mongo down")
+	rec.recorded = nil
+	resp = doRequest(t, app, submitTopicsReq(beef, mandala.MandalaTopic, own))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if body := decodeJSON(t, resp); body["code"] != CodeUnavailable || body["description"] != "applied-transaction lookup failed: mongo down" {
+		t.Fatalf("body = %v", body)
+	}
+	if len(rec.recorded) != 0 {
+		t.Fatalf("a failed re-read finalized %+v", rec.recorded)
+	}
+}
+
+func TestSubmit_ReplayFinalizeFailureIs503(t *testing.T) {
+	beef, _ := submitBeef(t, 0x18)
+	rec := &stubAdmissionStore{recordErr: errors.New("mongo down")}
+	app := newServer(&stubSubmitter{}, nil, nil, nil, WithAdmissionSigner(testSigner(t)),
+		WithAdmissionStore(rec, proofOf(map[string][]uint32{testTopicA: {0}})))
+
+	resp := doRequest(t, app, submitBeefReq(beef))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if body := decodeJSON(t, resp); body["description"] != "admission record write failed: mongo down" {
+		t.Fatalf("body = %v", body)
 	}
 }
 
 func TestSubmit_EvictedTxidIs410Forever(t *testing.T) {
-	beef, txid := submitBeef(t, 0x17)
-	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid:      txid,
-		EvictedAt: "2026-02-03T04:05:06.000Z",
-	}}
-	// Even with the engine still claiming the tx was applied, the eviction
-	// stamp wins.
-	proof := func(context.Context, string) (bool, []uint32, error) { return true, []uint32{0}, nil }
-	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof))
+	beef, txid := submitBeef(t, 0x19)
+	stub := &stubSubmitter{steak: overlay.Steak{testTopicA: {OutputsToAdmit: []uint32{0}}}}
+	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{Txid: txid, EvictedAt: "2026-10-05T00:00:00.000Z"}}
+	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proofOf(map[string][]uint32{testTopicA: {0}})))
 
 	resp := doRequest(t, app, submitBeefReq(beef))
 	if resp.StatusCode != http.StatusGone {
 		t.Fatalf("status = %d, want 410", resp.StatusCode)
 	}
 	body := decodeJSON(t, resp)
-	if body["code"] != CodeEvicted || body["retryable"] != false || body["status"] != "error" {
+	if body["code"] != CodeEvicted || body["retryable"] != false ||
+		body["description"] != "transaction "+txid+" was admitted and later evicted; its inputs are spendable again" {
 		t.Fatalf("body = %v", body)
 	}
-	// The description is part of the wire contract: byte-identical on both
-	// engines and on both routes, with no timestamp in it.
-	want := "transaction " + txid + " was admitted and later evicted; its inputs are spendable again"
-	if body["description"] != want {
-		t.Fatalf("description = %q, want %q", body["description"], want)
-	}
 	if stub.gotCtx != nil {
-		t.Fatal("an evicted txid must not be resubmitted to the engine")
+		t.Fatal("an evicted txid must not reach Submit")
 	}
 }
 
-func TestSubmit_PersistedRefusalIsReservedIdentically(t *testing.T) {
-	beef, txid := submitBeef(t, 0x18)
-	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid:               txid,
-		RefusedCode:        CodeConservation,
-		RefusedDescription: "conservation violated: outputs exceed authorized inputs/issuance",
-		RefusedPayloadHash: emptyPayloadHash(),
+func TestSubmit_PersistedRefusalReplaysForTheSamePayloadOnly(t *testing.T) {
+	beef, txid := submitBeef(t, 0x1a)
+	const reason = "output 0: token output with no verified linkage"
+	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+		Txid: txid, RefusedCode: CodeLinkage, RefusedDescription: reason, RefusedPayloadHash: emptyPayloadHash(), RefusedTopic: testTopicA,
 	}}
-	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
+	stub := &stubSubmitter{steak: overlay.Steak{testTopicA: {OutputsToAdmit: []uint32{0}}}}
+	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proofOf(nil)))
 
 	resp := doRequest(t, app, submitBeefReq(beef))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("same payload: status = %d, want 400", resp.StatusCode)
+	}
+	if body := decodeJSON(t, resp); body["code"] != CodeLinkage || body["description"] != reason || body["retryable"] != false {
+		t.Fatalf("same payload: body = %v", body)
+	}
+	if stub.gotCtx != nil {
+		t.Fatal("the persisted refusal must answer without Submit")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(framedSubmitBody(beef, []byte(`{"outputs":[]}`))))
+	req.Header.Set("X-Topics", `["`+testTopicA+`"]`)
+	req.Header.Set("x-includes-off-chain-values", "true")
+	if resp := doRequest(t, app, req); resp.StatusCode != http.StatusOK || stub.gotCtx == nil {
+		t.Fatalf("different payload: status %d, reached Submit %v; want a fresh evaluation", resp.StatusCode, stub.gotCtx != nil)
+	}
+}
+
+func TestSubmit_RecordAndProofFaultsAre503(t *testing.T) {
+	beef, _ := submitBeef(t, 0x1b)
+	stub := &stubSubmitter{}
+	app := newServer(stub, nil, nil, nil, WithAdmissionStore(&stubAdmissionStore{getErr: errors.New("mongo down")}, nil))
+	resp := doRequest(t, app, submitBeefReq(beef))
+	if body := decodeJSON(t, resp); resp.StatusCode != 503 || body["description"] != "admission record lookup failed: mongo down" {
+		t.Fatalf("record fault: %d %v", resp.StatusCode, body)
+	}
+	failing := func(context.Context, string) (map[string][]uint32, error) {
+		return nil, errors.New("engine store down")
+	}
+	app = newServer(stub, nil, nil, nil, WithAdmissionStore(&stubAdmissionStore{}, failing))
+	resp = doRequest(t, app, submitBeefReq(beef))
+	if body := decodeJSON(t, resp); resp.StatusCode != 503 || body["description"] != "applied-transaction lookup failed: engine store down" {
+		t.Fatalf("proof fault: %d %v", resp.StatusCode, body)
+	}
+	if stub.gotCtx != nil {
+		t.Fatal("a read fault must stop before Submit")
+	}
+}
+
+// G6/A1.3: an unhosted topic is answered before any admission-record read or write, and nothing reaches the engine.
+func TestSubmit_UnknownTopicPreCheckTouchesNothing(t *testing.T) {
+	beef, _ := submitBeef(t, 0x1c)
+	stub := &stubSubmitter{hasTopic: func(name string) bool { return name != testTopicB }}
+	comp := &stubCompensation{}
+	rec := &stubAdmissionStore{}
+	proofCalls := 0
+	proof := func(context.Context, string) (map[string][]uint32, error) {
+		proofCalls++
+		return map[string][]uint32{}, nil
+	}
+	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof), WithBroadcastCompensation(comp.prepare))
+
+	resp := doRequest(t, app, submitTopicsReq(beef, testTopicA, testTopicB))
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 	body := decodeJSON(t, resp)
-	if body["code"] != CodeConservation || body["retryable"] != false {
+	if body["code"] != CodeShape || body["retryable"] != false || body["description"] != "unknown-topic: "+testTopicB {
 		t.Fatalf("body = %v", body)
 	}
-	if body["description"] != "conservation violated: outputs exceed authorized inputs/issuance" {
-		t.Fatalf("description = %v", body["description"])
-	}
-	if stub.gotCtx != nil {
-		t.Fatal("a txid with a final verdict for THIS payload must not be resubmitted to the engine")
+	if stub.gotCtx != nil || comp.prepareCalls != 0 || rec.getCalls != 0 || proofCalls != 0 || len(rec.provisional) != 0 || rec.refusalCalls != 0 {
+		t.Fatalf("the pre-check must touch nothing: submit=%v prepare=%d get=%d proof=%d provisional=%d refusals=%d",
+			stub.gotCtx != nil, comp.prepareCalls, rec.getCalls, proofCalls, len(rec.provisional), rec.refusalCalls)
 	}
 }
 
-// §9.1 — a refusal earned with one payload says nothing about another. The
-// same BEEF submitted with a different payload is evaluated fresh.
-func TestSubmit_PersistedRefusalDoesNotApplyToADifferentPayload(t *testing.T) {
-	beef, txid := submitBeef(t, 0x24)
-	stub := &stubSubmitter{steak: overlay.Steak{
-		tokenTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
-	}}
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid:               txid,
-		RefusedCode:        CodeLinkage,
-		RefusedDescription: "output 0: MandalaToken-decodable output with no verified linkage",
-		RefusedPayloadHash: mandalav2.PayloadHashHex([]byte("some other payload")),
-	}}
+// G17: duplicate X-Topics are submitted once, first positions kept.
+func TestSubmit_DuplicateTopicsAreSubmittedOnce(t *testing.T) {
+	beef, _ := submitBeef(t, 0x1d)
+	stub := &stubSubmitter{steak: overlay.Steak{}}
+	rec := &stubAdmissionStore{}
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
+	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(beef))
+	req.Header.Set("X-Topics", `["`+testTopicA+`","`+testTopicA+`","`+mandala.KYCTopic+`","`+testTopicA+`"]`)
 
+	if resp := doRequest(t, app, req); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	want := []string{testTopicA, mandala.KYCTopic}
+	if !reflect.DeepEqual(stub.gotTB.Topics, want) {
+		t.Fatalf("submitted topics = %v, want %v", stub.gotTB.Topics, want)
+	}
+	if len(rec.provisional) != 1 || !reflect.DeepEqual(rec.provisional[0].Topics, want) {
+		t.Fatalf("provisional topics = %+v, want %v", rec.provisional, want)
+	}
+}
+
+// TT §9 / A1.3: the engine's unknown-topic (a race with the pre-check) is 400 ERR_SHAPE and never persisted.
+func TestSubmit_EngineUnknownTopicIs400AndNeverPersisted(t *testing.T) {
+	beef, _ := submitBeef(t, 0x1e)
+	rec := &stubAdmissionStore{}
+	app := newServer(&stubSubmitter{err: engine.ErrUnknownTopic}, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
+	resp := doRequest(t, app, submitBeefReq(beef))
+	body := decodeJSON(t, resp)
+	if resp.StatusCode != 400 || body["code"] != CodeShape || body["description"] != "unknown-topic" || body["retryable"] != false {
+		t.Fatalf("%d %v", resp.StatusCode, body)
+	}
+	if rec.refusalCalls != 0 {
+		t.Fatal("unknown-topic must never be persisted")
+	}
+}
+
+func TestSubmit_ConflictingSpendIs400WithSpendTxidAndIsNeverPersisted(t *testing.T) {
+	beef, _ := submitBeef(t, 0x1f)
+	competitor := strings.Repeat("c", 64)
+	reason := "input " + vectorTxid + ".0: already spent by " + competitor
+	rec := &stubAdmissionStore{}
+	stub := &stubSubmitter{err: &mandala.RejectError{Code: mandala.CodeInputSpent, Reason: reason, Topic: testTopicA, SpendTxid: competitor}}
+	app := newServer(stub, nil, nil, nil, WithAdmissionStore(rec, nil))
+	resp := doRequest(t, app, submitBeefReq(beef))
+	body := decodeJSON(t, resp)
+	if resp.StatusCode != 400 || body["code"] != CodeInputSpent || body["retryable"] != false || body["spendTxid"] != competitor || body["description"] != reason {
+		t.Fatalf("%d %v", resp.StatusCode, body)
+	}
+	if rec.refusalCalls != 0 {
+		t.Fatal("ERR_INPUT_SPENT is live state and must never be persisted")
+	}
+}
+
+func TestSubmit_NoStoreNoSignerStillAdmits(t *testing.T) {
+	beef, _ := submitBeef(t, 0x20)
+	app := newServer(&stubSubmitter{steak: overlay.Steak{testTopicA: {OutputsToAdmit: []uint32{0}}}}, nil, nil, nil)
 	resp := doRequest(t, app, submitBeefReq(beef))
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readRawBody(t, resp))
+		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if stub.gotCtx == nil {
-		t.Fatal("a refusal scoped to another payload must not short-circuit the engine")
-	}
+	requireNoSigma(t, entryOf(t, decodeJSON(t, resp), testTopicA))
 }
 
-// A final verdict earned fresh is persisted; a liftable 409 one is not.
-func TestSubmit_PersistsFinalVerdictsOnly(t *testing.T) {
-	cases := []struct {
-		name      string
-		err       error
-		wantCode  string
-		wantHTTP  int
-		persisted bool
-	}{
-		{
-			"final: linkage",
-			&mandalav2.RejectError{Topic: tokenTopic, Err: errors.New("output 1: MandalaToken-decodable output with no verified linkage")},
-			CodeLinkage, http.StatusBadRequest, true,
-		},
-		{
-			"final: conservation",
-			&mandalav2.RejectError{Topic: tokenTopic, Err: errors.New("conservation violated: outputs exceed authorized inputs/issuance")},
-			CodeConservation, http.StatusBadRequest, true,
-		},
-		{
-			"liftable: paused",
-			&mandalav2.RejectError{Topic: tokenTopic, Err: errors.New("control gate rejected the transaction (paused asset or access mode)")},
-			CodePaused, http.StatusConflict, false,
-		},
-		{
-			"fault: not persisted",
-			errors.New("mongo down"),
-			CodeUnavailable, http.StatusServiceUnavailable, false,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			beef, txid := submitBeef(t, 0x19)
-			stub := &stubSubmitter{err: tc.err}
-			rec := &stubAdmissionStore{}
-			app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
-
-			resp := doRequest(t, app, submitBeefReq(beef))
-			if resp.StatusCode != tc.wantHTTP {
-				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantHTTP)
-			}
-			if body := decodeJSON(t, resp); body["code"] != tc.wantCode {
-				t.Fatalf("code = %v, want %s", body["code"], tc.wantCode)
-			}
-			if tc.persisted {
-				if rec.refusalCalls != 1 {
-					t.Fatalf("persisted %d verdicts, want 1", rec.refusalCalls)
-				}
-				if rec.refusals[0].Txid != txid || rec.refusals[0].RefusedCode != tc.wantCode {
-					t.Fatalf("persisted %+v", rec.refusals[0])
-				}
-				// §9.1: every persisted refusal is scoped to the payload that
-				// earned it, never to the txid alone.
-				if rec.refusals[0].RefusedPayloadHash != emptyPayloadHash() {
-					t.Fatalf("persisted refusal has payloadHash %q, want the submitted payload's hash",
-						rec.refusals[0].RefusedPayloadHash)
-				}
-			} else if rec.refusalCalls != 0 {
-				t.Fatalf("a non-final verdict was persisted: %+v", rec.refusals)
-			}
-		})
-	}
-}
-
-// FIX L end to end through the HTTP layer: the manager's conflicting-spend
-// verdict becomes a 400 that names the competitor — and, per §9.2, is NEVER
-// persisted. It is a statement about live state that an eviction of the
-// competitor undoes; persisted, it would outlive its own truth and keep
-// telling the wallet a coin is gone after it came back.
-func TestSubmit_ConflictingSpendIs400WithSpendTxidAndIsNeverPersisted(t *testing.T) {
-	beef, _ := submitBeef(t, 0x1a)
-	competitor := "cc" + vectorTxid[2:]
-	stub := &stubSubmitter{err: &mandalav2.RejectError{
-		Topic:     tokenTopic,
-		Err:       errors.New("input aa.0 already spent by " + competitor),
-		SpendTxid: competitor,
-	}}
-	rec := &stubAdmissionStore{}
-	app := newServer(stub, nil, nil, nil, WithAdmissionStore(rec, nil))
-
-	resp := doRequest(t, app, submitBeefReq(beef))
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
-	}
-	body := decodeJSON(t, resp)
-	if body["code"] != CodeInputSpent || body["spendTxid"] != competitor {
-		t.Fatalf("body = %v", body)
-	}
-	if body["retryable"] != false {
-		t.Fatalf("retryable = %v, want false on the wire", body["retryable"])
-	}
-	if rec.refusalCalls != 0 {
-		t.Fatalf("ERR_INPUT_SPENT was persisted (§9.2 forbids it): %+v", rec.refusals)
-	}
-}
-
-// Wire contract §9.5, at the HTTP boundary: a fault raised inside one of the
-// manager's guards reaches Submit as a plain (non-*RejectError) error — see
-// mandala's TestInfraFaultInEveryGuardIsNeverAVerdict, which proves store,
-// provider and chaintracker faults are typed that way — and must answer 503
-// with nothing admitted and nothing persisted. A 4xx here would tell a wallet
-// its perfectly good transaction is invalid forever because Mongo blinked.
-func TestSubmit_GuardDependencyFaultIs503AndAdmitsNothing(t *testing.T) {
-	beef, _ := submitBeef(t, 0x25)
-	stub := &stubSubmitter{err: errors.New("tm_mandala: token row for aa.0: mongo down")}
-	rec := &stubAdmissionStore{}
-	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
-
-	resp := doRequest(t, app, submitBeefReq(beef))
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
-	}
-	body := decodeJSON(t, resp)
-	if body["code"] != CodeUnavailable || body["retryable"] != true {
-		t.Fatalf("body = %v, want a retryable ERR_UNAVAILABLE", body)
-	}
-	if body[tokenTopic] != nil {
-		t.Fatalf("a faulted submit returned an admittance: %v", body)
-	}
-	if len(rec.recorded) != 0 {
-		t.Fatalf("a faulted submit recorded an admission: %+v", rec.recorded)
-	}
-	if rec.refusalCalls != 0 {
-		t.Fatalf("a dependency fault was persisted as a verdict: %+v", rec.refusals)
-	}
-}
-
-// A record lookup that fails is a dependency fault: 503, never a guess.
-func TestSubmit_RecordLookupFailureIs503(t *testing.T) {
-	beef, _ := submitBeef(t, 0x1b)
-	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{getErr: errors.New("mongo down")}
-	app := newServer(stub, nil, nil, nil, WithAdmissionStore(rec, nil))
-
-	resp := doRequest(t, app, submitBeefReq(beef))
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
-	}
-	if stub.gotCtx != nil {
-		t.Fatal("Submit must not run when the verdict lookup failed")
-	}
-}
-
-// --- wire contract §3: GET /admin/admission/:txid ---
+// --- GET /admin/admission/:txid -------------------------------------------------------------------------------
 
 func admissionReq(txid, token string) *http.Request {
 	req := httptest.NewRequest(http.MethodGet, "/admin/admission/"+txid, nil)
@@ -717,240 +636,132 @@ func admissionReq(txid, token string) *http.Request {
 	return req
 }
 
-func TestAdmissionEndpoint_200ForAnAdmittedTxid(t *testing.T) {
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid:                 vectorTxid,
-		Topics:               []string{tokenTopic},
-		OutputsToAdmit:       []uint32{2, 0},
-		AdmissionSignature:   "3044stored",
-		AdmissionIdentityKey: "02stored",
-		At:                   "2026-01-01T00:00:00.000Z",
+func TestAdmissionEndpoint_ReturnsThePerTopicMap(t *testing.T) {
+	signer := testSigner(t)
+	sigM, ident, err := signer.SignAdmission(mandala.MandalaTopic, vectorTxid, []uint32{0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigA, _, err := signer.SignAdmission(testTopicA, vectorTxid, []uint32{0, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+		Txid: vectorTxid, Topics: []string{mandala.MandalaTopic, testTopicA},
+		Admissions: map[string]mandala.TopicAdmission{
+			mandala.MandalaTopic: {OutputsToAdmit: []uint32{0}, AdmissionSignature: sigM},
+			testTopicA:           {OutputsToAdmit: []uint32{0, 2}, AdmissionSignature: sigA},
+		},
+		AdmissionIdentityKey: ident, At: "2026-10-05T01:02:03.000Z",
 	}}
-	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil,
-		WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
+	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil, WithAdmissionSigner(signer), WithAdmissionStore(rec, nil))
 
 	resp := doRequest(t, app, admissionReq(vectorTxid, ""))
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	body := decodeJSON(t, resp)
-	if body["txid"] != vectorTxid {
-		t.Fatalf("txid = %v", body["txid"])
+	var got map[string]any
+	if err := json.Unmarshal(readRawBody(t, resp), &got); err != nil {
+		t.Fatal(err)
 	}
-	outs, _ := body["outputsToAdmit"].([]any)
-	if len(outs) != 2 || outs[0].(float64) != 0 || outs[1].(float64) != 2 {
-		t.Fatalf("outputsToAdmit = %v, want [0 2] ascending", body["outputsToAdmit"])
+	want := map[string]any{
+		"txid": vectorTxid, "admissionIdentityKey": ident, "at": "2026-10-05T01:02:03.000Z",
+		"admissions": map[string]any{
+			mandala.MandalaTopic: map[string]any{"outputsToAdmit": []any{0.0}, "admissionSignature": sigM},
+			testTopicA:           map[string]any{"outputsToAdmit": []any{0.0, 2.0}, "admissionSignature": sigA},
+		},
 	}
-	if body["admissionSignature"] != "3044stored" || body["admissionIdentityKey"] != "02stored" {
-		t.Fatalf("stored σ_I not served verbatim: %v", body)
-	}
-	if body["at"] != "2026-01-01T00:00:00.000Z" {
-		t.Fatalf("at = %v", body["at"])
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("body = %v\nwant   %v", got, want)
 	}
 }
 
-func TestAdmissionEndpoint_ReSignsFromAppliedProofWhenRecordMissing(t *testing.T) {
-	rec := &stubAdmissionStore{}
-	proof := func(context.Context, string) (bool, []uint32, error) { return true, []uint32{1}, nil }
-	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil,
-		WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof))
+func TestAdmissionEndpoint_ReSignsFromTheAppliedProof(t *testing.T) {
+	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil, WithAdmissionSigner(testSigner(t)),
+		WithAdmissionStore(&stubAdmissionStore{}, proofOf(map[string][]uint32{testTopicA: {2, 0}, mandala.KYCTopic: {0}, mandala.MandalaTopic: {}})))
 
 	resp := doRequest(t, app, admissionReq(vectorTxid, ""))
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+		t.Fatalf("status = %d", resp.StatusCode)
 	}
 	body := decodeJSON(t, resp)
-	want, _, _ := testSigner(t).SignAdmission(vectorTxid, []uint32{1})
-	if body["admissionSignature"] != want {
-		t.Fatalf("admissionSignature = %v, want a re-derived σ_I", body["admissionSignature"])
+	adm, _ := body["admissions"].(map[string]any)
+	if len(adm) != 1 {
+		t.Fatalf("admissions = %v, want only tm_<A> (KYC is never signed; an empty set is not a σI)", adm)
 	}
-	if body["admissionIdentityKey"] != testIdentityKey(t) {
-		t.Fatalf("admissionIdentityKey = %v", body["admissionIdentityKey"])
+	a := adm[testTopicA].(map[string]any)
+	a["admissionIdentityKey"] = body["admissionIdentityKey"]
+	if got := outputsOf(t, a); !reflect.DeepEqual(got, []uint32{0, 2}) {
+		t.Fatalf("outputs = %v, want [0 2] (canonical)", got)
 	}
-	if body["at"] == "" {
-		t.Fatalf("at must still be present: %v", body)
+	requireSigma(t, a, testIdentityKey(t), testTopicA, vectorTxid, []uint32{0, 2}, mandala.MandalaTopic)
+	if at, _ := body["at"].(string); at == "" {
+		t.Fatal("a re-derived admission still carries an at stamp")
 	}
 }
 
 func TestAdmissionEndpoint_410ForAnEvictedTxid(t *testing.T) {
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid: vectorTxid, EvictedAt: "2026-02-03T04:05:06.000Z",
-	}}
-	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil,
-		WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
-
+	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{Txid: vectorTxid, EvictedAt: "2026-10-05T00:00:00.000Z"}}
+	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil, WithAdmissionStore(rec, proofOf(map[string][]uint32{testTopicA: {0}})))
 	resp := doRequest(t, app, admissionReq(vectorTxid, ""))
-	if resp.StatusCode != http.StatusGone {
-		t.Fatalf("status = %d, want 410", resp.StatusCode)
-	}
-	body := decodeJSON(t, resp)
-	if body["status"] != "error" || body["code"] != CodeEvicted || body["retryable"] != false {
-		t.Fatalf("body = %v", body)
-	}
-	want := "transaction " + vectorTxid + " was admitted and later evicted; its inputs are spendable again"
-	if body["description"] != want {
-		t.Fatalf("description = %q, want %q (identical to the /submit 410)", body["description"], want)
+	if body := decodeJSON(t, resp); resp.StatusCode != http.StatusGone || body["code"] != CodeEvicted {
+		t.Fatalf("%d %v", resp.StatusCode, body)
 	}
 }
 
-// §9.3 — the persisted refusal is served only to a caller that names the
-// payload it was earned with; every other caller falls through to the
-// applied-proof check and then to 404.
 func TestAdmissionEndpoint_RefusalIsGatedOnThePayloadHash(t *testing.T) {
-	const desc = "conservation violated: outputs exceed authorized inputs/issuance"
-	hash := mandalav2.PayloadHashHex([]byte(`{"outputs":[{"index":0}]}`))
-	newApp := func(t *testing.T) *fiber.App {
-		rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-			Txid:               vectorTxid,
-			RefusedCode:        CodeConservation,
-			RefusedDescription: desc,
-			RefusedPayloadHash: hash,
-		}}
-		proof := func(context.Context, string) (bool, []uint32, error) { return false, nil, nil }
-		return newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil,
-			WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof))
-	}
-
-	t.Run("matching payloadHash is the 400", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/admin/admission/"+vectorTxid+"?payloadHash="+hash, nil)
-		resp := doRequest(t, newApp(t), req)
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Fatalf("status = %d, want 400", resp.StatusCode)
-		}
-		body := decodeJSON(t, resp)
-		if body["code"] != CodeConservation || body["retryable"] != false || body["description"] != desc {
-			t.Fatalf("body = %v", body)
-		}
-	})
-
-	t.Run("uppercase payloadHash still matches", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/admin/admission/"+vectorTxid+"?payloadHash="+strings.ToUpper(hash), nil)
-		resp := doRequest(t, newApp(t), req)
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Fatalf("status = %d, want 400", resp.StatusCode)
-		}
-	})
-
-	t.Run("mismatched payloadHash falls through to 404", func(t *testing.T) {
-		other := mandalav2.PayloadHashHex(nil)
-		req := httptest.NewRequest(http.MethodGet, "/admin/admission/"+vectorTxid+"?payloadHash="+other, nil)
-		resp := doRequest(t, newApp(t), req)
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("status = %d, want 404", resp.StatusCode)
-		}
-	})
-
-	t.Run("absent payloadHash falls through to 404", func(t *testing.T) {
-		resp := doRequest(t, newApp(t), admissionReq(vectorTxid, ""))
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("status = %d, want 404", resp.StatusCode)
-		}
-	})
-}
-
-// §9.3 — a malformed txid is the caller's deterministic mistake, answered with
-// the contract's error body rather than a 404 or a 500.
-func TestAdmissionEndpoint_MalformedTxidIs400ErrShape(t *testing.T) {
-	rec := &stubAdmissionStore{}
-	proof := func(context.Context, string) (bool, []uint32, error) {
-		t.Fatal("a malformed txid must never reach the applied-proof lookup")
-		return false, nil, nil
-	}
-	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil,
-		WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof))
-
-	for _, bad := range []string{"not-a-txid", vectorTxid[:63], vectorTxid + "ab", strings.Repeat("g", 64)} {
-		t.Run(bad[:min(len(bad), 12)], func(t *testing.T) {
-			resp := doRequest(t, app, admissionReq(bad, ""))
-			if resp.StatusCode != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400", resp.StatusCode)
-			}
-			body := decodeJSON(t, resp)
-			if body["status"] != "error" || body["code"] != CodeShape || body["retryable"] != false {
-				t.Fatalf("body = %v", body)
-			}
-			if body["description"] == "" || body["message"] == "" {
-				t.Fatalf("body = %v, want both description and message", body)
-			}
-		})
-	}
-	if rec.getCalls != 0 {
-		t.Fatalf("a malformed txid hit the record store %d times", rec.getCalls)
-	}
-}
-
-// §9.3 — txids are lowercase everywhere in this system; an uppercase one is
-// the same transaction, not an unknown one.
-func TestAdmissionEndpoint_TxidIsLowercased(t *testing.T) {
-	var askedFor string
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid: vectorTxid, Topics: []string{tokenTopic}, OutputsToAdmit: []uint32{0},
-		AdmissionSignature: "3044stored", AdmissionIdentityKey: "02stored",
-		At: "2026-01-01T00:00:00.000Z",
+	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+		Txid: vectorTxid, RefusedCode: CodeConservation, RefusedDescription: "token x_0: value in 1 != value out 2 without an authority",
+		RefusedPayloadHash: emptyPayloadHash(), RefusedTopic: testTopicA,
 	}}
-	proof := func(_ context.Context, id string) (bool, []uint32, error) {
-		askedFor = id
-		return false, nil, nil
-	}
-	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil,
-		WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof))
+	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil, WithAdmissionStore(rec, proofOf(nil)))
 
-	resp := doRequest(t, app, admissionReq(strings.ToUpper(vectorTxid), ""))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readRawBody(t, resp))
+	resp := doRequest(t, app, admissionReq(vectorTxid+"?payloadHash="+strings.ToUpper(emptyPayloadHash()), ""))
+	if body := decodeJSON(t, resp); resp.StatusCode != 400 || body["code"] != CodeConservation {
+		t.Fatalf("matching hash: %d %v", resp.StatusCode, body)
 	}
-	if body := decodeJSON(t, resp); body["txid"] != vectorTxid {
-		t.Fatalf("txid = %v, want the lowercase form", body["txid"])
-	}
-	if askedFor != "" {
-		t.Fatalf("applied proof was consulted with %q despite a record hit", askedFor)
+	resp = doRequest(t, app, admissionReq(vectorTxid, ""))
+	if body := decodeJSON(t, resp); resp.StatusCode != 404 || body["message"] != "no admission on record for "+vectorTxid {
+		t.Fatalf("no hash: %d %v", resp.StatusCode, body)
 	}
 }
 
-// §9.3 — an applied proof with an EMPTY admitted set is not an admission: σ_I
-// speaks for a set of outputs, and there is no set here to speak for.
-func TestAdmissionEndpoint_EmptyAdmittedSetIs404NotAn200(t *testing.T) {
-	rec := &stubAdmissionStore{}
-	proof := func(context.Context, string) (bool, []uint32, error) { return true, nil, nil }
-	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil,
-		WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof))
-
-	resp := doRequest(t, app, admissionReq(vectorTxid, ""))
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404 (body %s)", resp.StatusCode, readRawBody(t, resp))
-	}
+func TestAdmissionEndpoint_MalformedTxidIs400ErrShape(t *testing.T) {
+	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil, WithAdmissionStore(&stubAdmissionStore{}, nil))
+	resp := doRequest(t, app, admissionReq("abc", ""))
 	body := decodeJSON(t, resp)
-	if body["status"] != "error" || body["message"] != "no admission on record for "+vectorTxid {
-		t.Fatalf("body = %v", body)
+	if resp.StatusCode != 400 || body["code"] != CodeShape || body["description"] != "invalid txid: expected 64 hex characters, got 3" {
+		t.Fatalf("%d %v", resp.StatusCode, body)
 	}
 }
 
-// The 404 body keeps the TS overlay's existing wording verbatim.
-func TestAdmissionEndpoint_404ForAnUnknownTxid(t *testing.T) {
+func TestAdmissionEndpoint_TxidIsLowercased(t *testing.T) {
 	rec := &stubAdmissionStore{}
-	proof := func(context.Context, string) (bool, []uint32, error) { return false, nil, nil }
-	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil,
-		WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof))
+	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil, WithAdmissionStore(rec, nil))
+	resp := doRequest(t, app, admissionReq(strings.ToUpper(vectorTxid), ""))
+	if body := decodeJSON(t, resp); resp.StatusCode != 404 || body["message"] != "no admission on record for "+vectorTxid {
+		t.Fatalf("%d %v", resp.StatusCode, body)
+	}
+	if rec.getCalls != 1 {
+		t.Fatalf("record reads = %d, want 1", rec.getCalls)
+	}
+}
 
-	resp := doRequest(t, app, admissionReq(vectorTxid, ""))
-	if resp.StatusCode != http.StatusNotFound {
+func TestAdmissionEndpoint_EmptyAdmittedSetIs404NotA200(t *testing.T) {
+	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil, WithAdmissionSigner(testSigner(t)),
+		WithAdmissionStore(&stubAdmissionStore{}, proofOf(map[string][]uint32{testTopicA: {}})))
+	if resp := doRequest(t, app, admissionReq(vectorTxid, "")); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
-	body := decodeJSON(t, resp)
-	if body["status"] != "error" || body["message"] != "no admission on record for "+vectorTxid {
-		t.Fatalf("body = %v", body)
-	}
 }
 
-// A13: the route is gated exactly like /admin/registry.
 func TestAdmissionEndpoint_IsBearerGated(t *testing.T) {
-	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
-		Txid: vectorTxid, OutputsToAdmit: []uint32{0},
-		AdmissionSignature: "3044", AdmissionIdentityKey: "02aa", At: "2026-01-01T00:00:00.000Z",
+	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+		Txid: vectorTxid, Admissions: map[string]mandala.TopicAdmission{testTopicA: {OutputsToAdmit: []uint32{0}, AdmissionSignature: "3044"}},
+		AdmissionIdentityKey: "02aa", At: "2026-01-01T00:00:00.000Z",
 	}}
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil,
 		WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil), WithAdminAPIToken("secret"))
-
 	for _, tc := range []struct {
 		name   string
 		token  string
@@ -967,19 +778,16 @@ func TestAdmissionEndpoint_IsBearerGated(t *testing.T) {
 			}
 			if tc.status == http.StatusUnauthorized {
 				if body := decodeJSON(t, resp); body["error"] != "unauthorized" {
-					t.Fatalf("body = %v, want the /admin/registry 401 shape", body)
+					t.Fatalf("body = %v", body)
 				}
 			}
 		})
 	}
 }
 
-// Narrowed CORS applies to the admission route too (adminGatedPath).
 func TestAdmissionEndpoint_UsesNarrowedCORS(t *testing.T) {
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil,
-		WithAdmissionStore(&stubAdmissionStore{}, nil),
-		WithAdminCORSOrigins([]string{"https://console.example"}))
-
+		WithAdmissionStore(&stubAdmissionStore{}, nil), WithAdminCORSOrigins([]string{"https://console.example"}))
 	req := admissionReq(vectorTxid, "")
 	req.Header.Set(fiber.HeaderOrigin, "https://evil.example")
 	resp := doRequest(t, app, req)
