@@ -555,49 +555,101 @@ func TestOwnerIndexSweepsThenRebuildsBalancesInsideTheExclusiveSection(t *testin
 	}
 }
 
-// A sweep or balance-rebuild fault fails the run like a token-listing fault: readiness carries its class only, no later
-// step runs (the rebuild after a failed sweep, the reconcile), and the next run comes sooner.
-func TestOwnerIndexSweepAndRebuildFaultsFailTheRunAndBackOff(t *testing.T) {
+// A sweep or balance-rebuild fault is recorded like a refold fault (V-11/V-13 "the refold's error class and retry
+// backoff"): readiness carries the step and its class only, the run still reconciles every topic and counts as
+// reconciled, and the next run comes sooner. A sweep fault skips the rebuild; a rebuild fault follows the sweep.
+func TestOwnerIndexSweepAndRebuildFaultsStillReconcileAndBackOff(t *testing.T) {
 	ctx := context.Background()
+	kyc := mandala.KYCTopic
 	for _, c := range []struct {
 		name    string
 		setup   func(f *ownerIndexFake)
 		message string
-		last    string
+		calls   []string
+		logged  string
 	}{
-		{"sweep", func(f *ownerIndexFake) { f.sweepErr = sweepBoom{} }, "owner index run failed (sweepBoom)", "sweep"},
-		{"rebuild", func(f *ownerIndexFake) { f.rebuildErr = rebuildBoom{} }, "owner index run failed (rebuildBoom)", "rebuild balances"},
+		{"sweep", func(f *ownerIndexFake) { f.sweepErr = sweepBoom{} }, "sweep failed (sweepBoom)",
+			[]string{"ids", "refold a_0", "refold b_0", "sweep", "reconcile tm_a", "reconcile " + kyc},
+			"[mandala] owner index error: sweep: sweepBoom: sweep boom"},
+		{"rebuild", func(f *ownerIndexFake) { f.rebuildErr = rebuildBoom{} }, "balance rebuild failed (rebuildBoom)",
+			[]string{"ids", "refold a_0", "refold b_0", "sweep", "rebuild balances", "reconcile tm_a", "reconcile " + kyc},
+			"[mandala] owner index error: balance rebuild: rebuildBoom: rebuild boom"},
 		{"sweep after a refold fault", func(f *ownerIndexFake) {
 			f.refoldErr["a_0"] = refoldBoom{}
 			f.sweepErr = sweepBoom{}
-		}, "owner index run failed (sweepBoom); refold failed for 1 token(s) (refoldBoom)", "sweep"},
+		}, "refold failed for 1 token(s) (refoldBoom); sweep failed (sweepBoom)",
+			[]string{"ids", "refold a_0", "refold b_0", "sweep", "reconcile tm_a", "reconcile " + kyc},
+			"[mandala] owner index error: sweep: sweepBoom: sweep boom"},
+		{"rebuild beside a reconcile fault", func(f *ownerIndexFake) {
+			f.rebuildErr = rebuildBoom{}
+			f.reconcileErr["tm_a"] = &reconcileBoom{}
+		}, "balance rebuild failed (rebuildBoom); reconcile tm_a failed (reconcileBoom)",
+			[]string{"ids", "refold a_0", "refold b_0", "sweep", "rebuild balances", "reconcile tm_a", "reconcile " + kyc},
+			"[mandala] owner index error: balance rebuild: rebuildBoom: rebuild boom"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f := newOwnerIndexFake()
 			c.setup(f)
+			f.swept = 1
 			f.onSweep = func() { f.record("sweep") }
 			f.onRebuild = func() { f.record("rebuild balances") }
 			gate, lock := testGates()
-			m := NewOwnerIndexMaintenance(f.deps(gate, lock))
+			var logs []string
+			deps := f.deps(gate, lock)
+			deps.Logf = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+			m := NewOwnerIndexMaintenance(deps)
 			m.RunOnce(ctx)
 			if s, msg := m.Readiness(); s != "degraded" || msg != c.message {
 				t.Fatalf("readiness = %q %q, want degraded %q", s, msg, c.message)
 			}
-			if got := f.seen(); got[len(got)-1] != c.last {
-				t.Fatalf("calls = %v, want %q last", got, c.last)
+			if got := f.seen(); !reflect.DeepEqual(got, c.calls) {
+				t.Fatalf("calls = %v, want %v", got, c.calls)
 			}
-			if m.Status().Ran {
-				t.Fatal("a failed run counts as reconciled")
+			if st := m.Status(); !st.Ran || st.LastRunAt.IsZero() || st.Unrepairable == nil {
+				t.Fatalf("status = %+v, want a reconciled run", st)
+			}
+			for _, line := range []string{c.logged, "[mandala] owner index sweep: 1 row(s) taken back"} {
+				if !slices.Contains(logs, line) {
+					t.Fatalf("log %q missing from %q", line, logs)
+				}
 			}
 			if d := delayOf(m); d != OwnerIndexRetryBase {
 				t.Fatalf("next delay = %v, want %v", d, OwnerIndexRetryBase)
 			}
-			f.refoldErr, f.sweepErr, f.rebuildErr = map[string]error{}, nil, nil
+			m.RunOnce(ctx)
+			if d := delayOf(m); d != 2*OwnerIndexRetryBase {
+				t.Fatalf("after two faulted runs: delay %v, want %v", d, 2*OwnerIndexRetryBase)
+			}
+			f.refoldErr, f.sweepErr, f.rebuildErr, f.reconcileErr = map[string]error{}, nil, nil, map[string]error{}
 			m.RunOnce(ctx)
 			if s, _ := m.Readiness(); s != "ok" || delayOf(m) != OwnerIndexInterval {
 				t.Fatalf("after recovery: readiness %q, delay %v", s, delayOf(m))
 			}
 		})
+	}
+}
+
+// A reconcile lock that cannot drain fails the run after a faulted sweep: the run-failure text keeps the sweep's part.
+func TestOwnerIndexRunFailureKeepsTheSweepFault(t *testing.T) {
+	ctx := context.Background()
+	f := newOwnerIndexFake()
+	f.sweepErr = sweepBoom{}
+	gate, lock := maintenance.NewGate(time.Second), maintenance.NewGate(30*time.Millisecond)
+	release, err := lock.Enter(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewOwnerIndexMaintenance(f.deps(gate, lock))
+	m.RunOnce(ctx)
+	release()
+	if st := m.Status(); st.Ran || st.LastError != "owner index run failed (BusyError); sweep failed (sweepBoom)" {
+		t.Fatalf("status = %+v", st)
+	}
+	if got := f.seen(); slices.Contains(got, "reconcile tm_a") {
+		t.Fatalf("calls = %v, want no reconcile while the lock cannot drain", got)
+	}
+	if d := delayOf(m); d != OwnerIndexRetryBase {
+		t.Fatalf("next delay = %v, want %v", d, OwnerIndexRetryBase)
 	}
 }
 

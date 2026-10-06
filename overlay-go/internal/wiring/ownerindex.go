@@ -128,10 +128,18 @@ type topicError struct {
 	err   error
 }
 
-func summarizeOwnerIndex(refold []error, reconcile []topicError) string {
+// summarizeOwnerIndex joins the run's faults in run order: the refold, the sweep (V-13), the balance rebuild (V-11),
+// then each topic's reconcile.
+func summarizeOwnerIndex(refold []error, sweep, rebuild error, reconcile []topicError) string {
 	var parts []string
 	if len(refold) > 0 {
 		parts = append(parts, fmt.Sprintf("refold failed for %d token(s) (%s)", len(refold), errorClasses(refold)))
+	}
+	if sweep != nil {
+		parts = append(parts, fmt.Sprintf("sweep failed (%s)", errorClass(sweep)))
+	}
+	if rebuild != nil {
+		parts = append(parts, fmt.Sprintf("balance rebuild failed (%s)", errorClass(rebuild)))
 	}
 	for _, r := range reconcile {
 		parts = append(parts, fmt.Sprintf("reconcile %s failed (%s)", r.topic, errorClass(r.err)))
@@ -159,6 +167,7 @@ func (m *OwnerIndexMaintenance) RunOnce(ctx context.Context) {
 
 func (m *OwnerIndexMaintenance) run(ctx context.Context) {
 	var refoldErrs []error
+	var sweepErr, rebuildErr error
 	// Step 1, submit gate only.
 	err := m.d.Gate.Exclusive(ctx, func(ctx context.Context) error {
 		started := time.Now()
@@ -174,15 +183,21 @@ func (m *OwnerIndexMaintenance) run(ctx context.Context) {
 		}
 		m.d.Logf("[mandala] owner index refold: %d token(s) in %dms", len(ids), time.Since(started).Milliseconds())
 		// Rulings V-13 then V-11. The sweep's debits come first, so the rebuild sums the rows that remain. A fault in
-		// either fails the run like a token-listing fault: the next run comes sooner.
+		// either is recorded like a refold fault (readiness degrades, the next run comes sooner) and the reconcile still
+		// runs: the sweep takes rows of coins that are not unspent admitted, the reconcile repairs rows of coins that
+		// are, so one never undoes the other. A sweep fault skips the rebuild, which would sum a half-swept index.
 		swept, err := m.d.SweepOwnerIndex(ctx)
+		m.d.Logf("[mandala] owner index sweep: %d row(s) taken back", swept) // also on a fault: those takes stand
 		if err != nil {
-			return err
+			sweepErr = err
+			m.d.Logf("[mandala] owner index error: sweep: %s: %v", errorClass(err), err)
+			return nil
 		}
-		m.d.Logf("[mandala] owner index sweep: %d row(s) taken back", swept)
 		rebuilt, err := m.d.RebuildBalances(ctx)
 		if err != nil {
-			return err
+			rebuildErr = err
+			m.d.Logf("[mandala] owner index error: balance rebuild: %s: %v", errorClass(err), err)
+			return nil
 		}
 		m.d.Logf("[mandala] owner index balances: %d rebuilt", rebuilt.Changed)
 		for _, key := range rebuilt.Unsafe {
@@ -209,7 +224,7 @@ func (m *OwnerIndexMaintenance) run(ctx context.Context) {
 				m.d.Logf("[mandala] owner index UNREPAIRABLE outpoint %s", op)
 			}
 			m.mu.Lock()
-			m.status = OwnerIndexStatus{Ran: true, LastRunAt: time.Now(), LastError: summarizeOwnerIndex(refoldErrs, reconcileErrs), Unrepairable: unrepairable}
+			m.status = OwnerIndexStatus{Ran: true, LastRunAt: time.Now(), LastError: summarizeOwnerIndex(refoldErrs, sweepErr, rebuildErr, reconcileErrs), Unrepairable: unrepairable}
 			m.mu.Unlock()
 			return nil
 		})
@@ -221,8 +236,8 @@ func (m *OwnerIndexMaintenance) run(ctx context.Context) {
 	defer m.mu.Unlock()
 	if err != nil {
 		failed := fmt.Sprintf("owner index run failed (%s)", errorClass(err))
-		if refold := summarizeOwnerIndex(refoldErrs, nil); refold != "" {
-			failed += "; " + refold
+		if faults := summarizeOwnerIndex(refoldErrs, sweepErr, rebuildErr, nil); faults != "" {
+			failed += "; " + faults
 		}
 		m.status.LastError = failed
 	}
