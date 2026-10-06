@@ -15,6 +15,7 @@ import (
 
 // stubAdminStore is the v3 AdminStore double.
 type stubAdminStore struct {
+	noTokenReads
 	rows  []mandala.KYCRow
 	err   error
 	calls int

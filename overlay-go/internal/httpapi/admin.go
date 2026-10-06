@@ -13,9 +13,16 @@ import (
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
 
-// AdminStore is the slice of *mandala.Store the admin GET routes read. Task 24 adds the token-route reads.
+// AdminStore is the narrow slice of *mandala.Store the /admin/* GET routes read: Task 20's KYC listing plus the
+// Task 24 token-route reads. *mandala.Store satisfies it; tests substitute stubs that never need Mongo.
 type AdminStore interface {
 	ListKYC(ctx context.Context) ([]mandala.KYCRow, error)
+	GetAssetState(ctx context.Context, tokenID string) (mandala.AssetAdminState, error)
+	GetTokenRow(ctx context.Context, txid string, vout uint32) (*mandala.TokenRecord, error)
+	FindAdminHistory(ctx context.Context, tokenID string, limit, skip int64) ([]mandala.AdminHistoryEntry, error)
+	PageAdminHistoryNewestFirst(ctx context.Context, tokenID string, limit, offset int64) ([]mandala.AdminHistoryEntry, error)
+	ListAuthorities(ctx context.Context, topic, tokenID string) ([]mandala.AuthorityRecord, error)
+	ListRegistryRecords(ctx context.Context, limit, skip int64) ([]mandala.TokenRegistryRecord, error)
 }
 
 var _ AdminStore = (*mandala.Store)(nil)

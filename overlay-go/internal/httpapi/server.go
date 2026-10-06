@@ -35,6 +35,8 @@ func New(app *wiring.App) *fiber.App {
 		WithBroadcastCompensation(app.PrepareSubmitCompensation),
 		WithDeployHook(app.Tokens, registryPrecheck(app.Registry)),
 		WithSubmitGate(app.Gate),
+		WithActivity(app.Store, app.FindRawTxs),
+		WithTokenHosting(app.Tokens.Hosted),
 	}
 	if app.ServerPrivKeyHex != "" {
 		if s, err := mandala.NewECAdmissionSigner(app.ServerPrivKeyHex); err == nil {
@@ -72,9 +74,12 @@ type serverOptions struct {
 	adminAPIToken       string
 	adminCORSOrigins    []string
 	readiness           Readiness
-	submitGate          SubmitGate     // WithSubmitGate (Task 23)
-	tokenRegistrar      TokenRegistrar // WithDeployHook (Task 23)
-	deployPrecheck      DeployPrecheck // WithDeployHook (Task 23)
+	submitGate          SubmitGate      // WithSubmitGate (Task 23)
+	tokenRegistrar      TokenRegistrar  // WithDeployHook (Task 23)
+	deployPrecheck      DeployPrecheck  // WithDeployHook (Task 23)
+	activityLinkage     ActivityLinkage // WithActivity (Task 24)
+	activityFindRawTxs  FindRawTxsFunc  // WithActivity (Task 24)
+	tokenHosting        TokenHosting    // WithTokenHosting (Task 24)
 }
 
 // ServerOption customizes newServer without changing its required parameters.
@@ -169,6 +174,10 @@ func newServer(submitter Submitter, lookuper Lookuper, store AdminStore, ping Pi
 	registerLookupRoutes(f, lookuper)
 	registerAdminRoutes(f, store, o.outputBeefWhere, o.adminAPIToken)
 	registerAdmissionRoute(f, o.admissionRecorder, o.appliedProof, o.admissionSigner, o.adminAPIToken)
+	registerTokenRoutes(f, store, o.tokenHosting, o.outputBeefWhere) // o.outputBeefWhere: the field WithOutputBeefWhere sets
+	if o.activityLinkage != nil {
+		registerActivityRoute(f, o.activityLinkage, o.activityFindRawTxs, o.adminAPIToken)
+	}
 	registerHealthRoutes(f, ping, o.readiness)
 	if o.arcadeEnabled {
 		// An unauthenticated /arc-ingest would let anyone trigger an eviction: refuse to mount it without a token.
