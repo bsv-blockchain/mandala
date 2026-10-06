@@ -12,6 +12,11 @@ const (
 	key2G = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
 )
 
+// jsTrimSet is every BMP code point JS String.prototype.trim strips, probed on Node v24.15.0
+// (String.fromCharCode(c).trim() === "" for c in 0..0xffff, surrogates skipped).
+const jsTrimSet = "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a" +
+	"\u2028\u2029\u202f\u205f\u3000\ufeff"
+
 // TestParseIssuerKeys pins every TS parseIssuerKeys string (overlay/src/bootConfig.ts:30-46, F/p2-parity §6) and the
 // check order: shape (upper case allowed) -> lowercase -> on-curve -> duplicate.
 func TestParseIssuerKeys(t *testing.T) {
@@ -42,6 +47,12 @@ func TestParseIssuerKeys(t *testing.T) {
 		{"duplicate", `["` + keyG + `","` + key2G + `","` + keyG + `"]`, nil, "MANDALA_ISSUER_KEYS[2] is a duplicate"},
 		{"valid keeps input order", `["` + key2G + `","` + keyG + `"]`, []string{key2G, keyG}, ""},
 		{"surrounding whitespace", "  [\"" + keyG + "\"]  ", []string{keyG}, ""},
+		// JSON.parse reads 1e400 as Infinity, a non-string element, not a parse failure.
+		{"number overflowing to Infinity", `[1e400]`, nil, "MANDALA_ISSUER_KEYS[0] is not a compressed public key (02/03 + 64 hex)"},
+		// JS trim() strips U+FEFF (strings.TrimSpace keeps it) and keeps U+0085 NEL (strings.TrimSpace strips it).
+		{"only a byte order mark", "\ufeff", nil, required},
+		{"only NEL", "\u0085", nil, notArray},
+		{"every JS trim code point", jsTrimSet, nil, required},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

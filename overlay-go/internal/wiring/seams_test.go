@@ -159,8 +159,8 @@ func TestCompensationUnmarksAndRestoresOnlyLiveCoins(t *testing.T) {
 	}
 }
 
-// A duplicate resubmit whose broadcast fails must not undo the committed original: one applied named topic skips
-// the whole compensation.
+// A duplicate resubmit whose broadcast fails must not undo the committed original: one applied topic skips the whole
+// compensation.
 func TestCompensationIsSkippedWhenAnyNamedTopicIsApplied(t *testing.T) {
 	es, store := seamStores(t, "mandala3_test_wiring_compensate_dupe")
 	ctx := context.Background()
@@ -188,6 +188,57 @@ func TestCompensationIsSkippedWhenAnyNamedTopicIsApplied(t *testing.T) {
 	}
 	if row, _ := store.GetTokenRow(ctx, src.String(), 0); row != nil {
 		t.Fatalf("compensation restored a row over an applied topic: %+v", row)
+	}
+}
+
+// A two-token transfer T committed on tm_<a> (so already broadcast), then retried naming only tm_<b>, whose broadcast
+// fails: the retry's compensation must not run. UnmarkSpentBySpendTxid filters on the spend txid alone, so running it
+// would unmark T's input on the committed tm_<a> and credit its owner row again, reading a coin spent on chain as live.
+func TestCompensationIsSkippedWhenAnUnnamedTopicIsApplied(t *testing.T) {
+	es, store := seamStores(t, "mandala3_test_wiring_compensate_unnamed")
+	ctx := context.Background()
+	topicA, topicB := seamTopic("a"), seamTopic("b")
+	srcA, srcB := seamHash(t, 0x83), seamHash(t, 0x84)
+	beef, txid := seamSpendTx(t, transaction.Outpoint{Txid: *srcA, Index: 0}, transaction.Outpoint{Txid: *srcB, Index: 0})
+	seamSeedCoin(t, es, topicA, srcA, 0)
+	seamSeedCoin(t, es, topicB, srcB, 0)
+	if err := store.RecordOwners(ctx, []mandala.OwnerRecord{
+		seamValueJournal(srcA.String(), 0, topicA, 40),
+		seamValueJournal(srcB.String(), 0, topicB, 60),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seamMarkSpent(t, es, topicA, srcA, 0, txid) // the first submit, committed on tm_<a>
+	if err := es.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: txid, Topic: topicA}); err != nil {
+		t.Fatal(err)
+	}
+	seamMarkSpent(t, es, topicB, srcB, 0, txid) // the retry, marked on tm_<b> before its broadcast failed
+
+	compensate, _, err := prepareSubmitCompensation(es, store)(ctx, beef, []string{topicB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := compensate(cctx); err == nil {
+		t.Fatal("a fault reading the applied topics must surface, not compensate")
+	}
+	if err := compensate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		topic string
+		src   *chainhash.Hash
+	}{{topicA, srcA}, {topicB, srcB}} {
+		if by, err := es.SpendStateOf(ctx, c.topic, c.src.String(), 0); err != nil || by != txid.String() {
+			t.Fatalf("compensation unmarked %s.0 on %s: spent by %q, %v; want %s", c.src, c.topic, by, err, txid)
+		}
+		if row, err := store.GetTokenRow(ctx, c.src.String(), 0); err != nil || row != nil {
+			t.Fatalf("compensation restored the row of %s.0 on %s: %+v, %v", c.src, c.topic, row, err)
+		}
+	}
+	if bal, err := store.GetBalance(ctx, mandalatest.Holder.Identity); err != nil || bal != 0 {
+		t.Fatalf("holder balance = %d, %v; want 0 (no credit)", bal, err)
 	}
 }
 

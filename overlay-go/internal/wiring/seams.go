@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"strings"
 
-	"github.com/bsv-blockchain/go-sdk/overlay"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/enginestore"
@@ -73,9 +73,11 @@ func appliedAdmissionProof(es *enginestore.Store) func(ctx context.Context, txid
 
 // prepareSubmitCompensation snapshots, before Submit, every input the transaction spends (the restore snapshot the
 // admission record keeps, D-7) and returns the compensation /submit runs only on a broadcast failure: the pinned engine
-// marks inputs spent before it broadcasts and never unwinds. A named topic that already has an applied record means
-// this is a duplicate resubmit of a committed transaction, so nothing is undone. Otherwise the transaction's spends are
-// unmarked (every topic) and the owner rows of coins that are live again come back from the journal.
+// marks inputs spent before it broadcasts and never unwinds. An applied record on any topic, named by this submit or
+// not, means an earlier submit of this transaction already broadcast it (the engine writes applied records only after
+// a successful broadcast), so nothing is undone; a fault reading the applied topics undoes nothing either. Otherwise
+// the transaction's spends are unmarked (every topic) and the owner rows of coins that are live again come back from
+// the journal.
 func prepareSubmitCompensation(es *enginestore.Store, store *mandala.Store) func(ctx context.Context, beef []byte, topics []string) (func(context.Context) error, *mandala.RestoreSnapshot, error) {
 	return func(ctx context.Context, beefBytes []byte, topics []string) (func(context.Context) error, *mandala.RestoreSnapshot, error) {
 		_, tx, id, err := transaction.ParseBeef(beefBytes)
@@ -97,15 +99,16 @@ func prepareSubmitCompensation(es *enginestore.Store, store *mandala.Store) func
 		restore := &mandala.RestoreSnapshot{SpentOutpoints: spent}
 		named := append([]string(nil), topics...)
 		return func(ctx context.Context) error {
-			for _, topic := range named {
-				applied, err := es.DoesAppliedTransactionExist(ctx, &overlay.AppliedTransaction{Txid: id, Topic: topic})
-				if err != nil {
-					return fmt.Errorf("wiring: applied-transaction record of %s on %s: %w", spendTxid, topic, err)
-				}
-				if applied {
-					log.Printf("wiring: skipping compensation: %s is already applied on %s (duplicate resubmit)", spendTxid, topic)
-					return nil
-				}
+			// Any applied topic, named by this submit or not: UnmarkSpentBySpendTxid filters on spendTxid alone,
+			// so it would also unmark the spends of a topic an earlier submit committed.
+			applied, err := es.AppliedTopics(ctx, spendTxid)
+			if err != nil {
+				return fmt.Errorf("wiring: applied topics of %s: %w", spendTxid, err)
+			}
+			if len(applied) > 0 {
+				log.Printf("wiring: skipping compensation: %s is already applied on %s (resubmit naming %s)",
+					spendTxid, strings.Join(applied, ","), strings.Join(named, ","))
+				return nil
 			}
 			if _, err := es.UnmarkSpentBySpendTxid(ctx, spendTxid); err != nil {
 				return fmt.Errorf("wiring: unmark spends of %s: %w", spendTxid, err)
