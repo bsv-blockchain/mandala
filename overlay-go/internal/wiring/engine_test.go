@@ -1,121 +1,222 @@
 package wiring
 
-// Task 12 wiring test: Build with a local Mongo and empty ArcadeURL returns
-// an App whose Engine is non-nil, and Engine.Lookup for ls_mandala with
-// {"assetId":"missing.0"} answers an empty output-list. That single call
-// proves topic-manager/lookup-service registration, the enginestore Storage,
-// and the engine hydration path end-to-end.
-//
-// Requires Mongo at localhost:27017 (Task 8 skip pattern; the
-// mandala_wiring_test_lookup_services db is dropped in cleanup).
+// Build-level tests for the v3 wiring, plus the helpers every Build-based wiring test shares (seams, boot, eviction
+// in Task 21, owner index in Task 22). Every Build-based test runs on a fresh <NodeName>_lookup_services database
+// (testmongo drops it before and after) and SKIPs when Mongo is down, so gates must count zero "--- SKIP" lines.
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/overlay"
-	"github.com/bsv-blockchain/go-sdk/overlay/lookup"
 	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/arcade"
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
+	"github.com/sirdeggen/mandala/overlay-go/internal/testmongo"
 )
 
-func TestBuildAndLookupEndToEnd(t *testing.T) {
-	requireMongo(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	app, err := Build(ctx, Config{
-		NodeName:         "mandala_wiring_test",
-		ServerPrivKeyHex: testPrivHex,
+// v3Config is the Config every Build-based wiring test starts from: the kit's overlay key as SERVER_PRIVATE_KEY
+// (the verifier every kit linkage is revealed to), the kit's issuer as the only trusted issuer, no Arcade.
+func v3Config(nodeName string) Config {
+	return Config{
+		NodeName:         nodeName,
+		ServerPrivKeyHex: mandalatest.Overlay.PrivHex(),
 		HostingURL:       "http://localhost:8080",
 		MongoURL:         "mongodb://localhost:27017",
 		Network:          "test",
-		// ArcadeURL empty: scripts-only chain tracker, nil broadcaster.
-	})
-	if err != nil {
-		t.Fatal("Build:", err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_ = app.Mongo.Drop(cleanupCtx)
-		_ = app.Mongo.Client().Disconnect(cleanupCtx)
-	})
-
-	if app.Engine == nil {
-		t.Fatal("Engine is nil")
-	}
-	if app.Store == nil || app.Verifier == nil || app.Mongo == nil {
-		t.Fatalf("incomplete App: %+v", app)
-	}
-	if app.ArcadeEnabled {
-		t.Fatal("ArcadeEnabled must be false when ArcadeURL is empty")
-	}
-	if app.PrepareSubmitCompensation != nil || app.EvictTx != nil {
-		t.Fatal("compensation/eviction closures must be nil without Arcade (no broadcaster, no /arc-ingest)")
-	}
-	if app.FindRawTxs == nil {
-		t.Fatal("FindRawTxs must always be wired -- /admin/activity has no Arcade dependency")
-	}
-	if app.Mongo.Name() != "mandala_wiring_test_lookup_services" {
-		t.Fatalf("db name = %q", app.Mongo.Name())
-	}
-	if !app.Engine.HasTopicManager("tm_mandala") {
-		t.Fatal("tm_mandala not registered")
-	}
-	if !app.Engine.HasLookupService("ls_mandala") {
-		t.Fatal("ls_mandala not registered")
-	}
-
-	answer, err := app.Engine.Lookup(ctx, &lookup.LookupQuestion{
-		Service: "ls_mandala",
-		Query:   []byte(`{"assetId":"missing.0"}`),
-	})
-	if err != nil {
-		t.Fatal("Lookup:", err)
-	}
-	if answer.Type != lookup.AnswerTypeOutputList {
-		t.Fatalf("answer type = %v, want output-list", answer.Type)
-	}
-	if len(answer.Outputs) != 0 {
-		t.Fatalf("outputs = %d, want 0", len(answer.Outputs))
+		IssuerKeys:       []string{mandalatest.Issuer.Identity},
 	}
 }
 
-// TestBuildWithArcadeURLDefaultsBroadcasterAndTracker proves Task 16's
-// wiring: a non-empty ArcadeURL makes Build default the engine's
-// Broadcaster/ChainTracker to Arcade-backed implementations (rather than
-// nil/scriptsOnlyTracker) without any Option override, and threads
-// ArcadeCallbackToken onto App. No real Arcade deployment is contacted —
-// arcade.NewBroadcaster/NewChaintracks only build HTTP clients at
-// construction time.
-func TestBuildWithArcadeURLDefaultsBroadcasterAndTracker(t *testing.T) {
-	requireMongo(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+// buildV3App gives the test a fresh <NodeName>_lookup_services (testmongo.DB skips when Mongo is unreachable,
+// drops the db now and again in cleanup) and Builds on it.
+func buildV3App(t *testing.T, cfg Config, opts ...Option) *App {
+	t.Helper()
+	testmongo.DB(t, cfg.NodeName+"_lookup_services")
+	return rebuildV3App(t, cfg, opts...)
+}
 
-	app, err := Build(ctx, Config{
-		NodeName:            "mandala_wiring_test_arcade",
-		ServerPrivKeyHex:    testPrivHex,
-		HostingURL:          "https://overlay.example.com",
-		MongoURL:            "mongodb://localhost:27017",
-		Network:             "test",
-		ArcadeURL:           "https://arcade.example.com",
-		ArcadeAPIKey:        "test-api-key",
-		ArcadeCallbackToken: "test-callback-token",
-	})
+// rebuildV3App Builds on whatever the database already holds (a restart); cleanup closes the App and its client. Call it
+// only after buildV3App (or testmongo.DB) has arranged the skip and the drop for the same NodeName.
+func rebuildV3App(t *testing.T, cfg Config, opts ...Option) *App {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	app, err := Build(ctx, cfg, opts...)
 	if err != nil {
-		t.Fatal("Build:", err)
+		t.Fatalf("Build: %v", err)
 	}
 	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_ = app.Mongo.Drop(cleanupCtx)
-		_ = app.Mongo.Client().Disconnect(cleanupCtx)
+		app.Close()
+		_ = app.Mongo.Client().Disconnect(context.Background())
 	})
+	return app
+}
+
+// submitBuilt submits a kit transaction straight to the engine, threading the envelope exactly as /submit does: on ctx
+// for the managers and on the TaggedBEEF for the lookups.
+func submitBuilt(t *testing.T, app *App, b *mandalatest.Built, topics ...string) (overlay.Steak, error) {
+	t.Helper()
+	ctx := mandala.WithOffChainValues(context.Background(), b.OffChain)
+	return app.Engine.Submit(ctx, overlay.TaggedBEEF{Beef: b.Beef, Topics: topics, OffChainValues: b.OffChain}, engine.SubmitModeCurrent, nil)
+}
+
+func mustSubmitBuilt(t *testing.T, app *App, b *mandalatest.Built, topics ...string) overlay.Steak {
+	t.Helper()
+	steak, err := submitBuilt(t, app, b, topics...)
+	if err != nil {
+		t.Fatalf("Submit %s to %v: %v", b.Txid, topics, err)
+	}
+	return steak
+}
+
+// tokenTopicOf is tm_<deploy txid>.
+func tokenTopicOf(t *testing.T, deploy *mandalatest.Built) string {
+	t.Helper()
+	topic, err := mandala.TokenTopic(deploy.Txid + "_0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return topic
+}
+
+// deployToken registers the deploy's token topic through the registrar (as Task 23's deploy hook will) and submits
+// the deploy to tm_mandala and tm_<txid>.
+func deployToken(t *testing.T, app *App, sym string) *mandalatest.Built {
+	t.Helper()
+	dep := mandalatest.Deploy(t, mandalatest.Issuer, sym)
+	if ok, err := app.Tokens.Ensure(dep.Txid + "_0"); err != nil || !ok {
+		t.Fatalf("Ensure(%s_0) = %v, %v", dep.Txid, ok, err)
+	}
+	mustSubmitBuilt(t, app, dep, mandala.MandalaTopic, tokenTopicOf(t, dep))
+	return dep
+}
+
+func sortedMetaKeys(m map[string]*overlay.MetaData) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// A1.1: one overlay. Build registers exactly the two static topics and lookups (token topics come only from the
+// registrar) and configures no sync or advertising on the engine.
+func TestBuildRegistersOnlyTheStaticTopicsAndNoSync(t *testing.T) {
+	app := buildV3App(t, v3Config("mandala3_test_wiring_build"))
+
+	if got, want := sortedMetaKeys(app.Engine.ListTopicManagers()), []string{mandala.MandalaTopic, mandala.KYCTopic}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("topic managers = %v, want %v", got, want)
+	}
+	if got, want := sortedMetaKeys(app.Engine.ListLookupServiceProviders()), []string{mandala.MandalaLookup, mandala.KYCLookup}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("lookup services = %v, want %v", got, want)
+	}
+	if app.Engine.Advertiser != nil {
+		t.Fatalf("Advertiser = %T, want nil (A1.1)", app.Engine.Advertiser)
+	}
+	if len(app.Engine.SyncConfiguration) != 0 || len(app.Engine.SHIPTrackers) != 0 || len(app.Engine.SLAPTrackers) != 0 {
+		t.Fatalf("sync config %v, SHIP %v, SLAP %v: want all empty (A1.1)", app.Engine.SyncConfiguration, app.Engine.SHIPTrackers, app.Engine.SLAPTrackers)
+	}
+	if app.Store == nil || app.EngineStore == nil || app.Verifier == nil || app.Tokens == nil || app.Registry == nil {
+		t.Fatalf("incomplete App: %+v", app)
+	}
+	if app.Gate == nil || app.ReconcileLock == nil || app.Gate == app.ReconcileLock {
+		t.Fatal("Build must create two distinct gates (submit gate, reconcile lock)")
+	}
+	if app.PrepareSubmitCompensation == nil || app.AppliedAdmissionProof == nil || app.FindRawTxs == nil || app.OutputBeefWhere == nil {
+		t.Fatal("the always-set seams must be wired without Arcade")
+	}
+	if app.ArcadeEnabled {
+		t.Fatal("ArcadeEnabled must be false without ARCADE_URL")
+	}
+	if app.Mongo.Name() != "mandala3_test_wiring_build_lookup_services" {
+		t.Fatalf("db = %q", app.Mongo.Name())
+	}
+	if got := app.Tokens.Registered(); len(got) != 0 {
+		t.Fatalf("Build registered tokens %v; only Start (boot union) and Ensure register token topics", got)
+	}
+}
+
+// Build's first manager is the registry; its constructor refuses an empty trusted set with the TS string
+// (F/ts-layers §0, owner = Go type name).
+func TestBuildRefusesAnEmptyIssuerSet(t *testing.T) {
+	testmongo.DB(t, "mandala3_test_wiring_noissuer_lookup_services")
+	cfg := v3Config("mandala3_test_wiring_noissuer")
+	cfg.IssuerKeys = nil
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	app, err := Build(ctx, cfg)
+	if err == nil {
+		_ = app.Mongo.Client().Disconnect(context.Background())
+		t.Fatal("Build accepted an empty issuer set")
+	}
+	if want := "TokenRegistryTopicManager: trustedIssuers must be a non-empty array"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("err = %v, want it to contain %q", err, want)
+	}
+}
+
+// A1.1 at the source level: no wiring file sets or calls the engine's sync/advertising surface.
+func TestWiringSourceNeverConfiguresSyncOrAdvertising(t *testing.T) {
+	forbidden := map[string]bool{
+		"Advertiser": true, "SyncConfiguration": true, "SHIPTrackers": true, "SLAPTrackers": true,
+		"LookupResolver": true, "SyncAdvertisements": true, "StartGASPSync": true, "SyncInvalidatedOutputs": true,
+	}
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	checked := 0
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checked++
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.SelectorExpr:
+				if forbidden[x.Sel.Name] {
+					t.Errorf("%s: uses %s", fset.Position(x.Pos()), x.Sel.Name)
+				}
+			case *ast.KeyValueExpr:
+				if id, ok := x.Key.(*ast.Ident); ok && forbidden[id.Name] {
+					t.Errorf("%s: sets %s", fset.Position(x.Pos()), id.Name)
+				}
+			}
+			return true
+		})
+	}
+	if checked == 0 {
+		t.Fatal("no non-test wiring sources found")
+	}
+}
+
+// A non-empty ArcadeURL defaults the broadcaster and tracker to Arcade (no Arcade is contacted at construction).
+func TestBuildWithArcadeURLDefaultsBroadcasterAndTracker(t *testing.T) {
+	cfg := v3Config("mandala3_test_wiring_arcade")
+	cfg.HostingURL = "https://overlay.example.com"
+	cfg.ArcadeURL = "https://arcade.example.com"
+	cfg.ArcadeAPIKey = "test-api-key"
+	cfg.ArcadeCallbackToken = "test-callback-token"
+	app := buildV3App(t, cfg)
 
 	if !app.ArcadeEnabled {
 		t.Fatal("ArcadeEnabled must be true when ArcadeURL is set")
@@ -131,36 +232,16 @@ func TestBuildWithArcadeURLDefaultsBroadcasterAndTracker(t *testing.T) {
 	}
 }
 
-// TestBuildWithArcadeURLHonorsOptionOverride proves the WithBroadcaster/
-// WithChainTracker seam still wins over the ArcadeURL default — the seam
-// tests substitute a stub through instead of a real Arcade deployment.
+// WithChainTracker still wins over the ArcadeURL default.
 func TestBuildWithArcadeURLHonorsOptionOverride(t *testing.T) {
-	requireMongo(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	stubTracker := scriptsOnlyTracker{}
-	app, err := Build(ctx, Config{
-		NodeName:         "mandala_wiring_test_arcade_override",
-		ServerPrivKeyHex: testPrivHex,
-		HostingURL:       "https://overlay.example.com",
-		MongoURL:         "mongodb://localhost:27017",
-		Network:          "test",
-		ArcadeURL:        "https://arcade.example.com",
-	}, WithChainTracker(stubTracker))
-	if err != nil {
-		t.Fatal("Build:", err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_ = app.Mongo.Drop(cleanupCtx)
-		_ = app.Mongo.Client().Disconnect(cleanupCtx)
-	})
+	cfg := v3Config("mandala3_test_wiring_arcade_override")
+	cfg.HostingURL = "https://overlay.example.com"
+	cfg.ArcadeURL = "https://arcade.example.com"
+	app := buildV3App(t, cfg, WithChainTracker(scriptsOnlyTracker{}))
 
 	if _, ok := app.Engine.ChainTracker.(scriptsOnlyTracker); !ok {
 		t.Fatalf("Engine.ChainTracker = %T, want the injected scriptsOnlyTracker override", app.Engine.ChainTracker)
 	}
-	// Broadcaster wasn't overridden, so it should still default to Arcade.
 	if _, ok := app.Engine.Broadcaster.(*arcade.Broadcaster); !ok {
 		t.Fatalf("Engine.Broadcaster = %T, want *arcade.Broadcaster", app.Engine.Broadcaster)
 	}
@@ -178,10 +259,8 @@ func TestScriptsOnlyTracker(t *testing.T) {
 	}
 }
 
-// --- Task 18: broadcast-failure compensation + terminal-status eviction ---
-
-// wiringTestTx builds a minimal transaction: one input spending src:vout
-// (or a dummy outpoint when src is nil) and n outputs.
+// wiringTestTx builds a minimal transaction: one input spending src:vout (or a dummy outpoint when src is nil) and
+// n outputs.
 func wiringTestTx(t *testing.T, src *transaction.Transaction, vout uint32, outputs int, fill byte) *transaction.Transaction {
 	t.Helper()
 	tx := transaction.NewTransaction()
@@ -209,317 +288,10 @@ func wiringTestTx(t *testing.T, src *transaction.Transaction, vout uint32, outpu
 	return tx
 }
 
-// TestBuildArcadeCompensationRoundTrip drives Build's
-// PrepareSubmitCompensation closure against real Mongo: seed the state the
-// engine would have seen pre-submit, snapshot, replay the exact mutations
-// v1.3.7's markSpentAndNotify performs before a failed broadcast, then
-// compensate and assert everything is restored.
-func TestBuildArcadeCompensationRoundTrip(t *testing.T) {
-	requireMongo(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	app, err := Build(ctx, Config{
-		NodeName:         "mandala_wiring_test_comp",
-		ServerPrivKeyHex: testPrivHex,
-		HostingURL:       "https://overlay.example.com",
-		MongoURL:         "mongodb://localhost:27017",
-		Network:          "test",
-		ArcadeURL:        "https://arcade.example.com",
-	})
-	if err != nil {
-		t.Fatal("Build:", err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_ = app.Mongo.Drop(cleanupCtx)
-		_ = app.Mongo.Client().Disconnect(cleanupCtx)
-	})
-	if app.PrepareSubmitCompensation == nil || app.EvictTx == nil {
-		t.Fatal("Arcade-enabled Build must wire PrepareSubmitCompensation and EvictTx")
-	}
-
-	const topic = "tm_mandala"
-	parent := wiringTestTx(t, nil, 0, 1, 0x41)
-	parentID := parent.TxID()
-	child := wiringTestTx(t, parent, 0, 1, 0)
-	childID := child.TxID()
-	beefBytes, err := child.AtomicBEEF(true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	st := app.Engine.Storage
-	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := app.Store.StoreToken(ctx, mandalav2.TokenRow{
-		Txid: parentID.String(), OutputIndex: 0, AssetID: "a.0", Amount: 40,
-		IdentityKey: "02k", CreatedAt: time.Now(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := app.Store.AdjustBalance(ctx, "02k", 40); err != nil {
-		t.Fatal(err)
-	}
-
-	// The submit handler snapshots BEFORE Engine.Submit.
-	compensate, restore, err := app.PrepareSubmitCompensation(ctx, beefBytes)
-	if err != nil {
-		t.Fatal("prepare:", err)
-	}
-	if compensate == nil {
-		t.Fatal("prepare returned nil compensation for a valid BEEF")
-	}
-	// The same snapshot must also come back as a plain value, for the
-	// admission record to persist (FIX E).
-	if restore == nil || len(restore.TokenRows) != 1 || restore.TokenRows[0].Amount != 40 {
-		t.Fatalf("restore snapshot = %+v, want the pre-spend parent row", restore)
-	}
-	if len(restore.SpentOutpoints) != 1 || restore.SpentOutpoints[0] != parentID.String()+".0" {
-		t.Fatalf("restore.spentOutpoints = %v", restore.SpentOutpoints)
-	}
-
-	// Replay what v1.3.7's markSpentAndNotify does before broadcastIfNeeded
-	// fails: MarkUTXOsAsSpent + ls_mandala.OutputSpent (balance debit + row
-	// delete).
-	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *parentID, Index: 0}}, topic, childID); err != nil {
-		t.Fatal(err)
-	}
-	if err := app.Store.AdjustBalance(ctx, "02k", -40); err != nil {
-		t.Fatal(err)
-	}
-	if err := app.Store.DeleteToken(ctx, parentID.String(), 0); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := compensate(ctx); err != nil {
-		t.Fatal("compensate:", err)
-	}
-
-	topicName := topic
-	unspent := false
-	got, err := st.FindOutput(ctx, &transaction.Outpoint{Txid: *parentID, Index: 0}, &topicName, &unspent, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got == nil || got.Spent {
-		t.Fatalf("parent:0 must be unspent again after compensation, got %+v", got)
-	}
-	row, err := app.Store.GetTokenRow(ctx, parentID.String(), 0)
-	if err != nil || row == nil {
-		t.Fatal(row, err)
-	}
-	if row.Amount != 40 || row.IdentityKey != "02k" || row.AssetID != "a.0" {
-		t.Fatalf("restored token row: %+v", row)
-	}
-	if b, _ := app.Store.GetBalance(ctx, "02k"); b != 40 {
-		t.Fatalf("balance after compensation = %d, want 40", b)
-	}
-
-	// Running the compensation twice must not double-credit.
-	if err := compensate(ctx); err != nil {
-		t.Fatal("second compensate:", err)
-	}
-	if b, _ := app.Store.GetBalance(ctx, "02k"); b != 40 {
-		t.Fatalf("balance after double compensation = %d, want 40", b)
-	}
-}
-
-// TestBuildArcadeCompensationSkipsAlreadyCommittedTx is the dupe-resubmit
-// case: a tx already folded (applied-transaction record exists, its input
-// already spent by it, and the mandala token row it consumed already gone)
-// gets resubmitted — go-overlay-services v1.3.7 lets a duplicate through its
-// per-topic dupe gate before re-attempting broadcast, so a broadcast failure
-// on the SECOND attempt must not compensate: doing so would unmark the
-// original successful submit's spent input and try to resurrect a token row
-// that was correctly deleted. A genuine broadcast failure can never reach
-// this state (commitAdmittedOutputs — which inserts the applied-transaction
-// record — never runs before a failed broadcast).
-func TestBuildArcadeCompensationSkipsAlreadyCommittedTx(t *testing.T) {
-	requireMongo(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	app, err := Build(ctx, Config{
-		NodeName:         "mandala_wiring_test_comp_dup",
-		ServerPrivKeyHex: testPrivHex,
-		HostingURL:       "https://overlay.example.com",
-		MongoURL:         "mongodb://localhost:27017",
-		Network:          "test",
-		ArcadeURL:        "https://arcade.example.com",
-	})
-	if err != nil {
-		t.Fatal("Build:", err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_ = app.Mongo.Drop(cleanupCtx)
-		_ = app.Mongo.Client().Disconnect(cleanupCtx)
-	})
-
-	const topic = "tm_mandala"
-	parent := wiringTestTx(t, nil, 0, 1, 0x61)
-	parentID := parent.TxID()
-	child := wiringTestTx(t, parent, 0, 1, 0)
-	childID := child.TxID()
-	beefBytes, err := child.AtomicBEEF(true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	st := app.Engine.Storage
-
-	// Seed the state left behind by the ORIGINAL successful submit of child:
-	// parent:0 already spent by childID, an applied-transaction record for
-	// childID under tm_mandala, and NO mandala token row for parent:0 (it was
-	// correctly consumed when that submit committed).
-	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *parentID, Index: 0}}, topic, childID); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: childID, Topic: topic}); err != nil {
-		t.Fatal(err)
-	}
-
-	// The submit handler snapshots BEFORE Engine.Submit, exactly as it would
-	// for the duplicate resubmit attempt.
-	compensate, _, err := app.PrepareSubmitCompensation(ctx, beefBytes)
-	if err != nil {
-		t.Fatal("prepare:", err)
-	}
-	if compensate == nil {
-		t.Fatal("prepare returned nil compensation for a valid BEEF")
-	}
-
-	if err := compensate(ctx); err != nil {
-		t.Fatal("compensate:", err)
-	}
-
-	topicName := topic
-	spent := true
-	got, err := st.FindOutput(ctx, &transaction.Outpoint{Txid: *parentID, Index: 0}, &topicName, &spent, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got == nil {
-		t.Fatal("parent:0 must remain spent after skipped compensation (already-committed tx)")
-	}
-	row, err := app.Store.GetTokenRow(ctx, parentID.String(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if row != nil {
-		t.Fatalf("token row must not be resurrected by skipped compensation: %+v", row)
-	}
-}
-
-// TestBuildArcadeEvictTxRoundTrip drives Build's EvictTx closure against
-// real Mongo: seed a folded transaction (engine outputs + applied record +
-// mandala token/metadata projections), evict by txid, and assert everything
-// is gone — with balances untouched (TS OutputEvicted parity: eviction never
-// adjusts balances).
-func TestBuildArcadeEvictTxRoundTrip(t *testing.T) {
-	requireMongo(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	app, err := Build(ctx, Config{
-		NodeName:         "mandala_wiring_test_evict",
-		ServerPrivKeyHex: testPrivHex,
-		HostingURL:       "https://overlay.example.com",
-		MongoURL:         "mongodb://localhost:27017",
-		Network:          "test",
-		ArcadeURL:        "https://arcade.example.com",
-	})
-	if err != nil {
-		t.Fatal("Build:", err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_ = app.Mongo.Drop(cleanupCtx)
-		_ = app.Mongo.Client().Disconnect(cleanupCtx)
-	})
-
-	const topic = "tm_mandala"
-	tx := wiringTestTx(t, nil, 0, 2, 0x51)
-	txid := tx.TxID()
-	txidStr := txid.String()
-
-	st := app.Engine.Storage
-	if err := st.InsertOutputs(ctx, topic, txid, []uint32{0, 1}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: txid, Topic: topic}); err != nil {
-		t.Fatal(err)
-	}
-	if err := app.Store.StoreToken(ctx, mandalav2.TokenRow{
-		Txid: txidStr, OutputIndex: 0, AssetID: "a.0", Amount: 10,
-		IdentityKey: "02e", CreatedAt: time.Now(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := app.Store.AdjustBalance(ctx, "02e", 10); err != nil {
-		t.Fatal(err)
-	}
-	if err := app.Store.StoreMetadata(ctx, mandalav2.MetadataRow{Txid: txidStr, OutputIndex: 1, AssetID: "asset-x"}); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := app.EvictTx(ctx, txidStr); err != nil {
-		t.Fatal("EvictTx:", err)
-	}
-
-	outs, err := st.FindOutputsForTransaction(ctx, txid, false)
-	if err != nil || len(outs) != 0 {
-		t.Fatalf("engine outputs after eviction = %d err %v, want 0", len(outs), err)
-	}
-	exists, err := st.DoesAppliedTransactionExist(ctx, &overlay.AppliedTransaction{Txid: txid, Topic: topic})
-	if err != nil || exists {
-		t.Fatalf("applied record after eviction: exists=%v err=%v", exists, err)
-	}
-	if row, _ := app.Store.GetTokenRow(ctx, txidStr, 0); row != nil {
-		t.Fatalf("token row survived eviction: %+v", row)
-	}
-	if ops, _ := app.Store.FindMetadataByAssetID(ctx, "asset-x"); len(ops) != 0 {
-		t.Fatalf("metadata survived eviction: %v", ops)
-	}
-	if b, _ := app.Store.GetBalance(ctx, "02e"); b != 10 {
-		t.Fatalf("balance after eviction = %d, want 10 (eviction must not adjust balances)", b)
-	}
-
-	// Evicting the same txid again is a no-op.
-	if _, err := app.EvictTx(ctx, txidStr); err != nil {
-		t.Fatal("second EvictTx:", err)
-	}
-}
-
-// TestFindRawTxsBatchesOverEnginestore is Task 17's wiring test: App's
-// FindRawTxs (activity.Deps.FindRawTxs's production implementation) must
-// resolve every stored txid to its raw hex and simply omit unknown ones,
-// batching several txids in one call.
+// App.FindRawTxs resolves every stored txid to its raw hex and omits unknown ones.
 func TestFindRawTxsBatchesOverEnginestore(t *testing.T) {
-	requireMongo(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	app, err := Build(ctx, Config{
-		NodeName:         "mandala_wiring_test_rawtxs",
-		ServerPrivKeyHex: testPrivHex,
-		HostingURL:       "http://localhost:8080",
-		MongoURL:         "mongodb://localhost:27017",
-		Network:          "test",
-	})
-	if err != nil {
-		t.Fatal("Build:", err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_ = app.Mongo.Drop(cleanupCtx)
-		_ = app.Mongo.Client().Disconnect(cleanupCtx)
-	})
+	app := buildV3App(t, v3Config("mandala3_test_wiring_rawtxs"))
+	ctx := context.Background()
 
 	const topic = "tm_mandala"
 	tx1 := wiringTestTx(t, nil, 0, 1, 0x71)
@@ -560,326 +332,5 @@ func TestFindRawTxsBatchesOverEnginestore(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("len(got) = %d, want 2", len(got))
-	}
-}
-
-// TestBuildArcadeEvictTxRestoresInputs is FIX E: an /arc-ingest terminal
-// status used to delete the transaction's outputs and walk away, leaving the
-// coin it spent marked spent forever with no token row — provably unspent on
-// chain, unspendable through the overlay. Eviction must now be the exact
-// inverse of admission for inputs: unmark the engine-side spend, replay the
-// token rows from the snapshot persisted on the admission record, stamp
-// evictedAt, and only then delete the evicted outputs.
-func TestBuildArcadeEvictTxRestoresInputs(t *testing.T) {
-	requireMongo(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	app, err := Build(ctx, Config{
-		NodeName:         "mandala_wiring_test_evict_restore",
-		ServerPrivKeyHex: testPrivHex,
-		HostingURL:       "https://overlay.example.com",
-		MongoURL:         "mongodb://localhost:27017",
-		Network:          "test",
-		ArcadeURL:        "https://arcade.example.com",
-	})
-	if err != nil {
-		t.Fatal("Build:", err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_ = app.Mongo.Drop(cleanupCtx)
-		_ = app.Mongo.Client().Disconnect(cleanupCtx)
-	})
-
-	const topic = "tm_mandala"
-	parent := wiringTestTx(t, nil, 0, 1, 0x61)
-	parentID := parent.TxID()
-	child := wiringTestTx(t, parent, 0, 1, 0)
-	childID := child.TxID()
-	childStr := childID.String()
-
-	st := app.Engine.Storage
-	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.InsertOutputs(ctx, topic, childID, []uint32{0}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: childID, Topic: topic}); err != nil {
-		t.Fatal(err)
-	}
-	// The child spent the parent's coin: engine mark + the mandala row gone.
-	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *parentID, Index: 0}}, topic, childID); err != nil {
-		t.Fatal(err)
-	}
-	// ... and the admission recorded the pre-spend snapshot, exactly as the
-	// submit handler persists it.
-	if err := app.Store.RecordAdmission(ctx, mandalav2.AdmissionRecord{
-		Txid:                 childStr,
-		Topics:               []string{topic},
-		OutputsToAdmit:       []uint32{0},
-		AdmissionSignature:   "3044",
-		AdmissionIdentityKey: "02aa",
-		Restore: &mandalav2.RestoreSnapshot{
-			SpentOutpoints: []string{parentID.String() + ".0"},
-			TokenRows: []mandalav2.TokenRow{{
-				Txid: parentID.String(), OutputIndex: 0, AssetID: "a.0",
-				Amount: 40, IdentityKey: "02k", CreatedAt: time.Now(),
-			}},
-		},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := app.EvictTx(ctx, childStr); err != nil {
-		t.Fatal("EvictTx:", err)
-	}
-
-	topicName := topic
-	unspent := false
-	got, err := st.FindOutput(ctx, &transaction.Outpoint{Txid: *parentID, Index: 0}, &topicName, &unspent, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got == nil || got.Spent {
-		t.Fatalf("the evicted tx's input must be spendable again, got %+v", got)
-	}
-	row, err := app.Store.GetTokenRow(ctx, parentID.String(), 0)
-	if err != nil || row == nil || row.Amount != 40 {
-		t.Fatalf("token row not restored from the admission snapshot: %+v %v", row, err)
-	}
-	if b, _ := app.Store.GetBalance(ctx, "02k"); b != 40 {
-		t.Fatalf("balance after restore = %d, want 40", b)
-	}
-	rec, err := app.Store.GetAdmission(ctx, childStr)
-	if err != nil || rec == nil || rec.EvictedAt == "" {
-		t.Fatalf("evictedAt not stamped: %+v %v", rec, err)
-	}
-	// The evicted transaction's own outputs are gone, as before.
-	outs, err := st.FindOutputsForTransaction(ctx, childID, false)
-	if err != nil || len(outs) != 0 {
-		t.Fatalf("evicted outputs = %d err %v, want 0", len(outs), err)
-	}
-
-	// And the restored coin now reads as LIVE to the FIX L spend guard, even
-	// though an engine row still names the evicted tx elsewhere: a client
-	// racing the restore must never be told the coin is gone.
-	by, err := spendChecker(app.EngineStore, app.Store).SpentBy(ctx, parentID.String(), 0)
-	if err != nil || by != "" {
-		t.Fatalf("spend guard after eviction = %q (%v), want live", by, err)
-	}
-}
-
-// TestSpendCheckerNamesTheCompetingSpender is the other half of the guard:
-// a coin spent by a live (un-evicted) transaction reports that transaction.
-func TestSpendCheckerNamesTheCompetingSpender(t *testing.T) {
-	requireMongo(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	app, err := Build(ctx, Config{
-		NodeName:         "mandala_wiring_test_spendguard",
-		ServerPrivKeyHex: testPrivHex,
-		HostingURL:       "http://localhost:8080",
-		MongoURL:         "mongodb://localhost:27017",
-		Network:          "test",
-	})
-	if err != nil {
-		t.Fatal("Build:", err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_ = app.Mongo.Drop(cleanupCtx)
-		_ = app.Mongo.Client().Disconnect(cleanupCtx)
-	})
-
-	const topic = "tm_mandala"
-	parent := wiringTestTx(t, nil, 0, 1, 0x71)
-	parentID := parent.TxID()
-	child := wiringTestTx(t, parent, 0, 1, 0)
-	childID := child.TxID()
-
-	st := app.Engine.Storage
-	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	guard := spendChecker(app.EngineStore, app.Store)
-	if by, err := guard.SpentBy(ctx, parentID.String(), 0); err != nil || by != "" {
-		t.Fatalf("live coin reported spent by %q (%v)", by, err)
-	}
-	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *parentID, Index: 0}}, topic, childID); err != nil {
-		t.Fatal(err)
-	}
-	if by, err := guard.SpentBy(ctx, parentID.String(), 0); err != nil || by != childID.String() {
-		t.Fatalf("spend guard = %q (%v), want %s", by, err, childID)
-	}
-}
-
-// TestAppliedAdmissionProofDerivesOutputsFromTheEngine is FIX C: the engine's
-// own applied-transaction record plus its stored outputs are enough to
-// re-sign an admission whose mandalaAdmissions row never existed.
-func TestAppliedAdmissionProofDerivesOutputsFromTheEngine(t *testing.T) {
-	requireMongo(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	app, err := Build(ctx, Config{
-		NodeName:         "mandala_wiring_test_proof",
-		ServerPrivKeyHex: testPrivHex,
-		HostingURL:       "http://localhost:8080",
-		MongoURL:         "mongodb://localhost:27017",
-		Network:          "test",
-	})
-	if err != nil {
-		t.Fatal("Build:", err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_ = app.Mongo.Drop(cleanupCtx)
-		_ = app.Mongo.Client().Disconnect(cleanupCtx)
-	})
-	if app.AppliedAdmissionProof == nil {
-		t.Fatal("AppliedAdmissionProof must always be wired")
-	}
-
-	const topic = "tm_mandala"
-	tx := wiringTestTx(t, nil, 0, 3, 0x81)
-	txid := tx.TxID()
-
-	applied, outputs, err := app.AppliedAdmissionProof(ctx, txid.String())
-	if err != nil || applied || len(outputs) != 0 {
-		t.Fatalf("unknown txid: applied=%v outputs=%v err=%v", applied, outputs, err)
-	}
-	// A malformed txid is "not applied", never an error.
-	if applied, _, err := app.AppliedAdmissionProof(ctx, "not-a-txid"); err != nil || applied {
-		t.Fatalf("malformed txid: applied=%v err=%v", applied, err)
-	}
-
-	st := app.Engine.Storage
-	if err := st.InsertOutputs(ctx, topic, txid, []uint32{2, 0}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: txid, Topic: topic}); err != nil {
-		t.Fatal(err)
-	}
-	applied, outputs, err = app.AppliedAdmissionProof(ctx, txid.String())
-	if err != nil || !applied {
-		t.Fatalf("applied=%v err=%v", applied, err)
-	}
-	if len(outputs) != 2 || outputs[0] != 0 || outputs[1] != 2 {
-		t.Fatalf("outputs = %v, want [0 2]", outputs)
-	}
-}
-
-// TestBuildArcadeEvictTxPurgesAdminHistory — 2026-09-21 incident: eviction
-// restored the inputs but left the evicted tx's admin-history row behind, so
-// PickAssetAuthHead kept naming the evicted tx as the live auth head and the
-// asset state kept its folded (never-mined) action. Eviction must delete the
-// rows and rebuild the state — and must do so on a REPEAT callback too, since
-// the production heads were stuck behind an eviction that had already been
-// stamped before this fix existed.
-func TestBuildArcadeEvictTxPurgesAdminHistory(t *testing.T) {
-	requireMongo(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	app, err := Build(ctx, Config{
-		NodeName:         "mandala_wiring_test_evict_history",
-		ServerPrivKeyHex: testPrivHex,
-		HostingURL:       "https://overlay.example.com",
-		MongoURL:         "mongodb://localhost:27017",
-		Network:          "test",
-		ArcadeURL:        "https://arcade.example.com",
-	})
-	if err != nil {
-		t.Fatal("Build:", err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_ = app.Mongo.Drop(cleanupCtx)
-		_ = app.Mongo.Client().Disconnect(cleanupCtx)
-	})
-
-	const topic = "tm_mandala"
-	parent := wiringTestTx(t, nil, 0, 1, 0x62)
-	parentID := parent.TxID()
-	parentStr := parentID.String()
-	child := wiringTestTx(t, parent, 0, 1, 0)
-	childID := child.TxID()
-	childStr := childID.String()
-	assetID := parentStr + ".0"
-	issuer := "03" + "ab"[:2] + parentStr[:62]
-
-	st := app.Engine.Storage
-	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.InsertOutputs(ctx, topic, childID, []uint32{0}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: childID, Topic: topic}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *parentID, Index: 0}}, topic, childID); err != nil {
-		t.Fatal(err)
-	}
-	// Admin chain: parent.0 registered the asset (seq 1); child.0 paused it
-	// (seq 2) and is the current head + the folded state.
-	for _, e := range []mandalav2.AdminHistoryEntry{
-		{AssetID: assetID, Txid: parentStr, OutputIndex: 0, Height: 9007199254740991, AdmitSeq: 1,
-			ActionDetails: mandalav2.ActionDetails{"kind": "register", "assetId": assetID, "issuer": issuer}, CreatedAt: time.Now()},
-		{AssetID: assetID, Txid: childStr, OutputIndex: 0, Height: 9007199254740991, AdmitSeq: 2,
-			ActionDetails: mandalav2.ActionDetails{"kind": "pause", "assetId": assetID, "priorOutpoint": assetID}, CreatedAt: time.Now()},
-	} {
-		if err := app.Store.AppendAdminHistory(ctx, e); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := app.Store.PutAssetState(ctx, mandalav2.AssetAdminState{
-		AssetID: assetID, IssuerIdentityKey: issuer, IsPaused: true, AccessMode: "denylist",
-		BlockedIdentities: []string{}, AllowedIdentities: []string{}, FrozenOutpoints: []mandalav2.FrozenRef{}, EvictedOutpoints: []string{},
-		LastProcessedHeight: 9007199254740991, LastAdmitSeq: 2,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := app.Store.RecordAdmission(ctx, mandalav2.AdmissionRecord{
-		Txid: childStr, Topics: []string{topic}, OutputsToAdmit: []uint32{0},
-		AdmissionSignature: "3044", AdmissionIdentityKey: "02aa",
-		Restore: &mandalav2.RestoreSnapshot{SpentOutpoints: []string{assetID}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	// The production case: already stamped by an eviction that predates the
-	// history purge. The repeat must still purge.
-	if err := app.Store.MarkEvicted(ctx, childStr); err != nil {
-		t.Fatal(err)
-	}
-
-	out, err := app.EvictTx(ctx, childStr)
-	if err != nil {
-		t.Fatal("EvictTx:", err)
-	}
-	if !out.AlreadyEvicted {
-		t.Fatalf("expected the repeat eviction to report alreadyEvicted, got %+v", out)
-	}
-
-	rows, err := app.Store.FindAdminHistoryByAssetID(ctx, assetID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rows) != 1 || rows[0].Txid != parentStr {
-		t.Fatalf("admin history after eviction = %+v, want only the register row", rows)
-	}
-	head, ok := mandalav2.PickAssetAuthHead(rows)
-	if !ok || head.Txid != parentStr || head.OutputIndex != 0 {
-		t.Fatalf("auth head after eviction = %+v (%v), want %s.0", head, ok, parentStr)
-	}
-	state, err := app.Store.GetAssetState(ctx, assetID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.IsPaused || state.LastAdmitSeq != 1 || state.IssuerIdentityKey != issuer {
-		t.Fatalf("asset state after eviction = %+v, want unpaused, seq 1, issuer kept", state)
 	}
 }

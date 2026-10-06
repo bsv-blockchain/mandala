@@ -1,19 +1,17 @@
-// Package wiring assembles the mandala overlay engine: Mongo, the mandala
-// domain store/verifier, tm_mandala + ls_mandala, the in-repo engine.Storage
-// (enginestore) and the chain tracker/broadcaster seams Task 16 fills with
-// Arcade implementations. No advertiser, no GASP sync config (GASP off).
+// Package wiring assembles the Mandala overlay on BRC-162 with token topics on one overlay: Mongo, the v3 mandala
+// store and verifier, the static registry (tm_mandala / ls_mandala) and KYC (tm_mandala_kyc / ls_mandala_kyc) topics,
+// the TokenTopics registrar that alone creates tm_<id> / ls_<id>, the in-repo engine.Storage (enginestore), the two
+// maintenance gates and the host seams /submit and /arc-ingest use. The overlay neither syncs with peers nor
+// advertises (token-topics design §14 A1.1).
 package wiring
 
 import (
 	"context"
 	"fmt"
-	"log"
-	"strconv"
 	"strings"
 
 	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
-	"github.com/bsv-blockchain/go-sdk/overlay"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/bsv-blockchain/go-sdk/transaction/chaintracker"
@@ -22,24 +20,16 @@ import (
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/arcade"
 	"github.com/sirdeggen/mandala/overlay-go/internal/enginestore"
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
+	"github.com/sirdeggen/mandala/overlay-go/internal/maintenance"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
 
-// defaultChaintracksPrefix mirrors overlay/src/index.ts's
-// `process.env.CHAINTRACKS_API_PREFIX ?? '/v2'`.
+// defaultChaintracksPrefix mirrors overlay/src/index.ts's `process.env.CHAINTRACKS_API_PREFIX ?? '/v2'`.
 const defaultChaintracksPrefix = "/v2"
 
-// tokenTopic is the topic σ_I speaks for — the one the FIX C applied proof
-// and the FIX L spend guard are scoped to.
-const tokenTopic = "tm_mandala"
-
-// Config is the node configuration (mirrors the TS overlay's env surface —
-// overlay/src/index.ts's ARCADE_URL/ARCADE_API_KEY/CHAINTRACKS_URL/
-// CHAINTRACKS_API_PREFIX). ArcadeCallbackURL/ArcadeCallbackToken have no TS
-// env-var counterpart in that file (it never calls configureArcCallbackToken
-// and lets OverlayExpress derive callbackUrl from its own advertisable
-// FQDN); leaving both empty here reproduces that no-token, no-callback-url
-// default.
+// Config is the node configuration. cmd/overlay's loadConfig fills it from the environment; IssuerKeys come from
+// ParseIssuerKeys, TokenAllowlist/TokenAllowlistSet from ParseTokenAllowlist, AdminCORSOrigins from
+// httpapi.ParseAdminCORSOrigins (resolved there so this package never imports httpapi).
 type Config struct {
 	NodeName            string
 	ServerPrivKeyHex    string
@@ -52,113 +42,68 @@ type Config struct {
 	ArcadeCallbackToken string
 	ChaintracksURL      string
 	ChaintracksPrefix   string
-
-	// AdminAPIToken and AdminCORSOrigins are A13's server-side gate for the
-	// identity-bearing admin routes (/admin/registry, /admin/activity,
-	// /admin/admission/:txid). Read from ADMIN_API_TOKEN / ADMIN_CORS_ORIGINS
-	// by cmd/overlay/main.go's loadConfig, which also resolves
-	// AdminCORSOrigins's TS-parity default via
-	// httpapi.ParseAdminCORSOrigins — done there, not in this package, so
-	// this package (which httpapi imports) never has to import httpapi back.
-	AdminAPIToken    string
-	AdminCORSOrigins []string
+	AdminAPIToken       string
+	AdminCORSOrigins    []string
+	IssuerKeys          []string // parsed MANDALA_ISSUER_KEYS; Build fails on an empty set (manager constructor error)
+	TokenAllowlist      []string // deploy txids; meaningful only when TokenAllowlistSet
+	TokenAllowlistSet   bool
 }
 
-// App is the wired application: the overlay engine plus the mandala domain
-// handles the HTTP layer (Task 13) serves from.
+// App is the wired application: the engine, the Mandala stores, the registrar, the gates and the host seams httpapi
+// serves from.
 type App struct {
-	Engine *engine.Engine
-	Store  *mandalav2.Store
-	// EngineStore is the concrete engine.Storage behind Engine, exposed
-	// because several seams (compensation, eviction, the FIX L spend guard,
-	// the FIX C applied proof) need methods that are deliberately not part of
-	// go-overlay-services' engine.Storage interface.
-	EngineStore         *enginestore.Store
-	Verifier            *mandalav2.Verifier
-	Mongo               *mongo.Database
+	Engine        *engine.Engine
+	Store         *mandala.Store
+	EngineStore   *enginestore.Store
+	Verifier      *mandala.Verifier
+	Mongo         *mongo.Database
+	Tokens        *TokenTopics
+	Registry      *mandala.TokenRegistryTopicManager
+	Gate          *maintenance.Gate
+	ReconcileLock *maintenance.Gate
+
 	ArcadeEnabled       bool
 	ArcadeCallbackToken string
 
-	// PrepareSubmitCompensation compensates for the pinned v1.3.7 engine's
-	// submit ordering (inputs marked spent + mandala projections destroyed
-	// BEFORE broadcast; a failed broadcast aborts without unwinding — still
-	// present in v1.3.7: Submit marks spends before broadcast;
-	// ErrorOnBroadcastFailure unread). The
-	// submit handler calls it with the raw BEEF before Engine.Submit; the
-	// returned closure — run only on a broadcast-classified Submit error —
-	// unmarks the engine-side spends (UnmarkSpentBySpendTxid) and restores
-	// the snapshotted mandala token rows/balances (RestoreTokens). The
-	// snapshot is ALSO returned as a plain value so the submit handler can
-	// persist it on the admission record, which is what makes a post-hoc
-	// eviction (FIX E) restorable long after this request's closures are
-	// gone. Set only when Arcade is enabled (without a broadcaster, broadcast
-	// cannot fail, and without /arc-ingest nothing can be evicted).
-	PrepareSubmitCompensation func(ctx context.Context, beef []byte) (func(context.Context) error, *mandalav2.RestoreSnapshot, error)
-
-	// EvictTx implements the TS /arc-ingest route's
-	// Engine.evictAppliedTransaction for terminal Arcade statuses. FIX E: it
-	// is the exact inverse of admission — restore the inputs this txid
-	// consumed (UnmarkSpentBySpendTxid + RestoreTokens from the admission
-	// record's snapshot), stamp evictedAt so the ERR_EVICTED verdict is
-	// permanent for these bytes, then notify ls_mandala's OutputEvicted per
-	// output and delete the engine's output docs and applied-transaction
-	// records. Set only when Arcade is enabled (the /arc-ingest route is only
-	// mounted then, and only with a callback token).
-	EvictTx func(ctx context.Context, txid string) (mandalav2.EvictionOutcome, error)
-
-	// AppliedAdmissionProof is FIX C's durable proof seam: whether the
-	// engine's own applied-transaction store says txid went through
-	// tm_mandala, plus the output indexes it holds for it. It lets /submit
-	// and GET /admin/admission/:txid re-sign an admission whose
-	// mandalaAdmissions row is missing entirely. Always set.
-	AppliedAdmissionProof func(ctx context.Context, txid string) (bool, []uint32, error)
-
-	// FindRawTxs implements activity.Deps.FindRawTxs (Task 17, Appendix B
-	// §3e): raw tx hex by txid, batched over the enginestore's per-output
-	// BEEFs (enginestore.Store.RawTxHexByTxid — there is no dedicated raw-tx
-	// collection). Always set; /admin/activity has no Arcade dependency.
+	// PrepareSubmitCompensation snapshots a submit's inputs before Engine.Submit and returns the broadcast-failure
+	// compensation (prepareSubmitCompensation). Always set: the snapshot is also what the admission record keeps for
+	// a later eviction.
+	PrepareSubmitCompensation func(ctx context.Context, beef []byte, topics []string) (compensate func(context.Context) error, restore *mandala.RestoreSnapshot, err error)
+	// EvictTx is the /arc-ingest terminal-status eviction. Nil until Task 21.
+	EvictTx func(ctx context.Context, txid string) (mandala.EvictionOutcome, error)
+	// AppliedAdmissionProof maps every topic with an engine applied record for txid to its admitted vouts.
+	AppliedAdmissionProof func(ctx context.Context, txid string) (map[string][]uint32, error)
+	// FindRawTxs resolves raw tx hex by txid (activity, Task 24).
 	FindRawTxs func(ctx context.Context, txids []string) (map[string]string, error)
+	// OutputBeefWhere serves the stored BEEF of one output from the first topic accept() approves (recovery routes).
+	OutputBeefWhere func(ctx context.Context, txid string, vout uint32, accept func(topic string) bool) (beef []byte, topic string, found bool, err error)
 
-	// OutputBeef serves the BEEF the engine stored for one admitted output
-	// (enginestore.Store.OutputBeefBytes) — the /admin/registry/beef and
-	// /admin/asset-auth/beef recovery routes (A10/A17). Always set.
-	OutputBeef func(ctx context.Context, topic, txid string, vout uint32) ([]byte, bool, error)
-
-	// ServerPrivKeyHex is the overlay identity key; httpapi uses it to
-	// attach σ_I on admitted submits.
 	ServerPrivKeyHex string
-
-	// AdminAPIToken and AdminCORSOrigins pass Config's A13 fields through to
-	// httpapi.New, unmodified (see Config's doc comment for why resolution
-	// lives in cmd/overlay/main.go rather than here).
 	AdminAPIToken    string
 	AdminCORSOrigins []string
 }
 
-// buildOptions carries the Task 16 injection seams.
+// buildOptions carries the injection seams.
 type buildOptions struct {
 	broadcaster transaction.Broadcaster
 	tracker     chaintracker.ChainTracker
 }
 
-// Option customizes Build without changing its signature (Task 12 lands with
-// nils; Task 16 injects the Arcade broadcaster and chaintracks tracker).
+// Option customizes Build without changing its signature.
 type Option func(*buildOptions)
 
-// WithBroadcaster injects a transaction broadcaster (Task 16: Arcade,
-// broadcast-before-fold, failure rejects the submit).
+// WithBroadcaster injects a transaction broadcaster.
 func WithBroadcaster(b transaction.Broadcaster) Option {
 	return func(o *buildOptions) { o.broadcaster = b }
 }
 
-// WithChainTracker injects a chain tracker (Task 16: chaintracks client).
+// WithChainTracker injects a chain tracker.
 func WithChainTracker(ct chaintracker.ChainTracker) Option {
 	return func(o *buildOptions) { o.tracker = ct }
 }
 
-// scriptsOnlyTracker is the permissive ChainTracker used when no Arcade is
-// configured — the Go mirror of the TS engine's 'scripts only' mode: every
-// merkle root is accepted, so SPV degrades to script checks.
+// scriptsOnlyTracker is the permissive ChainTracker used when no Arcade is configured — the Go mirror of the TS
+// engine's 'scripts only' mode: every merkle root is accepted, so SPV degrades to script checks.
 type scriptsOnlyTracker struct{}
 
 var _ chaintracker.ChainTracker = scriptsOnlyTracker{}
@@ -168,20 +113,15 @@ func (scriptsOnlyTracker) IsValidRootForHeight(context.Context, *chainhash.Hash,
 	return true, nil
 }
 
-// CurrentHeight reports 0 — nothing in the engine consults it, and 'scripts
-// only' mode has no chain view to answer from.
+// CurrentHeight reports 0 — nothing in the engine consults it.
 func (scriptsOnlyTracker) CurrentHeight(context.Context) (uint32, error) {
 	return 0, nil
 }
 
-// Build connects Mongo (db ${NodeName}_lookup_services — same db handle for
-// the mandala Store and the engine storage), wires tm_mandala/ls_mandala and
-// returns the assembled App. With an empty ArcadeURL the chain tracker is
-// scripts-only and the broadcaster nil. With a non-empty ArcadeURL, Build
-// defaults the tracker/broadcaster to Arcade-backed implementations
-// (overlay/src/index.ts's ARCADE_URL branch) unless opts already injected
-// them — the WithBroadcaster/WithChainTracker seam exists so tests can
-// substitute a stub instead of hitting a real Arcade deployment.
+// Build connects Mongo (db <NodeName>_lookup_services, shared by the Mandala store and the engine storage), wires the
+// static topics and the token-topic registrar, and returns the App. Token topics are not registered here: Start runs
+// the boot union, and /submit's deploy hook (Task 23) registers new deploys. With an empty ArcadeURL the chain tracker
+// is scripts-only and the broadcaster nil; with one, Build defaults both to Arcade unless opts injected them.
 func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 	var o buildOptions
 	for _, opt := range opts {
@@ -217,66 +157,67 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 		_ = client.Disconnect(context.Background())
 		return nil, fmt.Errorf("wiring: mongo ping: %w", err)
 	}
-	db := client.Database(cfg.NodeName + "_lookup_services")
-
-	// Wire contract §9.9: index creation failures abort startup on both
-	// engines — better a node that refuses to come up than one serving
-	// confident answers without the uniqueness its invariants rest on.
-	store, err := mandalav2.NewStore(db)
-	if err != nil {
+	fail := func(err error) (*App, error) {
 		_ = client.Disconnect(context.Background())
 		return nil, err
 	}
-	verifier, err := mandalav2.NewVerifier(cfg.ServerPrivKeyHex)
-	if err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, fmt.Errorf("wiring: verifier: %w", err)
-	}
-	adminWallet, err := mandalav2.NewAdminWallet(cfg.ServerPrivKeyHex)
-	if err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, fmt.Errorf("wiring: admin wallet: %w", err)
-	}
+	db := client.Database(cfg.NodeName + "_lookup_services")
 
-	// Membership (A04): once the registry has a row, non-admitted identities
-	// are refused — except asset issuers (store.IssuerIdentityKeys) and this
-	// overlay's own identity, exactly as the TS registryScreening exemptions.
+	// Index creation failures abort startup (mandala.NewStore and enginestore.New both create eagerly).
+	store, err := mandala.NewStore(db)
+	if err != nil {
+		return fail(err)
+	}
+	verifier, err := mandala.NewVerifier(cfg.ServerPrivKeyHex)
+	if err != nil {
+		return fail(fmt.Errorf("wiring: verifier: %w", err))
+	}
 	overlayPriv, err := ec.PrivateKeyFromHex(cfg.ServerPrivKeyHex)
 	if err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, fmt.Errorf("wiring: overlay identity: %w", err)
+		return fail(fmt.Errorf("wiring: overlay identity: %w", err))
 	}
 	es, err := enginestore.New(db)
 	if err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, err
+		return fail(err)
 	}
-	tm := mandalav2.NewTopicManager(verifier, adminWallet, mandalav2.NoSanctions{}, store).
-		WithRegistry(store).
-		WithSpendChecker(spendChecker(es, store)).
-		WithMembershipExemptions(overlayPriv.PubKey().ToDERHex())
-	ls := mandalav2.NewLookupService(verifier, store)
-	regWallet, err := mandalav2.NewRegistryWallet(cfg.ServerPrivKeyHex)
+
+	deps := mandala.TokenTopicDeps{
+		Verifier:         verifier,
+		TrustedIssuers:   cfg.IssuerKeys,
+		MembershipExempt: []string{overlayPriv.PubKey().ToDERHex()},
+		Store:            store,
+		Engine:           es,
+		Screening:        mandala.NoSanctions{},
+		Membership:       mandala.KYCMembership{Store: store},
+		Spends:           spendChecker(es, store),
+	}
+	registry, err := mandala.NewTokenRegistryTopicManager(deps)
 	if err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, fmt.Errorf("wiring: registry wallet: %w", err)
+		return fail(fmt.Errorf("wiring: %s: %w", mandala.MandalaTopic, err))
 	}
-	rtm := mandalav2.NewRegistryTopicManager(regWallet, store)
-	rls := mandalav2.NewRegistryLookupService(store)
+	kyc, err := mandala.NewKYCTopicManager(mandala.KYCTopicDeps{
+		Verifier:       verifier,
+		TrustedIssuers: cfg.IssuerKeys,
+		Store:          store,
+		Engine:         es,
+		Claims:         store,
+	})
+	if err != nil {
+		return fail(fmt.Errorf("wiring: %s: %w", mandala.KYCTopic, err))
+	}
 
 	tracker := o.tracker
 	if tracker == nil {
 		tracker = scriptsOnlyTracker{}
 	}
-
 	eng := engine.NewEngine(&engine.Config{
 		Managers: map[string]engine.TopicManager{
-			"tm_mandala":            tm,
-			mandalav2.RegistryTopic: rtm,
+			mandala.MandalaTopic: registry,
+			mandala.KYCTopic:     kyc,
 		},
 		LookupServices: map[string]engine.LookupService{
-			"ls_mandala":             ls,
-			mandalav2.RegistryLookup: rls,
+			mandala.MandalaLookup: mandala.NewTokenRegistryLookupService(verifier, store),
+			mandala.KYCLookup:     mandala.NewKYCLookupService(store),
 		},
 		Storage:      es,
 		ChainTracker: tracker,
@@ -284,36 +225,66 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 		HostingURL:   cfg.HostingURL,
 	})
 
+	gate := maintenance.NewGate(maintenance.DefaultDrainTimeout)
+	reconcileLock := maintenance.NewGate(maintenance.DefaultDrainTimeout)
 	app := &App{
-		Engine:                eng,
-		Store:                 store,
-		EngineStore:           es,
-		Verifier:              verifier,
-		Mongo:                 db,
-		ArcadeEnabled:         cfg.ArcadeURL != "",
-		ArcadeCallbackToken:   cfg.ArcadeCallbackToken,
-		FindRawTxs:            findRawTxs(es),
-		OutputBeef:            es.OutputBeefBytes,
-		AppliedAdmissionProof: appliedAdmissionProof(es),
-		ServerPrivKeyHex:      cfg.ServerPrivKeyHex,
-		AdminAPIToken:         cfg.AdminAPIToken,
-		AdminCORSOrigins:      cfg.AdminCORSOrigins,
-	}
-	if app.ArcadeEnabled {
-		app.PrepareSubmitCompensation = prepareSubmitCompensation(store, es)
-		app.EvictTx = evictTx(es, ls, store)
+		Engine:                    eng,
+		Store:                     store,
+		EngineStore:               es,
+		Verifier:                  verifier,
+		Mongo:                     db,
+		Tokens:                    NewTokenTopics(eng, cfg.TokenAllowlist, cfg.TokenAllowlistSet, tokenTopicFactory(deps, verifier, store)),
+		Registry:                  registry,
+		Gate:                      gate,
+		ReconcileLock:             reconcileLock,
+		ArcadeEnabled:             cfg.ArcadeURL != "",
+		ArcadeCallbackToken:       cfg.ArcadeCallbackToken,
+		PrepareSubmitCompensation: prepareSubmitCompensation(es, store),
+		AppliedAdmissionProof:     appliedAdmissionProof(es),
+		FindRawTxs:                findRawTxs(es),
+		OutputBeefWhere:           es.OutputBeefWhere,
+		ServerPrivKeyHex:          cfg.ServerPrivKeyHex,
+		AdminAPIToken:             cfg.AdminAPIToken,
+		AdminCORSOrigins:          cfg.AdminCORSOrigins,
 	}
 	return app, nil
 }
 
-// findRawTxs adapts enginestore.Store.RawTxHexByTxid (single txid in, single
-// raw hex out — the method Task 17 added) into activity.Deps.FindRawTxs's
-// batch shape (many txids in, a txid->hex map out). This is the same
-// "for each txid, load its BEEF" loop the TS route's Mongo-backed
-// findRawTransactions(txids) query condenses into one round trip; here it's
-// one RawTxHexByTxid call per txid instead, since enginestore keeps BEEF
-// bytes on individual output documents rather than in a dedicated
-// raw-tx-by-txid collection. Missing txids are simply absent from the map.
+// Start runs the boot union (TT §6.2.1): it registers every token in the union of the registry records and the token
+// topics of the owner journal (allowlist permitting), before the overlay listens. Any read or registration fault fails
+// boot rather than serving unknown-topic for every token. It then runs the registry's boot repair (Q2
+// restoreMissingRecords, D-21), so a hosted token whose ls_mandala record write was lost is back on GET /admin/tokens
+// before submissions start; its fault fails boot too.
+func (a *App) Start(ctx context.Context) error {
+	if _, err := a.Tokens.Boot(ctx, a.Store.AllRegistryTokenIDs, journalTokenIDs(a.Store)); err != nil {
+		return fmt.Errorf("wiring: start: %w", err)
+	}
+	if _, err := mandala.NewTokenRegistryLookupService(a.Verifier, a.Store).RestoreMissingRecords(ctx); err != nil {
+		return fmt.Errorf("wiring: start: restore registry records: %w", err)
+	}
+	return nil
+}
+
+// Close stops the App's background work. It never disconnects Mongo; the caller owns the client.
+func (a *App) Close() {}
+
+// tokenTopicFactory builds one token's manager and lookup on the shared store with the shared deps (one spend checker,
+// one trusted set, one membership provider for every token topic).
+func tokenTopicFactory(deps mandala.TokenTopicDeps, v *mandala.Verifier, store *mandala.Store) TokenTopicFactory {
+	return func(tokenID string) (engine.TopicManager, engine.LookupService, error) {
+		tm, err := mandala.NewTokenTopicManager(tokenID, deps)
+		if err != nil {
+			return nil, nil, err
+		}
+		ls, err := mandala.NewTokenLookupService(tokenID, v, store)
+		if err != nil {
+			return nil, nil, err
+		}
+		return tm, ls, nil
+	}
+}
+
+// findRawTxs adapts enginestore.Store.RawTxHexByTxid to the batch shape activity uses; missing txids are absent.
 func findRawTxs(es *enginestore.Store) func(context.Context, []string) (map[string]string, error) {
 	return func(ctx context.Context, txids []string) (map[string]string, error) {
 		out := make(map[string]string, len(txids))
@@ -328,329 +299,4 @@ func findRawTxs(es *enginestore.Store) func(context.Context, []string) (map[stri
 		}
 		return out, nil
 	}
-}
-
-// prepareSubmitCompensation builds the App.PrepareSubmitCompensation closure
-// over the mandala store (token-row snapshot/restore) and the concrete
-// engine store (spend unmarking) — the two projections the pinned engine
-// mutates before a broadcast can fail (see App.PrepareSubmitCompensation).
-func prepareSubmitCompensation(store *mandalav2.Store, es *enginestore.Store) func(context.Context, []byte) (func(context.Context) error, *mandalav2.RestoreSnapshot, error) {
-	return func(ctx context.Context, beefBytes []byte) (func(context.Context) error, *mandalav2.RestoreSnapshot, error) {
-		_, tx, txid, err := transaction.ParseBeef(beefBytes)
-		if err != nil || tx == nil {
-			// Engine.Submit parses the same bytes first thing and will
-			// reject them before markSpentAndNotify runs — nothing will be
-			// mutated, so there is nothing to compensate.
-			return nil, nil, nil
-		}
-		outpoints := make([]mandalav2.Outpoint, 0, len(tx.Inputs))
-		spentOutpoints := make([]string, 0, len(tx.Inputs))
-		for _, in := range tx.Inputs {
-			if in.SourceTXID == nil {
-				continue
-			}
-			outpoints = append(outpoints, mandalav2.Outpoint{Txid: in.SourceTXID.String(), OutputIndex: in.SourceTxOutIndex})
-			spentOutpoints = append(spentOutpoints, fmt.Sprintf("%s.%d", in.SourceTXID.String(), in.SourceTxOutIndex))
-		}
-		snapshot, err := store.SnapshotTokens(ctx, outpoints)
-		if err != nil {
-			return nil, nil, fmt.Errorf("wiring: snapshot token rows for %s: %w", txid.String(), err)
-		}
-		// The very same snapshot, handed back as a plain value so the submit
-		// handler can persist it on the admission record (FIX E): the
-		// closure below dies with this request, the record does not.
-		restore := &mandalav2.RestoreSnapshot{SpentOutpoints: spentOutpoints, TokenRows: snapshot}
-		spendTxid := txid.String()
-		return func(ctx context.Context) error {
-			// A duplicate resubmit of an already-committed tx can reach this
-			// closure too: go-overlay-services v1.3.7's per-topic dupe gate
-			// lets a resubmit past validation, and a broadcast failure on
-			// THAT attempt is classified the same as a genuine one. But a
-			// genuine broadcast failure can never have an applied-transaction
-			// record for this txid — commitAdmittedOutputs (which writes it)
-			// only runs after a successful broadcast. If the record exists,
-			// the original submit already committed: unmarking the spend and
-			// restoring the snapshotted token rows here would corrupt that
-			// committed state (resurrecting rows the original commit
-			// correctly deleted, flipping its retained input back to
-			// unspent). Skip compensation entirely in that case.
-			committed, err := es.DoesAppliedTransactionExist(ctx, &overlay.AppliedTransaction{
-				Txid:  txid,
-				Topic: "tm_mandala",
-			})
-			if err != nil {
-				return fmt.Errorf("wiring: check applied-transaction record for %s: %w", spendTxid, err)
-			}
-			if committed {
-				log.Printf("wiring: skipping compensation: tx already committed (duplicate resubmit): %s", spendTxid)
-				return nil
-			}
-			if _, err := es.UnmarkSpentBySpendTxid(ctx, spendTxid); err != nil {
-				return fmt.Errorf("wiring: unmark spends of %s: %w", spendTxid, err)
-			}
-			// Same never-clobber rule as eviction: only coins live again.
-			if _, err := restoreLiveTokenRows(ctx, es, store, restore); err != nil {
-				return fmt.Errorf("wiring: restore token rows spent by %s: %w", spendTxid, err)
-			}
-			return nil
-		}, restore, nil
-	}
-}
-
-// appliedAdmissionProof builds App.AppliedAdmissionProof (FIX C): the
-// engine's own applied-transaction record for tm_mandala is the durable
-// proof that a transaction was admitted, independent of whether the
-// mandalaAdmissions row survives, and the stored outputs for that txid are
-// the durable proof of WHICH outputs it admitted. Together they let a
-// resubmit (or GET /admin/admission/:txid) re-sign an admission with no
-// record row at all.
-func appliedAdmissionProof(es *enginestore.Store) func(context.Context, string) (bool, []uint32, error) {
-	return func(ctx context.Context, txid string) (bool, []uint32, error) {
-		h, err := chainhash.NewHashFromHex(txid)
-		if err != nil {
-			// Not a txid at all: nothing can have been applied under it.
-			return false, nil, nil
-		}
-		applied, err := es.DoesAppliedTransactionExist(ctx, &overlay.AppliedTransaction{Txid: h, Topic: tokenTopic})
-		if err != nil {
-			return false, nil, fmt.Errorf("wiring: applied-transaction record for %s: %w", txid, err)
-		}
-		if !applied {
-			return false, nil, nil
-		}
-		outputs, err := es.AdmittedOutputIndexes(ctx, tokenTopic, txid)
-		if err != nil {
-			return false, nil, fmt.Errorf("wiring: admitted outputs of %s: %w", txid, err)
-		}
-		return true, outputs, nil
-	}
-}
-
-// spendChecker builds the FIX L conflicting-spend guard the topic manager
-// consults: the engine store says which transaction marked a coin spent, and
-// the admission record says whether that transaction was later evicted — in
-// which case its spend was undone and the coin counts as live again (wire
-// contract §7), so a client racing the restore is never told a live coin is
-// gone.
-func spendChecker(es *enginestore.Store, store *mandalav2.Store) mandalav2.SpendChecker {
-	return spendCheckerFunc(func(ctx context.Context, txid string, vout uint32) (string, error) {
-		spendTxid, err := es.SpendStateOf(ctx, tokenTopic, txid, vout)
-		if err != nil {
-			return "", fmt.Errorf("wiring: spend state of %s.%d: %w", txid, vout, err)
-		}
-		if spendTxid == "" {
-			return "", nil
-		}
-		rec, err := store.GetAdmission(ctx, spendTxid)
-		if err != nil {
-			return "", fmt.Errorf("wiring: admission record of %s: %w", spendTxid, err)
-		}
-		if rec != nil && rec.EvictedAt != "" {
-			return "", nil
-		}
-		return spendTxid, nil
-	})
-}
-
-// spendCheckerFunc adapts a plain func to mandalav2.SpendChecker.
-type spendCheckerFunc func(ctx context.Context, txid string, vout uint32) (string, error)
-
-func (f spendCheckerFunc) SpentBy(ctx context.Context, txid string, vout uint32) (string, error) {
-	return f(ctx, txid, vout)
-}
-
-// evictTx builds the App.EvictTx closure: the Go equivalent of the TS
-// Engine.evictAppliedTransaction, assembled from the concrete stores because
-// the pinned engine exposes no eviction API.
-//
-// FIX E — eviction is the exact inverse of admission for INPUTS, not just a
-// deletion of outputs. Before this, an /arc-ingest terminal status (Arcade
-// rejects a previously-admitted transaction after the fact — fee/policy
-// rejection, reorg) deleted the transaction's outputs and left its inputs
-// marked spent with no token row and no path back, stranding coins that are
-// provably unspent on chain. The order is deliberate:
-//
-//  1. restore the inputs (unmark the engine-side spends, re-insert the
-//     snapshotted mandala token rows of the coins that are live again and
-//     re-credit balances; a coin another live tx has spent since keeps no
-//     row, and a repeat callback restores nothing) — do this FIRST, so a
-//     crash anywhere later leaves coins live rather than stranded;
-//  2. stamp evictedAt, which makes ERR_EVICTED permanent for these bytes and
-//     simultaneously tells the FIX L spend guard that the restored coins are
-//     live again;
-//  3. notify OutputEvicted and delete the outputs and applied-transaction
-//     records, exactly as before.
-//
-// A missing admission record (an admission predating this feature) is not an
-// error: the engine-side unmark still runs and the eviction is still stamped;
-// only the token-row restore has nothing to replay.
-// The reported outcome (wire contract §9.12) counts what was actually handed
-// back, so /arc-ingest's 200 body distinguishes a real unwind from the
-// idempotent repeat Arcade is entitled to send.
-func evictTx(es *enginestore.Store, ls *mandalav2.LookupService, store *mandalav2.Store) func(context.Context, string) (mandalav2.EvictionOutcome, error) {
-	return func(ctx context.Context, txid string) (mandalav2.EvictionOutcome, error) {
-		var out mandalav2.EvictionOutcome
-		rec, err := store.GetAdmission(ctx, txid)
-		if err != nil {
-			return out, fmt.Errorf("wiring: admission record of %s: %w", txid, err)
-		}
-		out.AlreadyEvicted = rec != nil && rec.EvictedAt != ""
-
-		// §9.8 — the restore comes FIRST and evictedAt is stamped only once it
-		// has succeeded. Any failure below returns before the stamp, so the
-		// callback answers 503, Arcade retries, and the transaction is never
-		// left marked evicted with its inputs still gone.
-		//
-		// A repeat callback (already stamped) restores nothing, as on TS: the
-		// first one already handed the inputs back, and a coin may have been
-		// legitimately re-spent since — re-inserting its row then would mint
-		// a phantom row and credit the holder twice.
-		switch {
-		case out.AlreadyEvicted:
-			// nothing to restore; the stamp and the deletions below are idempotent
-		case rec != nil && rec.Restore != nil:
-			unmarked, err := es.UnmarkSpentBySpendTxid(ctx, txid)
-			if err != nil {
-				return out, fmt.Errorf("wiring: unmark spends of %s: %w", txid, err)
-			}
-			out.RestoredOutpoints = int(unmarked)
-			restored, err := restoreLiveTokenRows(ctx, es, store, rec.Restore)
-			if err != nil {
-				return out, fmt.Errorf("wiring: restore token rows spent by %s: %w", txid, err)
-			}
-			out.RestoredTokenRows = restored
-		default:
-			unmarked, err := es.UnmarkSpentBySpendTxid(ctx, txid)
-			if err != nil {
-				return out, fmt.Errorf("wiring: unmark spends of %s: %w", txid, err)
-			}
-			out.RestoredOutpoints = int(unmarked)
-			log.Printf("wiring: evicting %s with no restore snapshot on record — engine-side spends unmarked, token rows cannot be replayed", txid)
-		}
-		if err := store.MarkEvicted(ctx, txid); err != nil {
-			return out, fmt.Errorf("wiring: stamp eviction of %s: %w", txid, err)
-		}
-
-		outpoints, err := es.FindOutputsByTxid(ctx, txid)
-		if err != nil {
-			return out, fmt.Errorf("wiring: find outputs of %s: %w", txid, err)
-		}
-		for _, op := range outpoints {
-			if err := ls.OutputEvicted(ctx, op); err != nil {
-				return out, fmt.Errorf("wiring: notify eviction of %s: %w", op.String(), err)
-			}
-		}
-		if err := es.DeleteOutputsByTxid(ctx, txid); err != nil {
-			return out, fmt.Errorf("wiring: delete outputs of %s: %w", txid, err)
-		}
-		if err := es.DeleteAppliedTransactionsByTxid(ctx, txid); err != nil {
-			return out, fmt.Errorf("wiring: delete applied tx records of %s: %w", txid, err)
-		}
-		// The evicted tx's admin actions never happened: rebuild each touched
-		// asset without its rows, then drop the rows (what PickAssetAuthHead
-		// reads). Runs on a repeat callback too — deliberately not gated on
-		// AlreadyEvicted — so a head stuck behind an older eviction is
-		// repaired by re-delivering the terminal status (2026-09-21 incident).
-		if err := rebuildThenPurgeAdminHistory(ctx, txid, evictHistoryDeps{
-			assetsTouched: store.FindAssetsTouchedByTxid,
-			rebuildExcluding: func(ctx context.Context, assetID, txid string) error {
-				_, err := ls.RebuildStateExcluding(ctx, assetID, txid)
-				return err
-			},
-			purge: store.DeleteAdminHistoryByTxid,
-		}); err != nil {
-			return out, err
-		}
-		return out, nil
-	}
-}
-
-// restoreLiveTokenRows hands back the snapshot's token rows whose coin is
-// live again — unmarked by the caller just now, or already unspent because an
-// earlier, partly failed attempt unmarked it — and returns how many it handed
-// to RestoreTokens. It is the TS overlay's evictWithRestore rule
-// (overlay/src/eviction.ts): a coin another live transaction has spent since,
-// or one the engine holds no output for, is in neither set, so it keeps no
-// row. The count is of rows restored-or-already-present (RestoreTokens is an
-// idempotent upsert), which is what TS reports as restoredTokenRows.
-//
-// The liveness read fails CLOSED (wire contract §9.5): an error is returned
-// rather than read as "not live", so the callback answers 503 and is retried.
-// The narrow in-call race — another spend landing between the unmark and this
-// read — is the same one TS has.
-func restoreLiveTokenRows(ctx context.Context, es *enginestore.Store, store *mandalav2.Store, snap *mandalav2.RestoreSnapshot) (int, error) {
-	if snap == nil {
-		return 0, nil
-	}
-	live := make(map[string]bool, len(snap.SpentOutpoints))
-	for _, op := range snap.SpentOutpoints {
-		txid, vout, ok := parseOutpoint(op)
-		if !ok {
-			// Bad data in the snapshot, not a failed restore: it names no coin.
-			continue
-		}
-		unspent, err := es.IsUnspent(ctx, tokenTopic, txid, vout)
-		if err != nil {
-			return 0, fmt.Errorf("spend state of %s: %w", op, err)
-		}
-		if unspent {
-			live[fmt.Sprintf("%s.%d", txid, vout)] = true
-		}
-	}
-	rows := make([]mandalav2.TokenRow, 0, len(snap.TokenRows))
-	for _, r := range snap.TokenRows {
-		if live[fmt.Sprintf("%s.%d", strings.ToLower(r.Txid), r.OutputIndex)] {
-			rows = append(rows, r)
-		}
-	}
-	if err := store.RestoreTokens(ctx, rows); err != nil {
-		return 0, err
-	}
-	return len(rows), nil
-}
-
-// parseOutpoint splits a "<64-hex txid>.<vout>" snapshot outpoint, lowercasing
-// the txid; anything else is not an outpoint.
-func parseOutpoint(s string) (string, uint32, bool) {
-	dot := strings.LastIndexByte(s, '.')
-	if dot != 64 {
-		return "", 0, false
-	}
-	txid := strings.ToLower(s[:dot])
-	if _, err := chainhash.NewHashFromHex(txid); err != nil {
-		return "", 0, false
-	}
-	n, err := strconv.ParseUint(s[dot+1:], 10, 32)
-	if err != nil {
-		return "", 0, false
-	}
-	return txid, uint32(n), true
-}
-
-type evictHistoryDeps struct {
-	assetsTouched    func(ctx context.Context, txid string) ([]string, error)
-	rebuildExcluding func(ctx context.Context, assetID, txid string) error
-	purge            func(ctx context.Context, txid string) error
-}
-
-// rebuildThenPurgeAdminHistory is eviction's history step, rebuild-first:
-// find the assets whose rows carry txid, rebuild each from its history
-// excluding those rows, and only then delete the rows. Nothing is deleted
-// before every rebuild succeeded, so a 503 retry after any failure finds the
-// rows again and redoes the whole idempotent sequence — the same order as the
-// TS overlay's evictWithRestore.
-func rebuildThenPurgeAdminHistory(ctx context.Context, txid string, d evictHistoryDeps) error {
-	assets, err := d.assetsTouched(ctx, txid)
-	if err != nil {
-		return fmt.Errorf("wiring: find assets touched by %s: %w", txid, err)
-	}
-	for _, assetID := range assets {
-		if err := d.rebuildExcluding(ctx, assetID, txid); err != nil {
-			return fmt.Errorf("wiring: rebuild asset state %s after evicting %s: %w", assetID, txid, err)
-		}
-	}
-	if err := d.purge(ctx, txid); err != nil {
-		return fmt.Errorf("wiring: purge admin history of %s: %w", txid, err)
-	}
-	return nil
 }
