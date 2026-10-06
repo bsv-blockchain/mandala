@@ -21,7 +21,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/arcade"
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 func TestBuildAndLookupEndToEnd(t *testing.T) {
@@ -253,7 +253,7 @@ func TestBuildArcadeCompensationRoundTrip(t *testing.T) {
 	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.Store.StoreToken(ctx, mandala.TokenRow{
+	if err := app.Store.StoreToken(ctx, mandalav2.TokenRow{
 		Txid: parentID.String(), OutputIndex: 0, AssetID: "a.0", Amount: 40,
 		IdentityKey: "02k", CreatedAt: time.Now(),
 	}); err != nil {
@@ -455,7 +455,7 @@ func TestBuildArcadeEvictTxRoundTrip(t *testing.T) {
 	if err := st.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: txid, Topic: topic}); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.Store.StoreToken(ctx, mandala.TokenRow{
+	if err := app.Store.StoreToken(ctx, mandalav2.TokenRow{
 		Txid: txidStr, OutputIndex: 0, AssetID: "a.0", Amount: 10,
 		IdentityKey: "02e", CreatedAt: time.Now(),
 	}); err != nil {
@@ -464,7 +464,7 @@ func TestBuildArcadeEvictTxRoundTrip(t *testing.T) {
 	if err := app.Store.AdjustBalance(ctx, "02e", 10); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.Store.StoreMetadata(ctx, mandala.MetadataRow{Txid: txidStr, OutputIndex: 1, AssetID: "asset-x"}); err != nil {
+	if err := app.Store.StoreMetadata(ctx, mandalav2.MetadataRow{Txid: txidStr, OutputIndex: 1, AssetID: "asset-x"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -615,15 +615,15 @@ func TestBuildArcadeEvictTxRestoresInputs(t *testing.T) {
 	}
 	// ... and the admission recorded the pre-spend snapshot, exactly as the
 	// submit handler persists it.
-	if err := app.Store.RecordAdmission(ctx, mandala.AdmissionRecord{
+	if err := app.Store.RecordAdmission(ctx, mandalav2.AdmissionRecord{
 		Txid:                 childStr,
 		Topics:               []string{topic},
 		OutputsToAdmit:       []uint32{0},
 		AdmissionSignature:   "3044",
 		AdmissionIdentityKey: "02aa",
-		Restore: &mandala.RestoreSnapshot{
+		Restore: &mandalav2.RestoreSnapshot{
 			SpentOutpoints: []string{parentID.String() + ".0"},
-			TokenRows: []mandala.TokenRow{{
+			TokenRows: []mandalav2.TokenRow{{
 				Txid: parentID.String(), OutputIndex: 0, AssetID: "a.0",
 				Amount: 40, IdentityKey: "02k", CreatedAt: time.Now(),
 			}},
@@ -826,27 +826,27 @@ func TestBuildArcadeEvictTxPurgesAdminHistory(t *testing.T) {
 	}
 	// Admin chain: parent.0 registered the asset (seq 1); child.0 paused it
 	// (seq 2) and is the current head + the folded state.
-	for _, e := range []mandala.AdminHistoryEntry{
+	for _, e := range []mandalav2.AdminHistoryEntry{
 		{AssetID: assetID, Txid: parentStr, OutputIndex: 0, Height: 9007199254740991, AdmitSeq: 1,
-			ActionDetails: mandala.ActionDetails{"kind": "register", "assetId": assetID, "issuer": issuer}, CreatedAt: time.Now()},
+			ActionDetails: mandalav2.ActionDetails{"kind": "register", "assetId": assetID, "issuer": issuer}, CreatedAt: time.Now()},
 		{AssetID: assetID, Txid: childStr, OutputIndex: 0, Height: 9007199254740991, AdmitSeq: 2,
-			ActionDetails: mandala.ActionDetails{"kind": "pause", "assetId": assetID, "priorOutpoint": assetID}, CreatedAt: time.Now()},
+			ActionDetails: mandalav2.ActionDetails{"kind": "pause", "assetId": assetID, "priorOutpoint": assetID}, CreatedAt: time.Now()},
 	} {
 		if err := app.Store.AppendAdminHistory(ctx, e); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := app.Store.PutAssetState(ctx, mandala.AssetAdminState{
+	if err := app.Store.PutAssetState(ctx, mandalav2.AssetAdminState{
 		AssetID: assetID, IssuerIdentityKey: issuer, IsPaused: true, AccessMode: "denylist",
-		BlockedIdentities: []string{}, AllowedIdentities: []string{}, FrozenOutpoints: []mandala.FrozenRef{}, EvictedOutpoints: []string{},
+		BlockedIdentities: []string{}, AllowedIdentities: []string{}, FrozenOutpoints: []mandalav2.FrozenRef{}, EvictedOutpoints: []string{},
 		LastProcessedHeight: 9007199254740991, LastAdmitSeq: 2,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.Store.RecordAdmission(ctx, mandala.AdmissionRecord{
+	if err := app.Store.RecordAdmission(ctx, mandalav2.AdmissionRecord{
 		Txid: childStr, Topics: []string{topic}, OutputsToAdmit: []uint32{0},
 		AdmissionSignature: "3044", AdmissionIdentityKey: "02aa",
-		Restore: &mandala.RestoreSnapshot{SpentOutpoints: []string{assetID}},
+		Restore: &mandalav2.RestoreSnapshot{SpentOutpoints: []string{assetID}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -871,7 +871,7 @@ func TestBuildArcadeEvictTxPurgesAdminHistory(t *testing.T) {
 	if len(rows) != 1 || rows[0].Txid != parentStr {
 		t.Fatalf("admin history after eviction = %+v, want only the register row", rows)
 	}
-	head, ok := mandala.PickAssetAuthHead(rows)
+	head, ok := mandalav2.PickAssetAuthHead(rows)
 	if !ok || head.Txid != parentStr || head.OutputIndex != 0 {
 		t.Fatalf("auth head after eviction = %+v (%v), want %s.0", head, ok, parentStr)
 	}

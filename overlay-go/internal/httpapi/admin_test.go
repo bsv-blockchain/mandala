@@ -15,7 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/enginestore"
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 // testAdminDB connects to a dedicated test database (dropped in cleanup) so
@@ -42,11 +42,11 @@ func testAdminDB(t *testing.T) *mongo.Database {
 // if index creation does not succeed — both constructors abort on that (wire
 // contract §9.9), so tests must too rather than running against a
 // half-indexed database.
-func mustMandalaStore(t *testing.T, db *mongo.Database) *mandala.Store {
+func mustMandalaStore(t *testing.T, db *mongo.Database) *mandalav2.Store {
 	t.Helper()
-	s, err := mandala.NewStore(db)
+	s, err := mandalav2.NewStore(db)
 	if err != nil {
-		t.Fatalf("mandala.NewStore: %v", err)
+		t.Fatalf("mandalav2.NewStore: %v", err)
 	}
 	return s
 }
@@ -63,7 +63,7 @@ func mustEngineStore(t *testing.T, db *mongo.Database) *enginestore.Store {
 // seedHistory appends an "issue 100" then a "redeem 30" admin-history entry
 // for assetID via the real Store (NextAdmitSeq'd, so admitSeq ordering is
 // realistic), returning the two admitSeqs in insertion order.
-func seedHistory(t *testing.T, store *mandala.Store, assetID string) (seq1, seq2 int64) {
+func seedHistory(t *testing.T, store *mandalav2.Store, assetID string) (seq1, seq2 int64) {
 	t.Helper()
 	ctx := context.Background()
 	var err error
@@ -75,16 +75,16 @@ func seedHistory(t *testing.T, store *mandala.Store, assetID string) (seq1, seq2
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.AppendAdminHistory(ctx, mandala.AdminHistoryEntry{
+	if err := store.AppendAdminHistory(ctx, mandalav2.AdminHistoryEntry{
 		AssetID: assetID, Txid: "t1", OutputIndex: 0, Height: 10, Offset: 0, AdmitSeq: seq1,
-		ActionDetails: mandala.ActionDetails{"kind": "issue", "amount": float64(100)},
+		ActionDetails: mandalav2.ActionDetails{"kind": "issue", "amount": float64(100)},
 		CreatedAt:     time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.AppendAdminHistory(ctx, mandala.AdminHistoryEntry{
+	if err := store.AppendAdminHistory(ctx, mandalav2.AdminHistoryEntry{
 		AssetID: assetID, Txid: "t2", OutputIndex: 1, Height: 11, Offset: 0, AdmitSeq: seq2,
-		ActionDetails: mandala.ActionDetails{"kind": "redeem", "amount": float64(30)},
+		ActionDetails: mandalav2.ActionDetails{"kind": "redeem", "amount": float64(30)},
 		CreatedAt:     time.Now(),
 	}); err != nil {
 		t.Fatal(err)
@@ -100,7 +100,7 @@ func TestAdminAssetState_DefaultShapeForUnknownAsset(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body: %s)", resp.StatusCode, readRawBody(t, resp))
 	}
-	var state mandala.AssetAdminState
+	var state mandalav2.AssetAdminState
 	raw := readRawBody(t, resp)
 	if err := json.Unmarshal(raw, &state); err != nil {
 		t.Fatalf("unmarshal: %v (body: %s)", err, raw)
@@ -207,7 +207,7 @@ func TestAdminHistoryPage_NewestFirstAndLimit(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body: %s)", resp.StatusCode, readRawBody(t, resp))
 	}
-	var rows []mandala.AdminHistoryEntry
+	var rows []mandalav2.AdminHistoryEntry
 	raw := readRawBody(t, resp)
 	if err := json.Unmarshal(raw, &rows); err != nil {
 		t.Fatalf("unmarshal: %v (body: %s)", err, raw)
@@ -362,15 +362,15 @@ type stubAdminStore struct {
 	summaryErr error
 }
 
-func (s *stubAdminStore) GetAssetState(context.Context, string) (mandala.AssetAdminState, error) {
-	return mandala.AssetAdminState{}, s.stateErr
+func (s *stubAdminStore) GetAssetState(context.Context, string) (mandalav2.AssetAdminState, error) {
+	return mandalav2.AssetAdminState{}, s.stateErr
 }
 
-func (s *stubAdminStore) FindAdminHistoryByAssetID(context.Context, string) ([]mandala.AdminHistoryEntry, error) {
+func (s *stubAdminStore) FindAdminHistoryByAssetID(context.Context, string) ([]mandalav2.AdminHistoryEntry, error) {
 	return nil, s.historyErr
 }
 
-func (s *stubAdminStore) PageAdminHistory(context.Context, string, int64, int64) ([]mandala.AdminHistoryEntry, error) {
+func (s *stubAdminStore) PageAdminHistory(context.Context, string, int64, int64) ([]mandalav2.AdminHistoryEntry, error) {
 	return nil, s.pageErr
 }
 
@@ -378,7 +378,7 @@ func (s *stubAdminStore) AdminSummary(context.Context, string) (int64, int64, in
 	return 0, 0, 0, s.summaryErr
 }
 
-func (s *stubAdminStore) GetTokenRow(context.Context, string, uint32) (*mandala.TokenRow, error) {
+func (s *stubAdminStore) GetTokenRow(context.Context, string, uint32) (*mandalav2.TokenRow, error) {
 	return nil, nil
 }
 
@@ -437,14 +437,14 @@ func TestAdminAssetState_NilStoreReturns500(t *testing.T) {
 // 10 and 11) and one unmined (height = Number.MAX_SAFE_INTEGER, as the TS
 // lookup service records it), inserted out of chain order so the head must
 // come from the (height, offset, admitSeq) ordering, not insertion order.
-func seedAuthChain(t *testing.T, store *mandala.Store, assetID string) (headOutpoint string) {
+func seedAuthChain(t *testing.T, store *mandalav2.Store, assetID string) (headOutpoint string) {
 	t.Helper()
 	ctx := context.Background()
 	const maxSafe = int64(9007199254740991)
-	entries := []mandala.AdminHistoryEntry{
-		{AssetID: assetID, Txid: strings.Repeat("bb", 32), OutputIndex: 1, Height: 11, Offset: 4, ActionDetails: mandala.ActionDetails{"kind": "pause", "assetId": assetID}},
-		{AssetID: assetID, Txid: strings.Repeat("cc", 32), OutputIndex: 0, Height: maxSafe, Offset: 0, ActionDetails: mandala.ActionDetails{"kind": "unpause", "assetId": assetID, "priorOutpoint": strings.Repeat("bb", 32) + ".1"}},
-		{AssetID: assetID, Txid: strings.Repeat("aa", 32), OutputIndex: 0, Height: 10, Offset: 9, ActionDetails: mandala.ActionDetails{"kind": "register"}},
+	entries := []mandalav2.AdminHistoryEntry{
+		{AssetID: assetID, Txid: strings.Repeat("bb", 32), OutputIndex: 1, Height: 11, Offset: 4, ActionDetails: mandalav2.ActionDetails{"kind": "pause", "assetId": assetID}},
+		{AssetID: assetID, Txid: strings.Repeat("cc", 32), OutputIndex: 0, Height: maxSafe, Offset: 0, ActionDetails: mandalav2.ActionDetails{"kind": "unpause", "assetId": assetID, "priorOutpoint": strings.Repeat("bb", 32) + ".1"}},
+		{AssetID: assetID, Txid: strings.Repeat("aa", 32), OutputIndex: 0, Height: 10, Offset: 9, ActionDetails: mandalav2.ActionDetails{"kind": "register"}},
 	}
 	for _, e := range entries {
 		seq, err := store.NextAdmitSeq(ctx)
@@ -472,8 +472,8 @@ func TestAssetAuth_HeadByChainOrderAndURLEncodedAssetID(t *testing.T) {
 	}
 	plainBody := readRawBody(t, plain)
 	var got struct {
-		AuthOutpoint string                `json:"authOutpoint"`
-		AuthDetails  mandala.ActionDetails `json:"authDetails"`
+		AuthOutpoint string                  `json:"authOutpoint"`
+		AuthDetails  mandalav2.ActionDetails `json:"authDetails"`
 	}
 	if err := json.Unmarshal(plainBody, &got); err != nil {
 		t.Fatalf("unmarshal: %v (body: %s)", err, plainBody)
@@ -586,15 +586,15 @@ func TestAdminAssetState_HasFrozenRow(t *testing.T) {
 	const assetID = "frz.0"
 	live := strings.Repeat("11", 32) + ".0"
 	gone := strings.Repeat("22", 32) + ".1"
-	st := mandala.DefaultAssetState(assetID)
-	st.FrozenOutpoints = []mandala.FrozenRef{
+	st := mandalav2.DefaultAssetState(assetID)
+	st.FrozenOutpoints = []mandalav2.FrozenRef{
 		{Outpoint: live, Amount: 40, Owner: "02aa"},
 		{Outpoint: gone, Amount: 0, Owner: ""},
 	}
 	if err := store.PutAssetState(ctx, st); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreToken(ctx, mandala.TokenRow{Txid: strings.Repeat("11", 32), OutputIndex: 0, AssetID: assetID, Amount: 40, IdentityKey: "02aa"}); err != nil {
+	if err := store.StoreToken(ctx, mandalav2.TokenRow{Txid: strings.Repeat("11", 32), OutputIndex: 0, AssetID: assetID, Amount: 40, IdentityKey: "02aa"}); err != nil {
 		t.Fatal(err)
 	}
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, store, nil)
@@ -632,11 +632,11 @@ func TestAdminAssetState_HasFrozenRow(t *testing.T) {
 // that route when the store satisfies the ListRegistry interface).
 type stubRegistryStore struct {
 	stubAdminStore
-	rows []mandala.RegistryRow
+	rows []mandalav2.RegistryRow
 	err  error
 }
 
-func (s *stubRegistryStore) ListRegistry(context.Context) ([]mandala.RegistryRow, error) {
+func (s *stubRegistryStore) ListRegistry(context.Context) ([]mandalav2.RegistryRow, error) {
 	return s.rows, s.err
 }
 
@@ -645,11 +645,11 @@ func (s *stubRegistryStore) ListRegistry(context.Context) ([]mandala.RegistryRow
 // on a 401.
 type noopActivityLinkage struct{}
 
-func (noopActivityLinkage) ListLinkage(context.Context, int64, *time.Time) ([]mandala.LinkageRow, error) {
+func (noopActivityLinkage) ListLinkage(context.Context, int64, *time.Time) ([]mandalav2.LinkageRow, error) {
 	return nil, nil
 }
 
-func (noopActivityLinkage) FindLinkageByOutpoints(context.Context, []mandala.Outpoint) ([]mandala.LinkageRow, error) {
+func (noopActivityLinkage) FindLinkageByOutpoints(context.Context, []mandalav2.Outpoint) ([]mandalav2.LinkageRow, error) {
 	return nil, nil
 }
 
@@ -684,7 +684,7 @@ func TestAdminAuth_RegistryWrongTokenIs401(t *testing.T) {
 }
 
 func TestAdminAuth_RegistryCorrectTokenIs200(t *testing.T) {
-	store := &stubRegistryStore{rows: []mandala.RegistryRow{{IdentityKey: "02aa", Status: "admitted"}}}
+	store := &stubRegistryStore{rows: []mandalav2.RegistryRow{{IdentityKey: "02aa", Status: "admitted"}}}
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, store, nil, WithAdminAPIToken("secret"))
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/registry", nil)
@@ -696,7 +696,7 @@ func TestAdminAuth_RegistryCorrectTokenIs200(t *testing.T) {
 }
 
 func TestAdminAuth_RegistryOpenWhenTokenUnset(t *testing.T) {
-	store := &stubRegistryStore{rows: []mandala.RegistryRow{}}
+	store := &stubRegistryStore{rows: []mandalav2.RegistryRow{}}
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, store, nil) // no WithAdminAPIToken: unset -> open
 
 	resp := doRequest(t, app, httptest.NewRequest(http.MethodGet, "/admin/registry", nil))
@@ -779,7 +779,7 @@ func TestAdminAuth_RegistryBeefStaysOpenEvenWhenTokenSet(t *testing.T) {
 }
 
 func TestAdminCORS_GatedRouteEchoesAllowedOriginOnly(t *testing.T) {
-	store := &stubRegistryStore{rows: []mandala.RegistryRow{}}
+	store := &stubRegistryStore{rows: []mandalav2.RegistryRow{}}
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, store, nil,
 		WithAdminCORSOrigins([]string{"https://console.example"}))
 
@@ -821,7 +821,7 @@ func TestAdminCORS_GatedRouteOptionsPreflightListsAuthorization(t *testing.T) {
 // Access-Control-Allow-Private-Network — set on every public route's CORS
 // (server.go) — is NOT set on the gated routes.
 func TestAdminCORS_GatedRouteOmitsPrivateNetworkHeader(t *testing.T) {
-	store := &stubRegistryStore{rows: []mandala.RegistryRow{}}
+	store := &stubRegistryStore{rows: []mandalav2.RegistryRow{}}
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, store, nil,
 		WithAdminCORSOrigins([]string{"https://console.example"}))
 
@@ -921,7 +921,7 @@ func TestAdminAssetState_FeeRateNullByDefaultAndSurfacedWhenSet(t *testing.T) {
 		t.Fatalf("default body must carry feeRatePerKb:null, got %s", raw)
 	}
 
-	st := mandala.DefaultAssetState("fee-asset.0")
+	st := mandalav2.DefaultAssetState("fee-asset.0")
 	rate := int64(25)
 	st.FeeRatePerKb = &rate
 	if err := store.PutAssetState(context.Background(), st); err != nil {

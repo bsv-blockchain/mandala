@@ -17,7 +17,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 // Arbitrary valid secp256k1 private key (test-only), shared by the signer
@@ -72,7 +72,7 @@ func submitBeef(t *testing.T, fill byte) ([]byte, string) {
 // so tests can assert both the wire answer and the side effects (or their
 // absence).
 type stubAdmissionStore struct {
-	record *mandala.AdmissionRecord
+	record *mandalav2.AdmissionRecord
 	getErr error
 	// recordErr fails the FINALIZE write; provisionalErr fails the §9.4
 	// provisional one. They are separate so a test can break exactly one.
@@ -83,13 +83,13 @@ type stubAdmissionStore struct {
 	// recorded holds finalizing writes; provisional holds the pending ones,
 	// so "did this submit record an admission?" stays a question about the
 	// finalize.
-	recorded     []mandala.AdmissionRecord
-	provisional  []mandala.AdmissionRecord
-	refusals     []mandala.AdmissionRecord
+	recorded     []mandalav2.AdmissionRecord
+	provisional  []mandalav2.AdmissionRecord
+	refusals     []mandalav2.AdmissionRecord
 	refusalCalls int
 }
 
-func (s *stubAdmissionStore) GetAdmission(_ context.Context, txid string) (*mandala.AdmissionRecord, error) {
+func (s *stubAdmissionStore) GetAdmission(_ context.Context, txid string) (*mandalav2.AdmissionRecord, error) {
 	s.getCalls++
 	if s.getErr != nil {
 		return nil, s.getErr
@@ -100,7 +100,7 @@ func (s *stubAdmissionStore) GetAdmission(_ context.Context, txid string) (*mand
 	return nil, nil
 }
 
-func (s *stubAdmissionStore) RecordAdmission(_ context.Context, rec mandala.AdmissionRecord) error {
+func (s *stubAdmissionStore) RecordAdmission(_ context.Context, rec mandalav2.AdmissionRecord) error {
 	if rec.Pending {
 		if s.provisionalErr != nil {
 			return s.provisionalErr
@@ -115,9 +115,9 @@ func (s *stubAdmissionStore) RecordAdmission(_ context.Context, rec mandala.Admi
 	return nil
 }
 
-func (s *stubAdmissionStore) MarkRefused(_ context.Context, r mandala.Refusal) error {
+func (s *stubAdmissionStore) MarkRefused(_ context.Context, r mandalav2.Refusal) error {
 	s.refusalCalls++
-	s.refusals = append(s.refusals, mandala.AdmissionRecord{
+	s.refusals = append(s.refusals, mandalav2.AdmissionRecord{
 		Txid: r.Txid, RefusedCode: r.Code, RefusedDescription: r.Description,
 		RefusedSpendTxid: r.SpendTxid, RefusedPayloadHash: r.PayloadHash,
 	})
@@ -128,7 +128,7 @@ var _ AdmissionRecorder = (*stubAdmissionStore)(nil)
 
 // emptyPayloadHash is the §9.1 identity of a submit carrying no off-chain
 // values — what every submitBeefReq below sends.
-func emptyPayloadHash() string { return mandala.PayloadHashHex(nil) }
+func emptyPayloadHash() string { return mandalav2.PayloadHashHex(nil) }
 
 func submitBeefReq(beef []byte) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(beef))
@@ -187,20 +187,20 @@ func TestSubmit_SignsDigestV2OverTheTmMandalaSet(t *testing.T) {
 func TestSubmit_RegistryOnlyAdmissionGetsNoSignature(t *testing.T) {
 	beef, _ := submitBeef(t, 0x12)
 	stub := &stubSubmitter{steak: overlay.Steak{
-		mandala.RegistryTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
-		tokenTopic:            &overlay.AdmittanceInstructions{OutputsToAdmit: nil},
+		mandalav2.RegistryTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
+		tokenTopic:              &overlay.AdmittanceInstructions{OutputsToAdmit: nil},
 	}}
 	rec := &stubAdmissionStore{}
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
 
 	req := submitBeefReq(beef)
-	req.Header.Set("X-Topics", `["tm_mandala","`+mandala.RegistryTopic+`"]`)
+	req.Header.Set("X-Topics", `["tm_mandala","`+mandalav2.RegistryTopic+`"]`)
 	resp := doRequest(t, app, req)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	body := decodeJSON(t, resp)
-	reg, _ := body[mandala.RegistryTopic].(map[string]any)
+	reg, _ := body[mandalav2.RegistryTopic].(map[string]any)
 	if reg == nil {
 		t.Fatalf("body = %v", body)
 	}
@@ -217,13 +217,13 @@ func TestSubmit_RegistryOnlyAdmissionGetsNoSignature(t *testing.T) {
 func TestSubmit_RecordsAdmissionSynchronouslyWithRestoreSnapshot(t *testing.T) {
 	beef, txid := submitBeef(t, 0x13)
 	stub := &stubSubmitter{steak: overlay.Steak{
-		tokenTopic:            &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
-		mandala.RegistryTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{1}},
+		tokenTopic:              &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
+		mandalav2.RegistryTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{1}},
 	}}
 	rec := &stubAdmissionStore{}
-	snapshot := &mandala.RestoreSnapshot{
+	snapshot := &mandalav2.RestoreSnapshot{
 		SpentOutpoints: []string{"aa.0"},
-		TokenRows:      []mandala.TokenRow{{Txid: "aa", OutputIndex: 0, AssetID: "a.0", Amount: 100}},
+		TokenRows:      []mandalav2.TokenRow{{Txid: "aa", OutputIndex: 0, AssetID: "a.0", Amount: 100}},
 	}
 	comp := &stubCompensation{restore: snapshot}
 	app := newServer(stub, nil, nil, nil,
@@ -277,11 +277,11 @@ func TestSubmit_RecordsAdmissionSynchronouslyWithRestoreSnapshot(t *testing.T) {
 func TestSubmit_DupeFinalizesAPendingRecordFromTheAppliedProof(t *testing.T) {
 	beef, txid := submitBeef(t, 0x21)
 	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid:    txid,
 		Topics:  []string{tokenTopic},
 		Pending: true,
-		Restore: &mandala.RestoreSnapshot{SpentOutpoints: []string{"aa.0"}},
+		Restore: &mandalav2.RestoreSnapshot{SpentOutpoints: []string{"aa.0"}},
 	}}
 	proof := func(context.Context, string) (bool, []uint32, error) { return true, []uint32{0, 2}, nil }
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, proof))
@@ -308,7 +308,7 @@ func TestSubmit_DupeFinalizeFailureIs503(t *testing.T) {
 	beef, txid := submitBeef(t, 0x22)
 	stub := &stubSubmitter{steak: overlay.Steak{}}
 	rec := &stubAdmissionStore{
-		record:    &mandala.AdmissionRecord{Txid: txid, Pending: true},
+		record:    &mandalav2.AdmissionRecord{Txid: txid, Pending: true},
 		recordErr: errors.New("mongo down"),
 	}
 	proof := func(context.Context, string) (bool, []uint32, error) { return true, []uint32{0}, nil }
@@ -371,7 +371,7 @@ func TestSubmit_DupeOfAdmittedTxidReSignsWithoutSideEffects(t *testing.T) {
 	beef, txid := submitBeef(t, 0x15)
 	stub := &stubSubmitter{steak: overlay.Steak{}}
 	comp := &stubCompensation{}
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid:                 txid,
 		Topics:               []string{tokenTopic},
 		OutputsToAdmit:       []uint32{0, 2},
@@ -421,7 +421,7 @@ func TestSubmit_DupeOfAdmittedTxidReSignsWithoutSideEffects(t *testing.T) {
 // checks σ_I against a set the signer did not use.
 func TestSubmit_DupePathServesTheCanonicalOutputSet(t *testing.T) {
 	beef, txid := submitBeef(t, 0x1c)
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid:                 txid,
 		OutputsToAdmit:       []uint32{2, 0, 2},
 		AdmissionSignature:   "stale",
@@ -485,7 +485,7 @@ func TestSubmit_DupeFromAppliedProofWithNoRecord(t *testing.T) {
 func TestSubmit_EvictedTxidIs410Forever(t *testing.T) {
 	beef, txid := submitBeef(t, 0x17)
 	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid:      txid,
 		EvictedAt: "2026-02-03T04:05:06.000Z",
 	}}
@@ -516,7 +516,7 @@ func TestSubmit_EvictedTxidIs410Forever(t *testing.T) {
 func TestSubmit_PersistedRefusalIsReservedIdentically(t *testing.T) {
 	beef, txid := submitBeef(t, 0x18)
 	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid:               txid,
 		RefusedCode:        CodeConservation,
 		RefusedDescription: "conservation violated: outputs exceed authorized inputs/issuance",
@@ -547,11 +547,11 @@ func TestSubmit_PersistedRefusalDoesNotApplyToADifferentPayload(t *testing.T) {
 	stub := &stubSubmitter{steak: overlay.Steak{
 		tokenTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
 	}}
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid:               txid,
 		RefusedCode:        CodeLinkage,
 		RefusedDescription: "output 0: MandalaToken-decodable output with no verified linkage",
-		RefusedPayloadHash: mandala.PayloadHashHex([]byte("some other payload")),
+		RefusedPayloadHash: mandalav2.PayloadHashHex([]byte("some other payload")),
 	}}
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
 
@@ -575,17 +575,17 @@ func TestSubmit_PersistsFinalVerdictsOnly(t *testing.T) {
 	}{
 		{
 			"final: linkage",
-			&mandala.RejectError{Topic: tokenTopic, Err: errors.New("output 1: MandalaToken-decodable output with no verified linkage")},
+			&mandalav2.RejectError{Topic: tokenTopic, Err: errors.New("output 1: MandalaToken-decodable output with no verified linkage")},
 			CodeLinkage, http.StatusBadRequest, true,
 		},
 		{
 			"final: conservation",
-			&mandala.RejectError{Topic: tokenTopic, Err: errors.New("conservation violated: outputs exceed authorized inputs/issuance")},
+			&mandalav2.RejectError{Topic: tokenTopic, Err: errors.New("conservation violated: outputs exceed authorized inputs/issuance")},
 			CodeConservation, http.StatusBadRequest, true,
 		},
 		{
 			"liftable: paused",
-			&mandala.RejectError{Topic: tokenTopic, Err: errors.New("control gate rejected the transaction (paused asset or access mode)")},
+			&mandalav2.RejectError{Topic: tokenTopic, Err: errors.New("control gate rejected the transaction (paused asset or access mode)")},
 			CodePaused, http.StatusConflict, false,
 		},
 		{
@@ -636,7 +636,7 @@ func TestSubmit_PersistsFinalVerdictsOnly(t *testing.T) {
 func TestSubmit_ConflictingSpendIs400WithSpendTxidAndIsNeverPersisted(t *testing.T) {
 	beef, _ := submitBeef(t, 0x1a)
 	competitor := "cc" + vectorTxid[2:]
-	stub := &stubSubmitter{err: &mandala.RejectError{
+	stub := &stubSubmitter{err: &mandalav2.RejectError{
 		Topic:     tokenTopic,
 		Err:       errors.New("input aa.0 already spent by " + competitor),
 		SpendTxid: competitor,
@@ -718,7 +718,7 @@ func admissionReq(txid, token string) *http.Request {
 }
 
 func TestAdmissionEndpoint_200ForAnAdmittedTxid(t *testing.T) {
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid:                 vectorTxid,
 		Topics:               []string{tokenTopic},
 		OutputsToAdmit:       []uint32{2, 0},
@@ -773,7 +773,7 @@ func TestAdmissionEndpoint_ReSignsFromAppliedProofWhenRecordMissing(t *testing.T
 }
 
 func TestAdmissionEndpoint_410ForAnEvictedTxid(t *testing.T) {
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid: vectorTxid, EvictedAt: "2026-02-03T04:05:06.000Z",
 	}}
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, nil, nil,
@@ -798,9 +798,9 @@ func TestAdmissionEndpoint_410ForAnEvictedTxid(t *testing.T) {
 // applied-proof check and then to 404.
 func TestAdmissionEndpoint_RefusalIsGatedOnThePayloadHash(t *testing.T) {
 	const desc = "conservation violated: outputs exceed authorized inputs/issuance"
-	hash := mandala.PayloadHashHex([]byte(`{"outputs":[{"index":0}]}`))
+	hash := mandalav2.PayloadHashHex([]byte(`{"outputs":[{"index":0}]}`))
 	newApp := func(t *testing.T) *fiber.App {
-		rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+		rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 			Txid:               vectorTxid,
 			RefusedCode:        CodeConservation,
 			RefusedDescription: desc,
@@ -832,7 +832,7 @@ func TestAdmissionEndpoint_RefusalIsGatedOnThePayloadHash(t *testing.T) {
 	})
 
 	t.Run("mismatched payloadHash falls through to 404", func(t *testing.T) {
-		other := mandala.PayloadHashHex(nil)
+		other := mandalav2.PayloadHashHex(nil)
 		req := httptest.NewRequest(http.MethodGet, "/admin/admission/"+vectorTxid+"?payloadHash="+other, nil)
 		resp := doRequest(t, newApp(t), req)
 		if resp.StatusCode != http.StatusNotFound {
@@ -883,7 +883,7 @@ func TestAdmissionEndpoint_MalformedTxidIs400ErrShape(t *testing.T) {
 // the same transaction, not an unknown one.
 func TestAdmissionEndpoint_TxidIsLowercased(t *testing.T) {
 	var askedFor string
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid: vectorTxid, Topics: []string{tokenTopic}, OutputsToAdmit: []uint32{0},
 		AdmissionSignature: "3044stored", AdmissionIdentityKey: "02stored",
 		At: "2026-01-01T00:00:00.000Z",
@@ -944,7 +944,7 @@ func TestAdmissionEndpoint_404ForAnUnknownTxid(t *testing.T) {
 
 // A13: the route is gated exactly like /admin/registry.
 func TestAdmissionEndpoint_IsBearerGated(t *testing.T) {
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid: vectorTxid, OutputsToAdmit: []uint32{0},
 		AdmissionSignature: "3044", AdmissionIdentityKey: "02aa", At: "2026-01-01T00:00:00.000Z",
 	}}

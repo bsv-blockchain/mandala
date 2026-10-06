@@ -16,7 +16,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/arcade"
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 	"github.com/sirdeggen/mandala/overlay-go/internal/wiring"
 )
 
@@ -36,18 +36,18 @@ type Submitter interface {
 var _ Submitter = (*engine.Engine)(nil)
 
 // AdmissionRecorder is the σ_I / verdict persistence seam (wire contract §4).
-// *mandala.Store satisfies it; tests substitute a stub so they never need
+// *mandalav2.Store satisfies it; tests substitute a stub so they never need
 // Mongo. Writes happen synchronously before /submit answers, so a client
 // holding a 200 is guaranteed the record is readable on its very next GET.
 type AdmissionRecorder interface {
-	GetAdmission(ctx context.Context, txid string) (*mandala.AdmissionRecord, error)
+	GetAdmission(ctx context.Context, txid string) (*mandalav2.AdmissionRecord, error)
 	// RecordAdmission writes the provisional row (rec.Pending) or finalizes it
 	// (wire contract §9.4).
-	RecordAdmission(ctx context.Context, rec mandala.AdmissionRecord) error
-	MarkRefused(ctx context.Context, r mandala.Refusal) error
+	RecordAdmission(ctx context.Context, rec mandalav2.AdmissionRecord) error
+	MarkRefused(ctx context.Context, r mandalav2.Refusal) error
 }
 
-var _ AdmissionRecorder = (*mandala.Store)(nil)
+var _ AdmissionRecorder = (*mandalav2.Store)(nil)
 
 // AppliedAdmissionProof answers FIX C: does the ENGINE's own durable
 // applied-transaction store say this txid went through tm_mandala, and which
@@ -73,7 +73,7 @@ type AppliedAdmissionProof func(ctx context.Context, txid string) (applied bool,
 // this request is gone. A nil compensate means "nothing to compensate" (e.g.
 // the BEEF won't survive Submit's own parse step anyway). Wired by
 // wiring.Build when Arcade is enabled; nil otherwise.
-type PrepareSubmitCompensation func(ctx context.Context, beef []byte) (compensate func(context.Context) error, restore *mandala.RestoreSnapshot, err error)
+type PrepareSubmitCompensation func(ctx context.Context, beef []byte) (compensate func(context.Context) error, restore *mandalav2.RestoreSnapshot, err error)
 
 func registerSubmitRoutes(f *fiber.App, s Submitter, prepare PrepareSubmitCompensation, signer AdmissionSigner, rec AdmissionRecorder, proof AppliedAdmissionProof) {
 	f.Post("/submit", submitHandler(s, prepare, signer, rec, proof))
@@ -116,16 +116,16 @@ func submitHandler(s Submitter, prepare PrepareSubmitCompensation, signer Admiss
 			beef = body
 		}
 
-		payload, err := mandala.DecodeLinkagePayload(offChain)
+		payload, err := mandalav2.DecodeLinkagePayload(offChain)
 		if err != nil {
 			return verdictResponse(c, verdictShape, "invalid off-chain values payload: "+err.Error(), "")
 		}
-		ctx := mandala.WithPayload(c.UserContext(), payload)
+		ctx := mandalav2.WithPayload(c.UserContext(), payload)
 
 		// Wire contract §9.1: a persisted refusal is keyed by (txid,
 		// payloadHash), because the txid does not commit to the off-chain
 		// payload. Computed over the bytes exactly as framed on the wire.
-		payloadHash := mandala.PayloadHashHex(offChain)
+		payloadHash := mandalav2.PayloadHashHex(offChain)
 
 		// The txid is needed before anything else: it keys the persisted
 		// verdict, the engine's applied proof and σ_I itself. Bodies that
@@ -166,7 +166,7 @@ func submitHandler(s Submitter, prepare PrepareSubmitCompensation, signer Admiss
 		// snapshot itself fails, refuse to submit — a broadcast failure
 		// afterwards would be uncompensatable.
 		var compensate func(context.Context) error
-		var restore *mandala.RestoreSnapshot
+		var restore *mandalav2.RestoreSnapshot
 		if prepare != nil {
 			var prepErr error
 			if compensate, restore, prepErr = prepare(ctx, beef); prepErr != nil {
@@ -184,7 +184,7 @@ func submitHandler(s Submitter, prepare PrepareSubmitCompensation, signer Admiss
 		// write is 503: submitting without a durable snapshot is exactly the
 		// unwind hole the record exists to close.
 		if rec != nil && txidErr == nil && tokenSubmit {
-			if perr := rec.RecordAdmission(ctx, mandala.AdmissionRecord{
+			if perr := rec.RecordAdmission(ctx, mandalav2.AdmissionRecord{
 				Txid:    txid,
 				Topics:  topics,
 				Restore: restore,
@@ -220,7 +220,7 @@ func submitHandler(s Submitter, prepare PrepareSubmitCompensation, signer Admiss
 			// failure to persist is logged, never surfaced — the caller still
 			// gets the verdict it earned.
 			if sv.Persistable() && rec != nil && txidErr == nil {
-				if perr := rec.MarkRefused(ctx, mandala.Refusal{
+				if perr := rec.MarkRefused(ctx, mandalav2.Refusal{
 					Txid:        txid,
 					Code:        sv.Verdict.Code,
 					Description: sv.Description,
@@ -243,7 +243,7 @@ func submitHandler(s Submitter, prepare PrepareSubmitCompensation, signer Admiss
 		// own applied proof. It also clears any refusal this txid earned under
 		// a different payload (§9.1).
 		if rec != nil && txidErr == nil && len(admits) > 0 {
-			record := mandala.AdmissionRecord{
+			record := mandalav2.AdmissionRecord{
 				Txid:                 txid,
 				Topics:               admittingTopics(steak),
 				OutputsToAdmit:       admits,
@@ -275,7 +275,7 @@ func submitHandler(s Submitter, prepare PrepareSubmitCompensation, signer Admiss
 // stops any holder of the BEEF from poisoning a transaction by submitting it
 // stripped of its linkage payload.
 func serveKnownVerdict(c *fiber.Ctx, ctx context.Context, txid, payloadHash string, signer AdmissionSigner, rec AdmissionRecorder, proof AppliedAdmissionProof) (bool, error) {
-	var record *mandala.AdmissionRecord
+	var record *mandalav2.AdmissionRecord
 	if rec != nil {
 		var err error
 		record, err = rec.GetAdmission(ctx, txid)
@@ -309,7 +309,7 @@ func serveKnownVerdict(c *fiber.Ctx, ctx context.Context, txid, payloadHash stri
 			// without consulting the engine again. A failed finalize is 503:
 			// the caller retries, and the snapshot is already durable.
 			if rec != nil && !record.Admitted() && len(canonical) > 0 {
-				if perr := rec.RecordAdmission(ctx, mandala.AdmissionRecord{
+				if perr := rec.RecordAdmission(ctx, mandalav2.AdmissionRecord{
 					Txid:                 txid,
 					Topics:               []string{tokenTopic},
 					OutputsToAdmit:       canonical,

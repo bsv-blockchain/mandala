@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 // TestVerdictForRejectReason is the shared substring table of wire contract
@@ -112,9 +112,9 @@ func TestVerdictForRejectReason(t *testing.T) {
 			// Finding 9: the table has NO Go-only rows. Only the one reason
 			// string both engines actually emit is matched; a paraphrase is
 			// not in the table and falls where its own substrings put it.
-			// This is why mandala.adminNotAnchoredReason is a constant.
+			// This is why mandalav2.adminNotAnchoredReason is a constant.
 			"the exact shared constant is what the anchoring row matches",
-			mandala.AdminNotAnchoredReason,
+			mandalav2.AdminNotAnchoredReason,
 			CodeShape, http.StatusBadRequest, false, true,
 		},
 		{
@@ -186,12 +186,12 @@ func TestVerdictForSubmitErrorOnlyTrustsManagerVerdicts(t *testing.T) {
 		},
 		{
 			"a manager verdict",
-			&mandala.RejectError{Topic: "tm_mandala", Err: errors.New("conservation violated")},
+			&mandalav2.RejectError{Topic: "tm_mandala", Err: errors.New("conservation violated")},
 			CodeConservation, http.StatusBadRequest, "",
 		},
 		{
 			"a manager verdict wrapped by a caller",
-			fmt.Errorf("submit: %w", &mandala.RejectError{Topic: "tm_mandala", Err: errors.New("token output 0 must carry exactly 1 satoshi")}),
+			fmt.Errorf("submit: %w", &mandalav2.RejectError{Topic: "tm_mandala", Err: errors.New("token output 0 must carry exactly 1 satoshi")}),
 			CodeSatoshis, http.StatusBadRequest,
 			"token output 0 must carry exactly 1 satoshi",
 		},
@@ -217,7 +217,7 @@ func TestVerdictForSubmitErrorOnlyTrustsManagerVerdicts(t *testing.T) {
 // the HTTP layer has to parse back out of prose.
 func TestVerdictForSubmitErrorCarriesTheCompetingSpendTxid(t *testing.T) {
 	competitor := "bb" + vectorTxid[2:]
-	err := &mandala.RejectError{
+	err := &mandalav2.RejectError{
 		Topic:     "tm_mandala",
 		Err:       errors.New("input aa.0 already spent by " + competitor),
 		SpendTxid: competitor,
@@ -241,8 +241,8 @@ func TestVerdictForSubmitErrorCarriesTheCompetingSpendTxid(t *testing.T) {
 // record is keyed by txid alone, so a registry refusal would otherwise
 // poison a later, valid tm_mandala-only submission of the same bytes.
 func TestSubmitVerdictPersistableIsScopedToTheTokenTopic(t *testing.T) {
-	registryRefusal := &mandala.RejectError{
-		Topic: mandala.RegistryTopic,
+	registryRefusal := &mandalav2.RejectError{
+		Topic: mandalav2.RegistryTopic,
 		Err:   errors.New("tm_mandala_registry: no admissible registry outputs"),
 	}
 	sv := VerdictForSubmitError(registryRefusal)
@@ -253,7 +253,7 @@ func TestSubmitVerdictPersistableIsScopedToTheTokenTopic(t *testing.T) {
 		t.Fatal("a registry refusal must not be persisted as the txid's verdict")
 	}
 
-	liftable := &mandala.RejectError{
+	liftable := &mandalav2.RejectError{
 		Topic: "tm_mandala",
 		Err:   errors.New("control gate rejected the transaction (paused asset or access mode)"),
 	}

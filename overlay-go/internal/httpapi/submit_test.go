@@ -16,7 +16,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 // varintBytes encodes n as a Bitcoin VarInt, the inverse of readVarInt —
@@ -369,7 +369,7 @@ func TestSubmit_CtxThreadsDecodedPayload(t *testing.T) {
 	if stub.gotCtx == nil {
 		t.Fatal("Submit was called with a nil ctx")
 	}
-	payload := mandala.PayloadFromContext(stub.gotCtx)
+	payload := mandalav2.PayloadFromContext(stub.gotCtx)
 	if len(payload.Inputs) != 1 {
 		t.Fatalf("payload.Inputs = %d, want 1 (payload: %+v)", len(payload.Inputs), payload)
 	}
@@ -501,14 +501,14 @@ func TestUnknownRoute404(t *testing.T) {
 type stubCompensation struct {
 	prepareErr    error
 	compensateErr error
-	restore       *mandala.RestoreSnapshot
+	restore       *mandalav2.RestoreSnapshot
 
 	prepareCalls    int
 	compensateCalls int
 	gotBeef         []byte
 }
 
-func (s *stubCompensation) prepare(_ context.Context, beef []byte) (func(context.Context) error, *mandala.RestoreSnapshot, error) {
+func (s *stubCompensation) prepare(_ context.Context, beef []byte) (func(context.Context) error, *mandalav2.RestoreSnapshot, error) {
 	s.prepareCalls++
 	s.gotBeef = append([]byte(nil), beef...)
 	if s.prepareErr != nil {

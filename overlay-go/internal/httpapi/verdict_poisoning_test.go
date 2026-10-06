@@ -12,7 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
 	"github.com/bsv-blockchain/go-sdk/overlay"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 // Wire contract §9.1 — payload-scoped final verdicts.
@@ -34,9 +34,9 @@ type payloadAwareSubmitter struct {
 
 func (p *payloadAwareSubmitter) Submit(ctx context.Context, _ overlay.TaggedBEEF, _ engine.SumbitMode, _ engine.OnSteakReady) (overlay.Steak, error) {
 	p.calls++
-	pl := mandala.PayloadFromContext(ctx)
+	pl := mandalav2.PayloadFromContext(ctx)
 	if pl == nil || len(pl.Outputs) == 0 {
-		return overlay.Steak{}, &mandala.RejectError{
+		return overlay.Steak{}, &mandalav2.RejectError{
 			Topic: tokenTopic,
 			Err:   errors.New("output 0: MandalaToken-decodable output with no verified linkage"),
 		}
@@ -49,18 +49,18 @@ func (p *payloadAwareSubmitter) Submit(ctx context.Context, _ overlay.TaggedBEEF
 // one, an admission clears them, and a provisional row never clobbers an
 // admission.
 type memRecorder struct {
-	rows map[string]*mandala.AdmissionRecord
+	rows map[string]*mandalav2.AdmissionRecord
 }
 
 func newMemRecorder() *memRecorder {
-	return &memRecorder{rows: map[string]*mandala.AdmissionRecord{}}
+	return &memRecorder{rows: map[string]*mandalav2.AdmissionRecord{}}
 }
 
-func (m *memRecorder) GetAdmission(_ context.Context, txid string) (*mandala.AdmissionRecord, error) {
+func (m *memRecorder) GetAdmission(_ context.Context, txid string) (*mandalav2.AdmissionRecord, error) {
 	return m.rows[txid], nil
 }
 
-func (m *memRecorder) RecordAdmission(_ context.Context, rec mandala.AdmissionRecord) error {
+func (m *memRecorder) RecordAdmission(_ context.Context, rec mandalav2.AdmissionRecord) error {
 	cur := m.rows[rec.Txid]
 	if rec.Pending {
 		if cur != nil && cur.AdmissionSignature != "" {
@@ -79,12 +79,12 @@ func (m *memRecorder) RecordAdmission(_ context.Context, rec mandala.AdmissionRe
 	return nil
 }
 
-func (m *memRecorder) MarkRefused(_ context.Context, r mandala.Refusal) error {
+func (m *memRecorder) MarkRefused(_ context.Context, r mandalav2.Refusal) error {
 	cur := m.rows[r.Txid]
 	if cur != nil && (cur.AdmissionSignature != "" || cur.EvictedAt != "") {
 		return nil
 	}
-	row := mandala.AdmissionRecord{Txid: r.Txid}
+	row := mandalav2.AdmissionRecord{Txid: r.Txid}
 	if cur != nil {
 		row = *cur
 	}
@@ -126,14 +126,14 @@ func TestSubmit_StrippedPayloadCannotPoisonTheTxid(t *testing.T) {
 	if row == nil || row.RefusedCode != CodeLinkage {
 		t.Fatalf("expected the refusal to be persisted, got %+v", row)
 	}
-	if row.RefusedPayloadHash != mandala.PayloadHashHex(nil) {
+	if row.RefusedPayloadHash != mandalav2.PayloadHashHex(nil) {
 		t.Fatalf("refusal payloadHash = %q, want the empty-payload hash", row.RefusedPayloadHash)
 	}
 
 	// (2) The legitimate holder submits the identical BEEF with the correct
 	// linkage payload. It must reach the engine and be admitted with σ_I.
-	payload, err := json.Marshal(mandala.LinkagePayload{
-		Outputs: []mandala.IndexedLinkage{{Index: 0, Linkage: &mandala.SpecificLinkage{}}},
+	payload, err := json.Marshal(mandalav2.LinkagePayload{
+		Outputs: []mandalav2.IndexedLinkage{{Index: 0, Linkage: &mandalav2.SpecificLinkage{}}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -181,9 +181,9 @@ func TestSubmit_StrippedPayloadCannotPoisonTheTxid(t *testing.T) {
 func TestSubmit_RegistryOnlySubmitOfAnAdmittedTxidStillReachesTheEngine(t *testing.T) {
 	beef, txid := submitBeef(t, 0x43)
 	stub := &stubSubmitter{steak: overlay.Steak{
-		mandala.RegistryTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
+		mandalav2.RegistryTopic: &overlay.AdmittanceInstructions{OutputsToAdmit: []uint32{0}},
 	}}
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid:                 txid,
 		Topics:               []string{tokenTopic},
 		OutputsToAdmit:       []uint32{0},
@@ -194,7 +194,7 @@ func TestSubmit_RegistryOnlySubmitOfAnAdmittedTxidStillReachesTheEngine(t *testi
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
 
 	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(beef))
-	req.Header.Set("X-Topics", `["`+mandala.RegistryTopic+`"]`)
+	req.Header.Set("X-Topics", `["`+mandalav2.RegistryTopic+`"]`)
 	resp := doRequest(t, app, req)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readRawBody(t, resp))
@@ -203,7 +203,7 @@ func TestSubmit_RegistryOnlySubmitOfAnAdmittedTxidStillReachesTheEngine(t *testi
 		t.Fatal("a registry-only submit was answered from the tm_mandala admission record")
 	}
 	body := decodeJSON(t, resp)
-	if _, has := body[mandala.RegistryTopic]; !has {
+	if _, has := body[mandalav2.RegistryTopic]; !has {
 		t.Fatalf("body = %v, want the registry topic's own STEAK entry", body)
 	}
 	if _, has := body[tokenTopic]; has {
@@ -220,13 +220,13 @@ func TestSubmit_RegistryOnlySubmitOfAnAdmittedTxidStillReachesTheEngine(t *testi
 func TestSubmit_TokenSubmitOfAnEvictedTxidIsStill410(t *testing.T) {
 	beef, txid := submitBeef(t, 0x44)
 	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid: txid, EvictedAt: "2026-02-03T04:05:06.000Z",
 	}}
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)), WithAdmissionStore(rec, nil))
 
 	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(beef))
-	req.Header.Set("X-Topics", `["`+mandala.RegistryTopic+`","tm_mandala"]`)
+	req.Header.Set("X-Topics", `["`+mandalav2.RegistryTopic+`","tm_mandala"]`)
 	resp := doRequest(t, app, req)
 	if resp.StatusCode != http.StatusGone {
 		t.Fatalf("status = %d, want 410", resp.StatusCode)

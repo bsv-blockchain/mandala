@@ -6,7 +6,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 // FIX D — the structural, persisted verdict taxonomy for POST /submit and
@@ -72,7 +72,7 @@ var (
 // both on BOTH stacks:
 //
 //  1. The admin-chain anchoring row is pre-empted to the top. That refusal
-//     (mandala.adminNotAnchoredReason, byte-identical to TS's
+//     (mandalav2.adminNotAnchoredReason, byte-identical to TS's
 //     adminChainGuard) ends "...spent by this transaction", so the generic
 //     "spent" row would otherwise mint ERR_INPUT_SPENT for a bad admin chain
 //     and tell a wallet some innocent coin is gone — while §2 files a bad
@@ -161,10 +161,10 @@ func (s SubmitVerdict) Persistable() bool {
 }
 
 // VerdictForSubmitError classifies an error returned by engine.Submit. Only a
-// *mandala.RejectError — a manager's own verdict — may become a 400/409;
+// *mandalav2.RejectError — a manager's own verdict — may become a 400/409;
 // every other error is a dependency fault and answers 503 ERR_UNAVAILABLE.
 func VerdictForSubmitError(err error) SubmitVerdict {
-	var rej *mandala.RejectError
+	var rej *mandalav2.RejectError
 	if errors.As(err, &rej) {
 		return SubmitVerdict{
 			Verdict:     VerdictForRejectReason(rej.Error()),

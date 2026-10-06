@@ -2,7 +2,7 @@ package httpapi
 
 // Task 17 route tests for GET /admin/activity (Appendix B §3e): invalid
 // `before` -> 400, assetId post-classification filtering, and a full wire
-// shape assertion against a real classified entry (real mandala.Store +
+// shape assertion against a real classified entry (real mandalav2.Store +
 // enginestore.Store, real BEEF, real MandalaToken locking script — the only
 // thing faked is nothing; this exercises internal/activity.Build end to
 // end, not just the route glue).
@@ -20,7 +20,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/enginestore"
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 // findRawTxsFromEngine mirrors wiring.findRawTxs (unexported in that
@@ -50,7 +50,7 @@ func findRawTxsFromEngine(es *enginestore.Store) FindRawTxsFunc {
 // this tx, so summarizeTx classifies it as an issue to toIdentity — exactly
 // the TS "classifies a mint" case, but end to end through real raw-tx
 // decoding instead of summarizeTx's unit-test fixture.
-func seedIssueTx(t *testing.T, store *mandala.Store, es *enginestore.Store, assetID, toIdentity string, amount int64, createdAt time.Time) string {
+func seedIssueTx(t *testing.T, store *mandalav2.Store, es *enginestore.Store, assetID, toIdentity string, amount int64, createdAt time.Time) string {
 	t.Helper()
 	ctx := context.Background()
 
@@ -66,7 +66,7 @@ func seedIssueTx(t *testing.T, store *mandala.Store, es *enginestore.Store, asse
 		SourceTxOutIndex: 0,
 		UnlockingScript:  &script.Script{},
 	})
-	lock, err := mandala.LockToken(assetID, amount, make([]byte, 20))
+	lock, err := mandalav2.LockToken(assetID, amount, make([]byte, 20))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,11 +80,11 @@ func seedIssueTx(t *testing.T, store *mandala.Store, es *enginestore.Store, asse
 	if err := es.InsertOutputs(ctx, "tm_mandala", txid, []uint32{0}, nil, beef, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.StoreLinkage(ctx, mandala.LinkageRow{
+	if err := store.StoreLinkage(ctx, mandalav2.LinkageRow{
 		Txid:        txid.String(),
 		OutputIndex: 0,
 		IdentityKey: toIdentity,
-		Linkage: mandala.SpecificLinkage{
+		Linkage: mandalav2.SpecificLinkage{
 			Prover:       toIdentity,
 			Verifier:     "verifier-id",
 			Counterparty: toIdentity,

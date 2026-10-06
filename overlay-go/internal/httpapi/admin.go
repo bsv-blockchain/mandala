@@ -10,21 +10,21 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
-// AdminStore is the narrow slice of *mandala.Store the /admin/* GET routes
-// depend on (Appendix B §3). *mandala.Store satisfies it; tests substitute
+// AdminStore is the narrow slice of *mandalav2.Store the /admin/* GET routes
+// depend on (Appendix B §3). *mandalav2.Store satisfies it; tests substitute
 // a stub so they never need Mongo.
 type AdminStore interface {
-	GetAssetState(ctx context.Context, assetID string) (mandala.AssetAdminState, error)
-	GetTokenRow(ctx context.Context, txid string, vout uint32) (*mandala.TokenRow, error)
-	FindAdminHistoryByAssetID(ctx context.Context, assetID string) ([]mandala.AdminHistoryEntry, error)
-	PageAdminHistory(ctx context.Context, assetID string, limit, offset int64) ([]mandala.AdminHistoryEntry, error)
+	GetAssetState(ctx context.Context, assetID string) (mandalav2.AssetAdminState, error)
+	GetTokenRow(ctx context.Context, txid string, vout uint32) (*mandalav2.TokenRow, error)
+	FindAdminHistoryByAssetID(ctx context.Context, assetID string) ([]mandalav2.AdminHistoryEntry, error)
+	PageAdminHistory(ctx context.Context, assetID string, limit, offset int64) ([]mandalav2.AdminHistoryEntry, error)
 	AdminSummary(ctx context.Context, assetID string) (totalIssued, totalRedeemed, actionCount int64, err error)
 }
 
-var _ AdminStore = (*mandala.Store)(nil)
+var _ AdminStore = (*mandalav2.Store)(nil)
 
 // OutputBeefFunc serves the BEEF the engine stored for one admitted output
 // (enginestore.Store.OutputBeefBytes): (bytes, true) when the topic admitted
@@ -58,9 +58,9 @@ func registerAdminRoutes(f *fiber.App, store AdminStore, beef OutputBeefFunc, ad
 	// "beef" segment can never be read as an asset id.
 	f.Get("/admin/asset-auth/beef/:txid", beefHandler(beef, "tm_mandala", adminTxNotFound))
 	f.Get("/admin/asset-auth/:assetId", assetAuthHandler(store))
-	f.Get("/admin/registry/beef/:txid", beefHandler(beef, mandala.RegistryTopic, registryTxNotFound))
+	f.Get("/admin/registry/beef/:txid", beefHandler(beef, mandalav2.RegistryTopic, registryTxNotFound))
 	if r, ok := store.(interface {
-		ListRegistry(ctx context.Context) ([]mandala.RegistryRow, error)
+		ListRegistry(ctx context.Context) ([]mandalav2.RegistryRow, error)
 	}); ok {
 		f.Get("/admin/registry", AdminAuthMiddleware(adminToken), func(c *fiber.Ctx) error {
 			rows, err := r.ListRegistry(c.UserContext())
@@ -166,7 +166,7 @@ func admissionJSON(c *fiber.Ctx, txid string, outputs []uint32, sig, ident, at s
 		sig, ident = signAdmission(signer, txid, nil, canonical)
 	}
 	if at == "" {
-		at = mandala.IsoStamp(time.Now())
+		at = mandalav2.IsoStamp(time.Now())
 	}
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{
 		"txid":                 txid,
@@ -194,7 +194,7 @@ func assetAuthHandler(store AdminStore) fiber.Handler {
 		if err != nil {
 			return adminErrorResponse(c, err)
 		}
-		head, ok := mandala.PickAssetAuthHead(rows)
+		head, ok := mandalav2.PickAssetAuthHead(rows)
 		if !ok {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": assetAuthNotFound})
 		}
@@ -300,7 +300,7 @@ func assetStateHandler(store AdminStore) fiber.Handler {
 		}
 		// Each frozen ref carries hasFrozenRow (A16): whether the frozen coin
 		// still has a token row, i.e. whether a reissue of it can succeed.
-		state, err = mandala.AnnotateFrozenRows(c.UserContext(), state, store)
+		state, err = mandalav2.AnnotateFrozenRows(c.UserContext(), state, store)
 		if err != nil {
 			return adminErrorResponse(c, err)
 		}
@@ -373,9 +373,9 @@ func adminSummaryHandler(store AdminStore) fiber.Handler {
 
 // nonNilHistory normalizes a nil history slice to an empty one — the wire
 // contract requires JSON `[]`, never `null` (Appendix B §3b/§3c).
-func nonNilHistory(rows []mandala.AdminHistoryEntry) []mandala.AdminHistoryEntry {
+func nonNilHistory(rows []mandalav2.AdminHistoryEntry) []mandalav2.AdminHistoryEntry {
 	if rows == nil {
-		return []mandala.AdminHistoryEntry{}
+		return []mandalav2.AdminHistoryEntry{}
 	}
 	return rows
 }

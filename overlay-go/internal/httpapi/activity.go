@@ -12,19 +12,19 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/activity"
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
-// ActivityLinkage is the narrow slice of *mandala.Store the /admin/activity
-// route depends on. *mandala.Store satisfies it (it already exposes both
+// ActivityLinkage is the narrow slice of *mandalav2.Store the /admin/activity
+// route depends on. *mandalav2.Store satisfies it (it already exposes both
 // methods for the mandala lookup service); tests substitute an in-memory
 // fake so they never need Mongo.
 type ActivityLinkage interface {
-	ListLinkage(ctx context.Context, limit int64, before *time.Time) ([]mandala.LinkageRow, error)
-	FindLinkageByOutpoints(ctx context.Context, outpoints []mandala.Outpoint) ([]mandala.LinkageRow, error)
+	ListLinkage(ctx context.Context, limit int64, before *time.Time) ([]mandalav2.LinkageRow, error)
+	FindLinkageByOutpoints(ctx context.Context, outpoints []mandalav2.Outpoint) ([]mandalav2.LinkageRow, error)
 }
 
-var _ ActivityLinkage = (*mandala.Store)(nil)
+var _ ActivityLinkage = (*mandalav2.Store)(nil)
 
 // FindRawTxsFunc is activity.Deps.FindRawTxs's function type, named here so
 // WithActivity's signature doesn't need to import internal/activity's Deps

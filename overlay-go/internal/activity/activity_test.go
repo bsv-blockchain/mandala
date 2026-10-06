@@ -28,7 +28,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 var noProofs = []Proof{}
@@ -153,12 +153,12 @@ func TestSummarizeTx_UnknownOwnerOutputIgnored(t *testing.T) {
 // Build pagination — complete-group guarantee at page boundaries
 // ---------------------------------------------------------------------------
 
-func link(txid string, outputIndex uint32, identityKey string, createdAt time.Time) mandala.LinkageRow {
-	return mandala.LinkageRow{
+func link(txid string, outputIndex uint32, identityKey string, createdAt time.Time) mandalav2.LinkageRow {
+	return mandalav2.LinkageRow{
 		Txid:        txid,
 		OutputIndex: outputIndex,
 		IdentityKey: identityKey,
-		Linkage: mandala.SpecificLinkage{
+		Linkage: mandalav2.SpecificLinkage{
 			Prover:       identityKey,
 			Verifier:     "v",
 			Counterparty: identityKey,
@@ -173,12 +173,12 @@ func link(txid string, outputIndex uint32, identityKey string, createdAt time.Ti
 // in-memory fake exercising only the paging/grouping layer. findRawTxs
 // always returns empty, so every group is skipped after grouping, but the
 // cursor math still runs — exactly like the TS fixture's comment says.
-func pagingDeps(rows []mandala.LinkageRow) Deps {
+func pagingDeps(rows []mandalav2.LinkageRow) Deps {
 	return Deps{
-		ListLinkage: func(_ context.Context, limit int64, before *time.Time) ([]mandala.LinkageRow, error) {
+		ListLinkage: func(_ context.Context, limit int64, before *time.Time) ([]mandalav2.LinkageRow, error) {
 			r := rows
 			if before != nil {
-				filtered := make([]mandala.LinkageRow, 0, len(r))
+				filtered := make([]mandalav2.LinkageRow, 0, len(r))
 				for _, x := range r {
 					if !x.CreatedAt.After(*before) {
 						filtered = append(filtered, x)
@@ -191,7 +191,7 @@ func pagingDeps(rows []mandala.LinkageRow) Deps {
 			}
 			return r, nil
 		},
-		FindLinkageByOutpoints: func(context.Context, []mandala.Outpoint) ([]mandala.LinkageRow, error) {
+		FindLinkageByOutpoints: func(context.Context, []mandalav2.Outpoint) ([]mandalav2.LinkageRow, error) {
 			return nil, nil
 		},
 		FindRawTxs: func(context.Context, []string) (map[string]string, error) {
@@ -201,7 +201,7 @@ func pagingDeps(rows []mandala.LinkageRow) Deps {
 }
 
 func TestBuildActivity_NullCursorSinglePage(t *testing.T) {
-	rows := []mandala.LinkageRow{
+	rows := []mandalav2.LinkageRow{
 		link("t1", 0, "a", mustParse(t, "2026-07-07T10:00:00.000Z")),
 		link("t2", 0, "a", mustParse(t, "2026-07-07T09:00:00.000Z")),
 	}
@@ -226,7 +226,7 @@ func mustParse(t *testing.T, s string) time.Time {
 func TestBuildActivity_DropsBoundaryStraddlingGroup(t *testing.T) {
 	// 20 single-output txs, newest first; page limit 2 -> fetches 2+overlap
 	// rows, sees more exist, drops the oldest fetched group and cursors to it.
-	rows := make([]mandala.LinkageRow, 20)
+	rows := make([]mandalav2.LinkageRow, 20)
 	for i := 0; i < 20; i++ {
 		ts := time.Date(2026, 7, 7, 10, 0, 59-i, 0, time.UTC)
 		rows[i] = link(fmt.Sprintf("t%d", i), 0, "a", ts)
@@ -257,7 +257,7 @@ func TestBuildActivity_MaxSplitGroupAtLimitOne(t *testing.T) {
 	// change). The overlap must cover a whole such group, or a limit-1 page
 	// whose newest tx is a max-split transfer fills the entire fetch window
 	// with one txid and pagination dies (hasMore true, but len(order) == 1).
-	rows := make([]mandala.LinkageRow, 0, 11)
+	rows := make([]mandalav2.LinkageRow, 0, 11)
 	big := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
 	for i := uint32(0); i < 9; i++ {
 		rows = append(rows, link("big", i, "a", big))
@@ -277,11 +277,11 @@ func TestBuildActivity_MaxSplitGroupAtLimitOne(t *testing.T) {
 func TestBuildActivity_ClampsLimit(t *testing.T) {
 	var requested int64
 	deps := Deps{
-		ListLinkage: func(_ context.Context, limit int64, _ *time.Time) ([]mandala.LinkageRow, error) {
+		ListLinkage: func(_ context.Context, limit int64, _ *time.Time) ([]mandalav2.LinkageRow, error) {
 			requested = limit
 			return nil, nil
 		},
-		FindLinkageByOutpoints: func(context.Context, []mandala.Outpoint) ([]mandala.LinkageRow, error) {
+		FindLinkageByOutpoints: func(context.Context, []mandalav2.Outpoint) ([]mandalav2.LinkageRow, error) {
 			return nil, nil
 		},
 		FindRawTxs: func(context.Context, []string) (map[string]string, error) {
@@ -298,7 +298,7 @@ func TestBuildActivity_ClampsLimit(t *testing.T) {
 
 	// Opts.Limit's zero value doubles as "unspecified" (the HTTP layer has no
 	// way to distinguish an omitted query param from an explicit 0 -- see
-	// mandala.Store.PageAdminHistory's identical divergence), so it maps to
+	// mandalav2.Store.PageAdminHistory's identical divergence), so it maps to
 	// the 100 default rather than TS's clamp-to-1. Limit: 1 exercises the
 	// actual lower-bound clamp the TS test intends.
 	if _, err := Build(context.Background(), deps, Opts{Limit: 1}); err != nil {
@@ -312,11 +312,11 @@ func TestBuildActivity_ClampsLimit(t *testing.T) {
 func TestBuildActivity_ClampsLimit_ZeroDefaultsTo100(t *testing.T) {
 	var requested int64
 	deps := Deps{
-		ListLinkage: func(_ context.Context, limit int64, _ *time.Time) ([]mandala.LinkageRow, error) {
+		ListLinkage: func(_ context.Context, limit int64, _ *time.Time) ([]mandalav2.LinkageRow, error) {
 			requested = limit
 			return nil, nil
 		},
-		FindLinkageByOutpoints: func(context.Context, []mandala.Outpoint) ([]mandala.LinkageRow, error) {
+		FindLinkageByOutpoints: func(context.Context, []mandalav2.Outpoint) ([]mandalav2.LinkageRow, error) {
 			return nil, nil
 		},
 		FindRawTxs: func(context.Context, []string) (map[string]string, error) {
@@ -332,7 +332,7 @@ func TestBuildActivity_ClampsLimit_ZeroDefaultsTo100(t *testing.T) {
 }
 
 func TestBuildActivity_ISOFormatHasMilliseconds(t *testing.T) {
-	rows := []mandala.LinkageRow{
+	rows := []mandalav2.LinkageRow{
 		link("t1", 0, "a", time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)),
 	}
 	// Force a cursor by requiring more rows than available: limit 0 rows is

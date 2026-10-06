@@ -18,7 +18,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/overlay"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 	"github.com/sirdeggen/mandala/overlay-go/internal/wiring"
 )
 
@@ -124,7 +124,7 @@ func TestSubmit_ChronicleSighashRuleDoesNotOverrideAnAdmittedRecord(t *testing.T
 		t.Fatal(err)
 	}
 	stub := &stubSubmitter{steak: overlay.Steak{}}
-	rec := &stubAdmissionStore{record: &mandala.AdmissionRecord{
+	rec := &stubAdmissionStore{record: &mandalav2.AdmissionRecord{
 		Txid: txid, Topics: []string{tokenTopic}, OutputsToAdmit: []uint32{0},
 		AdmissionSignature: "stale", AdmissionIdentityKey: "02stale", At: "2026-01-01T00:00:00.000Z",
 	}}

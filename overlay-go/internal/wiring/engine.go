@@ -22,7 +22,7 @@ import (
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/arcade"
 	"github.com/sirdeggen/mandala/overlay-go/internal/enginestore"
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 // defaultChaintracksPrefix mirrors overlay/src/index.ts's
@@ -68,13 +68,13 @@ type Config struct {
 // handles the HTTP layer (Task 13) serves from.
 type App struct {
 	Engine *engine.Engine
-	Store  *mandala.Store
+	Store  *mandalav2.Store
 	// EngineStore is the concrete engine.Storage behind Engine, exposed
 	// because several seams (compensation, eviction, the FIX L spend guard,
 	// the FIX C applied proof) need methods that are deliberately not part of
 	// go-overlay-services' engine.Storage interface.
 	EngineStore         *enginestore.Store
-	Verifier            *mandala.Verifier
+	Verifier            *mandalav2.Verifier
 	Mongo               *mongo.Database
 	ArcadeEnabled       bool
 	ArcadeCallbackToken string
@@ -93,7 +93,7 @@ type App struct {
 	// eviction (FIX E) restorable long after this request's closures are
 	// gone. Set only when Arcade is enabled (without a broadcaster, broadcast
 	// cannot fail, and without /arc-ingest nothing can be evicted).
-	PrepareSubmitCompensation func(ctx context.Context, beef []byte) (func(context.Context) error, *mandala.RestoreSnapshot, error)
+	PrepareSubmitCompensation func(ctx context.Context, beef []byte) (func(context.Context) error, *mandalav2.RestoreSnapshot, error)
 
 	// EvictTx implements the TS /arc-ingest route's
 	// Engine.evictAppliedTransaction for terminal Arcade statuses. FIX E: it
@@ -104,7 +104,7 @@ type App struct {
 	// output and delete the engine's output docs and applied-transaction
 	// records. Set only when Arcade is enabled (the /arc-ingest route is only
 	// mounted then, and only with a callback token).
-	EvictTx func(ctx context.Context, txid string) (mandala.EvictionOutcome, error)
+	EvictTx func(ctx context.Context, txid string) (mandalav2.EvictionOutcome, error)
 
 	// AppliedAdmissionProof is FIX C's durable proof seam: whether the
 	// engine's own applied-transaction store says txid went through
@@ -222,17 +222,17 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 	// Wire contract §9.9: index creation failures abort startup on both
 	// engines — better a node that refuses to come up than one serving
 	// confident answers without the uniqueness its invariants rest on.
-	store, err := mandala.NewStore(db)
+	store, err := mandalav2.NewStore(db)
 	if err != nil {
 		_ = client.Disconnect(context.Background())
 		return nil, err
 	}
-	verifier, err := mandala.NewVerifier(cfg.ServerPrivKeyHex)
+	verifier, err := mandalav2.NewVerifier(cfg.ServerPrivKeyHex)
 	if err != nil {
 		_ = client.Disconnect(context.Background())
 		return nil, fmt.Errorf("wiring: verifier: %w", err)
 	}
-	adminWallet, err := mandala.NewAdminWallet(cfg.ServerPrivKeyHex)
+	adminWallet, err := mandalav2.NewAdminWallet(cfg.ServerPrivKeyHex)
 	if err != nil {
 		_ = client.Disconnect(context.Background())
 		return nil, fmt.Errorf("wiring: admin wallet: %w", err)
@@ -251,18 +251,18 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 		_ = client.Disconnect(context.Background())
 		return nil, err
 	}
-	tm := mandala.NewTopicManager(verifier, adminWallet, mandala.NoSanctions{}, store).
+	tm := mandalav2.NewTopicManager(verifier, adminWallet, mandalav2.NoSanctions{}, store).
 		WithRegistry(store).
 		WithSpendChecker(spendChecker(es, store)).
 		WithMembershipExemptions(overlayPriv.PubKey().ToDERHex())
-	ls := mandala.NewLookupService(verifier, store)
-	regWallet, err := mandala.NewRegistryWallet(cfg.ServerPrivKeyHex)
+	ls := mandalav2.NewLookupService(verifier, store)
+	regWallet, err := mandalav2.NewRegistryWallet(cfg.ServerPrivKeyHex)
 	if err != nil {
 		_ = client.Disconnect(context.Background())
 		return nil, fmt.Errorf("wiring: registry wallet: %w", err)
 	}
-	rtm := mandala.NewRegistryTopicManager(regWallet, store)
-	rls := mandala.NewRegistryLookupService(store)
+	rtm := mandalav2.NewRegistryTopicManager(regWallet, store)
+	rls := mandalav2.NewRegistryLookupService(store)
 
 	tracker := o.tracker
 	if tracker == nil {
@@ -271,12 +271,12 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 
 	eng := engine.NewEngine(&engine.Config{
 		Managers: map[string]engine.TopicManager{
-			"tm_mandala":          tm,
-			mandala.RegistryTopic: rtm,
+			"tm_mandala":            tm,
+			mandalav2.RegistryTopic: rtm,
 		},
 		LookupServices: map[string]engine.LookupService{
-			"ls_mandala":           ls,
-			mandala.RegistryLookup: rls,
+			"ls_mandala":             ls,
+			mandalav2.RegistryLookup: rls,
 		},
 		Storage:      es,
 		ChainTracker: tracker,
@@ -334,8 +334,8 @@ func findRawTxs(es *enginestore.Store) func(context.Context, []string) (map[stri
 // over the mandala store (token-row snapshot/restore) and the concrete
 // engine store (spend unmarking) — the two projections the pinned engine
 // mutates before a broadcast can fail (see App.PrepareSubmitCompensation).
-func prepareSubmitCompensation(store *mandala.Store, es *enginestore.Store) func(context.Context, []byte) (func(context.Context) error, *mandala.RestoreSnapshot, error) {
-	return func(ctx context.Context, beefBytes []byte) (func(context.Context) error, *mandala.RestoreSnapshot, error) {
+func prepareSubmitCompensation(store *mandalav2.Store, es *enginestore.Store) func(context.Context, []byte) (func(context.Context) error, *mandalav2.RestoreSnapshot, error) {
+	return func(ctx context.Context, beefBytes []byte) (func(context.Context) error, *mandalav2.RestoreSnapshot, error) {
 		_, tx, txid, err := transaction.ParseBeef(beefBytes)
 		if err != nil || tx == nil {
 			// Engine.Submit parses the same bytes first thing and will
@@ -343,13 +343,13 @@ func prepareSubmitCompensation(store *mandala.Store, es *enginestore.Store) func
 			// mutated, so there is nothing to compensate.
 			return nil, nil, nil
 		}
-		outpoints := make([]mandala.Outpoint, 0, len(tx.Inputs))
+		outpoints := make([]mandalav2.Outpoint, 0, len(tx.Inputs))
 		spentOutpoints := make([]string, 0, len(tx.Inputs))
 		for _, in := range tx.Inputs {
 			if in.SourceTXID == nil {
 				continue
 			}
-			outpoints = append(outpoints, mandala.Outpoint{Txid: in.SourceTXID.String(), OutputIndex: in.SourceTxOutIndex})
+			outpoints = append(outpoints, mandalav2.Outpoint{Txid: in.SourceTXID.String(), OutputIndex: in.SourceTxOutIndex})
 			spentOutpoints = append(spentOutpoints, fmt.Sprintf("%s.%d", in.SourceTXID.String(), in.SourceTxOutIndex))
 		}
 		snapshot, err := store.SnapshotTokens(ctx, outpoints)
@@ -359,7 +359,7 @@ func prepareSubmitCompensation(store *mandala.Store, es *enginestore.Store) func
 		// The very same snapshot, handed back as a plain value so the submit
 		// handler can persist it on the admission record (FIX E): the
 		// closure below dies with this request, the record does not.
-		restore := &mandala.RestoreSnapshot{SpentOutpoints: spentOutpoints, TokenRows: snapshot}
+		restore := &mandalav2.RestoreSnapshot{SpentOutpoints: spentOutpoints, TokenRows: snapshot}
 		spendTxid := txid.String()
 		return func(ctx context.Context) error {
 			// A duplicate resubmit of an already-committed tx can reach this
@@ -432,7 +432,7 @@ func appliedAdmissionProof(es *enginestore.Store) func(context.Context, string) 
 // which case its spend was undone and the coin counts as live again (wire
 // contract §7), so a client racing the restore is never told a live coin is
 // gone.
-func spendChecker(es *enginestore.Store, store *mandala.Store) mandala.SpendChecker {
+func spendChecker(es *enginestore.Store, store *mandalav2.Store) mandalav2.SpendChecker {
 	return spendCheckerFunc(func(ctx context.Context, txid string, vout uint32) (string, error) {
 		spendTxid, err := es.SpendStateOf(ctx, tokenTopic, txid, vout)
 		if err != nil {
@@ -452,7 +452,7 @@ func spendChecker(es *enginestore.Store, store *mandala.Store) mandala.SpendChec
 	})
 }
 
-// spendCheckerFunc adapts a plain func to mandala.SpendChecker.
+// spendCheckerFunc adapts a plain func to mandalav2.SpendChecker.
 type spendCheckerFunc func(ctx context.Context, txid string, vout uint32) (string, error)
 
 func (f spendCheckerFunc) SpentBy(ctx context.Context, txid string, vout uint32) (string, error) {
@@ -487,9 +487,9 @@ func (f spendCheckerFunc) SpentBy(ctx context.Context, txid string, vout uint32)
 // The reported outcome (wire contract §9.12) counts what was actually handed
 // back, so /arc-ingest's 200 body distinguishes a real unwind from the
 // idempotent repeat Arcade is entitled to send.
-func evictTx(es *enginestore.Store, ls *mandala.LookupService, store *mandala.Store) func(context.Context, string) (mandala.EvictionOutcome, error) {
-	return func(ctx context.Context, txid string) (mandala.EvictionOutcome, error) {
-		var out mandala.EvictionOutcome
+func evictTx(es *enginestore.Store, ls *mandalav2.LookupService, store *mandalav2.Store) func(context.Context, string) (mandalav2.EvictionOutcome, error) {
+	return func(ctx context.Context, txid string) (mandalav2.EvictionOutcome, error) {
+		var out mandalav2.EvictionOutcome
 		rec, err := store.GetAdmission(ctx, txid)
 		if err != nil {
 			return out, fmt.Errorf("wiring: admission record of %s: %w", txid, err)
@@ -578,7 +578,7 @@ func evictTx(es *enginestore.Store, ls *mandala.LookupService, store *mandala.St
 // rather than read as "not live", so the callback answers 503 and is retried.
 // The narrow in-call race — another spend landing between the unmark and this
 // read — is the same one TS has.
-func restoreLiveTokenRows(ctx context.Context, es *enginestore.Store, store *mandala.Store, snap *mandala.RestoreSnapshot) (int, error) {
+func restoreLiveTokenRows(ctx context.Context, es *enginestore.Store, store *mandalav2.Store, snap *mandalav2.RestoreSnapshot) (int, error) {
 	if snap == nil {
 		return 0, nil
 	}
@@ -597,7 +597,7 @@ func restoreLiveTokenRows(ctx context.Context, es *enginestore.Store, store *man
 			live[fmt.Sprintf("%s.%d", txid, vout)] = true
 		}
 	}
-	rows := make([]mandala.TokenRow, 0, len(snap.TokenRows))
+	rows := make([]mandalav2.TokenRow, 0, len(snap.TokenRows))
 	for _, r := range snap.TokenRows {
 		if live[fmt.Sprintf("%s.%d", strings.ToLower(r.Txid), r.OutputIndex)] {
 			rows = append(rows, r)

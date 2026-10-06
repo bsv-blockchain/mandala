@@ -21,7 +21,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/overlay"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 const evictHolder = "02evictholder"
@@ -75,15 +75,15 @@ func evictFixtureFor(t *testing.T, name string, fill byte) *evictFixture {
 	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *parentID, Index: 0}}, tokenTopic, childID); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.Store.RecordAdmission(ctx, mandala.AdmissionRecord{
+	if err := app.Store.RecordAdmission(ctx, mandalav2.AdmissionRecord{
 		Txid:                 childID.String(),
 		Topics:               []string{tokenTopic},
 		OutputsToAdmit:       []uint32{0},
 		AdmissionSignature:   "3044",
 		AdmissionIdentityKey: "02aa",
-		Restore: &mandala.RestoreSnapshot{
+		Restore: &mandalav2.RestoreSnapshot{
 			SpentOutpoints: []string{parentID.String() + ".0"},
-			TokenRows:      []mandala.TokenRow{evictRow(parentID.String(), 0)},
+			TokenRows:      []mandalav2.TokenRow{evictRow(parentID.String(), 0)},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -91,8 +91,8 @@ func evictFixtureFor(t *testing.T, name string, fill byte) *evictFixture {
 	return &evictFixture{app: app, parentID: parentID, childID: childID, child: childID.String()}
 }
 
-func evictRow(txid string, vout uint32) mandala.TokenRow {
-	return mandala.TokenRow{Txid: txid, OutputIndex: vout, AssetID: "a.0", Amount: 40, IdentityKey: evictHolder, CreatedAt: time.Now()}
+func evictRow(txid string, vout uint32) mandalav2.TokenRow {
+	return mandalav2.TokenRow{Txid: txid, OutputIndex: vout, AssetID: "a.0", Amount: 40, IdentityKey: evictHolder, CreatedAt: time.Now()}
 }
 
 func (f *evictFixture) balance(t *testing.T) int64 {
@@ -104,7 +104,7 @@ func (f *evictFixture) balance(t *testing.T) int64 {
 	return b
 }
 
-func (f *evictFixture) parentRow(t *testing.T) *mandala.TokenRow {
+func (f *evictFixture) parentRow(t *testing.T) *mandalav2.TokenRow {
 	t.Helper()
 	r, err := f.app.Store.GetTokenRow(context.Background(), f.parentID.String(), 0)
 	if err != nil {
@@ -229,12 +229,12 @@ func TestEvictTxRestoresNoRowForAnOutpointTheEngineDoesNotHold(t *testing.T) {
 	f := evictFixtureFor(t, "evict_missing", 0x86)
 	ctx := context.Background()
 	ghost := wiringTestTx(t, nil, 0, 1, 0x87).TxID().String()
-	if err := f.app.Store.RecordAdmission(ctx, mandala.AdmissionRecord{
+	if err := f.app.Store.RecordAdmission(ctx, mandalav2.AdmissionRecord{
 		Txid: f.child, Topics: []string{tokenTopic}, OutputsToAdmit: []uint32{0},
 		AdmissionSignature: "3044", AdmissionIdentityKey: "02aa",
-		Restore: &mandala.RestoreSnapshot{
+		Restore: &mandalav2.RestoreSnapshot{
 			SpentOutpoints: []string{f.parentID.String() + ".0", ghost + ".0"},
-			TokenRows:      []mandala.TokenRow{evictRow(f.parentID.String(), 0), evictRow(ghost, 0)},
+			TokenRows:      []mandalav2.TokenRow{evictRow(f.parentID.String(), 0), evictRow(ghost, 0)},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -261,7 +261,7 @@ func TestEvictTxRestoresNoRowForAnOutpointTheEngineDoesNotHold(t *testing.T) {
 func TestEvictTxCountsRestorableRowsEvenWhenAlreadyPresent(t *testing.T) {
 	f := evictFixtureFor(t, "evict_count", 0x88)
 	ctx := context.Background()
-	if err := f.app.Store.RestoreTokens(ctx, []mandala.TokenRow{evictRow(f.parentID.String(), 0)}); err != nil {
+	if err := f.app.Store.RestoreTokens(ctx, []mandalav2.TokenRow{evictRow(f.parentID.String(), 0)}); err != nil {
 		t.Fatal(err)
 	}
 	out, err := f.app.EvictTx(ctx, f.child)
@@ -283,9 +283,9 @@ func TestEvictTxCountsRestorableRowsEvenWhenAlreadyPresent(t *testing.T) {
 func TestEvictTxAfterACrashRetryStillRestoresTheRow(t *testing.T) {
 	f := evictFixtureFor(t, "evict_crash_retry", 0x89)
 	ctx := context.Background()
-	degraded := &mandala.RestoreSnapshot{SpentOutpoints: []string{f.parentID.String() + ".0"}, TokenRows: []mandala.TokenRow{}}
+	degraded := &mandalav2.RestoreSnapshot{SpentOutpoints: []string{f.parentID.String() + ".0"}, TokenRows: []mandalav2.TokenRow{}}
 	for _, pending := range []bool{true, false} {
-		rec := mandala.AdmissionRecord{Txid: f.child, Topics: []string{tokenTopic}, Pending: pending, Restore: degraded}
+		rec := mandalav2.AdmissionRecord{Txid: f.child, Topics: []string{tokenTopic}, Pending: pending, Restore: degraded}
 		if !pending {
 			rec.OutputsToAdmit, rec.AdmissionSignature, rec.AdmissionIdentityKey = []uint32{0}, "3044", "02aa"
 		}

@@ -19,7 +19,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandalav2"
 )
 
 func TestEvictTxStampsNothingWhenTheRestoreFails(t *testing.T) {
@@ -65,15 +65,15 @@ func TestEvictTxStampsNothingWhenTheRestoreFails(t *testing.T) {
 	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{{Txid: *parentID, Index: 0}}, topic, childID); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.Store.RecordAdmission(ctx, mandala.AdmissionRecord{
+	if err := app.Store.RecordAdmission(ctx, mandalav2.AdmissionRecord{
 		Txid:                 childStr,
 		Topics:               []string{topic},
 		OutputsToAdmit:       []uint32{0},
 		AdmissionSignature:   "3044",
 		AdmissionIdentityKey: "02aa",
-		Restore: &mandala.RestoreSnapshot{
+		Restore: &mandalav2.RestoreSnapshot{
 			SpentOutpoints: []string{parentID.String() + ".0"},
-			TokenRows: []mandala.TokenRow{{
+			TokenRows: []mandalav2.TokenRow{{
 				Txid: parentID.String(), OutputIndex: 0, AssetID: "a.0",
 				Amount: 40, IdentityKey: owner, CreatedAt: time.Now(),
 			}},
