@@ -47,8 +47,17 @@ func DB(t testing.TB, name string) *mongo.Database {
 		t.Fatalf("testmongo: drop %s before the test: %v", name, err)
 	}
 	t.Cleanup(func() {
-		_ = db.Drop(context.Background())
-		_ = client.Disconnect(context.Background())
+		// One bounded context for both calls: a Mongo that stalls after the ping must not hang
+		// the test binary until the go test timeout. Faults are logged, not failed, so a flaky
+		// teardown never turns a green test red; the next DB call drops the database anyway.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := db.Drop(ctx); err != nil {
+			t.Logf("testmongo: drop %s after the test: %v", name, err)
+		}
+		if err := client.Disconnect(ctx); err != nil {
+			t.Logf("testmongo: disconnect after %s: %v", name, err)
+		}
 	})
 	return db
 }
