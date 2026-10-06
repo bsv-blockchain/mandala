@@ -906,3 +906,155 @@ func (s *Store) LoadAncillaryBeef(ctx context.Context, output *engine.Output) er
 	}
 	return nil
 }
+
+// --- mandala.EngineOutputReader and the token-topic host reads ---
+//
+// Plan D-2: these use only builtin and go-sdk types, so *Store satisfies mandala.EngineOutputReader
+// directly and enginestore never imports mandala.
+
+// FindAdmittedOutput returns the locking script and satoshis of (topic, txid.vout), read from the
+// BEEF stored with that output document. A spent or absent output reads found=false (TS
+// EngineOutputReader: "a spent output MUST read as null"). A document whose BEEF is empty,
+// unparseable, lacks the transaction or the output is an error: the owner-index repair fails
+// closed on it rather than treating a corrupt store as "not admitted".
+func (s *Store) FindAdmittedOutput(ctx context.Context, txid string, vout uint32, topic string) ([]byte, uint64, bool, error) {
+	var doc struct {
+		Spent bool   `bson:"spent"`
+		Beef  []byte `bson:"beef"`
+	}
+	err := s.outputs.FindOne(ctx,
+		bson.D{
+			{Key: "topic", Value: topic},
+			{Key: "txid", Value: txid},
+			{Key: "outputIndex", Value: vout},
+		},
+		options.FindOne().SetProjection(bson.D{{Key: "spent", Value: 1}, {Key: "beef", Value: 1}}),
+	).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, 0, false, nil
+	}
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if doc.Spent {
+		return nil, 0, false, nil
+	}
+	if len(doc.Beef) == 0 {
+		return nil, 0, false, fmt.Errorf("enginestore: %s.%d on %s has no stored BEEF", txid, vout, topic)
+	}
+	h, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("enginestore: bad txid %q: %w", txid, err)
+	}
+	beef, err := transaction.NewBeefFromBytes(doc.Beef)
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("enginestore: stored BEEF for %s.%d on %s unparseable: %w", txid, vout, topic, err)
+	}
+	tx := beef.FindTransactionByHash(h)
+	if tx == nil {
+		return nil, 0, false, fmt.Errorf("enginestore: stored BEEF for %s.%d on %s does not carry the transaction", txid, vout, topic)
+	}
+	if int(vout) >= len(tx.Outputs) || tx.Outputs[vout].LockingScript == nil {
+		return nil, 0, false, fmt.Errorf("enginestore: stored transaction %s has no output %d", txid, vout)
+	}
+	out := tx.Outputs[vout]
+	return append([]byte(nil), out.LockingScript.Bytes()...), out.Satoshis, true, nil
+}
+
+// ListUnspentAdmittedOutputs pages the unspent outputs of topic by the keyset (txid, outputIndex)
+// ascending, strictly after `after` (nil = from the start), at most limit per page. Unlike
+// FindUTXOsForTopic's shared-score paging (F/gaps G15) it never skips a sibling cut at a page edge.
+// The unique {topic, txid, outputIndex} index serves the sort; spent is a residual filter (F/gaps C9).
+func (s *Store) ListUnspentAdmittedOutputs(ctx context.Context, topic string, after *transaction.Outpoint, limit int) ([]transaction.Outpoint, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("enginestore: ListUnspentAdmittedOutputs limit must be positive, got %d", limit)
+	}
+	filter := bson.D{{Key: "topic", Value: topic}, {Key: "spent", Value: false}}
+	if after != nil {
+		a := after.Txid.String()
+		filter = append(filter, bson.E{Key: "$or", Value: bson.A{
+			bson.D{{Key: "txid", Value: bson.D{{Key: "$gt", Value: a}}}},
+			bson.D{{Key: "txid", Value: a}, {Key: "outputIndex", Value: bson.D{{Key: "$gt", Value: after.Index}}}},
+		}})
+	}
+	cur, err := s.outputs.Find(ctx, filter, options.Find().
+		SetSort(bson.D{{Key: "txid", Value: 1}, {Key: "outputIndex", Value: 1}}).
+		SetLimit(int64(limit)).
+		SetProjection(bson.D{{Key: "txid", Value: 1}, {Key: "outputIndex", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	out := []transaction.Outpoint{}
+	for cur.Next(ctx) {
+		var doc struct {
+			Txid        string `bson:"txid"`
+			OutputIndex uint32 `bson:"outputIndex"`
+		}
+		if err := cur.Decode(&doc); err != nil {
+			return nil, err
+		}
+		h, err := chainhash.NewHashFromHex(doc.Txid)
+		if err != nil {
+			return nil, fmt.Errorf("enginestore: bad stored txid %q: %w", doc.Txid, err)
+		}
+		out = append(out, transaction.Outpoint{Txid: *h, Index: doc.OutputIndex})
+	}
+	return out, cur.Err()
+}
+
+// AppliedTopics lists, sorted, every topic with an engineAppliedTransactions record for txid;
+// []string{} when none. It is the per-topic dupe proof the /submit known-verdict path and the
+// applied-admission proof read (plan D-8).
+func (s *Store) AppliedTopics(ctx context.Context, txid string) ([]string, error) {
+	cur, err := s.applied.Find(ctx, bson.D{{Key: "txid", Value: txid}},
+		options.Find().SetProjection(bson.D{{Key: "topic", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	topics := []string{}
+	for cur.Next(ctx) {
+		var doc struct {
+			Topic string `bson:"topic"`
+		}
+		if err := cur.Decode(&doc); err != nil {
+			return nil, err
+		}
+		topics = append(topics, doc.Topic)
+	}
+	if err := cur.Err(); err != nil {
+		return nil, err
+	}
+	slices.Sort(topics)
+	return topics, nil
+}
+
+// OutputBeefWhere scans every document of (txid, vout) across topics in topic order and returns
+// the stored BEEF and topic of the first one whose topic accept approves and whose BEEF is
+// non-empty, spent or not; found=false when none qualifies. A nil accept approves every topic. It
+// backs the recovery routes that have no topic in their URL (TT A1.5).
+func (s *Store) OutputBeefWhere(ctx context.Context, txid string, vout uint32, accept func(topic string) bool) ([]byte, string, bool, error) {
+	cur, err := s.outputs.Find(ctx,
+		bson.D{{Key: "txid", Value: txid}, {Key: "outputIndex", Value: vout}},
+		options.Find().
+			SetSort(bson.D{{Key: "topic", Value: 1}}).
+			SetProjection(bson.D{{Key: "topic", Value: 1}, {Key: "beef", Value: 1}}))
+	if err != nil {
+		return nil, "", false, err
+	}
+	defer cur.Close(ctx)
+	for cur.Next(ctx) {
+		var doc struct {
+			Topic string `bson:"topic"`
+			Beef  []byte `bson:"beef"`
+		}
+		if err := cur.Decode(&doc); err != nil {
+			return nil, "", false, err
+		}
+		if len(doc.Beef) > 0 && (accept == nil || accept(doc.Topic)) {
+			return doc.Beef, doc.Topic, true, nil
+		}
+	}
+	return nil, "", false, cur.Err()
+}
