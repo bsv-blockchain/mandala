@@ -22,7 +22,11 @@ configureMandala({
   overlayUrl: import.meta.env.VITE_OVERLAY_URL ?? '',
   overlayIdentityKey: import.meta.env.VITE_OVERLAY_IDENTITY_KEY ?? '',
   messageBoxUrl: import.meta.env.VITE_MESSAGEBOX_URL ?? '',
-  adminApiToken: import.meta.env.VITE_ADMIN_API_TOKEN ?? ''
+  adminApiToken: import.meta.env.VITE_ADMIN_API_TOKEN ?? '',
+  // The wallet's 'mandala' permission module gates this basket: one approval
+  // per token createAction covers that transaction's signatures. A wallet
+  // without the module refuses 'p ' baskets outright.
+  basket: 'p mandala'
 })
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
