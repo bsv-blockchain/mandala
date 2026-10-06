@@ -630,13 +630,13 @@ describe('reconcileWallet — broadcast: false leaves accepted entries to the ho
 
   it('still re-submits a handed_over entry and journals the acceptance', async () => {
     const { PrivateKey, Beef, LockingScript, Transaction, Utils } = await import('@bsv/sdk')
-    const { admissionMessageV2 } = await import('./admission.js')
+    const { admissionMessageV3 } = await import('./admission.js')
     const overlayKey = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000f6')
     const tx = new Transaction()
     tx.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
     const beef = new Beef(); beef.mergeTransaction(tx)
     const txid = tx.id('hex')
-    const sig = Utils.toHex(overlayKey.sign(Utils.toArray(admissionMessageV2(txid, [0]), 'utf8')).toDER() as number[])
+    const sig = Utils.toHex(overlayKey.sign(Utils.toArray(admissionMessageV3('tm_mandala', txid, [0]), 'utf8')).toDER() as number[])
     configureMandala({ overlayUrl: 'https://overlay.test', overlayIdentityKey: overlayKey.toPublicKey().toString(), messageBoxUrl: 'https://box.test' })
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
       ok: true, status: 200,

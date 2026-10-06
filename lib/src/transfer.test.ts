@@ -27,7 +27,7 @@ const { transferTokens } = await import('./transfer.js')
 const { journalClear } = await import('./txJournal.js')
 const { notifyClear } = await import('./notifyJournal.js')
 
-const ASSET = `${'11'.repeat(32)}.0`
+const ASSET = `${'11'.repeat(32)}_0`
 const RECIPIENT = '02' + 'ab'.repeat(32)
 const SENDER_BLINDED = '03' + 'cd'.repeat(32)
 const OVERLAY_KEY = '02' + 'ef'.repeat(32)

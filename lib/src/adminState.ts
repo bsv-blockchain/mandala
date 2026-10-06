@@ -2,7 +2,8 @@ import { OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 
 export interface AssetAdminStateView {
   assetId: string
-  issuerIdentityKey: string
+  /** Not served by the BRC-162 overlay (the issuer is the token registry row's `issuer`). */
+  issuerIdentityKey?: string
   isPaused: boolean
   accessMode: 'denylist' | 'allowlist'
   /** Token-fee design §2: base units per 1000 bytes; null/absent = issuer-paid fees disabled. */
@@ -34,7 +35,11 @@ export async function resolveAssetState (
   if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
   try {
     const res = await fetch(`${OVERLAY_URL}/admin/asset-state/${encodeURIComponent(assetId)}`)
-    if (res.ok) val = await res.json() as AssetAdminStateView
+    if (res.ok) {
+      const body = await res.json()
+      // The v3 route keys the row by tokenId; keep the assetId view.
+      val = { ...body, assetId: body.assetId ?? body.tokenId } as AssetAdminStateView
+    }
   } catch { val = null }
   cache.set(assetId, { at: Date.now(), val })
   return val

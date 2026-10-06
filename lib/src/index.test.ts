@@ -12,7 +12,7 @@ describe('index — metadata is reachable from the package root', () => {
   })
 
   it('exports the AssetMetadata type', () => {
-    const meta: AssetMetadata = { label: 'Gold', ticker: 'GLD' }
+    const meta: AssetMetadata = { label: 'Gold', ticker: 'GLD', decimals: 2 }
     expect(meta.label).toBe('Gold')
   })
 

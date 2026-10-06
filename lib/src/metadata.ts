@@ -1,61 +1,91 @@
-import { LookupResolver, Transaction, WhatsOnChain } from '@bsv/sdk'
-import { MandalaAdmin } from '@bsv/templates'
-import type { AssetMetadata } from '@bsv/templates'
-export type { AssetMetadata }
-import { OVERLAY_URL, OVERLAY_URL_UNSET, LOOKUP } from './constants.js'
+import { Transaction } from '@bsv/sdk'
+import { OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
+import { decodeToken, parseDeployPayload } from './brc162.js'
 
-const cache = new Map<string, AssetMetadata | null>()
+/** Public token metadata (deploy payload + registry row). */
+export interface AssetMetadata {
+  label: string
+  ticker: string
+  decimals: number
+  /** Deployer identity key, when known (the registry row carries it). */
+  issuer?: string
+  feeRatePerKb?: number | null
+  [k: string]: unknown
+}
 
-// Pure decode helper (unit-testable without network): read output `index`'s
-// locking script from a BEEF and return its MandalaAdmin publicData, or null.
+/** One `GET /admin/tokens` row. */
+export interface TokenListing {
+  tokenId: string
+  deployTxid: string
+  sym: string
+  dec: number
+  label: string
+  issuer: string
+  feeRatePerKb: number | null
+  createdAt: string
+  /** Whether this overlay host follows the token's topic. */
+  hosted: boolean
+}
+
+/**
+ * GET /admin/tokens (public): every token ever deployed, ordered createdAt
+ * then tokenId. `limit` 1-100 (default 100), `skip` 0-100000.
+ */
+export async function listTokens (opts: { limit?: number, skip?: number } = {}): Promise<TokenListing[]> {
+  if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
+  const params = new URLSearchParams()
+  if (opts.limit != null) params.set('limit', String(opts.limit))
+  if (opts.skip != null) params.set('skip', String(opts.skip))
+  const q = params.toString()
+  const res = await fetch(`${OVERLAY_URL}/admin/tokens${q !== '' ? `?${q}` : ''}`)
+  if (!res.ok) throw new Error(`token list fetch failed: ${res.status}`)
+  const body = await res.json()
+  const rows: unknown[] = Array.isArray(body) ? body : Array.isArray(body?.tokens) ? body.tokens : []
+  return rows.filter((r): r is TokenListing => r != null && typeof (r as TokenListing).tokenId === 'string')
+}
+
+const toMetadata = (t: TokenListing): AssetMetadata => ({
+  label: t.label,
+  ticker: t.sym,
+  decimals: t.dec,
+  issuer: t.issuer,
+  feeRatePerKb: t.feeRatePerKb
+})
+
+const cache = new Map<string, AssetMetadata>()
+
+/** Pure decode helper: the deploy payload of output `index` in a BEEF, or null. */
 export function parseMetadataFromBeef (beef: number[], index: number): AssetMetadata | null {
   try {
     const tx = Transaction.fromBEEF(beef)
     const ls = tx.outputs[index]?.lockingScript
     if (ls == null) return null
-    const decoded = MandalaAdmin.decode(ls)
-    if (decoded.publicData == null || typeof (decoded.publicData as any).label !== 'string') return null
-    return decoded.publicData as AssetMetadata
+    const d = decodeToken(ls)
+    if (d == null || d.role !== 'deploy') return null
+    const m = parseDeployPayload(d.payload)
+    return m == null ? null : { label: m.label, ticker: m.sym, decimals: m.dec, ...(m.feeRatePerKb !== undefined ? { feeRatePerKb: m.feeRatePerKb } : {}) }
   } catch {
     return null
   }
 }
 
-// Resolve an asset's on-chain metadata by assetId: query the overlay lookup for
-// the genesis output, SPV-verify the genesis tx, then decode publicData. Memoized.
+/**
+ * An asset's metadata by token id, from the overlay's token registry
+ * (GET /admin/tokens, paged). Only positive answers are memoized.
+ */
 export async function resolveAssetMetadata (assetId: string): Promise<AssetMetadata | null> {
-  if (cache.has(assetId)) return cache.get(assetId) ?? null
-  // Outside the try: an unconfigured overlay must not read as "no metadata".
+  const hit = cache.get(assetId)
+  if (hit != null) return hit
   if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
-  let result: AssetMetadata | null = null
   try {
-    const resolver = new LookupResolver({ networkPreset: 'mainnet', hostOverrides: { [LOOKUP]: [OVERLAY_URL] } })
-    const answer = await resolver.query({ service: LOOKUP, query: { metadataAssetId: assetId } })
-    const dotIndex = assetId.lastIndexOf('.')
-    const vout = Number(assetId.slice(dotIndex + 1))
-    for (const out of answer.outputs) {
-      const tx = Transaction.fromBEEF(out.beef)
-      // A freshly registered genesis has no Merkle path yet, so a full SPV
-      // check fails until it is mined. The overlay that served this output is
-      // the same authority whose admission signatures the holder already
-      // trusts, so fall back to a scripts-only verification of the BEEF
-      // instead of treating an unmined genesis as "unknown asset".
-      let verified = false
-      try { verified = await tx.verify(new WhatsOnChain('main')) } catch { verified = false }
-      if (!verified) {
-        try { verified = await tx.verify('scripts only') } catch { verified = false }
-      }
-      if (!verified) continue
-      const idx = typeof (out as any).outputIndex === 'number' ? (out as any).outputIndex : vout
-      const meta = parseMetadataFromBeef(out.beef, idx)
-      if (meta != null) { result = meta; break }
+    const PAGE = 100
+    for (let skip = 0; skip <= 100000; skip += PAGE) {
+      const rows = await listTokens({ limit: PAGE, skip })
+      for (const r of rows) cache.set(r.tokenId, toMetadata(r))
+      if (cache.has(assetId) || rows.length < PAGE) break
     }
   } catch (e) {
     console.warn(`[mandala] asset metadata lookup failed for ${assetId}:`, e instanceof Error ? e.message : e)
-    result = null
   }
-  // Only a positive answer is memoized: a transient lookup/network failure
-  // must not brand the asset "unidentified" for the rest of the process.
-  if (result != null) cache.set(assetId, result)
-  return result
+  return cache.get(assetId) ?? null
 }

@@ -12,7 +12,7 @@ const asset: AdminAsset = {
   assetId: 'asset.0',
   label: 'USD',
   authOutpoint: 'auth-prior.0',
-  authDetails: { kind: 'issue', assetId: 'asset.0', amount: 1, priorOutpoint: 'genesis.0' },
+  authKeyID: 'deploy',
   metadata: { decimals: 0, label: 'USD', ticker: 'USD' }
 }
 

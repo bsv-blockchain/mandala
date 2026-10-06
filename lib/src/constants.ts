@@ -3,8 +3,8 @@ import { configureStorage, MandalaStorage } from './storage.js'
 
 export const TOPIC = 'tm_mandala'
 export const LOOKUP = 'ls_mandala'
-export const REGISTRY_TOPIC = 'tm_mandala_registry'
-export const REGISTRY_LOOKUP = 'ls_mandala_registry'
+export const REGISTRY_TOPIC = 'tm_mandala_kyc'
+export const REGISTRY_LOOKUP = 'ls_mandala_kyc'
 export const FT_PROTOCOL: WalletProtocol = [2, 'mandala token']
 export const ADMIN_PROTOCOL: WalletProtocol = [2, 'mandala admin']
 export const REGISTRY_PROTOCOL: WalletProtocol = [2, 'mandala registry']

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { PrivateKey, Transaction, P2PKH } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { MandalaToken } from './__fixtures__/token.js'
 import { configureMandala } from './constants.js'
 import { loadFtCandidates } from './ftCandidates.js'
 
@@ -12,7 +12,7 @@ describe('loadFtCandidates without lockingScript on the listing', () => {
     configureMandala({ overlayUrl: 'http://test-overlay', overlayIdentityKey: '02' + 'ab'.repeat(32) })
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) })))
     const pkh = new PrivateKey(11).toPublicKey().toHash() as number[]
-    const assetId = 'cc'.repeat(32) + '.0'
+    const assetId = 'cc'.repeat(32) + '_0'
     const src = new Transaction()
     src.addOutput({ satoshis: 2, lockingScript: new P2PKH().lock(pkh) })
     const tx = new Transaction()

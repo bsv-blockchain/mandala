@@ -1,10 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { MandalaToken } from '@bsv/templates'
+import { MandalaToken } from './__fixtures__/token.js'
 import { parseActionsToHistory, exportTransactionsCsv } from './history.js'
 
 // Real MandalaToken locking script (decodable), arbitrary pkh.
 // assetId must be outpoint-shaped: 64-hex txid + '.' + vout.
-const ASSET = `${'ab'.repeat(32)}.0`
+const ASSET = `${'ab'.repeat(32)}_0`
 const PKH = Array.from({ length: 20 }, (_, i) => i + 1)
 const ftScript = (assetId: string, amount: number): string =>
   new MandalaToken().lock(assetId, amount, PKH).toHex()

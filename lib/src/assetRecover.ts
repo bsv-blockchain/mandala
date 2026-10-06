@@ -7,20 +7,21 @@
  * strips that bookkeeping with it — after which `listAdminAssets` is empty
  * and every admin action on the asset is impossible. The overlay's admin
  * history holds the same chain, so it can hand the head back:
- * `GET /admin/asset-auth/:assetId` and the BEEF to spend it. Near-copy of
+ * `GET /admin/authorities/:tokenId` and the BEEF to spend it. Near-copy of
  * registryRecover.ts for the registry spine.
  */
-import { Utils, WalletInterface } from '@bsv/sdk'
-import type { MandalaActionDetails } from '@bsv/templates'
-import { adminAuthHeaders, BASKET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
+import { Transaction, Utils, WalletInterface } from '@bsv/sdk'
+import { BASKET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 import { AdminAsset, adminCustomInstructions, listAdminAssets } from './assets.js'
 import { resolveAssetMetadata } from './metadata.js'
+import { authorityKeyIdOf } from './brc162.js'
 import { beefFromWhatsOnChain, toAtomicBeef } from './registryRecover.js'
 
-/** The overlay's view of an asset's live admin authority (`GET /admin/asset-auth/:assetId`). */
+/** The overlay's view of a token's live authority (`GET /admin/authorities/:tokenId`). */
 export interface OverlayAssetAuth {
   authOutpoint: string
-  authDetails: MandalaActionDetails
+  /** The authority owner (issuer identity key). */
+  identityKey: string
 }
 
 function asBytes (v: unknown): number[] | null {
@@ -40,27 +41,28 @@ function parseOutpoint (outpoint: string): { txid: string, vout: number } {
 }
 
 /**
- * The chain head of the asset's admin outputs as the overlay sees it, or null
- * when the overlay holds no admin history for the asset (404). Any other
- * failure throws: silence must not read as "nothing to recover".
+ * The token's live authority as the overlay sees it, or null when it holds
+ * none (404, or an empty list). Several live authorities: the first owned by
+ * `issuerIdentityKey` when given, else the first. Any other failure throws:
+ * silence must not read as "nothing to recover".
  */
-export async function fetchAssetAuthHead (assetId: string): Promise<OverlayAssetAuth | null> {
+export async function fetchAssetAuthHead (assetId: string, issuerIdentityKey?: string): Promise<OverlayAssetAuth | null> {
   if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
-  const res = await fetch(`${OVERLAY_URL}/admin/asset-auth/${encodeURIComponent(assetId)}`, { headers: adminAuthHeaders() })
+  const res = await fetch(`${OVERLAY_URL}/admin/authorities/${encodeURIComponent(assetId)}`)
   if (res.status === 404) return null
-  if (!res.ok) throw new Error(`asset-auth fetch failed: ${res.status}`)
-  const body = await res.json() as { authOutpoint?: unknown, authDetails?: unknown }
-  if (typeof body.authOutpoint !== 'string' || body.authOutpoint === '') return null
-  const details = body.authDetails
-  if (details == null || typeof details !== 'object' || typeof (details as { kind?: unknown }).kind !== 'string') return null
-  return { authOutpoint: body.authOutpoint, authDetails: details as MandalaActionDetails }
+  if (!res.ok) throw new Error(`authorities fetch failed: ${res.status}`)
+  const body = await res.json() as { authorities?: Array<{ outpoint?: unknown, identityKey?: unknown }> }
+  const rows = (body.authorities ?? []).filter(r => typeof r?.outpoint === 'string' && typeof r?.identityKey === 'string') as Array<{ outpoint: string, identityKey: string }>
+  const mine = issuerIdentityKey != null ? rows.find(r => r.identityKey.toLowerCase() === issuerIdentityKey.toLowerCase()) : undefined
+  const head = mine ?? rows[0]
+  return head == null ? null : { authOutpoint: head.outpoint, identityKey: head.identityKey }
 }
 
-/** BEEF for the admin tx: the overlay's engine store first, the chain as a fallback. */
+/** BEEF for the authority tx: the overlay's engine store first, the chain as a fallback. */
 export async function fetchAssetAuthBeef (txid: string, outputIndex: number): Promise<number[] | null> {
   if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
   try {
-    const res = await fetch(`${OVERLAY_URL}/admin/asset-auth/beef/${txid}?vout=${outputIndex}`, { headers: adminAuthHeaders() })
+    const res = await fetch(`${OVERLAY_URL}/admin/authorities/beef/${txid}?vout=${outputIndex}`)
     if (res.ok) {
       const body = await res.json() as { beef?: unknown }
       const fromOverlay = asBytes(body.beef)
@@ -70,60 +72,52 @@ export async function fetchAssetAuthBeef (txid: string, outputIndex: number): Pr
   return await beefFromWhatsOnChain(txid)
 }
 
-/**
- * Label + metadata for the recovered asset, best source first: whatever the
- * basket still says (a stale entry keeps the operator's label), the genesis
- * details when the head IS the genesis, else the on-chain metadata; a short
- * asset id when nothing can be found — recovery must not fail on a label.
- */
+/** Label + metadata for the recovered asset, best source first. */
 async function describeAsset (
   assetId: string,
-  head: MandalaActionDetails,
   listed: AdminAsset | null
 ): Promise<{ label: string, metadata?: Record<string, unknown> }> {
   if (listed != null) return { label: listed.label, metadata: listed.metadata }
-  if (head.kind === 'register' && typeof head.label === 'string') {
-    const label = head.label
-    return { label, metadata: { label, ticker: head.ticker, decimals: head.decimals, issuer: head.issuer } }
-  }
   const meta = await resolveAssetMetadata(assetId).catch(() => null)
-  if (meta != null) return { label: meta.label, metadata: meta as Record<string, unknown> }
+  if (meta != null) return { label: meta.label, metadata: meta as unknown as Record<string, unknown> }
   return { label: `${assetId.slice(0, 8)}…` }
 }
 
 /**
- * Put the asset's live admin-auth UTXO back in this wallet's basket with the
- * customInstructions `listAdminAssets` needs, from the overlay's view of the
- * chain. Idempotent: an output the wallet already holds is a no-op, so a
- * double click or a second tab converges on the same head. Returns the live
- * head even when the basket listing still lacks it — the overlay, not the
- * basket, is the source of truth for the chain — or null when the overlay
- * has never admitted an admin output for the asset.
+ * Put the token's live authority UTXO back in this wallet's basket with the
+ * customInstructions `listAdminAssets` needs. The keyID is recomputed from
+ * the output itself (commitment hex, or 'deploy'). Idempotent. Returns null
+ * when the overlay holds no live authority for the token.
  */
 export async function recoverAdminAuth (p: {
   wallet: WalletInterface
   assetId: string
+  issuerIdentityKey?: string
 }): Promise<AdminAsset | null> {
   const listedFor = async (): Promise<AdminAsset | null> =>
     (await listAdminAssets(p.wallet)).find(a => a.assetId === p.assetId) ?? null
-  const head = await fetchAssetAuthHead(p.assetId)
+  const head = await fetchAssetAuthHead(p.assetId, p.issuerIdentityKey)
   if (head == null) return await listedFor()
   const listed = await listedFor()
   if (listed?.authOutpoint === head.authOutpoint) return listed
   const { txid, vout } = parseOutpoint(head.authOutpoint)
   const beef = await fetchAssetAuthBeef(txid, vout)
-  if (beef == null) throw new Error(`could not load admin tx ${txid}`)
-  const { label, metadata } = await describeAsset(p.assetId, head.authDetails, listed)
+  if (beef == null) throw new Error(`could not load authority tx ${txid}`)
+  const atomic = toAtomicBeef(beef, txid)
+  const script = Transaction.fromAtomicBEEF(atomic).outputs[vout]?.lockingScript
+  const authKeyID = script != null ? authorityKeyIdOf(script) : null
+  if (authKeyID == null) throw new Error(`${head.authOutpoint} is not an authority output`)
+  const { label, metadata } = await describeAsset(p.assetId, listed)
   try {
     await p.wallet.internalizeAction({
-      tx: toAtomicBeef(beef, txid),
+      tx: atomic,
       labels: ['mandala', 'admin', 'recover'],
       outputs: [{
         outputIndex: vout,
         protocol: 'basket insertion',
         insertionRemittance: {
           basket: BASKET,
-          customInstructions: adminCustomInstructions(p.assetId, label, head.authDetails, metadata),
+          customInstructions: adminCustomInstructions(p.assetId, label, authKeyID, metadata),
           tags: ['mandala-admin']
         }
       }],
@@ -134,5 +128,5 @@ export async function recoverAdminAuth (p: {
   }
   const again = await listedFor()
   if (again?.authOutpoint === head.authOutpoint) return again
-  return { assetId: p.assetId, label, authOutpoint: head.authOutpoint, authDetails: head.authDetails, metadata }
+  return { assetId: p.assetId, label, authOutpoint: head.authOutpoint, authKeyID, metadata }
 }

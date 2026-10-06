@@ -11,9 +11,12 @@
  *
  * Wire contract (binding, both overlays and both wallets):
  *
- *   digest = SHA-256("mandala-admit:" + txid + ":" + outputsToAdmit.sort(asc).join(","))
+ *   digest = SHA-256("mandala-admit:v3:" + topic + ":" + txid + ":" + outputsToAdmit.sort(asc).join(","))
  *
- * `txid` is 64 lowercase hex; `outputsToAdmit` is the `tm_mandala` topic's own
+ * (σI v3, overlay-go internal/mandala/admissions.go AdmissionDigestV3.) `topic`
+ * is the STEAK topic the signature speaks for — `tm_<deployTxid>` for token
+ * traffic (see brc162.ts tokenTopic), `tm_mandala` for a deploy's registry
+ * entry. `txid` is 64 lowercase hex; `outputsToAdmit` is that topic's own
  * admitted output indexes as ascending decimal, comma-joined ("0", "0,2,3"),
  * never empty — no admitted outputs means no signature exists at all. The
  * signature is DER (RFC-6979 deterministic ECDSA) over those digest bytes with
@@ -30,7 +33,7 @@
 import { BigNumber, ECDSA, Hash, PublicKey, Signature, Utils } from '@bsv/sdk'
 import { adminAuthHeaders } from './constants.js'
 
-export const ADMISSION_PREFIX = 'mandala-admit:'
+export const ADMISSION_PREFIX = 'mandala-admit:v3:'
 
 /** DER signature bytes, or their hex encoding (what the overlay puts on the wire). */
 export type DerSignature = string | number[] | Uint8Array
@@ -41,9 +44,9 @@ export type DerSignature = string | number[] | Uint8Array
  * other key proves nothing (see bundle.ts `Admitted`).
  */
 export interface AdmissionEntry {
-  /** The tm_mandala topic's own admitted output indexes, ascending. */
+  /** The token topic's own admitted output indexes, ascending. */
   outputsToAdmit: number[]
-  /** DER ECDSA over admissionDigestV2(txid, outputsToAdmit). */
+  /** DER ECDSA over admissionDigestV3(topic, txid, outputsToAdmit). */
   signature: DerSignature
   /** 66-hex compressed overlay identity key that produced `signature`. */
   signerKey: string
@@ -52,6 +55,8 @@ export interface AdmissionEntry {
 /** What verifyAdmission needs: an AdmissionEntry plus the txid it claims to cover. */
 export interface AdmissionCheck extends AdmissionEntry {
   txid: string
+  /** The STEAK topic the σI was taken for (`tokenTopic(assetId)` for a token coin). */
+  topic: string
 }
 
 const TXID_RE = /^[0-9a-f]{64}$/
@@ -76,17 +81,18 @@ function canonicalOutputs (outputsToAdmit: number[]): number[] {
   return [...new Set(outputsToAdmit)].sort((a, b) => a - b)
 }
 
-/** The exact UTF-8 message both overlays sign. Exported for test vectors. */
-export function admissionMessageV2 (txid: string, outputsToAdmit: number[]): string {
+/** The exact UTF-8 message the overlay signs (σI v3). Exported for test vectors. */
+export function admissionMessageV3 (topic: string, txid: string, outputsToAdmit: number[]): string {
   if (typeof txid !== 'string' || !TXID_RE.test(txid)) {
     throw new Error('admission: txid must be 64 lowercase hex characters')
   }
-  return `${ADMISSION_PREFIX}${txid}:${canonicalOutputs(outputsToAdmit).join(',')}`
+  if (typeof topic !== 'string' || topic === '') throw new Error('admission: topic is required')
+  return `${ADMISSION_PREFIX}${topic}:${txid}:${canonicalOutputs(outputsToAdmit).join(',')}`
 }
 
-/** SHA-256 digest bytes the overlay signature is taken over (wire contract §1). */
-export function admissionDigestV2 (txid: string, outputsToAdmit: number[]): number[] {
-  return Hash.sha256(Utils.toArray(admissionMessageV2(txid, outputsToAdmit), 'utf8'))
+/** SHA-256 digest bytes the overlay signature is taken over. */
+export function admissionDigestV3 (topic: string, txid: string, outputsToAdmit: number[]): number[] {
+  return Hash.sha256(Utils.toArray(admissionMessageV3(topic, txid, outputsToAdmit), 'utf8'))
 }
 
 /**
@@ -127,7 +133,7 @@ function toSignature (sig: DerSignature): Signature {
 export function verifyAdmission (a: AdmissionCheck): boolean {
   try {
     if (typeof a?.signerKey !== 'string' || !COMPRESSED_KEY_RE.test(a.signerKey)) return false
-    const digest = admissionDigestV2(a.txid, a.outputsToAdmit)
+    const digest = admissionDigestV3(a.topic, a.txid, a.outputsToAdmit)
     return ECDSA.verify(new BigNumber(digest, 16), toSignature(a.signature), PublicKey.fromString(a.signerKey))
   } catch {
     return false
@@ -157,6 +163,12 @@ export type FetchedAdmission =
   | FetchedAdmissionUnavailable
 
 export interface FetchAdmissionOptions {
+  /**
+   * The topic whose σI to return (`tokenTopic(assetId)`). The route serves
+   * `{admissions: {<topic>: {outputsToAdmit, admissionSignature}}}`; without
+   * this the first token topic (tm_<64 hex>) in the body is used.
+   */
+  topic?: string
   /**
    * `payloadHash(offChainValues)` — amendment v2.1 §9.3. A persisted refusal is
    * served (400) only when this matches the `refusedPayloadHash` the overlay
@@ -210,8 +222,13 @@ export async function fetchAdmission (
       }
     }
 
-    if (res.ok && typeof body?.txid === 'string' && Array.isArray(body.outputsToAdmit)) {
-      const signature = body.admissionSignature
+    const admissions = body?.admissions != null && typeof body.admissions === 'object' ? body.admissions : undefined
+    const topic = typeof opts?.topic === 'string' && opts.topic !== ''
+      ? opts.topic
+      : Object.keys(admissions ?? {}).find(t => /^tm_[0-9a-f]{64}$/.test(t))
+    const picked = topic != null ? admissions?.[topic] : undefined
+    if (res.ok && typeof body?.txid === 'string' && picked != null && Array.isArray(picked.outputsToAdmit)) {
+      const signature = picked.admissionSignature
       const signerKey = body.admissionIdentityKey
       // σ_I-less "admissions" are not verdicts. Treat the body as a fault
       // (retryable) rather than fabricating an entry with undefined fields.
@@ -222,7 +239,8 @@ export async function fetchAdmission (
       return {
         kind: 'admitted',
         txid: body.txid,
-        outputsToAdmit: body.outputsToAdmit,
+        topic: topic as string,
+        outputsToAdmit: picked.outputsToAdmit,
         signature,
         signerKey,
         at: body.at
@@ -249,6 +267,7 @@ export function verifyFetchedAdmission (entry: FetchedAdmission | undefined, exp
   if (typeof expectedSignerKey !== 'string' || typeof entry.signerKey !== 'string') return false
   if (entry.signerKey.toLowerCase() !== expectedSignerKey.toLowerCase()) return false
   return verifyAdmission({
+    topic: entry.topic,
     txid: entry.txid,
     outputsToAdmit: entry.outputsToAdmit,
     signature: entry.signature,

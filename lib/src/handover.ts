@@ -21,7 +21,7 @@
  * browser globals — RN-safe.
  */
 import { Transaction, Utils } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { decodeValue } from './brc162.js'
 import { AdmissionEntry } from './admission.js'
 import { JournalEntry, journalList } from './txJournal.js'
 
@@ -102,11 +102,7 @@ export function journalEvidenceSource (): EvidenceSource {
 /** Does this output decode as a MandalaToken of exactly `assetId`? */
 function isTokenOfAsset (out: { lockingScript: any } | undefined, assetId: string): boolean {
   if (out?.lockingScript == null) return false
-  try {
-    return MandalaToken.decode(out.lockingScript).assetId === assetId
-  } catch {
-    return false
-  }
+  return decodeValue(out.lockingScript, assetId) != null
 }
 
 /**

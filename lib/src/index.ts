@@ -148,6 +148,8 @@ export function createMandalaClient (opts: MandalaClientOptions = {}): MandalaCl
 export { configureMandala } from './constants.js'
 export * from './storage.js'
 export * from './metadata.js'
+export * from './brc162.js'
+export * from './authority.js'
 export * from './txJournal.js'
 export * from './overlay.js'
 export * from './admission.js'

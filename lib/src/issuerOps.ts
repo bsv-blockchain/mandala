@@ -4,22 +4,21 @@
  * built `noSend`, gated on overlay acceptance, broadcast in the background
  * (see submitAndBroadcast). Each resolves at the overlay-accept commit point.
  */
-import { Transaction, Beef, WalletInterface } from '@bsv/sdk'
-import { MandalaToken, MandalaAdmin } from '@bsv/templates'
+import { Beef, WalletInterface } from '@bsv/sdk'
 import { BASKET, FT_PROTOCOL } from './constants.js'
-import { encodeLinkagePayload, MandalaActionDetails } from './encoding.js'
+import { deployPayload, deployTopics, MandalaActionDetails } from './brc162.js'
 import { assertFeeRate } from './feeRate.js'
-import { AdmissionReceipt, admissionReceipt, submitAndBroadcast } from './overlay.js'
-import { outpoint, revealLinkage } from './tokens.js'
-import { walletMandalaUnlock } from './unlock.js'
+import { AdmissionReceipt, admissionReceipt } from './overlay.js'
+import { outpoint } from './tokens.js'
 import { loadFtCandidates } from './ftCandidates.js'
 import { selectFtInputs } from './ftSelect.js'
-import { AdminAsset, adminCustomInstructions, adminMarker, withBankRef } from './assets.js'
+import { AdminAsset, adminCustomInstructions, withBankRef } from './assets.js'
 import { withAdminAuthGate, assertSpendablePrior } from './adminAuthGate.js'
 import { guardRedeemSubmit } from './submitGuards.js'
 import { withIntent } from './txJournal.js'
 import { tryWithLock } from './webLocks.js'
 import { BusyError } from './singleFlight.js'
+import { runAuthorityTx, runDeployTx } from './authority.js'
 
 // ---------------------------------------------------------------------------
 // Register: ONE tx, ONE output that both carries the public metadata blob and
@@ -55,6 +54,8 @@ export interface RegisterResult extends AdmissionReceipt {
 export interface IssuerOpResult extends AdmissionReceipt {
   txid: string
   nextAuthOutpoint: string
+  /** keyID of the new authority coin. */
+  nextAuthKeyID: string
   nextAuthDetails: MandalaActionDetails
 }
 
@@ -76,70 +77,45 @@ export async function registerAsset (p: RegisterParams): Promise<RegisterResult>
 }
 
 /**
- * The genesis action details. Pure so the shape is testable without a wallet.
- * issuer = our identity key, baked into the on-chain publicData so any holder
- * can SPV-verify it and return funds to the issuer. feeRatePerKb rides in
- * BOTH the commitment (actionDetails) and publicData when present.
+ * The deploy metadata. Pure so the shape is testable without a wallet. The
+ * on-chain deploy payload is {sym, dec, label, feeRatePerKb?} (strict CBOR);
+ * `metadata` is the wallet-side bookkeeping copy (adds issuer).
  */
 export function registerDetails (
   p: Pick<RegisterParams, 'label' | 'ticker' | 'decimals' | 'identityKey' | 'feeRatePerKb'>
-): { metadata: Record<string, unknown>, regDetails: MandalaActionDetails } {
+): { metadata: Record<string, unknown>, payload: number[] } {
   if (p.feeRatePerKb !== undefined) assertFeeRate(p.feeRatePerKb)
+  const label = p.label.trim()
+  const ticker = p.ticker.trim().toUpperCase()
   const metadata: Record<string, unknown> = {
-    label: p.label.trim(),
-    ticker: p.ticker.trim().toUpperCase(),
+    label,
+    ticker,
     decimals: p.decimals,
     issuer: p.identityKey,
     ...(p.feeRatePerKb !== undefined ? { feeRatePerKb: p.feeRatePerKb } : {})
   }
-  const regDetails = { kind: 'register', ...metadata } as MandalaActionDetails
-  return { metadata, regDetails }
+  const payload = deployPayload({ sym: ticker, dec: p.decimals, label, feeRatePerKb: p.feeRatePerKb })
+  return { metadata, payload }
 }
 
 async function registerPipeline (p: RegisterParams): Promise<RegisterResult> {
   const { wallet, identityKey } = p
-  const { metadata, regDetails } = registerDetails({ ...p, identityKey })
-  const genesisLock = await MandalaAdmin.lock({ wallet: wallet as any, data: regDetails, publicData: metadata })
-
-  const reg = await wallet.createAction({
-    description: `Register ${metadata.label}`,
-    labels: ['mandala', 'register'],
-    outputs: [{
-      satoshis: 1,
-      lockingScript: genesisLock.toHex(),
-      outputDescription: 'asset genesis + admin auth',
-      basket: BASKET,
-      // Bookkeeping rides on the admin UTXO itself — the wallet basket is the
-      // source of truth for the auth chain (no localStorage, no on-chain marker).
-      customInstructions: adminCustomInstructions('', String(metadata.label), regDetails, metadata)
-    }],
-    options: { randomizeOutputs: false, noSend: true } // hold — broadcast after overlay accepts
+  const { metadata, payload } = registerDetails({ ...p, identityKey })
+  const res = await runDeployTx({
+    wallet: wallet as any,
+    identityKey,
+    payload,
+    topics: deployTopics,
+    // The deploy CI can't name its own token id; adminAssetFromOutput resolves it.
+    customInstructions: adminCustomInstructions('', String(metadata.label), 'deploy', metadata),
+    description: `Register ${String(metadata.label)}`,
+    labels: ['mandala', 'register']
   })
-
-  if (reg.tx == null || reg.txid == null) throw new Error('register: no tx returned')
-  const assetId = outpoint(reg.txid, 0)
-
-  // The output's CI was written with an empty assetId (it IS this outpoint, which
-  // didn't exist yet); adminAssetFromOutput resolves it to the outpoint on read.
-  const offChainValues = encodeLinkagePayload({
-    inputs: [],
-    outputs: [],
-    admin: [{ index: 0, actionDetails: regDetails }]
-  })
-  // Genesis has no signable FT inputs, so the wallet normally returns no
-  // reference — but forward one whenever it does, so an overlay rejection
-  // aborts the held action instead of leaving it stuck for the sweep.
-  const admitted = await submitAndBroadcast(
-    wallet as any,
-    { tx: reg.tx as number[], txid: reg.txid },
-    offChainValues,
-    reg.signableTransaction?.reference
-  )
-  return { assetId, ...admissionReceipt(admitted) }
+  return { assetId: res.tokenId, ...admissionReceipt(res.admitted) }
 }
 
 // ---------------------------------------------------------------------------
-// Issue: spend the current auth outpoint; mint FT + next admin-auth output.
+// Issue: spend the live authority; mint value + next authority.
 // ---------------------------------------------------------------------------
 
 export interface IssueParams {
@@ -148,117 +124,59 @@ export interface IssueParams {
   asset: AdminAsset
   amount: number
   /**
-   * sha256 hex of the off-chain deposit record backing this issuance. Committed
-   * on-chain as `bankRef` inside the auth details (R12 / R22) — the bank
-   * record itself stays off-chain. Omitted when empty (see withBankRef).
+   * sha256 hex of the off-chain deposit record backing this issuance,
+   * committed on-chain as `bankRef` (32 bytes). Omitted when empty.
    */
   depositHash?: string
 }
 
 export async function issueTokens (p: IssueParams): Promise<IssuerOpResult> {
   const { wallet, identityKey, asset, amount, depositHash } = p
-  // Serialize same-asset admin-auth so two issue/redeem/regulatory pipelines
-  // cannot both commit on one priorOutpoint; the intent marker keeps the
-  // reconcile sweep away from the live noSend action while it runs.
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
     const keyID = 'mint-' + Date.now()
-    // Self-mint: use our own identity key (hex) as counterparty, not the literal
-    // 'self' — the revealed linkage echoes counterparty verbatim and the overlay
-    // parses it as a public key. Derivation is identical ('self' normalizes to this).
+    // Self-mint: our own identity key (hex) as counterparty, not 'self' — the
+    // revealed linkage echoes counterparty verbatim and the overlay parses it.
     const counterparty = identityKey
+    const issueDetails: MandalaActionDetails = withBankRef({ kind: 'issue' as const }, depositHash)
 
-    const ftLock = await new MandalaToken(wallet as any).lockBRC29(
-      asset.assetId, amount, FT_PROTOCOL, keyID, counterparty
-    )
-
-    const priorOutpoint = asset.authOutpoint
-    const issueDetails: MandalaActionDetails = withBankRef({
-      kind: 'issue',
-      assetId: asset.assetId,
-      amount,
-      priorOutpoint
-    }, depositHash)
-    const nextAuthLock = await MandalaAdmin.lock({ wallet: wallet as any, data: issueDetails, publicData: adminMarker(asset.assetId) })
-
-    // Fetch BEEF for the prior auth outpoint.
-    const listResult = await wallet.listOutputs({
-      basket: BASKET,
-      include: 'entire transactions',
-      limit: 1000
-    })
+    const listResult = await wallet.listOutputs({ basket: BASKET, include: 'entire transactions', limit: 1000 })
     if (listResult.BEEF == null) throw new Error('listOutputs returned no BEEF')
-    assertSpendablePrior(priorOutpoint, listResult.outputs.map(o => o.outpoint))
+    assertSpendablePrior(asset.authOutpoint, listResult.outputs.map(o => o.outpoint))
 
-    const created = await wallet.createAction({
-      description: `Issue ${amount} ${asset.label}`,
-      labels: ['mandala', 'issue'],
-      inputBEEF: listResult.BEEF as number[],
-      inputs: [{
-        outpoint: priorOutpoint,
-        unlockingScriptLength: 108,
-        inputDescription: 'spend prior admin auth'
+    const res = await runAuthorityTx({
+      wallet: wallet as any,
+      identityKey,
+      legs: [{
+        prior: { tokenId: asset.assetId, outpoint: asset.authOutpoint, keyID: asset.authKeyID },
+        details: issueDetails,
+        customInstructions: k => adminCustomInstructions(asset.assetId, asset.label, k, asset.metadata)
       }],
-      outputs: [
-        {
-          satoshis: 1,
-          lockingScript: ftLock.toHex(),
-          outputDescription: 'minted FT',
-          basket: BASKET,
-          customInstructions: JSON.stringify({ protocolID: FT_PROTOCOL, keyID, counterparty })
-        },
-        {
-          satoshis: 1,
-          lockingScript: nextAuthLock.toHex(),
-          outputDescription: 'next admin auth',
-          basket: BASKET,
-          customInstructions: adminCustomInstructions(asset.assetId, asset.label, issueDetails, asset.metadata)
-        }
-      ],
-      options: { randomizeOutputs: false }
+      valueOuts: [{
+        tokenId: asset.assetId,
+        amount,
+        owner: counterparty,
+        keyID,
+        basket: BASKET,
+        customInstructions: JSON.stringify({ protocolID: FT_PROTOCOL, keyID, counterparty }),
+        outputDescription: 'minted FT'
+      }],
+      inputBEEF: listResult.BEEF as number[],
+      description: `Issue ${amount} ${asset.label}`,
+      labels: ['mandala', 'issue']
     })
-
-    if (created.signableTransaction == null) throw new Error('issue: no signableTransaction returned')
-
-    // Sign the prior auth input with the stored authDetails (symmetric with how it was locked).
-    const txToSign = Transaction.fromBEEF(created.signableTransaction.tx as number[])
-    txToSign.inputs[0].unlockingScriptTemplate = MandalaAdmin.unlock({ wallet: wallet as any, data: asset.authDetails })
-    await txToSign.sign()
-
-    const spends: Record<string, { unlockingScript: string }> = {
-      '0': { unlockingScript: txToSign.inputs[0].unlockingScript!.toHex() }
-    }
-
-    const signed = await wallet.signAction({
-      reference: created.signableTransaction.reference,
-      spends,
-      options: { noSend: true } // hold — broadcast only after the overlay accepts
-    })
-
-    if (signed.tx == null || signed.txid == null) throw new Error('signAction: no tx returned')
-
-    // Reveal linkage for the FT output; submit to the overlay, then broadcast.
-    const linkage = await revealLinkage(wallet as any, keyID, counterparty)
-    const offChainValues = encodeLinkagePayload({
-      inputs: [],
-      outputs: [{ index: 0, linkage }],
-      admin: [{ index: 1, actionDetails: issueDetails }]
-    })
-    const admitted = await submitAndBroadcast(wallet as any, { tx: signed.tx as number[], txid: signed.txid }, offChainValues, created.signableTransaction.reference)
-    // Output order is fixed (randomizeOutputs: false): FT at 0, next auth at 1.
-    // nextAuthDetails must travel with the outpoint — the next action's unlock
-    // derives from the details the new auth output was locked with.
     return {
-      txid: signed.txid,
-      nextAuthOutpoint: outpoint(signed.txid, 1),
+      txid: res.txid,
+      nextAuthOutpoint: outpoint(res.txid, res.authIndices[0]),
+      nextAuthKeyID: res.authKeyIDs[0],
       nextAuthDetails: issueDetails,
-      ...admissionReceipt(admitted)
+      ...admissionReceipt(res.admitted)
     }
   }))
 }
 
 // ---------------------------------------------------------------------------
-// Redeem: burn FT tokens by spending FT inputs + prior auth outpoint.
-//   Output [0] = next admin auth; Output [1] = FT change (if any).
+// Redeem: burn value coins by spending them + the live authority.
+//   Output [0] = value change (if any); last = next authority.
 // ---------------------------------------------------------------------------
 
 export interface RedeemParams {
@@ -275,116 +193,50 @@ export interface RedeemParams {
 
 export async function redeemTokens (p: RedeemParams): Promise<IssuerOpResult> {
   const { wallet, identityKey, asset, amount, balance } = p
-  // Client-side amount gate first — no gate acquire / wallet I/O on bad amount.
-  const amountGate = guardRedeemSubmit({
-    assetId: asset.assetId,
-    amount,
-    balance,
-    walletReady: true
-  })
+  const amountGate = guardRedeemSubmit({ assetId: asset.assetId, amount, balance, walletReady: true })
   if (!amountGate.ok) throw new Error(amountGate.reason)
 
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
-    // Token-aware coin selection (confirmed-first, fewest UTXOs) — same as
-    // transfer. requireSpendable fails fast on a stale admin prior against the
-    // selection's own first basket listing (before the heavier BEEF/listActions
-    // work), matching issueTokens / submitAdminAction without an extra
-    // listOutputs round-trip.
     const { candidates, beef: beefBytes } = await loadFtCandidates(wallet as any, asset.assetId, {
       requireSpendable: asset.authOutpoint
     })
     const { selected, total: gathered } = selectFtInputs(candidates, amount) // throws if insufficient
     const beef = new Beef()
     beef.mergeBeef(beefBytes)
-    const ftInputs = selected.map(s => ({ outpoint: s.outpoint, unlockingScriptLength: 108, inputDescription: 'burn FT' }))
-    const ftSpend = selected.map(s => ({ keyID: s.keyID, counterparty: s.counterparty }))
     const change = gathered - amount
+    const redeemDetails: MandalaActionDetails = { kind: 'redeem' }
+    const keyIDChange = 'rchg-' + Date.now()
 
-    const redeemDetails: MandalaActionDetails = {
-      kind: 'redeem',
-      assetId: asset.assetId,
-      amount,
-      priorOutpoint: asset.authOutpoint
-    }
-    const nextAuthLock = await MandalaAdmin.lock({ wallet: wallet as any, data: redeemDetails, publicData: adminMarker(asset.assetId) })
-
-    const inputs = [
-      ...ftInputs,
-      { outpoint: asset.authOutpoint, unlockingScriptLength: 108, inputDescription: 'spend prior auth' }
-    ]
-
-    const outputs: any[] = [
-      {
-        satoshis: 1,
-        lockingScript: nextAuthLock.toHex(),
-        outputDescription: 'redeem auth',
-        basket: BASKET,
-        customInstructions: adminCustomInstructions(asset.assetId, asset.label, redeemDetails, asset.metadata)
-      }
-    ]
-
-    let keyIDChange = ''
-    if (change > 0) {
-      keyIDChange = 'rchg-' + Date.now()
-      const ftChange = await new MandalaToken(wallet as any).lockBRC29(asset.assetId, change, FT_PROTOCOL, keyIDChange, identityKey)
-      outputs.push({
-        satoshis: 1,
-        lockingScript: ftChange.toHex(),
-        outputDescription: 'FT change',
-        basket: BASKET,
-        customInstructions: JSON.stringify({ protocolID: FT_PROTOCOL, keyID: keyIDChange, counterparty: identityKey })
-      })
-    }
-
-    const created = await wallet.createAction({
-      description: `Redeem ${amount} ${asset.label}`,
-      labels: ['mandala', 'redeem'],
+    const res = await runAuthorityTx({
+      wallet: wallet as any,
+      identityKey,
+      legs: [{
+        prior: { tokenId: asset.assetId, outpoint: asset.authOutpoint, keyID: asset.authKeyID },
+        details: redeemDetails,
+        customInstructions: k => adminCustomInstructions(asset.assetId, asset.label, k, asset.metadata)
+      }],
+      valueIns: selected.map(s => ({ outpoint: s.outpoint, keyID: s.keyID, counterparty: s.counterparty })),
+      valueOuts: change > 0
+        ? [{
+            tokenId: asset.assetId,
+            amount: change,
+            owner: identityKey,
+            keyID: keyIDChange,
+            basket: BASKET,
+            customInstructions: JSON.stringify({ protocolID: FT_PROTOCOL, keyID: keyIDChange, counterparty: identityKey }),
+            outputDescription: 'FT change'
+          }]
+        : [],
       inputBEEF: beef.toBinary(),
-      inputs,
-      outputs,
-      options: { randomizeOutputs: false }
+      description: `Redeem ${amount} ${asset.label}`,
+      labels: ['mandala', 'redeem']
     })
-
-    if (created.signableTransaction == null) throw new Error('redeem: no signableTransaction returned')
-
-    // Sign FT inputs then the prior-auth input.
-    const txToSign = Transaction.fromBEEF(created.signableTransaction.tx as number[])
-    for (let i = 0; i < ftSpend.length; i++) {
-      txToSign.inputs[i].unlockingScriptTemplate = walletMandalaUnlock(wallet as any, ftSpend[i].keyID, ftSpend[i].counterparty)
-    }
-    txToSign.inputs[ftSpend.length].unlockingScriptTemplate = MandalaAdmin.unlock({ wallet: wallet as any, data: asset.authDetails })
-    await txToSign.sign()
-
-    const spends: Record<string, { unlockingScript: string }> = {}
-    for (let i = 0; i < inputs.length; i++) {
-      spends[String(i)] = { unlockingScript: txToSign.inputs[i].unlockingScript!.toHex() }
-    }
-
-    const signed = await wallet.signAction({
-      reference: created.signableTransaction.reference,
-      spends,
-      options: { noSend: true } // hold — broadcast only after the overlay accepts
-    })
-
-    if (signed.tx == null || signed.txid == null) throw new Error('signAction: no tx returned')
-
-    // Admin auth is index 0; FT change (if any) is index 1.
-    const outLinks: Array<{ index: number, linkage: any }> = []
-    if (change > 0) {
-      outLinks.push({ index: 1, linkage: await revealLinkage(wallet as any, keyIDChange, identityKey) })
-    }
-    const offChainValues = encodeLinkagePayload({
-      inputs: [],
-      outputs: outLinks,
-      admin: [{ index: 0, actionDetails: redeemDetails }]
-    })
-    const admitted = await submitAndBroadcast(wallet as any, { tx: signed.tx as number[], txid: signed.txid }, offChainValues, created.signableTransaction.reference)
-    // Output order is fixed (randomizeOutputs: false): next auth at 0.
     return {
-      txid: signed.txid,
-      nextAuthOutpoint: outpoint(signed.txid, 0),
+      txid: res.txid,
+      nextAuthOutpoint: outpoint(res.txid, res.authIndices[0]),
+      nextAuthKeyID: res.authKeyIDs[0],
       nextAuthDetails: redeemDetails,
-      ...admissionReceipt(admitted)
+      ...admissionReceipt(res.admitted)
     }
   }))
 }

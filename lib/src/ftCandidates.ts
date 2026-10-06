@@ -4,7 +4,7 @@
  * (listOutputs exposes neither). Feeds selectFtInputs (see ftSelect.ts).
  */
 import { Beef, LockingScript, WalletInterface } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { decodeValue } from './brc162.js'
 import { BASKET } from './constants.js'
 import { FtCandidate } from './ftSelect.js'
 import { resolveAssetState } from './adminState.js'
@@ -106,9 +106,9 @@ export async function loadFtCandidates(
     try {
       const script = scriptOf(o)
       if (script == null) continue
-      decoded = MandalaToken.decode(script)
+      decoded = decodeValue(script, assetId)
     } catch { continue } // not a Mandala FT output
-    if (decoded.assetId !== assetId) continue
+    if (decoded == null) continue // not a value coin of this token (authority, deploy, other token)
 
     let ci: { keyID?: string, counterparty?: string } = {}
     try { ci = JSON.parse((o.customInstructions as string) ?? '{}') } catch { /* malformed */ }

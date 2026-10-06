@@ -4,10 +4,10 @@
  */
 import { Beef, Transaction, Utils, WalletInterface } from '@bsv/sdk'
 import { BASKET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
+import { authorityKeyIdOf, decodeToken } from './brc162.js'
 import {
   fetchRegistry,
   listRegistryAuth,
-  reconstructRegistryDetails,
   registryCustomInstructions,
   OverlayRegistryRow,
   RegistryAuth
@@ -240,21 +240,26 @@ export async function recoverRegistryAuth (p: {
   const row = pickRecoverableRegistryRow(await fetchRegistry())
   if (row == null) return await listRegistryAuth(p.wallet)
   const op = `${row.txid}.${row.outputIndex}`
-  const details = reconstructRegistryDetails(row, p.issuerIdentityKey)
   const listed = await listRegistryAuth(p.wallet)
   if (listed?.authOutpoint === op) return listed
   const beef = await fetchRegistryBeef(row.txid, row.outputIndex)
   if (beef == null) throw new Error(`could not load registry tx ${row.txid}`)
+  const atomic = toAtomicBeef(beef, row.txid)
+  const script = Transaction.fromAtomicBEEF(atomic).outputs[row.outputIndex]?.lockingScript
+  const authKeyID = script != null ? authorityKeyIdOf(script) : null
+  const decoded = script != null ? decodeToken(script) : null
+  if (authKeyID == null || decoded == null) throw new Error(`${op} is not a registry authority output`)
+  const tokenId = decoded.tokenId ?? `${row.txid}_0`
   try {
     await p.wallet.internalizeAction({
-      tx: toAtomicBeef(beef, row.txid),
+      tx: atomic,
       labels: ['mandala', 'registry', 'recover'],
       outputs: [{
         outputIndex: row.outputIndex,
         protocol: 'basket insertion',
         insertionRemittance: {
           basket: BASKET,
-          customInstructions: registryCustomInstructions(details),
+          customInstructions: registryCustomInstructions(tokenId, authKeyID),
           tags: ['mandala-registry']
         }
       }],
@@ -266,5 +271,5 @@ export async function recoverRegistryAuth (p: {
   const again = await listRegistryAuth(p.wallet)
   if (again?.authOutpoint === op) return again
   // Overlay is the source of truth for the live head. Basket CI is bookkeeping.
-  return { authOutpoint: op, authDetails: details }
+  return { authOutpoint: op, authKeyID, tokenId }
 }

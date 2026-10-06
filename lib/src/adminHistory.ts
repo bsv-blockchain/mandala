@@ -1,37 +1,52 @@
-import { MandalaAdmin } from '@bsv/templates'
-import type { MandalaActionDetails } from '@bsv/templates'
 import { OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
+import { decodeAdminDetails, MandalaActionDetails } from './brc162.js'
 
+/** One admin-history row (`GET /admin/admin-history/:tokenId`). */
 export interface AdminHistoryRow {
   assetId: string
   txid: string
   outputIndex: number
   height: number
   offset: number
+  /** Decoded from the strict-CBOR `detailsHex`; `{kind}` alone when undecodable. */
   actionDetails: MandalaActionDetails
+  detailsHex: string
+  /** sha256(details) hex — also the authority keyID of this link. */
+  commitment: string
+  /** Supply change of the action (issue > 0, redeem < 0, reissue = frozen amount). */
+  delta: number
+  admitSeq?: number
+  createdAt?: string
 }
+
+function toRow (e: any): AdminHistoryRow | null {
+  if (e == null || typeof e.txid !== 'string') return null
+  const detailsHex = typeof e.detailsHex === 'string' ? e.detailsHex : ''
+  const actionDetails = decodeAdminDetails(detailsHex) ?? { kind: e.kind }
+  return {
+    assetId: e.tokenId,
+    txid: e.txid,
+    outputIndex: Number(e.outputIndex) || 0,
+    height: Number(e.height) || 0,
+    offset: Number(e.offset) || 0,
+    actionDetails,
+    detailsHex,
+    commitment: typeof e.commitment === 'string' ? e.commitment : '',
+    delta: Number(e.delta) || 0,
+    ...(typeof e.admitSeq === 'number' ? { admitSeq: e.admitSeq } : {}),
+    ...(typeof e.createdAt === 'string' ? { createdAt: e.createdAt } : {})
+  }
+}
+
+const toRows = (body: unknown): AdminHistoryRow[] =>
+  Array.isArray(body) ? body.map(toRow).filter((r): r is AdminHistoryRow => r != null) : []
 
 export async function resolveAdminHistory (assetId: string): Promise<AdminHistoryRow[]> {
   if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
   try {
     const res = await fetch(`${OVERLAY_URL}/admin/admin-history/${encodeURIComponent(assetId)}`)
     if (!res.ok) return []
-    const entries: Array<{
-      assetId: string
-      txid: string
-      outputIndex: number
-      height: number
-      offset: number
-      actionDetails: MandalaActionDetails
-    }> = await res.json()
-    return entries.map(e => ({
-      assetId: e.assetId,
-      txid: e.txid,
-      outputIndex: e.outputIndex,
-      height: e.height,
-      offset: e.offset,
-      actionDetails: e.actionDetails
-    }))
+    return toRows(await res.json())
   } catch {
     return []
   }
@@ -49,8 +64,7 @@ export async function resolveAdminHistoryPage (
     params.set('offset', String(opts.offset ?? 0))
     const res = await fetch(`${OVERLAY_URL}/admin/admin-history-page/${encodeURIComponent(assetId)}?${params.toString()}`)
     if (!res.ok) return []
-    const entries = await res.json()
-    return Array.isArray(entries) ? entries as AdminHistoryRow[] : []
+    return toRows(await res.json())
   } catch {
     return []
   }
@@ -91,64 +105,48 @@ const feeRateOf = (d: Record<string, unknown>): number | undefined => {
   return typeof v === 'number' && Number.isSafeInteger(v) && v >= 1 ? v : undefined
 }
 
-export function describeAction (d: MandalaActionDetails): string {
-  // 'recover' was removed as an action kind (recovery is now the guarded
-  // 'reissue'), but legacy on-chain admin records may still carry it — describe
-  // it without referencing the removed union member.
-  if ((d.kind as string) === 'recover') return `Recovered ${d.amount} units to ${short(d.recipient as string)} (legacy)`
-  // 'setFeeRate' is not yet in the pinned MandalaActionKind union (ts-stack PR
-  // pending) — same situation as the removed 'recover', described outside the
-  // (exhaustively typed) switch below.
-  if ((d.kind as string) === 'setFeeRate') {
-    const rate = (d as unknown as { feeRatePerKb?: number | null }).feeRatePerKb
-    return rate == null ? 'Issuer-paid fees disabled' : `Fee rate set to ${rate} units/KB`
-  }
+/** `delta` is the supply change the overlay recorded for the row (issue/redeem/reissue amounts). */
+export function describeAction (d: MandalaActionDetails, delta?: number): string {
+  const amt = delta != null ? `${Math.abs(delta)} units` : 'units'
   switch (d.kind) {
-    // The register action carries the genesis metadata (label/ticker), not an
-    // assetId — the assetId is the outpoint of this very tx, so it can't be a
-    // field within its own payload.
-    case 'register': {
-      const rate = feeRateOf(d as unknown as Record<string, unknown>)
-      const feeSuffix = rate != null ? ` · fee rate ${rate} units/KB` : ''
-      return `Registered asset "${d.label as string}"${d.ticker != null && d.ticker !== '' ? ` (${d.ticker as string})` : ''}${feeSuffix}`
-    }
     // bankRef is the sha256 of the off-chain deposit record (R12) — shown in
     // full so an auditor can match it against the bank's own record hash.
-    case 'issue': return `Issued ${d.amount} units${d.bankRef != null ? ` (bankRef ${d.bankRef})` : ''}`
-    case 'redeem': return `Redeemed (burned) ${d.amount} units`
+    case 'issue': return `Issued ${amt}${d.bankRef != null ? ` (bankRef ${d.bankRef})` : ''}`
+    case 'redeem': return `Redeemed (burned) ${amt}`
     case 'pause': return 'Paused transfers'
     case 'unpause': return 'Resumed transfers'
-    case 'blockIdentity': return `Blocked identity ${short(d.identityKey as string)}`
-    case 'unblockIdentity': return `Unblocked identity ${short(d.identityKey as string)}`
-    case 'allowIdentity': return `Allowlisted identity ${short(d.identityKey as string)}`
-    case 'unallowIdentity': return `Removed ${short(d.identityKey as string)} from allowlist`
-    case 'setAccessMode': return `Set access mode to ${d.mode}`
-    case 'freezeOutput': return `Froze output ${d.outpoint}`
-    case 'unfreezeOutput': return `Unfroze output ${d.outpoint}`
-    case 'reissue': return `Reissued ${d.amount} units to ${short(d.recipient as string)}${d.bankRef != null ? ` (bankRef ${d.bankRef})` : ''}`
-    default: return (d as MandalaActionDetails).kind
+    case 'blockIdentity': return `Blocked identity ${short(d.identityKey)}`
+    case 'unblockIdentity': return `Unblocked identity ${short(d.identityKey)}`
+    case 'allowIdentity': return `Allowlisted identity ${short(d.identityKey)}`
+    case 'unallowIdentity': return `Removed ${short(d.identityKey)} from allowlist`
+    case 'setAccessMode': return `Set access mode to ${String(d.mode)}`
+    case 'freezeOutput': return `Froze output ${String(d.outpoint)}`
+    case 'unfreezeOutput': return `Unfroze output ${String(d.outpoint)}`
+    case 'reissue': return `Reissued ${amt} from ${String(d.outpoint)} to ${short(d.recipient)}`
+    case 'setFeeRate': return d.feeRatePerKb == null ? 'Issuer-paid fees disabled' : `Fee rate set to ${d.feeRatePerKb} units/KB`
+    case 'admitIdentity': return `Admitted identity ${short(d.identityKey)}`
+    case 'revokeIdentity': return `Revoked identity ${short(d.identityKey)}`
+    default: return String((d as { kind?: unknown }).kind)
   }
 }
 
 const esc = (s: string): string => `"${s.replace(/"/g, '""')}"`
 
 export function exportAdminHistoryCsv (rows: AdminHistoryRow[]): string {
-  const header = ['txid', 'outputIndex', 'priorOutpoint', 'kind', 'bankRef', 'canonicalDetailsJson', 'commitment', 'height', 'offset', 'description']
+  const header = ['txid', 'outputIndex', 'kind', 'bankRef', 'detailsHex', 'commitment', 'delta', 'height', 'offset', 'description']
   const lines = [header.join(',')]
   for (const r of rows) {
-    const canonical = MandalaAdmin.canonicalize(r.actionDetails)
-    const commitment = MandalaAdmin.commitment(r.actionDetails)
     lines.push([
       esc(r.txid),
       String(r.outputIndex),
-      esc(String(r.actionDetails.priorOutpoint ?? '')),
       esc(r.actionDetails.kind),
       esc(String(r.actionDetails.bankRef ?? '')),
-      esc(canonical),
-      esc(commitment),
+      esc(r.detailsHex),
+      esc(r.commitment),
+      String(r.delta),
       String(r.height),
       String(r.offset),
-      esc(describeAction(r.actionDetails))
+      esc(describeAction(r.actionDetails, r.delta))
     ].join(','))
   }
   return lines.join('\n')

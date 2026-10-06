@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest'
 import { PrivateKey, Transaction, UnlockingScript, Utils } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { MandalaToken } from './__fixtures__/token.js'
 
 vi.mock('./overlay.js', async () => {
   const actual = await vi.importActual<typeof import('./overlay.js')>('./overlay.js')
@@ -14,14 +14,15 @@ vi.mock('./overlay.js', async () => {
 })
 
 const { submitToOverlay, OverlayRefusedError } = await import('./overlay.js')
-const { admissionMessageV2 } = await import('./admission.js')
+const { admissionMessageV3 } = await import('./admission.js')
+const { tokenTopic } = await import('./brc162.js')
 const { configureMandala } = await import('./constants.js')
 const { receiveTokens } = await import('./receive.js')
 
 const OVERLAY = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000c3')
 const OVERLAY_KEY = OVERLAY.toPublicKey().toString()
 
-const ASSET = `${'11'.repeat(32)}.0`
+const ASSET = `${'11'.repeat(32)}_0`
 const AMOUNT = 42
 
 const tokenTx = (parent: Transaction | undefined, amount: number, fill: number): Transaction => {
@@ -39,7 +40,7 @@ const TIP0 = tokenTx(GRAND, AMOUNT, 9) // 0-hop: spends the admitted coin direct
 const TIP1 = tokenTx(MID, AMOUNT, 8) // 1-hop: spends a coin that was itself handed over
 
 const sigOver = (txid: string, outputsToAdmit: number[]): string => {
-  const der = OVERLAY.sign(Utils.toArray(admissionMessageV2(txid, outputsToAdmit), 'utf8')).toDER()
+  const der = OVERLAY.sign(Utils.toArray(admissionMessageV3(tokenTopic(ASSET), txid, outputsToAdmit), 'utf8')).toDER()
   return typeof der === 'string' ? der : Utils.toHex(der)
 }
 

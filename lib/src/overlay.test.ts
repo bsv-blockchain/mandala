@@ -26,24 +26,24 @@ beforeEach(async () => {
 describe('submitToOverlay', () => {
   it('returns admitted indices on success', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0, 1], coinsToRetain: [] } }) }
-    const res = await submitToOverlay([1, 2, 3], [4, 5], facilitator as any)
+    const res = await submitToOverlay([1, 2, 3], [4, 5], facilitator as any, ['tm_mandala'])
     expect(res.outputsToAdmit).toEqual([0, 1])
     expect(facilitator.send).toHaveBeenCalledWith(OVERLAY, { beef: [1, 2, 3], topics: ['tm_mandala'], offChainValues: [4, 5] })
   })
   it('surfaces the overlay admission signature', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0], admissionSignature: 'dead', admissionIdentityKey: '02aa' } }) }
-    const res = await submitToOverlay([1], undefined, facilitator as any)
+    const res = await submitToOverlay([1], undefined, facilitator as any, ['tm_mandala'])
     expect(res).toMatchObject({ outputsToAdmit: [0], admissionSignature: 'dead', admissionIdentityKey: '02aa' })
   })
   it('throws when nothing is admitted', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [], coinsToRetain: [] } }) }
-    await expect(submitToOverlay([1], undefined, facilitator as any)).rejects.toThrow('overlay rejected')
+    await expect(submitToOverlay([1], undefined, facilitator as any, ['tm_mandala'])).rejects.toThrow('overlay rejected')
   })
   it('refuses to send when configureMandala has not set the overlay URL', async () => {
     // Without this a missing configureMandala would POST to a relative /submit.
     configureMandala({ overlayUrl: '' })
     const facilitator = { send: vi.fn() }
-    await expect(submitToOverlay([1], undefined, facilitator as any)).rejects.toThrow(/configureMandala/)
+    await expect(submitToOverlay([1], undefined, facilitator as any, ['tm_mandala'])).rejects.toThrow(/configureMandala/)
     expect(facilitator.send).not.toHaveBeenCalled()
   })
 })
@@ -54,7 +54,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
   it('broadcasts via sendWith only after the overlay accepts', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
     const wallet = { createAction: vi.fn().mockResolvedValue({}), abortAction: vi.fn() }
-    const res = await submitAndBroadcast(wallet as any, signed, [9], 'ref-1', facilitator as any)
+    const res = await submitAndBroadcast(wallet as any, signed, [9], 'ref-1', facilitator as any, ['tm_mandala'])
     expect(res.outputsToAdmit).toEqual([0])
     expect(wallet.createAction).toHaveBeenCalledWith({
       description: 'broadcast overlay-accepted tx',
@@ -66,7 +66,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
   it('never broadcasts and aborts (releasing inputs) when the overlay rejects', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [] } }) }
     const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockResolvedValue({}) }
-    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any))
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala']))
       .rejects.toThrow('overlay rejected')
     expect(wallet.createAction).not.toHaveBeenCalled() // tx never hit the network
     expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-1' })
@@ -76,7 +76,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
     configureMandala({ overlayUrl: '' })
     const facilitator = { send: vi.fn() }
     const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockResolvedValue({}) }
-    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any))
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala']))
       .rejects.toThrow(/configureMandala/)
     expect(facilitator.send).not.toHaveBeenCalled()
     expect(wallet.createAction).not.toHaveBeenCalled()
@@ -87,7 +87,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
   it('skips abort with no reference (genesis) and still never broadcasts on reject', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [] } }) }
     const wallet = { createAction: vi.fn(), abortAction: vi.fn() }
-    await expect(submitAndBroadcast(wallet as any, signed, undefined, undefined, facilitator as any))
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, undefined, facilitator as any, ['tm_mandala']))
       .rejects.toThrow('overlay rejected')
     expect(wallet.createAction).not.toHaveBeenCalled()
     expect(wallet.abortAction).not.toHaveBeenCalled()
@@ -97,7 +97,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
     const wallet = { createAction: vi.fn().mockRejectedValue(new Error('net down')), abortAction: vi.fn() }
     // Resolves at the overlay-accept commit point despite the doomed broadcast.
-    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any))
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala']))
       .resolves.toMatchObject({ outputsToAdmit: [0] })
     await new Promise(r => setTimeout(r, 0)) // let the background broadcast settle
     // Accepted by the overlay → must NOT be aborted, must stay journaled for retry.
@@ -108,7 +108,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
   it('journals a pending abort when the overlay rejects and abortAction fails', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [] } }) }
     const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockRejectedValue(new Error('offline')) }
-    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any))
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala']))
       .rejects.toThrow('overlay rejected')
     expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'abort', reference: 'ref-1' }])
   })
@@ -116,7 +116,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
   it('clears the journal after a successful accept + broadcast', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0], admissionSignature: 'ab' } }) }
     const wallet = { createAction: vi.fn().mockImplementation(postingWallet), abortAction: vi.fn() }
-    const res = await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any)
+    const res = await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
     expect(res.admissionSignature).toBe('ab')
     await new Promise(r => setTimeout(r, 0)) // background broadcast
     expect(await journalList()).toEqual([])
@@ -135,7 +135,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
       }),
       abortAction: vi.fn()
     }
-    const done = submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any)
+    const done = submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
     // Commit point resolves with journal already written; broadcast still pending.
     await expect(done).resolves.toMatchObject({ outputsToAdmit: [0] })
     expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'accepted' }])
@@ -300,12 +300,12 @@ describe('submitToOverlay — refusal plumbing', () => {
   it('surfaces a structured refusal unchanged', async () => {
     const refusal = new OverlayRefusedError({ code: 'ERR_CONSERVATION', httpStatus: 400 })
     const facilitator = { send: vi.fn().mockRejectedValue(refusal) }
-    await expect(submitToOverlay([1], undefined, facilitator as any)).rejects.toBe(refusal)
+    await expect(submitToOverlay([1], undefined, facilitator as any, ['tm_mandala'])).rejects.toBe(refusal)
   })
 
   it('normalises any other transport failure to ERR_UNAVAILABLE/retryable', async () => {
     const facilitator = { send: vi.fn().mockRejectedValue(new Error('socket hang up')) }
-    await expect(submitToOverlay([1], undefined, facilitator as any))
+    await expect(submitToOverlay([1], undefined, facilitator as any, ['tm_mandala']))
       .rejects.toMatchObject({ code: 'ERR_UNAVAILABLE', retryable: true })
   })
 })
@@ -323,7 +323,7 @@ describe('submitAndBroadcast — refusals never broadcast', () => {
   ])('aborts (releasing inputs) and never broadcasts on a final %s', async (code, status) => {
     const facilitator = { send: vi.fn().mockRejectedValue(new OverlayRefusedError({ code: code as string, httpStatus: status as number })) }
     const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockResolvedValue({}) }
-    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any))
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala']))
       .rejects.toMatchObject({ code, retryable: false })
     expect(wallet.createAction).not.toHaveBeenCalled()
     expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-1' })
@@ -339,7 +339,7 @@ describe('submitAndBroadcast — refusals never broadcast', () => {
   ])('keeps the action alive (no abort, no broadcast) on a retryable %s', async (code, status) => {
     const facilitator = { send: vi.fn().mockRejectedValue(new OverlayRefusedError({ code: code as string, httpStatus: status as number })) }
     const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockResolvedValue({}) }
-    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any))
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala']))
       .rejects.toMatchObject({ code, retryable: true })
     expect(wallet.createAction).not.toHaveBeenCalled()
     // Inputs stay held: the very same tx is re-submittable once the condition lifts.
@@ -358,7 +358,7 @@ describe('submitAndBroadcast — refusals never broadcast', () => {
     let release!: () => void
     const gate = new Promise<void>(r => { release = r })
     const wallet = { createAction: vi.fn().mockImplementation(async () => { await gate; return {} }), abortAction: vi.fn() }
-    const res = await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any)
+    const res = await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
     expect(res).toMatchObject({ outputsToAdmit: [0, 2], admissionSignature: 'de', admissionIdentityKey: '02aa' })
     expect(await journalList()).toMatchObject([{
       txid: 'abc',
@@ -385,7 +385,7 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
 
   it('journals the bytes, topics, reference and code so reconcile can re-POST them', async () => {
     const wallet = { createAction: vi.fn(), abortAction: vi.fn() }
-    await expect(submitAndBroadcast(wallet as any, signed, [7, 8], 'ref-1', refusing(), ['tm_mandala_registry']))
+    await expect(submitAndBroadcast(wallet as any, signed, [7, 8], 'ref-1', refusing(), ['tm_mandala_kyc']))
       .rejects.toMatchObject({ code: 'ERR_PAUSED', retryable: true })
     expect(await journalList()).toMatchObject([{
       txid: 'abc',
@@ -393,13 +393,13 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
       code: 'ERR_PAUSED',
       reference: 'ref-1',
       attempts: 0,
-      submit: { txHex: 'deadbeef', offChainHex: '0708', topics: ['tm_mandala_registry'] }
+      submit: { txHex: 'deadbeef', offChainHex: '0708', topics: ['tm_mandala_kyc'] }
     }])
   })
 
   it('omits offChainHex when the flow had no off-chain payload', async () => {
     const wallet = { createAction: vi.fn(), abortAction: vi.fn() }
-    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing()))
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing(), ['tm_mandala']))
       .rejects.toMatchObject({ retryable: true })
     const [entry] = await journalList()
     expect(entry.submit?.offChainHex).toBeUndefined()
@@ -408,7 +408,7 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
 
   it('journals even with no reference (genesis): the record still names the txid', async () => {
     const wallet = { createAction: vi.fn(), abortAction: vi.fn() }
-    await expect(submitAndBroadcast(wallet as any, signed, undefined, undefined, refusing()))
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, undefined, refusing(), ['tm_mandala']))
       .rejects.toMatchObject({ retryable: true })
     expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'retryable' }])
     expect(wallet.abortAction).not.toHaveBeenCalled()
@@ -432,7 +432,7 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
     })
     try {
       const wallet = { createAction: vi.fn(), abortAction: vi.fn() }
-      const p = submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing())
+      const p = submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing(), ['tm_mandala'])
       let settled = false
       void p.catch(() => { settled = true })
       await new Promise(r => setTimeout(r, 0))
@@ -448,11 +448,11 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
 
   it('a later successful submit of the same txid replaces the retryable entry with accepted', async () => {
     const wallet = { createAction: vi.fn().mockImplementation(postingWallet), abortAction: vi.fn() }
-    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing()))
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing(), ['tm_mandala']))
       .rejects.toMatchObject({ retryable: true })
     expect(await journalList()).toMatchObject([{ stage: 'retryable' }])
     const ok = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
-    await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', ok as any)
+    await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', ok as any, ['tm_mandala'])
     await new Promise(r => setTimeout(r, 0))
     expect(await journalList()).toEqual([]) // accepted, broadcast, cleared
   })
@@ -502,7 +502,7 @@ describe('the wallet must prove it posted the tx', () => {
 
   it("keeps the 'accepted' entry when createAction resolves without posting", async () => {
     const wallet = { createAction: vi.fn().mockResolvedValue({}), abortAction: vi.fn() }
-    await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', accepting() as any)
+    await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', accepting() as any, ['tm_mandala'])
     await new Promise(r => setTimeout(r, 0)) // background broadcast settles
     expect(wallet.createAction).toHaveBeenCalled()
     expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'accepted' }])
@@ -514,7 +514,7 @@ describe('the wallet must prove it posted the tx', () => {
       createAction: vi.fn().mockResolvedValue({ sendWithResults: [{ txid: 'abc', status: 'failed' }] }),
       abortAction: vi.fn()
     }
-    await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', accepting() as any)
+    await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', accepting() as any, ['tm_mandala'])
     await new Promise(r => setTimeout(r, 0))
     expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'accepted' }])
   })
@@ -523,7 +523,7 @@ describe('the wallet must prove it posted the tx', () => {
 
 // 2026-09-15 — an admitted set is not an admission without a verifying σ_I
 import { PrivateKey, Beef, LockingScript, Transaction, Utils as U } from '@bsv/sdk'
-import { admissionMessageV2 } from './admission.js'
+import { admissionMessageV3 } from './admission.js'
 
 describe('submitToOverlay requires a verifying admission signature when a key is configured', () => {
   const OVERLAY_PRIV = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000d4')
@@ -534,34 +534,34 @@ describe('submitToOverlay requires a verifying admission signature when a key is
   const beef = new Beef(); beef.mergeTransaction(tx)
   const bytes = beef.toBinaryAtomic(tx.id('hex'))
   const sign = (key = OVERLAY_PRIV, outs = [0]) =>
-    U.toHex(key.sign(U.toArray(admissionMessageV2(tx.id('hex'), outs), 'utf8')).toDER() as number[])
+    U.toHex(key.sign(U.toArray(admissionMessageV3('tm_mandala', tx.id('hex'), outs), 'utf8')).toDER() as number[])
 
   beforeEach(() => configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: OVERLAY_KEY }))
 
   it('accepts a σ_I by the configured key', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0], admissionSignature: sign(), admissionIdentityKey: OVERLAY_KEY } }) }
-    await expect(submitToOverlay(bytes, undefined, facilitator as any)).resolves.toMatchObject({ outputsToAdmit: [0] })
+    await expect(submitToOverlay(bytes, undefined, facilitator as any, ['tm_mandala'])).resolves.toMatchObject({ outputsToAdmit: [0] })
   })
   it('an admitted set with NO signature is a retryable ERR_NO_ADMISSION, never a success', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
-    await expect(submitToOverlay(bytes, undefined, facilitator as any)).rejects.toMatchObject({ code: 'ERR_NO_ADMISSION', retryable: true })
+    await expect(submitToOverlay(bytes, undefined, facilitator as any, ['tm_mandala'])).rejects.toMatchObject({ code: 'ERR_NO_ADMISSION', retryable: true })
   })
   it('a signature by another key, or over another admitted set, is ERR_BAD_ADMISSION', async () => {
     const wrongKey = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0], admissionSignature: sign(IMPOSTOR), admissionIdentityKey: IMPOSTOR.toPublicKey().toString() } }) }
-    await expect(submitToOverlay(bytes, undefined, wrongKey as any)).rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION', retryable: true })
+    await expect(submitToOverlay(bytes, undefined, wrongKey as any, ['tm_mandala'])).rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION', retryable: true })
     const wrongSet = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0, 1], admissionSignature: sign(OVERLAY_PRIV, [0]), admissionIdentityKey: OVERLAY_KEY } }) }
-    await expect(submitToOverlay(bytes, undefined, wrongSet as any)).rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION' })
+    await expect(submitToOverlay(bytes, undefined, wrongSet as any, ['tm_mandala'])).rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION' })
   })
   it('never broadcasts on an unsigned admission', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
     const wallet = { createAction: vi.fn().mockImplementation(postingWallet), abortAction: vi.fn().mockResolvedValue({ aborted: true }) }
-    await expect(submitAndBroadcast(wallet as any, { tx: bytes, txid: tx.id('hex') } as any, undefined, 'ref', facilitator as any)).rejects.toMatchObject({ code: 'ERR_NO_ADMISSION' })
+    await expect(submitAndBroadcast(wallet as any, { tx: bytes, txid: tx.id('hex') } as any, undefined, 'ref', facilitator as any, ['tm_mandala'])).rejects.toMatchObject({ code: 'ERR_NO_ADMISSION' })
     expect(wallet.createAction).not.toHaveBeenCalled()
   })
 })
 
 // 2026-09-17 — σ_I rides on the tm_mandala entry only (wire contract §1/§2).
-// A registry-only submit (tm_mandala_registry) is never signed by either
+// A registry-only submit (tm_mandala_kyc) is never signed by either
 // overlay, so demanding a signature there refused every identity-chain action
 // AFTER the overlay had folded and broadcast it (testnet 4b0464ad…).
 describe('submitToOverlay does not demand σ_I for a registry-only submit', () => {
@@ -571,22 +571,22 @@ describe('submitToOverlay does not demand σ_I for a registry-only submit', () =
   tx.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
   const beef = new Beef(); beef.mergeTransaction(tx)
   const bytes = beef.toBinaryAtomic(tx.id('hex'))
-  const REGISTRY = ['tm_mandala_registry']
+  const REGISTRY = ['tm_mandala_kyc']
 
   beforeEach(() => configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: OVERLAY_KEY }))
 
-  it('accepts an unsigned tm_mandala_registry admission when a key is configured', async () => {
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala_registry: { outputsToAdmit: [0], coinsToRetain: [] } }) }
+  it('accepts an unsigned tm_mandala_kyc admission when a key is configured', async () => {
+    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala_kyc: { outputsToAdmit: [0], coinsToRetain: [] } }) }
     await expect(submitToOverlay(bytes, undefined, facilitator as any, REGISTRY)).resolves.toMatchObject({ outputsToAdmit: [0] })
   })
   it('broadcasts a registry-only admission and journals it as accepted', async () => {
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala_registry: { outputsToAdmit: [0], coinsToRetain: [] } }) }
+    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala_kyc: { outputsToAdmit: [0], coinsToRetain: [] } }) }
     const wallet = { createAction: vi.fn().mockImplementation(postingWallet), abortAction: vi.fn() }
     await submitAndBroadcast(wallet as any, { tx: bytes, txid: tx.id('hex') } as any, undefined, undefined, facilitator as any, REGISTRY)
     expect(wallet.createAction).toHaveBeenCalledWith(expect.objectContaining({ options: expect.objectContaining({ sendWith: [tx.id('hex')] }) }))
   })
   it('still demands σ_I when the submit names tm_mandala', async () => {
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] }, tm_mandala_registry: { outputsToAdmit: [], coinsToRetain: [] } }) }
-    await expect(submitToOverlay(bytes, undefined, facilitator as any, ['tm_mandala', 'tm_mandala_registry'])).rejects.toMatchObject({ code: 'ERR_NO_ADMISSION' })
+    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] }, tm_mandala_kyc: { outputsToAdmit: [], coinsToRetain: [] } }) }
+    await expect(submitToOverlay(bytes, undefined, facilitator as any, ['tm_mandala', 'tm_mandala_kyc'])).rejects.toMatchObject({ code: 'ERR_NO_ADMISSION' })
   })
 })

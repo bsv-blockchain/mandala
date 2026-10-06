@@ -1,9 +1,12 @@
 import { Beef, Utils, WalletInterface } from '@bsv/sdk'
-import { TOPIC, OVERLAY_URL, OVERLAY_URL_UNSET, OVERLAY_IDENTITY_KEY } from './constants.js'
+import { OVERLAY_URL, OVERLAY_URL_UNSET, OVERLAY_IDENTITY_KEY } from './constants.js'
+import { isSigmaTopic } from './brc162.js'
 import { verifyAdmission } from './admission.js'
 import { journalPut, journalRemove } from './txJournal.js'
 
 export interface OverlayAdmitResult {
+  /** The STEAK topic this receipt (and its σI) speaks for — the first token topic submitted. */
+  topic?: string
   /**
    * The submitted topic's own admitted output indexes — for a token submission
    * this is the `tm_mandala` entry's set, which is exactly what σ_I commits to
@@ -11,7 +14,7 @@ export interface OverlayAdmitResult {
    * in here.
    */
   outputsToAdmit: number[]
-  /** Overlay ECDSA signature over admissionDigestV2(txid, outputsToAdmit). */
+  /** Overlay ECDSA signature over admissionDigestV3(topic, txid, outputsToAdmit). */
   admissionSignature?: string
   admissionIdentityKey?: string
 }
@@ -22,6 +25,8 @@ export interface OverlayAdmitResult {
  * without the set it signed over and the key that signed it.
  */
 export interface AdmissionReceipt {
+  /** Topic the σI was taken for (`tm_<deployTxid>`). */
+  topic?: string
   admissionSignature?: string
   admissionIdentityKey?: string
   outputsToAdmit?: number[]
@@ -30,6 +35,7 @@ export interface AdmissionReceipt {
 /** Narrow an OverlayAdmitResult to the receipt fields a pipeline returns. */
 export function admissionReceipt (r: OverlayAdmitResult): AdmissionReceipt {
   return {
+    ...(r.topic != null ? { topic: r.topic } : {}),
     admissionSignature: r.admissionSignature,
     admissionIdentityKey: r.admissionIdentityKey,
     outputsToAdmit: r.outputsToAdmit
@@ -241,8 +247,10 @@ export async function submitToOverlay (
   beef: number[],
   offChainValues?: number[],
   facilitator: OverlayBroadcastFacilitator = createOverlayFacilitator(),
-  topics: string[] = [TOPIC]
+  /** Required: `[tokenTopic(assetId)]`, `deployTopics(txid)` or `[REGISTRY_TOPIC]`. */
+  topics: string[] = []
 ): Promise<OverlayAdmitResult> {
+  if (!Array.isArray(topics) || topics.length === 0) throw new Error('submitToOverlay: topics are required (tokenTopic(assetId))')
   // Fail loudly: without configureMandala this would POST to a relative /submit.
   if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
   const taggedBEEF = { beef, topics, offChainValues }
@@ -254,23 +262,36 @@ export async function submitToOverlay (
     // so a retryable fault is never mistaken for a permanent refusal (FIX D).
     throw asRefusal(e)
   }
-  // The admitted set comes from the submitted topic's own STEAK entry
-  // (`tm_mandala` for token traffic) — a registry-only admission must never be
-  // read as a token admission.
-  const topic = topics.map(t => steak[t]).find(t => (t?.outputsToAdmit?.length ?? 0) > 0) ?? steak[topics[0]]
-  const admit = topic?.outputsToAdmit ?? []
-  if (admit.length === 0) throw new Error('overlay rejected the transaction')
-  const result: OverlayAdmitResult = {
-    outputsToAdmit: admit,
-    admissionSignature: topic?.admissionSignature,
-    admissionIdentityKey: topic?.admissionIdentityKey
+  // Every submitted σI topic must admit: a multi-token tx that one token
+  // topic refused is not admitted (the overlay applies per topic). A
+  // non-σI topic (tm_mandala_kyc) only needs to admit when it is the sole
+  // topic. The primary receipt is the first token topic (tm_<64 hex>), else
+  // the first topic.
+  for (const t of topics) {
+    if ((isSigmaTopic(t) || topics.length === 1) && (steak[t]?.outputsToAdmit?.length ?? 0) === 0) {
+      throw new Error(`overlay rejected the transaction on ${t}`)
+    }
   }
-  // σ_I speaks for the tm_mandala admitted set only (wire contract §1/§2):
-  // neither overlay signs a registry-only admission, so demanding one there
-  // refused every identity-chain action AFTER the overlay had already folded
-  // and broadcast it (testnet, 2026-09-17). The registry chain is
-  // authenticated by spending its live head, not by σ_I.
-  if (topics.includes(TOPIC)) requireVerifiedAdmission(beef, result)
+  const primary = topics.find(t => /^tm_[0-9a-f]{64}$/.test(t)) ?? topics[0]
+  const entry = steak[primary]
+  const result: OverlayAdmitResult = {
+    topic: primary,
+    outputsToAdmit: entry.outputsToAdmit,
+    admissionSignature: entry.admissionSignature,
+    admissionIdentityKey: entry.admissionIdentityKey
+  }
+  // σI v3 is per topic and only on tm_mandala / tm_<id> (never tm_mandala_kyc,
+  // whose chain is authenticated by spending its live head). Verify EVERY
+  // signed topic, not only the primary.
+  for (const t of topics) {
+    if (!isSigmaTopic(t) || steak[t] == null) continue
+    const e = steak[t]
+    requireVerifiedAdmission(beef, t, {
+      outputsToAdmit: e.outputsToAdmit,
+      admissionSignature: e.admissionSignature,
+      admissionIdentityKey: e.admissionIdentityKey
+    })
+  }
   return result
 }
 
@@ -289,7 +310,7 @@ let warnedUnverifiable = false
  * host is warned once, and the call behaves as before. Every production host
  * configures the key (`configureMandala({ overlayIdentityKey })`).
  */
-function requireVerifiedAdmission (beef: number[], r: OverlayAdmitResult): void {
+function requireVerifiedAdmission (beef: number[], topic: string, r: OverlayAdmitResult): void {
   if (OVERLAY_IDENTITY_KEY === '') {
     if (!warnedUnverifiable) {
       warnedUnverifiable = true
@@ -315,7 +336,7 @@ function requireVerifiedAdmission (beef: number[], r: OverlayAdmitResult): void 
   }
   const ok =
     signer.toLowerCase() === OVERLAY_IDENTITY_KEY.toLowerCase() &&
-    verifyAdmission({ txid, outputsToAdmit: r.outputsToAdmit, signature: sig, signerKey: signer })
+    verifyAdmission({ topic, txid, outputsToAdmit: r.outputsToAdmit, signature: sig, signerKey: signer })
   if (!ok) {
     throw new OverlayRefusedError({
       code: 'ERR_BAD_ADMISSION',
@@ -409,7 +430,8 @@ export async function submitAndBroadcast (
   offChainValues: number[] | undefined,
   reference?: string,
   facilitator?: OverlayBroadcastFacilitator,
-  topics: string[] = [TOPIC]
+  /** Required (see submitToOverlay). */
+  topics: string[] = []
 ): Promise<OverlayAdmitResult> {
   let admitted: OverlayAdmitResult
   try {

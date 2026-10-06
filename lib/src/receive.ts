@@ -7,7 +7,7 @@
  * and a failed message is left un-acknowledged so a later run retries it.
  */
 import { AtomicBEEF, Beef, Transaction, WalletInterface } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { decodeValue, tokenTopic, tokenTopicOrEmpty } from './brc162.js'
 import { MESSAGEBOX, BASKET, OVERLAY_IDENTITY_KEY } from './constants.js'
 import { resolveAssetMetadata } from './metadata.js'
 import { AdmissionEntry, verifyAdmission } from './admission.js'
@@ -44,6 +44,8 @@ export interface SettleArgs {
   /** The tip — the transaction this credit is for. */
   txid: string
   mustSubmit: string[]
+  /** The token being credited; its topic (`tokenTopic(assetId)`) is what each submit names. */
+  assetId: string
   bytesFor: (txid: string) => { beef: number[], offChainValues: number[] } | undefined
 }
 
@@ -62,7 +64,7 @@ export type SettleFn = (args: SettleArgs) => Promise<void>
  * the caller records it; nothing is reversed, because the credit was made on
  * evidence the recipient verified for itself.
  */
-export const defaultSettle: SettleFn = async ({ mustSubmit, bytesFor }) => {
+export const defaultSettle: SettleFn = async ({ mustSubmit, assetId, bytesFor }) => {
   for (const id of mustSubmit) {
     const bytes = bytesFor(id)
     if (bytes == null) {
@@ -72,7 +74,7 @@ export const defaultSettle: SettleFn = async ({ mustSubmit, bytesFor }) => {
         retryable: true
       })
     }
-    await submitToOverlay(bytes.beef, bytes.offChainValues.length > 0 ? bytes.offChainValues : undefined)
+    await submitToOverlay(bytes.beef, bytes.offChainValues.length > 0 ? bytes.offChainValues : undefined, undefined, [tokenTopic(assetId)])
   }
 }
 
@@ -108,12 +110,9 @@ function verifyIncoming (msg: IncomingTransfer): { admissionVerified: boolean } 
   if (out == null) {
     throw new InvalidTransferError(`outputIndex ${msg.outputIndex} out of range`)
   }
-  let decoded: { assetId: string, amount: number }
-  try {
-    decoded = MandalaToken.decode(out.lockingScript)
-  } catch {
-    throw new InvalidTransferError('output is not a Mandala token')
-  }
+  const value = decodeValue(out.lockingScript)
+  if (value == null) throw new InvalidTransferError('output is not a Mandala token')
+  const decoded = { assetId: value.tokenId, amount: value.amount }
   if (decoded.assetId !== msg.assetId) {
     throw new InvalidTransferError(`asset mismatch: body says ${msg.assetId}, output is ${decoded.assetId}`)
   }
@@ -142,6 +141,7 @@ function checkAdmission (tx: Transaction, msg: IncomingTransfer): boolean {
   if (a.txid !== txid) return false
   if (!Array.isArray(a.outputsToAdmit) || !a.outputsToAdmit.includes(msg.outputIndex)) return false
   return verifyAdmission({
+    topic: tokenTopicOrEmpty(msg.assetId),
     txid,
     outputsToAdmit: a.outputsToAdmit,
     signature: a.signature,
@@ -361,6 +361,7 @@ async function acceptOne (
       await settle({
         txid: tip.id('hex'),
         mustSubmit,
+        assetId: msg.assetId,
         bytesFor: id => {
           const tx = beef.findAtomicTransaction(id)
           if (tx == null) return undefined

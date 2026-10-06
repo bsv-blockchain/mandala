@@ -3,50 +3,49 @@
  * issuance: one admit covers every stablecoin this issuer operates.
  * The overlay database is a cache of this chain.
  */
-import {
-  Hash, LockingScript, OP, Transaction, TransactionSignature, Signature,
-  UnlockingScript, Utils, WalletInterface
-} from '@bsv/sdk'
-import { MandalaAdmin } from '@bsv/templates'
-
-export interface RegistryActionDetails {
-  kind: 'register' | 'admitIdentity' | 'revokeIdentity'
-  identityKey?: string
-  issuer?: string
-  priorOutpoint?: string
-  counterparty?: string
-  [k: string]: unknown
-}
-import { adminAuthHeaders, BASKET, OVERLAY_URL, OVERLAY_URL_UNSET, REGISTRY_PROTOCOL, REGISTRY_TOPIC } from './constants.js'
-import { encodeLinkagePayload } from './encoding.js'
-import { AdmissionReceipt, admissionReceipt, submitAndBroadcast } from './overlay.js'
+import { WalletInterface } from '@bsv/sdk'
+import { adminAuthHeaders, BASKET, OVERLAY_URL, OVERLAY_URL_UNSET, REGISTRY_TOPIC } from './constants.js'
+import { deployPayload } from './brc162.js'
+import { AdmissionReceipt, admissionReceipt } from './overlay.js'
 import { registryFlight } from './singleFlight.js'
 import { guardIdentityKey } from './submitGuards.js'
 import { outpoint } from './tokens.js'
 import { withIntent } from './txJournal.js'
-import { walletMandalaUnlock } from './unlock.js'
+import { runAuthorityTx, runDeployTx } from './authority.js'
+
+export interface RegistryActionDetails {
+  kind: 'admitIdentity' | 'revokeIdentity'
+  identityKey: string
+}
 
 const CI_TYPE = 'mandala-registry'
 
+/** The live link of the KYC registry chain (a BRC-162 authority on tm_mandala_kyc). */
 export interface RegistryAuth {
   authOutpoint: string
-  authDetails: RegistryActionDetails
+  /** keyID of the authority coin (commitment hex, or 'deploy'). */
+  authKeyID: string
+  /** The registry's token id `<deployTxid>_0`. */
+  tokenId: string
 }
 
 interface RegistryCI {
   type: typeof CI_TYPE
-  authDetails: RegistryActionDetails
+  /** '' on the deploy output (its id is its own `<txid>_0`). */
+  tokenId: string
+  authKeyID: string
 }
 
-export function registryCustomInstructions (authDetails: RegistryActionDetails): string {
-  return JSON.stringify({ type: CI_TYPE, authDetails } satisfies RegistryCI)
+export function registryCustomInstructions (tokenId: string, authKeyID: string): string {
+  return JSON.stringify({ type: CI_TYPE, tokenId, authKeyID } satisfies RegistryCI)
 }
 
 export function parseRegistryCI (ci: string | object | null | undefined): RegistryCI | null {
   if (ci == null) return null
   try {
     const parsed = typeof ci === 'string' ? JSON.parse(ci) : ci
-    return parsed != null && typeof parsed === 'object' && (parsed as RegistryCI).type === CI_TYPE
+    return parsed != null && typeof parsed === 'object' && (parsed as RegistryCI).type === CI_TYPE &&
+      typeof (parsed as RegistryCI).authKeyID === 'string'
       ? parsed as RegistryCI
       : null
   } catch {
@@ -54,12 +53,15 @@ export function parseRegistryCI (ci: string | object | null | undefined): Regist
   }
 }
 
+const tokenIdOf = (ci: RegistryCI, op: string): string =>
+  ci.tokenId !== '' ? ci.tokenId : `${op.slice(0, op.lastIndexOf('.'))}_0`
+
 export async function listRegistryAuth (wallet: WalletInterface): Promise<RegistryAuth | null> {
   const res = await wallet.listOutputs({ basket: BASKET, includeCustomInstructions: true, limit: 1000 })
   const found: RegistryAuth[] = []
   for (const o of res.outputs) {
     const ci = parseRegistryCI(o.customInstructions)
-    if (ci != null) found.push({ authOutpoint: o.outpoint, authDetails: ci.authDetails })
+    if (ci != null) found.push({ authOutpoint: o.outpoint, authKeyID: ci.authKeyID, tokenId: tokenIdOf(ci, o.outpoint) })
   }
   if (found.length === 0) return null
   try {
@@ -73,172 +75,34 @@ export async function listRegistryAuth (wallet: WalletInterface): Promise<Regist
   return found[0]
 }
 
-async function lockRegistry (wallet: WalletInterface, data: RegistryActionDetails): Promise<LockingScript> {
-  const keyID = MandalaAdmin.commitment(data as any)
-  const { publicKey } = await wallet.getPublicKey({ protocolID: REGISTRY_PROTOCOL, keyID, counterparty: 'self' })
-  const pubKeyHash = Hash.hash160(Utils.toArray(publicKey, 'hex'))
-  // OP_DROP prefix so this is not a vanilla 1-sat P2PKH the wallet reclassifies
-  // (and drops basket customInstructions) after a chain sync.
-  const marker = Utils.toArray(JSON.stringify({ t: 'mandala-registry' }), 'utf8')
-  return new LockingScript([
-    { op: marker.length, data: marker },
-    { op: OP.OP_DROP },
-    { op: OP.OP_DUP },
-    { op: OP.OP_HASH160 },
-    { op: pubKeyHash.length, data: pubKeyHash },
-    { op: OP.OP_EQUALVERIFY },
-    { op: OP.OP_CHECKSIG }
-  ])
-}
-
-function registryUnlock (wallet: WalletInterface, data: RegistryActionDetails) {
-  const keyID = MandalaAdmin.commitment(data as any)
-  // Same P2PKH unlock shape as walletMandalaUnlock, different protocol.
-  const tmpl = walletMandalaUnlock(wallet, keyID, 'self')
-  return {
-    sign: async (tx: Transaction, inputIndex: number): Promise<UnlockingScript> => {
-      const input = tx.inputs[inputIndex]
-      const sourceTXID = input.sourceTXID ?? input.sourceTransaction?.id('hex')
-      const sourceOutput = input.sourceTransaction?.outputs[input.sourceOutputIndex]
-      if (sourceTXID == null || sourceOutput?.satoshis == null || sourceOutput.lockingScript == null) {
-        throw new Error('registry unlock: missing source')
-      }
-      const scope = TransactionSignature.SIGHASH_FORKID | TransactionSignature.SIGHASH_ALL
-      const preimage = TransactionSignature.format({
-        sourceTXID,
-        sourceOutputIndex: input.sourceOutputIndex,
-        sourceSatoshis: sourceOutput.satoshis,
-        transactionVersion: tx.version,
-        otherInputs: tx.inputs.filter((_, i) => i !== inputIndex),
-        inputIndex,
-        outputs: tx.outputs,
-        inputSequence: input.sequence ?? 0xffffffff,
-        subscript: sourceOutput.lockingScript,
-        lockTime: tx.lockTime,
-        scope
-      })
-      const { signature: der } = await wallet.createSignature({
-        hashToDirectlySign: Hash.hash256(preimage),
-        protocolID: REGISTRY_PROTOCOL,
-        keyID,
-        counterparty: 'self'
-      })
-      const sig = Signature.fromDER([...der])
-      const txSig = new TransactionSignature(sig.r, sig.s, scope)
-      const sigForScript = txSig.toChecksigFormat()
-      const { publicKey } = await wallet.getPublicKey({
-        protocolID: REGISTRY_PROTOCOL, keyID, counterparty: 'self', forSelf: true
-      })
-      const pubkey = Utils.toArray(publicKey, 'hex')
-      return new UnlockingScript([
-        { op: sigForScript.length, data: sigForScript },
-        { op: pubkey.length, data: pubkey }
-      ])
-    },
-    estimateLength: tmpl.estimateLength
-  }
-}
-
 /** A registry spend's outcome plus the overlay's acceptance proof (A12). */
 export interface RegistryActionResult extends AdmissionReceipt {
   authOutpoint: string
+  authKeyID: string
+  tokenId: string
 }
 
-export async function registerIdentities (p: { wallet: WalletInterface, identityKey: string }): Promise<RegistryActionResult> {
-  const details: RegistryActionDetails = { kind: 'register', issuer: p.identityKey, identityKey: p.identityKey }
-  const script = await lockRegistry(p.wallet, details)
-  return await withIntent(async () => {
-    const created = await p.wallet.createAction({
-      description: 'Register identity chain',
-      labels: ['mandala', 'registry', 'register'],
-      outputs: [{
-        satoshis: 1,
-        lockingScript: script.toHex(),
-        outputDescription: 'registry genesis',
-        basket: BASKET,
-        tags: ['mandala-registry'],
-        customInstructions: registryCustomInstructions(details)
-      }],
-      options: { randomizeOutputs: false, noSend: true }
-    })
-    if (created.tx == null || created.txid == null) throw new Error('registry register: no tx')
-    const admitted = await submitAndBroadcast(
-      p.wallet,
-      { tx: created.tx as number[], txid: created.txid },
-      encodeLinkagePayload({ inputs: [], outputs: [], admin: [{ index: 0, actionDetails: details as any }] }),
-      undefined,
-      undefined,
-      [REGISTRY_TOPIC]
-    )
-    return { authOutpoint: outpoint(created.txid, 0), ...admissionReceipt(admitted) }
-  })
-}
+/** The KYC registry deploy payload (the overlay ignores it on tm_mandala_kyc, but a deploy must be well-formed). */
+export const REGISTRY_DEPLOY_PAYLOAD = (): number[] => deployPayload({ sym: 'KYC', dec: 0, label: 'Mandala identity registry' })
 
 /**
- * Spend-and-replace the live identity-admin UTXO.
- * Genesis (registerIdentities) has no inputs. Every later action MUST list
- * the current admin outpoint as a createAction input and emit the next 1-sat
- * auth output — same shape as buildAdminActionArgs.
+ * Deploy the KYC registry chain on tm_mandala_kyc (the first trusted deploy
+ * wins; a second is refused). Admits no identity by itself.
  */
-export function buildRegistrySpendArgs (p: {
-  kind: 'admitIdentity' | 'revokeIdentity'
-  targetKey: string
-  priorOutpoint: string
-  nextLockHex: string
-  authDetails: RegistryActionDetails
-  inputBEEF: number[]
-}): {
-  description: string
-  labels: string[]
-  inputBEEF: number[]
-  inputs: Array<{ outpoint: string, unlockingScriptLength: number, inputDescription: string }>
-  outputs: Array<{
-    satoshis: number
-    lockingScript: string
-    outputDescription: string
-    basket: string
-    tags: string[]
-    customInstructions: string
-  }>
-  options: { randomizeOutputs: false, noSend: true, trustSelf: 'known' }
-} {
-  if (p.priorOutpoint.trim() === '' || !p.priorOutpoint.includes('.')) {
-    throw new Error('registry spend requires the live admin outpoint as an input')
-  }
-  if (p.inputBEEF.length === 0) {
-    throw new Error('registry spend requires inputBEEF for the live admin outpoint')
-  }
-  return {
-    description: `${p.kind} ${p.targetKey.slice(0, 16)}`,
-    labels: ['mandala', 'registry', p.kind],
-    inputBEEF: p.inputBEEF,
-    inputs: [{
-      outpoint: p.priorOutpoint,
-      unlockingScriptLength: 108,
-      inputDescription: 'spend registry auth'
-    }],
-    outputs: [{
-      satoshis: 1,
-      lockingScript: p.nextLockHex,
-      outputDescription: 'next registry auth',
-      basket: BASKET,
+export async function registerIdentities (p: { wallet: WalletInterface, identityKey: string }): Promise<RegistryActionResult> {
+  return await withIntent(async () => {
+    const res = await runDeployTx({
+      wallet: p.wallet,
+      identityKey: p.identityKey,
+      payload: REGISTRY_DEPLOY_PAYLOAD(),
+      topics: () => [REGISTRY_TOPIC],
+      customInstructions: registryCustomInstructions('', 'deploy'),
       tags: ['mandala-registry'],
-      customInstructions: registryCustomInstructions(p.authDetails)
-    }],
-    options: {
-      randomizeOutputs: false,
-      noSend: true,
-      trustSelf: 'known'
-    }
-  }
-}
-
-function txFromSignable (bytes: number[]): Transaction {
-  try {
-    return Transaction.fromAtomicBEEF(bytes)
-  } catch {
-    return Transaction.fromBEEF(bytes)
-  }
+      description: 'Register identity chain',
+      labels: ['mandala', 'registry', 'register']
+    })
+    return { authOutpoint: outpoint(res.txid, 0), authKeyID: 'deploy', tokenId: res.tokenId, ...admissionReceipt(res.admitted) }
+  })
 }
 
 export async function admitOrRevokeIdentity (p: {
@@ -256,64 +120,39 @@ export async function admitOrRevokeIdentity (p: {
   }
   if (live == null) live = await listRegistryAuth(p.wallet) ?? undefined
   if (live == null) throw new Error('no live identity-admin outpoint to spend')
-  const details: RegistryActionDetails = {
-    kind: p.kind,
-    identityKey: p.targetKey,
-    priorOutpoint: live.authOutpoint
-  }
-  const next = await lockRegistry(p.wallet, details)
+  const details: RegistryActionDetails = { kind: p.kind, identityKey: p.targetKey.trim().toLowerCase() }
+  const issuerKey = p.issuerIdentityKey ?? (await p.wallet.getPublicKey({ identityKey: true })).publicKey
+  const head = live
   return await withIntent(async () => {
     const { loadRegistryInputBeef, abortStuckRegistryActions } = await import('./registryRecover.js')
     await abortStuckRegistryActions(p.wallet)
-    const inputBEEF = await loadRegistryInputBeef(p.wallet, live.authOutpoint)
-    const args = buildRegistrySpendArgs({
-      kind: p.kind,
-      targetKey: p.targetKey,
-      priorOutpoint: live.authOutpoint,
-      nextLockHex: next.toHex(),
-      authDetails: details,
-      inputBEEF
-    })
-    let created
+    const inputBEEF = await loadRegistryInputBeef(p.wallet, head.authOutpoint)
+    let res
     try {
-      created = await p.wallet.createAction(args)
+      res = await runAuthorityTx({
+        wallet: p.wallet,
+        identityKey: issuerKey,
+        legs: [{
+          prior: { tokenId: head.tokenId, outpoint: head.authOutpoint, keyID: head.authKeyID },
+          details,
+          customInstructions: keyID => registryCustomInstructions(head.tokenId, keyID),
+          tags: ['mandala-registry']
+        }],
+        inputBEEF,
+        description: `${p.kind} ${p.targetKey.slice(0, 16)}`,
+        labels: ['mandala', 'registry', p.kind],
+        topics: [REGISTRY_TOPIC]
+      })
     } catch (e) {
       await abortStuckRegistryActions(p.wallet)
       throw e
     }
-    if (created.signableTransaction == null) throw new Error('registry: no signableTransaction')
-    const tx = txFromSignable(created.signableTransaction.tx as number[])
-    const [priorTxid, priorVoutStr] = live.authOutpoint.split('.')
-    const priorVout = Number(priorVoutStr ?? 0)
-    const spendIndex = tx.inputs.findIndex(i =>
-      (i.sourceTXID ?? i.sourceTransaction?.id('hex')) === priorTxid &&
-      i.sourceOutputIndex === priorVout
-    )
-    if (spendIndex < 0) {
-      throw new Error(`createAction did not spend registry auth ${live.authOutpoint}`)
+    return {
+      authOutpoint: outpoint(res.txid, res.authIndices[0]),
+      authKeyID: res.authKeyIDs[0],
+      tokenId: head.tokenId,
+      ...admissionReceipt(res.admitted)
     }
-    if (tx.inputs[spendIndex].sourceTransaction == null) {
-      tx.inputs[spendIndex].sourceTransaction = txFromSignable(inputBEEF)
-    }
-    tx.inputs[spendIndex].unlockingScriptTemplate = registryUnlock(p.wallet, live.authDetails)
-    await tx.sign()
-    const hex = tx.inputs[spendIndex].unlockingScript?.toHex()
-    if (hex == null) throw new Error('registry: missing unlocking script')
-    const signed = await p.wallet.signAction({
-      reference: created.signableTransaction.reference,
-      spends: { [spendIndex]: { unlockingScript: hex } },
-      options: { noSend: true }
-    })
-    const txid = signed.txid ?? Transaction.fromBEEF(signed.tx as number[]).id('hex')
-    const admitted = await submitAndBroadcast(
-      p.wallet,
-      { tx: signed.tx as number[], txid },
-      encodeLinkagePayload({ inputs: [], outputs: [], admin: [{ index: 0, actionDetails: details as any }] }),
-      created.signableTransaction.reference,
-      undefined,
-      [REGISTRY_TOPIC]
-    )
-    return { authOutpoint: `${txid}.0`, ...admissionReceipt(admitted) }
   })
 }
 
@@ -339,7 +178,6 @@ export interface OverlayRegistryRow {
   outputIndex: number
   admitSeq: number
   createdAt: string
-  actionDetails?: RegistryActionDetails
 }
 
 export function parseRegistryRows (body: unknown): OverlayRegistryRow[] {
@@ -360,10 +198,7 @@ export function parseRegistryRows (body: unknown): OverlayRegistryRow[] {
         ? r.createdAt
         : r.createdAt instanceof Date
           ? r.createdAt.toISOString()
-          : '',
-      actionDetails: r.actionDetails != null && typeof r.actionDetails === 'object'
-        ? r.actionDetails as RegistryActionDetails
-        : undefined
+          : ''
     })
   }
   return out
@@ -382,29 +217,6 @@ export function registryIsLive (rows: OverlayRegistryRow[]): boolean {
 }
 
 export type RegistryPlan = 'register' | 'admit' | 'register-then-admit' | 'recover' | 'recover-then-admit'
-
-/** Reconstruct the lock-binding details for an overlay cache row. */
-export function reconstructRegistryDetails (
-  row: OverlayRegistryRow,
-  issuerIdentityKey: string
-): RegistryActionDetails {
-  if (row.actionDetails != null && typeof row.actionDetails.kind === 'string') {
-    return row.actionDetails
-  }
-  // Genesis is the one action whose details are fully determined by the row:
-  // it has no priorOutpoint and names the issuer as both signer and subject.
-  if (row.identityKey.trim().toLowerCase() === issuerIdentityKey.trim().toLowerCase() && row.admitSeq <= 1) {
-    return { kind: 'register', issuer: issuerIdentityKey, identityKey: issuerIdentityKey }
-  }
-  // Every later link committed to its own priorOutpoint, which the cache row
-  // does not carry. Guessing yields a different commitment, hence a different
-  // locking key, and the spend fails later with an opaque signature error.
-  // Fail here instead, where the cause is legible.
-  throw new Error(
-    `registry row ${row.txid}.${row.outputIndex} has no actionDetails; ` +
-    'the overlay must serve the details that locked the head before it can be spent'
-  )
-}
 
 /** What the mock-KYC button must do given live wallet auth and the target key. */
 export function nextRegistryPlan (
@@ -441,8 +253,17 @@ export async function mockKycOpen (p: {
     const { recoverRegistryAuth } = await import('./registryRecover.js')
     const recovered = await recoverRegistryAuth(p)
     if (recovered != null) return { authOutpoint: recovered.authOutpoint, opened: false, recovered: true }
+    // Deploy, then admit the issuer itself: the deploy admits no identity, and
+    // an identity row is what lets a wallet that loses the head recover it.
     const genesis = await registerIdentities({ wallet: p.wallet, identityKey: p.issuerIdentityKey })
-    return { authOutpoint: genesis.authOutpoint, opened: true, recovered: false }
+    const self = await admitOrRevokeIdentity({
+      wallet: p.wallet,
+      kind: 'admitIdentity',
+      targetKey: p.issuerIdentityKey,
+      issuerIdentityKey: p.issuerIdentityKey,
+      live: { authOutpoint: genesis.authOutpoint, authKeyID: genesis.authKeyID, tokenId: genesis.tokenId }
+    })
+    return { authOutpoint: self.authOutpoint, opened: true, recovered: false }
   })
 }
 
@@ -462,13 +283,7 @@ export async function mockKycAdmit (p: {
     if (live == null) {
       const genesis = await registerIdentities({ wallet: p.wallet, identityKey: p.issuerIdentityKey })
       opened = true
-      live = {
-        authOutpoint: genesis.authOutpoint,
-        authDetails: { kind: 'register', issuer: p.issuerIdentityKey, identityKey: p.issuerIdentityKey }
-      }
-      if (target.toLowerCase() === p.issuerIdentityKey.trim().toLowerCase()) {
-        return { authOutpoint: live.authOutpoint, opened, recovered: false }
-      }
+      live = { authOutpoint: genesis.authOutpoint, authKeyID: genesis.authKeyID, tokenId: genesis.tokenId }
     }
     const admitted = await admitOrRevokeIdentity({
       wallet: p.wallet,

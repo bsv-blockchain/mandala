@@ -1,5 +1,5 @@
-import { LockingScript, WalletInterface } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { WalletInterface } from '@bsv/sdk'
+import { decodeValue } from './brc162.js'
 import { BASKET } from './constants.js'
 
 // ---------------------------------------------------------------------------
@@ -75,12 +75,8 @@ const counterpartyFromLabels = (labels: string[] = []): string => {
  */
 function decodeFt (o: RawOutput): { assetId: string, amount: number } | null {
   if (!o.lockingScript) return null
-  try {
-    const decoded = MandalaToken.decode(LockingScript.fromHex(o.lockingScript))
-    return { assetId: decoded.assetId, amount: decoded.amount }
-  } catch {
-    return null
-  }
+  const d = decodeValue(o.lockingScript)
+  return d == null ? null : { assetId: d.tokenId, amount: d.amount }
 }
 
 function parseCI (raw: string | undefined): ParsedCI {

@@ -3,8 +3,8 @@ import { Hash, PrivateKey, Utils } from '@bsv/sdk'
 import { configureMandala } from './constants.js'
 import {
   ADMISSION_PREFIX,
-  admissionDigestV2,
-  admissionMessageV2,
+  admissionDigestV3,
+  admissionMessageV3,
   verifyAdmission,
   fetchAdmission,
   payloadHash,
@@ -16,6 +16,7 @@ const PRIV = PrivateKey.fromHex('00000000000000000000000000000000000000000000000
 const KEY = PRIV.toPublicKey().toString()
 const TXID = 'a'.repeat(64)
 const OTHER_TXID = 'b'.repeat(64)
+const T = 'tm_' + 'c'.repeat(64)
 
 /** σ_I as both overlays mint it: ECDSA over SHA-256(message), DER hex. */
 const sign = (message: string): string => {
@@ -23,82 +24,82 @@ const sign = (message: string): string => {
   return typeof der === 'string' ? der : Utils.toHex(der)
 }
 
-describe('admissionDigestV2 (wire contract v2 §1)', () => {
-  it('is SHA-256 over "mandala-admit:<txid>:<ascending,comma,joined>"', () => {
-    expect(admissionMessageV2(TXID, [0, 2, 3])).toBe(`${ADMISSION_PREFIX}${TXID}:0,2,3`)
-    expect(admissionDigestV2(TXID, [0, 2, 3]))
-      .toEqual(Hash.sha256(Utils.toArray(`${ADMISSION_PREFIX}${TXID}:0,2,3`, 'utf8')))
+describe('admissionDigestV3 (σI v3)', () => {
+  it('is SHA-256 over "mandala-admit:v3:<topic>:<txid>:<ascending,comma,joined>"', () => {
+    expect(admissionMessageV3(T, TXID, [0, 2, 3])).toBe(`${ADMISSION_PREFIX}${T}:${TXID}:0,2,3`)
+    expect(admissionDigestV3(T, TXID, [0, 2, 3]))
+      .toEqual(Hash.sha256(Utils.toArray(`${ADMISSION_PREFIX}${T}:${TXID}:0,2,3`, 'utf8')))
   })
 
   it('canonicalizes by sorting ascending, so caller order cannot change the digest', () => {
-    expect(admissionDigestV2(TXID, [3, 0, 2])).toEqual(admissionDigestV2(TXID, [0, 2, 3]))
+    expect(admissionDigestV3(T, TXID, [3, 0, 2])).toEqual(admissionDigestV3(T, TXID, [0, 2, 3]))
   })
 
   it('renders a single admitted output without a separator', () => {
-    expect(admissionMessageV2(TXID, [0])).toBe(`${ADMISSION_PREFIX}${TXID}:0`)
+    expect(admissionMessageV3(T, TXID, [0])).toBe(`${ADMISSION_PREFIX}${T}:${TXID}:0`)
   })
 
   it('refuses an empty set — no admitted outputs means no signature exists', () => {
-    expect(() => admissionDigestV2(TXID, [])).toThrow(/outputsToAdmit/)
+    expect(() => admissionDigestV3(T, TXID, [])).toThrow(/outputsToAdmit/)
   })
 
   it('refuses a txid that is not 64 lowercase hex (an uppercase one would silently mis-verify)', () => {
-    expect(() => admissionDigestV2(TXID.toUpperCase(), [0])).toThrow(/txid/)
-    expect(() => admissionDigestV2('abc', [0])).toThrow(/txid/)
+    expect(() => admissionDigestV3(T, TXID.toUpperCase(), [0])).toThrow(/txid/)
+    expect(() => admissionDigestV3(T, 'abc', [0])).toThrow(/txid/)
   })
 
   it('refuses a non-integer or negative output index', () => {
-    expect(() => admissionDigestV2(TXID, [0, -1])).toThrow(/outputsToAdmit/)
-    expect(() => admissionDigestV2(TXID, [1.5])).toThrow(/outputsToAdmit/)
+    expect(() => admissionDigestV3(T, TXID, [0, -1])).toThrow(/outputsToAdmit/)
+    expect(() => admissionDigestV3(T, TXID, [1.5])).toThrow(/outputsToAdmit/)
   })
 })
 
 describe('verifyAdmission', () => {
-  const signature = sign(`${ADMISSION_PREFIX}${TXID}:0,2,3`)
+  const signature = sign(`${ADMISSION_PREFIX}${T}:${TXID}:0,2,3`)
 
   it('accepts the overlay signature over the exact admitted set', () => {
-    expect(verifyAdmission({ txid: TXID, outputsToAdmit: [0, 2, 3], signature, signerKey: KEY })).toBe(true)
+    expect(verifyAdmission({ topic: T, txid: TXID, outputsToAdmit: [0, 2, 3], signature, signerKey: KEY })).toBe(true)
   })
 
   it('accepts DER bytes as well as DER hex', () => {
     const bytes = Utils.toArray(signature, 'hex')
-    expect(verifyAdmission({ txid: TXID, outputsToAdmit: [0, 2, 3], signature: bytes, signerKey: KEY })).toBe(true)
-    expect(verifyAdmission({ txid: TXID, outputsToAdmit: [0, 2, 3], signature: new Uint8Array(bytes), signerKey: KEY })).toBe(true)
+    expect(verifyAdmission({ topic: T, txid: TXID, outputsToAdmit: [0, 2, 3], signature: bytes, signerKey: KEY })).toBe(true)
+    expect(verifyAdmission({ topic: T, txid: TXID, outputsToAdmit: [0, 2, 3], signature: new Uint8Array(bytes), signerKey: KEY })).toBe(true)
   })
 
   it('accepts the admitted set in any caller order (it is canonicalized)', () => {
-    expect(verifyAdmission({ txid: TXID, outputsToAdmit: [3, 2, 0], signature, signerKey: KEY })).toBe(true)
+    expect(verifyAdmission({ topic: T, txid: TXID, outputsToAdmit: [3, 2, 0], signature, signerKey: KEY })).toBe(true)
   })
 
   it('rejects a signature minted over a NON-canonical (unsorted) ordering', () => {
-    const wrongOrder = sign(`${ADMISSION_PREFIX}${TXID}:3,2,0`)
-    expect(verifyAdmission({ txid: TXID, outputsToAdmit: [0, 2, 3], signature: wrongOrder, signerKey: KEY })).toBe(false)
+    const wrongOrder = sign(`${ADMISSION_PREFIX}${T}:${TXID}:3,2,0`)
+    expect(verifyAdmission({ topic: T, txid: TXID, outputsToAdmit: [0, 2, 3], signature: wrongOrder, signerKey: KEY })).toBe(false)
   })
 
   it('rejects a subset of the signed admitted set (the phantom-coin guard)', () => {
-    expect(verifyAdmission({ txid: TXID, outputsToAdmit: [0, 2], signature, signerKey: KEY })).toBe(false)
+    expect(verifyAdmission({ topic: T, txid: TXID, outputsToAdmit: [0, 2], signature, signerKey: KEY })).toBe(false)
   })
 
   it('rejects a superset of the signed admitted set', () => {
-    expect(verifyAdmission({ txid: TXID, outputsToAdmit: [0, 1, 2, 3], signature, signerKey: KEY })).toBe(false)
+    expect(verifyAdmission({ topic: T, txid: TXID, outputsToAdmit: [0, 1, 2, 3], signature, signerKey: KEY })).toBe(false)
   })
 
   it('rejects the same signature replayed against another txid', () => {
-    expect(verifyAdmission({ txid: OTHER_TXID, outputsToAdmit: [0, 2, 3], signature, signerKey: KEY })).toBe(false)
+    expect(verifyAdmission({ topic: T, txid: OTHER_TXID, outputsToAdmit: [0, 2, 3], signature, signerKey: KEY })).toBe(false)
   })
 
   it('rejects a signature from a different key', () => {
     const other = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000b2')
     expect(verifyAdmission({
-      txid: TXID, outputsToAdmit: [0, 2, 3], signature, signerKey: other.toPublicKey().toString()
+      topic: T, txid: TXID, outputsToAdmit: [0, 2, 3], signature, signerKey: other.toPublicKey().toString()
     })).toBe(false)
   })
 
   it('returns false (never throws) on malformed input', () => {
-    expect(verifyAdmission({ txid: TXID, outputsToAdmit: [0, 2, 3], signature: 'not-der', signerKey: KEY })).toBe(false)
-    expect(verifyAdmission({ txid: TXID, outputsToAdmit: [0, 2, 3], signature, signerKey: 'nope' })).toBe(false)
-    expect(verifyAdmission({ txid: TXID, outputsToAdmit: [], signature, signerKey: KEY })).toBe(false)
-    expect(verifyAdmission({ txid: 'short', outputsToAdmit: [0], signature, signerKey: KEY })).toBe(false)
+    expect(verifyAdmission({ topic: T, txid: TXID, outputsToAdmit: [0, 2, 3], signature: 'not-der', signerKey: KEY })).toBe(false)
+    expect(verifyAdmission({ topic: T, txid: TXID, outputsToAdmit: [0, 2, 3], signature, signerKey: 'nope' })).toBe(false)
+    expect(verifyAdmission({ topic: T, txid: TXID, outputsToAdmit: [], signature, signerKey: KEY })).toBe(false)
+    expect(verifyAdmission({ topic: T, txid: 'short', outputsToAdmit: [0], signature, signerKey: KEY })).toBe(false)
   })
 })
 
@@ -110,7 +111,7 @@ const mockFetch = vi.fn()
 vi.stubGlobal('fetch', mockFetch)
 
 describe('fetchAdmission', () => {
-  const signature = sign(`${ADMISSION_PREFIX}${TXID}:0,2,3`)
+  const signature = sign(`${ADMISSION_PREFIX}${T}:${TXID}:0,2,3`)
 
   beforeEach(() => {
     mockFetch.mockReset()
@@ -121,7 +122,7 @@ describe('fetchAdmission', () => {
     mockFetch.mockResolvedValueOnce({
       status: 200,
       ok: true,
-      json: async () => ({ txid: TXID, outputsToAdmit: [0, 2, 3], admissionSignature: signature, admissionIdentityKey: KEY, at: 123 })
+      json: async () => ({ txid: TXID, admissions: { [T]: { outputsToAdmit: [0, 2, 3], admissionSignature: signature } }, admissionIdentityKey: KEY, at: 123 })
     })
     await fetchAdmission('http://test-overlay', TXID)
     expect(mockFetch).toHaveBeenCalledWith('http://test-overlay/admin/admission/' + TXID, { headers: {} })
@@ -141,12 +142,13 @@ describe('fetchAdmission', () => {
     mockFetch.mockResolvedValueOnce({
       status: 200,
       ok: true,
-      json: async () => ({ txid: TXID, outputsToAdmit: [0, 2, 3], admissionSignature: signature, admissionIdentityKey: KEY, at: 123 })
+      json: async () => ({ txid: TXID, admissions: { [T]: { outputsToAdmit: [0, 2, 3], admissionSignature: signature } }, admissionIdentityKey: KEY, at: 123 })
     })
     const entry = await fetchAdmission('http://test-overlay', TXID)
     expect(entry).toEqual({
       kind: 'admitted',
       txid: TXID,
+      topic: T,
       outputsToAdmit: [0, 2, 3],
       signature,
       signerKey: KEY,
@@ -203,9 +205,9 @@ describe('fetchAdmission', () => {
   it.each([
     ['no admissionSignature', { txid: TXID, outputsToAdmit: [0], admissionIdentityKey: KEY }],
     ['no admissionIdentityKey', { txid: TXID, outputsToAdmit: [0], admissionSignature: 'de' }],
-    ['a non-string signature', { txid: TXID, outputsToAdmit: [0], admissionSignature: 123, admissionIdentityKey: KEY }],
-    ['a non-string identity key', { txid: TXID, outputsToAdmit: [0], admissionSignature: 'de', admissionIdentityKey: { k: 1 } }],
-    ['an empty signature', { txid: TXID, outputsToAdmit: [0], admissionSignature: '', admissionIdentityKey: KEY }]
+    ['a non-string signature', { txid: TXID, admissions: { [T]: { outputsToAdmit: [0], admissionSignature: 123 } }, admissionIdentityKey: KEY }],
+    ['a non-string identity key', { txid: TXID, admissions: { [T]: { outputsToAdmit: [0], admissionSignature: 'de' } }, admissionIdentityKey: { k: 1 } }],
+    ['an empty signature', { txid: TXID, admissions: { [T]: { outputsToAdmit: [0], admissionSignature: '' } }, admissionIdentityKey: KEY }]
   ])('200 with %s → unavailable, never admitted and never a throw', async (_label, body) => {
     mockFetch.mockResolvedValueOnce({ status: 200, ok: true, json: async () => body })
     await expect(fetchAdmission('http://test-overlay', TXID)).resolves.toEqual({
@@ -257,8 +259,8 @@ describe('payloadHash (§9.1)', () => {
 })
 
 describe('verifyFetchedAdmission', () => {
-  const signature = sign(`${ADMISSION_PREFIX}${TXID}:0,2,3`)
-  const admitted = { kind: 'admitted' as const, txid: TXID, outputsToAdmit: [0, 2, 3], signature, signerKey: KEY, at: 1 }
+  const signature = sign(`${ADMISSION_PREFIX}${T}:${TXID}:0,2,3`)
+  const admitted = { kind: 'admitted' as const, txid: TXID, topic: T, outputsToAdmit: [0, 2, 3], signature, signerKey: KEY, at: 1 }
 
   it('true for a valid admitted entry from the expected signer', () => {
     expect(verifyFetchedAdmission(admitted, KEY)).toBe(true)

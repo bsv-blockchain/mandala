@@ -26,8 +26,8 @@
  * a notify failure never fails the transfer (the tx is already final).
  */
 import { Transaction, Beef, Utils, WalletInterface } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
-import { BASKET, FT_PROTOCOL, MESSAGEBOX, TOPIC } from './constants.js'
+import { codec, lockToken, tokenTopic } from './brc162.js'
+import { BASKET, FT_PROTOCOL, MESSAGEBOX } from './constants.js'
 import { walletMandalaUnlock } from './unlock.js'
 import { revealLinkage, matchOutputIndices } from './tokens.js'
 import {
@@ -206,7 +206,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     recipientKey,
     keyID: keyIDOut
   })
-  const ftOut = new MandalaToken(wallet as any).lock(assetId, amount, blinded.pubKeyHash)
+  const ftOut = codec.lock(assetId, BigInt(amount), blinded.pubKeyHash)
   const recipientScript = ftOut.toHex()
 
   // One keyID per change output (the loop index keeps same-millisecond keyIDs
@@ -217,7 +217,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     const keyID = `change-${stamp}-${i}`
     // Change back to self: use our identity key (hex), not the literal 'self' —
     // the overlay parses linkage.counterparty as a public key (it echoes verbatim).
-    const script = await new MandalaToken(wallet as any).lockBRC29(assetId, changeAmounts[i], FT_PROTOCOL, keyID, identityKey)
+    const script = await lockToken(wallet as any, assetId, changeAmounts[i], FT_PROTOCOL, keyID, identityKey)
     changePlans.push({ keyID, amount: changeAmounts[i], script: script.toHex() })
   }
 
@@ -376,11 +376,11 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
         submit: {
           txHex: Utils.toHex(signedTx),
           offChainHex: Utils.toHex(offChainValuesOut),
-          topics: [TOPIC]
+          topics: [tokenTopic(assetId)]
         }
       })
     } else {
-      const admitted = await submitAndBroadcast(wallet as any, { tx: signedTx, txid }, offChainValuesOut, created.signableTransaction.reference)
+      const admitted = await submitAndBroadcast(wallet as any, { tx: signedTx, txid }, offChainValuesOut, created.signableTransaction.reference, undefined, [tokenTopic(assetId)])
       receipt = admissionReceipt(admitted)
     }
   } finally {
@@ -452,7 +452,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
   // down) leaves this untouched; the payer's next reconcile pass covers it,
   // exactly as it would without this option.
   const settleResult = (handover && p.submitAfterHandover === true && notified)
-    ? await attemptImmediateSubmit(wallet, txid, signedTx, offChainValuesOut, reference)
+    ? await attemptImmediateSubmit(wallet, txid, signedTx, offChainValuesOut, reference, assetId)
     : {}
 
   return {
@@ -488,11 +488,12 @@ async function attemptImmediateSubmit (
   txid: string,
   signedTx: number[],
   offChainValues: number[],
-  reference: string | undefined
+  reference: string | undefined,
+  assetId: string
 ): Promise<Pick<TransferResult, 'settled' | 'refusedCode'> & AdmissionReceipt> {
   let admitted: OverlayAdmitResult
   try {
-    admitted = await submitToOverlay(signedTx, offChainValues, undefined, [TOPIC])
+    admitted = await submitToOverlay(signedTx, offChainValues, undefined, [tokenTopic(assetId)])
   } catch (e) {
     if (e instanceof OverlayRefusedError && !e.retryable) {
       // FINAL verdict — still never abort here (see class doc); surface the

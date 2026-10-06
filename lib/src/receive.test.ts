@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest'
 import { PrivateKey, Transaction, Utils } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
-import { admissionMessageV2 } from './admission.js'
+import { MandalaToken } from './__fixtures__/token.js'
+import { admissionMessageV3 } from './admission.js'
+import { tokenTopic } from './brc162.js'
 import { configureMandala } from './constants.js'
 import { receiveTokens } from './receive.js'
 
@@ -9,7 +10,7 @@ const OVERLAY = PrivateKey.fromHex('00000000000000000000000000000000000000000000
 const OVERLAY_KEY = OVERLAY.toPublicKey().toString()
 const IMPOSTOR = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000b2')
 
-const ASSET = `${'11'.repeat(32)}.0`
+const ASSET = `${'11'.repeat(32)}_0`
 const AMOUNT = 42
 const OTHER_TXID = 'f'.repeat(64)
 
@@ -22,7 +23,7 @@ const TXID = tx.id('hex')
 const MY_INDEX = 1
 
 const sigOver = (txid: string, outputsToAdmit: number[], key = OVERLAY): string => {
-  const der = key.sign(Utils.toArray(admissionMessageV2(txid, outputsToAdmit), 'utf8')).toDER()
+  const der = key.sign(Utils.toArray(admissionMessageV3(tokenTopic(ASSET), txid, outputsToAdmit), 'utf8')).toDER()
   return typeof der === 'string' ? der : Utils.toHex(der)
 }
 

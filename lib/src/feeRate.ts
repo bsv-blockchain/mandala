@@ -4,7 +4,7 @@
  * Set at register (issuerOps.ts) or later through the admin chain here.
  */
 import type { WalletInterface } from '@bsv/sdk'
-import type { MandalaActionDetails } from '@bsv/templates'
+import type { MandalaActionDetails } from './brc162.js'
 import { submitAdminAction, withReason, type AdminAsset, type SubmitAdminActionResult } from './assets.js'
 
 export function assertFeeRate (v: unknown): asserts v is number {
@@ -34,14 +34,10 @@ export interface SetFeeRateResult extends SubmitAdminActionResult {
  */
 export async function setFeeRate (p: SetFeeRateParams): Promise<SetFeeRateResult> {
   if (p.feeRatePerKb !== null) assertFeeRate(p.feeRatePerKb)
-  // 'setFeeRate' is not yet in the pinned MandalaActionKind union (ts-stack
-  // PR pending); both overlays admit any anchored kind and fold this one.
-  const details = withReason({
-    kind: 'setFeeRate',
-    assetId: p.asset.assetId,
-    priorOutpoint: p.asset.authOutpoint,
+  const details: MandalaActionDetails = withReason({
+    kind: 'setFeeRate' as const,
     feeRatePerKb: p.feeRatePerKb
-  }, p.reason) as unknown as MandalaActionDetails
+  }, p.reason)
   const res = await submitAdminAction({
     wallet: p.wallet,
     asset: p.asset,

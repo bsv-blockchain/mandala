@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import { Beef, LockingScript, PrivateKey, Transaction, UnlockingScript, Utils } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
-import { AdmissionEntry, admissionMessageV2 } from './admission.js'
+import { MandalaToken } from './__fixtures__/token.js'
+import { AdmissionEntry, admissionMessageV3 } from './admission.js'
+import { tokenTopic } from './brc162.js'
 import { AdmissionBundle, canonicalBundleId, cover, CoverOptions, TransactionLike } from './bundle.js'
 
 const OVERLAY = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000a1')
@@ -15,8 +16,8 @@ const IMPOSTOR_KEY = IMPOSTOR.toPublicKey().toString()
  */
 const TRUST: CoverOptions = { expectedSignerKey: OVERLAY_KEY }
 
-const ASSET = `${'11'.repeat(32)}.0`
-const OTHER_ASSET = `${'22'.repeat(32)}.0`
+const ASSET = `${'11'.repeat(32)}_0`
+const OTHER_ASSET = `${'22'.repeat(32)}_0`
 
 const PKH = (n: number): number[] => new Array(20).fill(n)
 
@@ -48,7 +49,7 @@ const mkTx = (inputs: InputSpec[], outputs: LockingScript[], nonce = 0): Transac
 const id = (tx: Transaction): string => tx.id('hex')
 
 const admit = (txid: string, outputsToAdmit: number[], key = OVERLAY): AdmissionEntry => {
-  const der = key.sign(Utils.toArray(admissionMessageV2(txid, outputsToAdmit), 'utf8')).toDER()
+  const der = key.sign(Utils.toArray(admissionMessageV3(tokenTopic(ASSET), txid, outputsToAdmit), 'utf8')).toDER()
   return {
     outputsToAdmit,
     signature: typeof der === 'string' ? der : Utils.toHex(der),

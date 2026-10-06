@@ -4,8 +4,8 @@ import { encodeLinkagePayload, MandalaLinkagePayload } from './encoding.js'
 import type { MandalaActionDetails } from './encoding.js'
 
 it('accepts the new stablecoin action kinds (type + runtime)', () => {
-  const d: MandalaActionDetails = { kind: 'reissue', assetId: 'x.0', outpoint: 'y.1', amount: 5, recipient: '02ab' }
-  const bytes = encodeLinkagePayload({ inputs: [], outputs: [], admin: [{ index: 0, actionDetails: d }] })
+  const d: MandalaActionDetails = { kind: 'reissue', outpoint: 'y.1', recipient: '02ab' }
+  const bytes = encodeLinkagePayload({ inputs: [], outputs: [], admin: [{ index: 0, details: JSON.stringify(d) }] })
   expect(bytes.length).toBeGreaterThan(0)
 })
 
@@ -18,7 +18,7 @@ describe('encodeLinkagePayload', () => {
         protocolID: [2, 'mandala token'], keyID: 'k',
         encryptedLinkage: [1, 2, 3], encryptedLinkageProof: [4, 5], proofType: 0
       } }],
-      admin: [{ index: 1, actionDetails: { kind: 'issue', assetId: 'x.0', amount: 5, priorOutpoint: 'y.0' } }]
+      admin: [{ index: 1, details: 'a16469737375' }]
     }
     const bytes = encodeLinkagePayload(payload)
     const decoded = JSON.parse(Utils.toUTF8(bytes))

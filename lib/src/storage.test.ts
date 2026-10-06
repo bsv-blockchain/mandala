@@ -225,7 +225,7 @@ describe('the commit point is an awaited write (deferred adapter)', () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
     const wallet = { createAction: vi.fn().mockResolvedValue({}), abortAction: vi.fn() }
 
-    const done = submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any)
+    const done = submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
 
     // Overlay accepted; the journal write is parked mid-flight.
     await vi.waitFor(() => expect(deferred.parked()).toBe(1))
@@ -249,7 +249,7 @@ describe('the commit point is an awaited write (deferred adapter)', () => {
       createAction: vi.fn(async () => { seenAtBroadcast.push(...map.keys()); return {} }),
       abortAction: vi.fn()
     }
-    await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any)
+    await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
     await vi.waitFor(() => expect(wallet.createAction).toHaveBeenCalled())
     expect(seenAtBroadcast).toEqual(['mandala.txJournal.abc'])
   })

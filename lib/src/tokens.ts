@@ -1,5 +1,5 @@
-import { LockingScript, WalletInterface, WalletCounterparty } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { WalletInterface, WalletCounterparty } from '@bsv/sdk'
+import { decodeValue } from './brc162.js'
 import { FT_PROTOCOL, OVERLAY_IDENTITY_KEY } from './constants.js'
 import { SpecificLinkage } from './encoding.js'
 
@@ -12,10 +12,8 @@ export function decodeBalances (
 ): TokenBalance[] {
   const totals = new Map<string, number>()
   for (const o of outputs) {
-    try {
-      const d = MandalaToken.decode(LockingScript.fromHex(o.lockingScript))
-      totals.set(d.assetId, (totals.get(d.assetId) ?? 0) + d.amount)
-    } catch { /* not a mandala token output */ }
+    const d = decodeValue(o.lockingScript)
+    if (d != null) totals.set(d.tokenId, (totals.get(d.tokenId) ?? 0) + d.amount)
   }
   return [...totals.entries()].map(([assetId, amount]) => ({ assetId, amount }))
 }

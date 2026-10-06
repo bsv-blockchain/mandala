@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Beef, LockingScript, Transaction, UnlockingScript, Utils } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { MandalaToken } from './__fixtures__/token.js'
 
 vi.mock('./overlay.js', async () => {
   const actual = await vi.importActual<typeof import('./overlay.js')>('./overlay.js')
@@ -45,8 +45,8 @@ const { collectHandoverEvidence, journalEvidenceSource } = await import('./hando
 const { journalClear, journalList, journalPut } = await import('./txJournal.js')
 const { notifyClear } = await import('./notifyJournal.js')
 
-const ASSET = `${'11'.repeat(32)}.0`
-const OTHER_ASSET = `${'22'.repeat(32)}.0`
+const ASSET = `${'11'.repeat(32)}_0`
+const OTHER_ASSET = `${'22'.repeat(32)}_0`
 const RECIPIENT = '02' + 'ab'.repeat(32)
 const SENDER_BLINDED = '03' + 'cd'.repeat(32)
 const OVERLAY_KEY = '02' + 'ef'.repeat(32)
@@ -183,7 +183,7 @@ describe('transferTokens({ mode: "handover" }) — sending never contacts the ov
     const entry = (await journalList()).find(e => e.txid === TXID)
     expect(entry).toMatchObject({ stage: 'handed_over', reference: 'ref-1' })
     expect(entry?.submit?.txHex).toBe(Utils.toHex(TIP_BEEF))
-    expect(entry?.submit?.topics).toEqual(['tm_mandala'])
+    expect(entry?.submit?.topics).toEqual([`tm_${'11'.repeat(32)}`])
     expect(typeof entry?.submit?.offChainHex).toBe('string')
   })
 

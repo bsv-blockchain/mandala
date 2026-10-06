@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   ProtoWallet, PrivateKey, Transaction, Spend
 } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { MandalaToken } from './__fixtures__/token.js'
 import { walletMandalaUnlock } from './unlock.js'
 import { FT_PROTOCOL } from './constants.js'
 
@@ -11,7 +11,7 @@ describe('walletMandalaUnlock', () => {
     const wallet = new ProtoWallet(PrivateKey.fromRandom())
     const keyID = 'tkn-1'
     const counterparty = 'self'
-    const assetId = `${'a'.repeat(64)}.0`
+    const assetId = `${'a'.repeat(64)}_0`
 
     const lockingScript = await new MandalaToken(wallet as any).lockBRC29(assetId, 100, FT_PROTOCOL, keyID, counterparty)
 
@@ -47,7 +47,7 @@ describe('walletMandalaUnlock', () => {
     const { publicKey: senderId } = await sender.getPublicKey({ identityKey: true })
     const { publicKey: recipientId } = await recipient.getPublicKey({ identityKey: true })
     const keyID = 'xfer-1'
-    const assetId = `${'b'.repeat(64)}.0`
+    const assetId = `${'b'.repeat(64)}_0`
 
     // Sender locks the FT to the recipient (counterparty = recipient identity).
     const lockingScript = await new MandalaToken(sender as any).lockBRC29(assetId, 100, FT_PROTOCOL, keyID, recipientId)

@@ -1,15 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest'
 import { BASKET, configureMandala } from './constants.js'
 import { loadFtCandidates } from './ftCandidates.js'
-import { buildAdminActionArgs } from './assets.js'
 
 const DEFAULT_BASKET = 'mandala-tokens'
 const CUSTOM_BASKET = 'p mandala'
 
 const asset = {
-  assetId: `${'11'.repeat(32)}.0`,
+  assetId: `${'11'.repeat(32)}_0`,
   label: 'Test',
-  authOutpoint: `${'22'.repeat(32)}.0`,
+  authOutpoint: `${'22'.repeat(32)}_0`,
   authDetails: { kind: 'register' } as any,
   metadata: undefined
 } as any
@@ -49,15 +48,6 @@ describe('D3a — the token basket is configurable', () => {
     for (const call of reconfigured.listOutputs.mock.calls) {
       expect(call[0].basket).toBe(CUSTOM_BASKET)
     }
-  })
-
-  it('tags newly built outputs with the configured basket (live binding, not a load-time capture)', () => {
-    expect(buildAdminActionArgs(asset, { kind: 'pause', assetId: asset.assetId } as any, 'aa')
-      .outputs[0].basket).toBe(DEFAULT_BASKET)
-
-    configureMandala({ basket: CUSTOM_BASKET })
-    expect(buildAdminActionArgs(asset, { kind: 'pause', assetId: asset.assetId } as any, 'aa')
-      .outputs[0].basket).toBe(CUSTOM_BASKET)
   })
 
   it('ignores an empty basket rather than pointing the wallet at ""', () => {

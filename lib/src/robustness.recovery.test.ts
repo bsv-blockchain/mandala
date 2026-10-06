@@ -6,8 +6,8 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { PrivateKey, Hash, Transaction, P2PKH, LockingScript, UnlockingScript } from '@bsv/sdk'
-import { MandalaToken, MandalaAdmin } from '@bsv/templates'
-import type { MandalaActionDetails } from '@bsv/templates'
+import { MandalaToken } from './__fixtures__/token.js'
+import type { MandalaActionDetails } from './brc162.js'
 import {
   journalPut,
   journalList,
@@ -148,7 +148,7 @@ describe('notification journal', () => {
 
 describe('receive verification', () => {
   const pkh = Hash.hash160(PrivateKey.fromRandom().toPublicKey().encode(true) as number[])
-  const assetId = `${'a'.repeat(64)}.0`
+  const assetId = `${'a'.repeat(64)}_0`
 
   const mkMbc = (messages: Array<{ messageId: string, body: any }>) => ({
     listMessages: vi.fn().mockResolvedValue(messages),
@@ -236,7 +236,7 @@ describe('webLocks', () => {
 // Admin pipelines driven end-to-end with the wallet + templates stubbed.
 // ---------------------------------------------------------------------------
 
-const ASSET_ID = 'a'.repeat(64) + '.0'
+const ASSET_ID = 'a'.repeat(64) + '_0'
 const PRIOR = 'b'.repeat(64) + '.1'
 const ISSUER = '02' + 'ab'.repeat(32)
 const RECIPIENT = '03' + 'cd'.repeat(32)
@@ -255,14 +255,13 @@ function signableBeef (n = 1): number[] {
   return tx.toBEEF(true)
 }
 
-function stubTemplates (): void {
-  vi.spyOn(MandalaAdmin, 'lock').mockResolvedValue(new LockingScript([]))
-  vi.spyOn(MandalaAdmin, 'unlock').mockReturnValue({
-    sign: async () => new UnlockingScript([]),
-    estimateLength: async () => 108
-  })
-  vi.spyOn(MandalaToken.prototype, 'lockBRC29').mockResolvedValue(new LockingScript([]))
-}
+// BRC-162 locks/unlocks run for real against these wallet key stubs.
+function stubTemplates (): void {}
+const STUB_KEY = PrivateKey.fromHex('11'.repeat(32))
+const keyStubs = () => ({
+  getPublicKey: vi.fn().mockResolvedValue({ publicKey: STUB_KEY.toPublicKey().toString() }),
+  createSignature: vi.fn().mockResolvedValue({ signature: STUB_KEY.sign([1, 2, 3]).toDER() as number[] })
+})
 
 const mkAdminWallet = () => ({
   listOutputs: vi.fn().mockResolvedValue({ outputs: [{ outpoint: PRIOR }], BEEF: [1] }),
@@ -270,19 +269,20 @@ const mkAdminWallet = () => ({
   signAction: vi.fn().mockResolvedValue({ tx: [9, 9, 9], txid: COMMIT_TXID }),
   revealSpecificKeyLinkage: vi.fn().mockResolvedValue({ keyID: 'k' }),
   abortAction: vi.fn().mockResolvedValue({ aborted: true }),
-  listActions: vi.fn().mockResolvedValue({ actions: [] })
+  listActions: vi.fn().mockResolvedValue({ actions: [] }),
+  ...keyStubs()
 })
 
 const asset: AdminAsset = {
   assetId: ASSET_ID,
   label: 'USD',
   authOutpoint: PRIOR,
-  authDetails: { kind: 'issue', assetId: ASSET_ID, amount: 1, priorOutpoint: 'genesis.0' }
+  authKeyID: 'deploy'
 }
 
 describe('A08 reissue notification is journaled before the send (submitAdminAction)', () => {
   const reissue: MandalaActionDetails = {
-    kind: 'reissue', assetId: ASSET_ID, outpoint: 'frozen.0', amount: 5, recipient: RECIPIENT, priorOutpoint: PRIOR
+    kind: 'reissue', outpoint: 'f'.repeat(64) + '.0', recipient: RECIPIENT
   }
   const run = (messageBoxClient: any, details: MandalaActionDetails = reissue, ftOutput?: { recipient: string, amount: number }) =>
     submitAdminAction({
@@ -357,7 +357,7 @@ describe('A08 reissue notification is journaled before the send (submitAdminActi
 
   it('actions without an FT output journal nothing and report notified', async () => {
     const mbc = { sendMessage: vi.fn() }
-    const res = await run(mbc, { kind: 'pause', assetId: ASSET_ID, priorOutpoint: PRIOR })
+    const res = await run(mbc, { kind: 'pause' })
     expect(res.notified).toBe(true)
     expect(res.nextAuthOutpoint).toBe(`${COMMIT_TXID}.0`)
     expect(mbc.sendMessage).not.toHaveBeenCalled()
@@ -370,7 +370,9 @@ describe('A15 registerAsset runs under an intent marker and the mandala.register
   const mkRegWallet = () => ({
     createAction: vi.fn().mockResolvedValue({ tx: [1, 2, 3], txid: REG_TXID }),
     listActions: vi.fn().mockResolvedValue({ actions: [{ txid: 'stuck' }] }),
-    abortAction: vi.fn().mockResolvedValue({ aborted: true })
+    abortAction: vi.fn().mockResolvedValue({ aborted: true }),
+    revealSpecificKeyLinkage: vi.fn().mockResolvedValue({ keyID: 'deploy' }),
+    ...keyStubs()
   })
   const params = (wallet: ReturnType<typeof mkRegWallet>) =>
     ({ wallet: wallet as any, identityKey: ISSUER, label: 'Gold', ticker: 'gld', decimals: 2 })
@@ -400,7 +402,7 @@ describe('A15 registerAsset runs under an intent marker and the mandala.register
     commit({ outputsToAdmit: [0] })
     // A12 widened the result with the overlay's acceptance proof; assetId is
     // still the contract this test is about.
-    await expect(inFlight).resolves.toMatchObject({ assetId: `${REG_TXID}.0` })
+    await expect(inFlight).resolves.toMatchObject({ assetId: `${REG_TXID}_0` })
     expect(await hasFreshIntent()).toBe(false)
   })
 
@@ -418,7 +420,7 @@ describe('A15 registerAsset runs under an intent marker and the mandala.register
     await first
     // Released after settle — a later register is allowed again.
     vi.mocked(submitAndBroadcast).mockResolvedValue({ outputsToAdmit: [0] })
-    await expect(registerAsset(params(wallet))).resolves.toMatchObject({ assetId: `${REG_TXID}.0` })
+    await expect(registerAsset(params(wallet))).resolves.toMatchObject({ assetId: `${REG_TXID}_0` })
   })
 
   it('forwards the wallet reference (when one exists) so an overlay rejection can abort the held action', async () => {

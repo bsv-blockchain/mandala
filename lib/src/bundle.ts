@@ -49,7 +49,7 @@
  * under a lying key and steer the walk), and `visited` memoizes each node.
  */
 import { Hash, LockingScript, Utils } from '@bsv/sdk'
-import { MandalaToken } from '@bsv/templates'
+import { decodeValue, tokenTopicOrEmpty } from './brc162.js'
 import { AdmissionEntry, DerSignature, verifyAdmission } from './admission.js'
 
 /**
@@ -260,7 +260,7 @@ export function cover (tip: TransactionLike, bundle: AdmissionBundle, opts: Cove
     const ok = entry != null &&
       typeof entry.signerKey === 'string' &&
       entry.signerKey.toLowerCase() === trustedKey &&
-      verifyAdmission({ txid, outputsToAdmit: entry.outputsToAdmit, signature: entry.signature, signerKey: entry.signerKey })
+      verifyAdmission({ topic: tokenTopicOrEmpty(bundle.assetId), txid, outputsToAdmit: entry.outputsToAdmit, signature: entry.signature, signerKey: entry.signerKey })
     admittedMemo.set(txid, ok)
     return ok
   }
@@ -270,11 +270,7 @@ export function cover (tip: TransactionLike, bundle: AdmissionBundle, opts: Cove
 
   const isTokenOfAsset = (out: TransactionOutputLike | undefined): boolean => {
     if (out?.lockingScript == null) return false
-    try {
-      return MandalaToken.decode(out.lockingScript).assetId === bundle.assetId
-    } catch {
-      return false // not a Mandala token at all
-    }
+    return decodeValue(out.lockingScript, bundle.assetId) != null
   }
 
   /** The parent txid an input names, preferring the explicit field. */
