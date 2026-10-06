@@ -5,8 +5,8 @@ package enginestore
 // engine.go's call sites do (positional FindOutputs, nil-on-missing
 // FindOutput, LoadAncillaryBeef merge, ReconcileMerkleRoot state moves).
 //
-// Requires Mongo at localhost:27017 (same skip-pattern as Task 8; test db
-// mandala_go_engine_test is dropped in cleanup).
+// Requires Mongo at localhost:27017: testDB goes through testmongo.DB, the one
+// skip path, with the database mandala3_test_engine (dropped before and after).
 
 import (
 	"bytes"
@@ -22,7 +22,8 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"github.com/sirdeggen/mandala/overlay-go/internal/testmongo"
 )
 
 const topic = "tm_mandala"
@@ -32,20 +33,7 @@ var topicVar = topic
 
 func testDB(t *testing.T) *mongo.Database {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	client, err := mongo.Connect(options.Client().ApplyURI("mongodb://localhost:27017"))
-	if err != nil {
-		t.Skip("mongo unavailable:", err)
-	}
-	if err := client.Ping(ctx, nil); err != nil {
-		t.Skip("mongo unavailable:", err)
-	}
-	db := client.Database("mandala_go_engine_test")
-	// Drop up-front too so a crashed previous run can't leak state in.
-	_ = db.Drop(context.Background())
-	t.Cleanup(func() { _ = db.Drop(context.Background()) })
-	return db
+	return testmongo.DB(t, "mandala3_test_engine")
 }
 
 // newTx builds a distinct minimal transaction: one dummy input (fill byte
@@ -613,6 +601,114 @@ func TestUniqueIndexes(t *testing.T) {
 	}
 }
 
+// V-15 (final review C6): a late InsertOutputs of the same transaction — a double-click whose second submit passed
+// the engine's dupe gate before the first committed, or a retry after a fault between InsertOutputs and the applied
+// record — must leave an existing output document exactly as it is. The engine's commitTopicOutputs calls
+// InsertOutputs before the second submit's notify, so a replace there made a coin a later transaction U had spent read
+// unspent again (U's spendTxid and consumedBy gone): the conflicting-spend guard then admitted a second spend of it.
+// Every field is insert-only, proof data included: /arc-ingest's UpdateTransactionBEEF anchors a stored output and a
+// late resubmit carrying the original unproven BEEF must not take that back.
+func TestInsertOutputsNeverOverwritesAnExistingOutput(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	st := mustNew(t, db)
+
+	parent := newTx(0x51, 1)
+	parentID := parent.TxID()
+	if err := st.InsertOutputs(ctx, topic, parentID, []uint32{0}, nil, beefFor(t, parent), nil); err != nil {
+		t.Fatal(err)
+	}
+	tx := newTx(0x52, 2) // T: T.0 and T.1, retaining parent:0
+	txid := tx.TxID()
+	unproven := beefFor(t, tx)
+	consumed := []*transaction.Outpoint{op(parentID, 0)}
+	if err := st.InsertOutputs(ctx, topic, txid, []uint32{0, 1}, consumed, unproven, nil); err != nil {
+		t.Fatal(err)
+	}
+	first, err := st.FindOutput(ctx, op(txid, 1), &topicVar, nil, false)
+	if err != nil || first == nil {
+		t.Fatal(first, err)
+	}
+
+	// U spends and retains T.1 (engine steps 7 and 11e).
+	u := newTx(0x53, 2)
+	uid := u.TxID()
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(txid, 1)}, topic, uid); err != nil {
+		t.Fatal(err)
+	}
+	consumedBy := []*transaction.Outpoint{op(uid, 0), op(uid, 1)}
+	if err := st.UpdateConsumedBy(ctx, op(txid, 1), topic, consumedBy); err != nil {
+		t.Fatal(err)
+	}
+	// T is mined: /arc-ingest anchors its outputs (HandleNewMerkleProof).
+	proved := newTx(0x52, 2)
+	root := addProof(t, proved, 120)
+	if err := st.UpdateTransactionBEEF(ctx, txid, beefFor(t, proved)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateOutputBlockHeight(ctx, op(txid, 1), topic, 120, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(5 * time.Millisecond) // a replace would stamp a later score
+	// The late resubmit of T with its original, unproven BEEF.
+	if err := st.InsertOutputs(ctx, topic, txid, []uint32{0, 1}, consumed, unproven, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if by, err := st.SpendStateOf(ctx, topic, txid.String(), 1); err != nil || by != uid.String() {
+		t.Fatalf("T.1 spendTxid = %q (%v), want U %s: the resubmit resurrected a spent output", by, err, uid)
+	}
+	if live, err := st.IsUnspent(ctx, topic, txid.String(), 1); err != nil || live {
+		t.Fatalf("T.1 live = %v (%v), want false", live, err)
+	}
+	got, err := st.FindOutput(ctx, op(txid, 1), &topicVar, nil, true)
+	if err != nil || got == nil {
+		t.Fatal(got, err)
+	}
+	if !got.Spent || len(got.ConsumedBy) != 2 || !got.ConsumedBy[0].Equal(consumedBy[0]) || !got.ConsumedBy[1].Equal(consumedBy[1]) {
+		t.Fatalf("T.1 spent=%v consumedBy=%v, want spent and consumed by U.0, U.1", got.Spent, got.ConsumedBy)
+	}
+	if got.Score != first.Score {
+		t.Fatalf("T.1 score = %f, want the first insert's %f (GASP pages by insertion score)", got.Score, first.Score)
+	}
+	if len(got.OutputsConsumed) != 1 || !got.OutputsConsumed[0].Equal(consumed[0]) {
+		t.Fatalf("T.1 outputsConsumed = %v, want [parent:0]", got.OutputsConsumed)
+	}
+	if got.MerkleState != engine.MerkleStateValidated || got.MerkleRoot == nil || !got.MerkleRoot.Equal(*root) || got.BlockHeight != 120 {
+		t.Fatalf("T.1 proof = {%v %v %d}, want {Validated %s 120}: the resubmit took back an anchored proof", got.MerkleState, got.MerkleRoot, got.BlockHeight, root)
+	}
+	if got.Beef == nil || got.Beef.FindBumpByHash(txid) == nil {
+		t.Fatal("T.1 BEEF lost its proof to the resubmit's unproven BEEF")
+	}
+	if live, err := st.IsUnspent(ctx, topic, txid.String(), 0); err != nil || !live {
+		t.Fatalf("T.0 live = %v (%v), want true", live, err)
+	}
+	n, err := db.Collection("engineOutputs").CountDocuments(ctx, map[string]any{"txid": txid.String()})
+	if err != nil || n != 2 {
+		t.Fatalf("T docs = %d (%v), want 2", n, err)
+	}
+
+	// A first insert still writes the full document: a fresh output is unspent and carries the BEEF.
+	fresh := newTx(0x54, 1)
+	if err := st.InsertOutputs(ctx, topic, fresh.TxID(), []uint32{0}, consumed, beefFor(t, fresh), nil); err != nil {
+		t.Fatal(err)
+	}
+	f, err := st.FindOutput(ctx, op(fresh.TxID(), 0), &topicVar, nil, true)
+	if err != nil || f == nil || f.Spent || f.Beef == nil || f.MerkleState != engine.MerkleStateUnmined || len(f.OutputsConsumed) != 1 || f.Score == 0 {
+		t.Fatalf("fresh insert = %+v (%v)", f, err)
+	}
+	var raw bson.M
+	if err := db.Collection("engineOutputs").FindOne(ctx, bson.D{{Key: "txid", Value: fresh.TxID().String()}}).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"spendTxid", "consumedBy", "blockHeight", "blockIdx", "merkleRoot", "ancillaryTxids"} {
+		if _, ok := raw[k]; ok {
+			t.Fatalf("fresh insert carries %q = %v; an unset field must stay absent as before", k, raw[k])
+		}
+	}
+}
+
 // --- broadcast-failure compensation (UnmarkSpentBySpendTxid) ---
 
 // TestUnmarkSpentBySpendTxid round-trips the compensation path: mark via
@@ -961,6 +1057,75 @@ func TestMarkUTXOsAsSpentIsIdempotentForTheSameSpender(t *testing.T) {
 	}
 	if by, _ := st.SpendStateOf(ctx, topic, parentID.String(), 0); by != spender.String() {
 		t.Fatalf("spendTxid = %q, want %s", by, spender)
+	}
+}
+
+// V-15 (final review C13/C15/C19): the CAS-conflict rollback hands back only what this call tried to mark — its
+// topic, its outpoints, this spender. x was admitted on [tm_A] (a1 spent by x, applied there); its retry names
+// [tm_A, tm_B], the engine skips tm_A as a dupe, and a competitor X marks b1 on tm_B between x's guard and x's mark.
+// The rollback used to unmark x's spends on every topic, so a1 read live on tm_A although x is applied there and a1
+// is spent on chain; the reconciler then re-minted its row and a second spend of a1 was admitted.
+func TestMarkUTXOsAsSpentRollbackIsScopedToThisCall(t *testing.T) {
+	ctx := context.Background()
+	st := mustNew(t, testDB(t))
+	const tmA, tmB = "tm_aa", "tm_bb"
+
+	pa := newTx(0x61, 1)
+	pb := newTx(0x62, 3) // b1 = pb:0 (contested), c1 = pb:1 (free), d1 = pb:2 (marked by x in an earlier call)
+	if err := st.InsertOutputs(ctx, tmA, pa.TxID(), []uint32{0}, nil, beefFor(t, pa), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertOutputs(ctx, tmB, pb.TxID(), []uint32{0, 1, 2}, nil, beefFor(t, pb), nil); err != nil {
+		t.Fatal(err)
+	}
+	// The same outpoint under tm_A as well, left live: the rollback must not reach other topics' copies.
+	if err := st.InsertOutputs(ctx, tmA, pb.TxID(), []uint32{1}, nil, beefFor(t, pb), nil); err != nil {
+		t.Fatal(err)
+	}
+	x := newTx(0x63, 1).TxID()
+	competitor := newTx(0x64, 1).TxID()
+
+	// x's first submit, naming [tm_A]: a1 marked spent by x, then applied on tm_A.
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(pa.TxID(), 0)}, tmA, x); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertAppliedTransaction(ctx, &overlay.AppliedTransaction{Txid: x, Topic: tmA}); err != nil {
+		t.Fatal(err)
+	}
+	// An earlier mark by x on tm_B, outside the failing call's outpoints.
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(pb.TxID(), 2)}, tmB, x); err != nil {
+		t.Fatal(err)
+	}
+	// The competitor takes b1 on tm_B.
+	if err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(pb.TxID(), 0)}, tmB, competitor); err != nil {
+		t.Fatal(err)
+	}
+
+	// x's retry marks [b1, c1] on tm_B: c1 is taken, b1 loses the CAS.
+	err := st.MarkUTXOsAsSpent(ctx, []*transaction.Outpoint{op(pb.TxID(), 0), op(pb.TxID(), 1)}, tmB, x)
+	if err == nil || !strings.Contains(err.Error(), "already spent by "+competitor.String()) {
+		t.Fatalf("retry mark error = %v, want the CAS refusal naming %s", err, competitor)
+	}
+
+	for _, c := range []struct {
+		name, topic string
+		vout        uint32
+		txid        *chainhash.Hash
+		want        string
+	}{
+		{"a1 on tm_A (x is applied there)", tmA, 0, pa.TxID(), x.String()},
+		{"b1 on tm_B (the competitor's)", tmB, 0, pb.TxID(), competitor.String()},
+		{"c1 on tm_B (this call's own mark, handed back)", tmB, 1, pb.TxID(), ""},
+		{"d1 on tm_B (an earlier call's mark)", tmB, 2, pb.TxID(), x.String()},
+		{"c1's copy on tm_A (never marked)", tmA, 1, pb.TxID(), ""},
+	} {
+		by, err := st.SpendStateOf(ctx, c.topic, c.txid.String(), c.vout)
+		if err != nil || by != c.want {
+			t.Errorf("%s: spendTxid = %q (%v), want %q", c.name, by, err, c.want)
+		}
+	}
+	if live, err := st.IsUnspent(ctx, tmB, pb.TxID().String(), 1); err != nil || !live {
+		t.Fatalf("c1 on tm_B live = %v (%v), want true: the failed call's own mark must roll back", live, err)
 	}
 }
 

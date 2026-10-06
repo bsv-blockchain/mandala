@@ -27,10 +27,9 @@ import (
 	"github.com/bsv-blockchain/go-sdk/overlay"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	sighash "github.com/bsv-blockchain/go-sdk/transaction/sighash"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/enginestore"
+	"github.com/sirdeggen/mandala/overlay-go/internal/testmongo"
 )
 
 var errStopAfterRecording = errors.New("previousCoins recorded; stop before any mutation")
@@ -60,19 +59,10 @@ func (r *previousCoinsRecorder) GetMetaData() *overlay.MetaData {
 }
 
 func TestEngineListsACoinAlreadySpentByAnotherTxInPreviousCoins(t *testing.T) {
-	requireMongo(t)
+	db := testmongo.DB(t, "mandala3_test_wiring_previous_coins")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	client, err := mongo.Connect(options.Client().ApplyURI("mongodb://localhost:27017"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	db := client.Database("mandala_wiring_test_previous_coins")
-	t.Cleanup(func() {
-		_ = db.Drop(context.Background())
-		_ = client.Disconnect(context.Background())
-	})
 	es, err := enginestore.New(db)
 	if err != nil {
 		t.Fatal(err)

@@ -222,9 +222,21 @@ func proofInfo(beef *transaction.Beef, txid *chainhash.Hash) (root string, state
 
 // InsertOutputs stores one document per admitted vout, all sharing the
 // submitted BEEF bytes, the consumed outpoints and the ancillary txids
-// (engine.commitTopicOutputs). Upsert keeps a partial-failure retry
-// idempotent under the unique index. An empty admit list is a no-op — the
-// engine calls this even for topics that admitted nothing.
+// (engine.commitTopicOutputs). An empty admit list is a no-op — the engine
+// calls this even for topics that admitted nothing.
+//
+// V-15: the write is insert-only. Each vout is an upsert whose whole document
+// rides in $setOnInsert, so a document that already exists is left exactly as
+// it is. The engine calls this once per (topic, txid), behind its dupe gate;
+// it reaches an existing document only on a same-txid submit that passed the
+// gate before the first one committed (a double-click, D-20) or on a retry
+// after a fault between InsertOutputs and the applied record. Neither carries
+// anything newer: spent, spendTxid and consumedBy belong to the transactions
+// that spent or retained the output since (MarkUTXOsAsSpent, UpdateConsumedBy);
+// beef and the merkle fields to /arc-ingest's anchoring (UpdateTransactionBEEF,
+// UpdateOutputBlockHeight, ReconcileMerkleRoot); score, outputsConsumed and
+// ancillaryTxids are insertion facts. A replace here once made a coin a later
+// transaction had spent read unspent again (final review C6).
 func (s *Store) InsertOutputs(ctx context.Context, topic string, txid *chainhash.Hash, outputs []uint32, outpointsConsumed []*transaction.Outpoint, beef *transaction.Beef, ancillaryTxids []*chainhash.Hash) error {
 	if len(outputs) == 0 {
 		return nil
@@ -259,9 +271,9 @@ func (s *Store) InsertOutputs(ctx context.Context, topic string, txid *chainhash
 			MerkleRoot:      root,
 			MerkleState:     uint8(state),
 		}
-		models = append(models, mongo.NewReplaceOneModel().
+		models = append(models, mongo.NewUpdateOneModel().
 			SetFilter(outpointFilter(topic, &transaction.Outpoint{Txid: *txid, Index: vout})).
-			SetReplacement(doc).
+			SetUpdate(bson.D{{Key: "$setOnInsert", Value: doc}}).
 			SetUpsert(true))
 	}
 	_, err := s.outputs.BulkWrite(ctx, models)
@@ -409,7 +421,9 @@ func (s *Store) DeleteOutput(ctx context.Context, outpoint *transaction.Outpoint
 // transaction whose first attempt died between marking and committing), and
 // then checks the matched count. A shortfall means some coin is already
 // spent by a different transaction: the rows this call DID take are handed
-// back, and the error names the competitor. Without the check, two concurrent
+// back — only this call's topic and outpoints marked by this spender (V-15),
+// never the spender's marks on another topic, which an earlier submit may have
+// committed — and the error names the competitor. Without the check, two concurrent
 // submits of conflicting spends both "succeeded" here and the double spend
 // was left for Arcade's broadcast race to notice — or not.
 //
@@ -455,8 +469,19 @@ func (s *Store) MarkUTXOsAsSpent(ctx context.Context, outpoints []*transaction.O
 	}
 	conflict := s.describeSpendConflict(ctx, topic, ors, spender)
 	if spender != "" {
-		if _, uerr := s.UnmarkSpentBySpendTxid(ctx, spender); uerr != nil {
-			log.Printf("engine store: rolling back partial spend marks of %s failed (state may need manual repair): %v", spender, uerr)
+		// V-15: only this call's topic and outpoints. The spender's marks on any other topic belong to another
+		// call — on a retry naming an extra topic, to a topic an earlier submit committed and broadcast.
+		if _, uerr := s.outputs.UpdateMany(ctx,
+			bson.D{
+				{Key: "topic", Value: topic},
+				{Key: "spendTxid", Value: spender},
+				{Key: "$or", Value: ors},
+			},
+			bson.D{
+				{Key: "$set", Value: bson.D{{Key: "spent", Value: false}}},
+				{Key: "$unset", Value: bson.D{{Key: "spendTxid", Value: ""}}},
+			}); uerr != nil {
+			log.Printf("engine store: rolling back partial spend marks of %s on %s failed (state may need manual repair): %v", spender, topic, uerr)
 		}
 	}
 	return fmt.Errorf("enginestore: refusing to mark inputs spent for %s: %s", spenderLabel(spender), conflict)
@@ -578,10 +603,12 @@ func (s *Store) AdmittedOutputIndexes(ctx context.Context, topic, txid string) (
 // cleared, across all topics. It is NOT part of engine.Storage — it exists
 // because go-overlay-services v1.3.7's Submit marks inputs spent BEFORE
 // broadcasting and never unwinds on broadcast failure (ErrorOnBroadcastFailure
-// is still unread); the HTTP layer calls
-// this (via wiring's compensation closure) to restore the engine-side spend
-// state. Returns the number of documents modified (0 when nothing matched —
-// re-running the compensation is a harmless no-op).
+// is still unread). Its reach is every topic, so it may only run where the
+// transaction's spends are void on every topic (V-15 audit); its callers are
+// wiring's broadcast-failure compensation, which skips a txid applied on any
+// topic (V-14), and wiring's terminal-status eviction, which runs quiesced.
+// MarkUTXOsAsSpent's CAS rollback does not use it. Returns the number of
+// documents modified (0 when nothing matched — re-running is a harmless no-op).
 func (s *Store) UnmarkSpentBySpendTxid(ctx context.Context, spendTxid string) (int64, error) {
 	res, err := s.outputs.UpdateMany(ctx,
 		bson.D{{Key: "spendTxid", Value: spendTxid}},
