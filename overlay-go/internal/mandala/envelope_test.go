@@ -2,6 +2,7 @@ package mandala
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -126,4 +127,27 @@ func TestDecodeEnvelopeRefusals(t *testing.T) {
 			assertEnvelopeRefusal(t, err, c.reason)
 		})
 	}
+}
+
+// nestedLinkageBody is a payload whose single output carries a linkage nested
+// depth arrays deep (total JSON depth is depth+3: object, outputs array, entry).
+func nestedLinkageBody(depth int) []byte {
+	return []byte(`{"outputs":[{"index":0,"linkage":` + strings.Repeat("[", depth) + strings.Repeat("]", depth) + `}]}`)
+}
+
+// TestDecodeEnvelopeRefusesNestingBeyondGoJSONCap pins the documented divergence
+// from JSON.parse (see DecodeEnvelope): encoding/json refuses JSON nested deeper
+// than 10000 levels while V8 has no cap, so TS would parse the second body.
+func TestDecodeEnvelopeRefusesNestingBeyondGoJSONCap(t *testing.T) {
+	// Control: the same shape at a modest depth decodes, so the refusal below is
+	// the depth cap and not a malformed body.
+	env, err := DecodeEnvelope(nestedLinkageBody(100))
+	if err != nil || env == nil || len(env.Outputs) != 1 || env.Outputs[0].Index != 0 {
+		t.Fatalf("depth-100 linkage: %+v, %v", env, err)
+	}
+	env, err = DecodeEnvelope(nestedLinkageBody(10001))
+	if env != nil {
+		t.Fatalf("env = %+v on a refusal", env)
+	}
+	assertEnvelopeRefusal(t, err, "Mandala payload must be UTF-8 JSON")
 }

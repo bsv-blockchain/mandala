@@ -46,11 +46,16 @@ func emptyEnvelope() *Envelope {
 	return &Envelope{Inputs: []IndexedLinkage{}, Outputs: []IndexedLinkage{}, Admin: []AdminEntry{}}
 }
 
-// DecodeEnvelope ports TS decodeEnvelope (ts-stack 37468f290 src/mandala/types.ts:187-201) with JS JSON.parse parity
+// DecodeEnvelope ports TS decodeEnvelope (ts-stack 37468f290 src/mandala/types.ts:204-218) with JS JSON.parse parity
 // (fact base ts-layers §7, §14.2): nil/empty -> empty envelope; BOM or invalid UTF-8 -> "must be UTF-8 JSON"; exact
 // lowercase keys (map[string]json.RawMessage, last duplicate wins); null list -> "<label> must be an array"; indices are
 // JS safe non-negative integers (1.0, 1e0, -0 valid; 2^53 refused); deploySig null or "" refused; linkage bodies kept
 // raw. Order: inputs, outputs, admin (each fully), then admin details, then deploySig. Refusal = rEnvelope(detail).
+//
+// Documented divergence from JSON.parse (D-13 style, controller ruling): encoding/json (json.Valid and Unmarshal alike)
+// refuses JSON nested deeper than 10000 levels, and V8 JSON.parse has no such cap, so a payload nested deeper than that
+// is refused here as ERR_SHAPE "must be UTF-8 JSON" where TS would parse it. Only adversarial or self-inflicted payloads
+// reach it, and refusals are keyed per payload hash, so a clean resubmit is unaffected.
 func DecodeEnvelope(b []byte) (*Envelope, error) {
 	if len(b) == 0 {
 		return emptyEnvelope(), nil
@@ -106,7 +111,7 @@ func DecodeEnvelope(b []byte) (*Envelope, error) {
 	return env, nil
 }
 
-// readList ports TS readList (types.ts:171-184): only an absent key is an empty
+// readList ports TS readList (types.ts:188-201): only an absent key is an empty
 // list; every entry must be an object with a unique safe non-negative integer index.
 func readList(payload map[string]json.RawMessage, label string) ([]rawEntry, error) {
 	raw, present := payload[label]

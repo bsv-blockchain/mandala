@@ -3,6 +3,7 @@ package mandala
 import (
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -47,6 +48,26 @@ func scopeLinkIdx(ls []IndexedLinkage) []uint64 {
 	return r
 }
 
+// deepCopyEnvelope copies every slice an Envelope carries, down to each
+// linkage's Raw bytes. A plain `*env` copy shares all of those backing arrays,
+// so an in-place element mutation of the original would show through it and a
+// reflect.DeepEqual against it could never notice.
+func deepCopyEnvelope(env *Envelope) Envelope {
+	c := *env
+	c.Inputs = deepCopyLinkages(env.Inputs)
+	c.Outputs = deepCopyLinkages(env.Outputs)
+	c.Admin = slices.Clone(env.Admin)
+	return c
+}
+
+func deepCopyLinkages(ls []IndexedLinkage) []IndexedLinkage {
+	c := slices.Clone(ls)
+	for i := range c {
+		c[i].Raw = slices.Clone(c[i].Raw)
+	}
+	return c
+}
+
 func TestScopeKeepsOnlyTheTokensOwnEntries(t *testing.T) {
 	env := &Envelope{
 		Outputs: []IndexedLinkage{scopeLink(0, `"la"`), scopeLink(1, `"lb"`), scopeLink(2, `"la2"`)},
@@ -59,7 +80,7 @@ func TestScopeKeepsOnlyTheTokensOwnEntries(t *testing.T) {
 		Inputs:  []brc162.Input{scopeIn(0, scopeA, 5), scopeIn(1, scopeB, 7)},
 		Env:     env,
 	}
-	before := *env
+	before := deepCopyEnvelope(env)
 	a := ScopeToToken(scopeA, v)
 	if got := scopeOutIdx(a.Outputs); !reflect.DeepEqual(got, []uint32{0, 2}) {
 		t.Errorf("outputs = %v", got)
