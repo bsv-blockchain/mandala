@@ -26,6 +26,7 @@ const { prepareBlindedPayment } = await import('./blinding.js')
 const { transferTokens } = await import('./transfer.js')
 const { journalClear } = await import('./txJournal.js')
 const { notifyClear } = await import('./notifyJournal.js')
+const { BASKET } = await import('./constants.js')
 
 const ASSET = `${'11'.repeat(32)}_0`
 const RECIPIENT = '02' + 'ab'.repeat(32)
@@ -180,5 +181,66 @@ describe('transferTokens — the signableTransaction reference reaches the calle
     vi.mocked(submitAndBroadcast).mockResolvedValue({ outputsToAdmit: [0] })
     const { result } = await send()
     expect(result.reference).toBe('ref-1')
+  })
+})
+
+describe('transferTokens — a send to our own identity key', () => {
+  const sendToSelf = async (overrides: Record<string, unknown> = {}): Promise<{ result: any, wallet: any, messageBoxClient: any }> => {
+    vi.mocked(submitAndBroadcast).mockResolvedValue({ outputsToAdmit: [0] })
+    const wallet = mkWallet()
+    const messageBoxClient = { sendMessage: vi.fn().mockResolvedValue({}) }
+    const result = await transferTokens({
+      wallet,
+      messageBoxClient,
+      identityKey: RECIPIENT,
+      assetId: ASSET,
+      amount: 5,
+      recipientKey: RECIPIENT.toUpperCase(),
+      ...overrides
+    })
+    return { result, wallet, messageBoxClient }
+  }
+
+  it('never blinds: the wallet refuses the root shared secret with itself', async () => {
+    vi.mocked(prepareBlindedPayment).mockClear()
+    await sendToSelf()
+    expect(prepareBlindedPayment).not.toHaveBeenCalled()
+  })
+
+  it('locks the output to our own key, keeps it in the basket, and records how to spend it', async () => {
+    const { wallet } = await sendToSelf()
+    const [out] = wallet.createAction.mock.calls[0][0].outputs
+    expect(out.basket).toBe(BASKET)
+    expect(JSON.parse(out.customInstructions)).toMatchObject({
+      protocolID: [2, 'p mandala token'],
+      keyID: expect.stringMatching(/^xfer-/),
+      counterparty: RECIPIENT,
+      direction: 'sent',
+      recipient: RECIPIENT
+    })
+    expect(wallet.getPublicKey.mock.calls[0][0]).toMatchObject({
+      protocolID: [2, 'p mandala token'],
+      counterparty: RECIPIENT
+    })
+  })
+
+  it('sends no MessageBox notification and reports notified', async () => {
+    const { result, messageBoxClient } = await sendToSelf()
+    expect(messageBoxClient.sendMessage).not.toHaveBeenCalled()
+    expect(result.notified).toBe(true)
+  })
+
+  it('refuses a hand-over to ourselves before building anything', async () => {
+    const wallet = mkWallet()
+    await expect(transferTokens({
+      wallet,
+      messageBoxClient: { sendMessage: vi.fn() },
+      identityKey: RECIPIENT,
+      assetId: ASSET,
+      amount: 5,
+      recipientKey: RECIPIENT,
+      mode: 'handover'
+    } as any)).rejects.toThrow('A hand-over send needs a recipient other than this wallet')
+    expect(wallet.createAction).not.toHaveBeenCalled()
   })
 })

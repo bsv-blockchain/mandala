@@ -162,6 +162,25 @@ export interface TransferResult extends AdmissionReceipt {
   refusedCode?: string
 }
 
+/** customInstructions for an output this wallet locks to itself in a send to
+ * its own identity key: enough to spend it again (protocolID/keyID/
+ * counterparty) and to classify it in history. */
+function selfCustomInstructions (args: {
+  keyID: string
+  identityKey: string
+  direction: 'sent' | 'change'
+  sentAmount?: number
+}): string {
+  return JSON.stringify({
+    protocolID: FT_PROTOCOL,
+    keyID: args.keyID,
+    counterparty: args.identityKey,
+    direction: args.direction,
+    recipient: args.identityKey,
+    ...(args.sentAmount != null ? { sentAmount: args.sentAmount } : {})
+  })
+}
+
 export async function transferTokens (p: TransferParams): Promise<TransferResult> {
   // Cross-tab serialization: the in-process sendFlight latch can't see a send
   // running in another tab of the same wallet; the web lock can. Never queue —
@@ -199,15 +218,24 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
 
   const stamp = Date.now()
   const keyIDOut = 'xfer-' + stamp
+  // A send to our own identity key is locked like change: derived toward
+  // ourselves, kept in BASKET, no blinding and no MessageBox. Blinding hides
+  // the sender from the recipient, which here is us, and needs the root
+  // shared secret with the recipient, which a wallet refuses for itself.
+  const toSelf = recipientKey.toLowerCase() === identityKey.toLowerCase()
+  if (toSelf && handover) throw new Error('A hand-over send needs a recipient other than this wallet')
   // Blind the sender identity toward the recipient (A′ = A + rG). r stays
   // sender-local — never on the recipient output, never in the remittance.
-  const blinded = await prepareBlindedPayment(wallet as any, {
-    identityKey,
-    recipientKey,
-    keyID: keyIDOut
-  })
-  const ftOut = codec.lock(assetId, BigInt(amount), blinded.pubKeyHash)
-  const recipientScript = ftOut.toHex()
+  const blinded = toSelf
+    ? undefined
+    : await prepareBlindedPayment(wallet as any, {
+      identityKey,
+      recipientKey,
+      keyID: keyIDOut
+    })
+  const recipientScript = blinded == null
+    ? (await lockToken(wallet as any, assetId, amount, FT_PROTOCOL, keyIDOut, identityKey)).toHex()
+    : codec.lock(assetId, BigInt(amount), blinded.pubKeyHash).toHex()
 
   // One keyID per change output (the loop index keeps same-millisecond keyIDs
   // unique — colliding keyIDs would reuse keys and produce byte-identical
@@ -221,17 +249,26 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     changePlans.push({ keyID, amount: changeAmounts[i], script: script.toHex() })
   }
 
-  const outputs: any[] = [{
-    satoshis: 1,
-    lockingScript: recipientScript,
-    outputDescription: 'FT to recipient',
-    customInstructions: recipientCustomInstructions({
-      keyID: keyIDOut,
-      recipientKey,
-      senderBlinded: blinded.senderBlinded
-    }),
-    tags: ['mandala', 'sent', assetId]
-  }]
+  const outputs: any[] = [blinded == null
+    ? {
+        satoshis: 1,
+        lockingScript: recipientScript,
+        outputDescription: 'FT to recipient',
+        basket: BASKET,
+        customInstructions: selfCustomInstructions({ keyID: keyIDOut, identityKey, direction: 'sent' }),
+        tags: ['mandala', 'sent', assetId]
+      }
+    : {
+        satoshis: 1,
+        lockingScript: recipientScript,
+        outputDescription: 'FT to recipient',
+        customInstructions: recipientCustomInstructions({
+          keyID: keyIDOut,
+          recipientKey,
+          senderBlinded: blinded.senderBlinded
+        }),
+        tags: ['mandala', 'sent', assetId]
+      }]
   for (const plan of changePlans) {
     outputs.push({
       satoshis: 1,
@@ -243,14 +280,16 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
       // of listActions — change outputs are the ones the wallet always keeps.
       // Every change output carries the FULL sentAmount (history reads the
       // first one it finds; per-output values would under-report).
-      customInstructions: changeCustomInstructions({
-        keyID: plan.keyID,
-        identityKey,
-        recipientKey,
-        sentAmount: amount,
-        r: blinded.r,
-        senderBlinded: blinded.senderBlinded
-      })
+      customInstructions: blinded == null
+        ? selfCustomInstructions({ keyID: plan.keyID, identityKey, direction: 'change', sentAmount: amount })
+        : changeCustomInstructions({
+          keyID: plan.keyID,
+          identityKey,
+          recipientKey,
+          sentAmount: amount,
+          r: blinded.r,
+          senderBlinded: blinded.senderBlinded
+        })
     })
   }
 
@@ -314,7 +353,7 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     // inputs are revealed so the overlay can screen senders under access mode
     // (A6 gate 3). The reveals are independent wallet calls — run them together.
     const [linkOut, ...restLinks] = await Promise.all([
-      Promise.resolve(blinded.linkage),
+      blinded != null ? Promise.resolve(blinded.linkage) : revealLinkage(wallet as any, keyIDOut, identityKey),
       ...changePlans.map(async c => await revealLinkage(wallet as any, c.keyID, identityKey)),
       ...spendInfo.map(async s => await revealLinkage(wallet as any, s.keyID, s.counterparty))
     ])
@@ -329,14 +368,16 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
     // Overlay gates: submit first; broadcast only on acceptance, else abort + throw.
     signedTx = signed.tx as number[]
     txid = signed.txid ?? Transaction.fromBEEF(signedTx).id('hex')
-    await blindingPut({
-      txid,
-      r: blinded.r,
-      senderBlinded: blinded.senderBlinded,
-      recipient: recipientKey,
-      keyID: keyIDOut,
-      at: Date.now()
-    })
+    if (blinded != null) {
+      await blindingPut({
+        txid,
+        r: blinded.r,
+        senderBlinded: blinded.senderBlinded,
+        recipient: recipientKey,
+        keyID: keyIDOut,
+        at: Date.now()
+      })
+    }
     if (handover) {
       // OFFLINE. No submitToOverlay, no broadcast, and — critically — no abort
       // of the held inputs: the recipient is about to hold evidence over these
@@ -394,55 +435,58 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
   // by reconcileNotifications — otherwise the recipient never learns about
   // their on-chain output. Duplicate delivery is safe (receive acks by
   // messageId and treats an already-internalized output as success).
-  const notification: PendingNotification = {
-    txid,
-    recipient: recipientKey,
-    messageBox: MESSAGEBOX,
-    body: {
-      ...(handoverExtras ?? {}),
-      ...(note != null ? { note } : {}),
-      assetId,
-      amount,
-      transaction: signedTx,
-      keyID: keyIDOut,
-      // With randomized output order the recipient can no longer assume
-      // their output sits at index 0 — tell them where it landed.
-      outputIndex: recipientIndex,
-      protocolID: FT_PROTOCOL,
-      // Remittance shows A′, not A — Bob derives against this and cannot
-      // join later payments. r is not included.
-      sender: blinded.senderBlinded,
-      senderMode: 'blinded',
-      // FIX H / §4.5: the handle rail's sender submits online, so it already
-      // holds the tip's own acceptance proof — forward it so the recipient can
-      // credit without waiting for its own overlay round-trip. Optional by
-      // design: a recipient that cannot verify it treats it as ABSENT (never
-      // as a decline), and legacy bodies simply do not carry it.
-      ...(receipt.admissionSignature != null && receipt.admissionIdentityKey != null
-        ? {
-            admission: {
-              txid,
-              outputsToAdmit: receipt.outputsToAdmit ?? [],
-              signature: receipt.admissionSignature,
-              signerKey: receipt.admissionIdentityKey
-            }
-          }
-        : {})
-    },
-    at: Date.now()
-  }
-  await notifyPut(notification)
+  // A send to ourselves already landed in BASKET: there is no one to notify.
   let notified = true
-  try {
-    await messageBoxClient.sendMessage({
-      recipient: notification.recipient,
-      messageBox: notification.messageBox,
-      body: notification.body
-    })
-    await notifyRemove(txid)
-  } catch (e) {
-    console.warn('[mandala] transfer committed but recipient notify failed; will retry via reconcileNotifications:', e)
-    notified = false
+  if (blinded != null) {
+    const notification: PendingNotification = {
+      txid,
+      recipient: recipientKey,
+      messageBox: MESSAGEBOX,
+      body: {
+        ...(handoverExtras ?? {}),
+        ...(note != null ? { note } : {}),
+        assetId,
+        amount,
+        transaction: signedTx,
+        keyID: keyIDOut,
+        // With randomized output order the recipient can no longer assume
+        // their output sits at index 0 — tell them where it landed.
+        outputIndex: recipientIndex,
+        protocolID: FT_PROTOCOL,
+        // Remittance shows A′, not A — Bob derives against this and cannot
+        // join later payments. r is not included.
+        sender: blinded.senderBlinded,
+        senderMode: 'blinded',
+        // FIX H / §4.5: the handle rail's sender submits online, so it already
+        // holds the tip's own acceptance proof — forward it so the recipient can
+        // credit without waiting for its own overlay round-trip. Optional by
+        // design: a recipient that cannot verify it treats it as ABSENT (never
+        // as a decline), and legacy bodies simply do not carry it.
+        ...(receipt.admissionSignature != null && receipt.admissionIdentityKey != null
+          ? {
+              admission: {
+                txid,
+                outputsToAdmit: receipt.outputsToAdmit ?? [],
+                signature: receipt.admissionSignature,
+                signerKey: receipt.admissionIdentityKey
+              }
+            }
+          : {})
+      },
+      at: Date.now()
+    }
+    await notifyPut(notification)
+    try {
+      await messageBoxClient.sendMessage({
+        recipient: notification.recipient,
+        messageBox: notification.messageBox,
+        body: notification.body
+      })
+      await notifyRemove(txid)
+    } catch (e) {
+      console.warn('[mandala] transfer committed but recipient notify failed; will retry via reconcileNotifications:', e)
+      notified = false
+    }
   }
 
   // Maintainer refinement (spec §4.3 step 7 / wire contract §9.13): hand-over
