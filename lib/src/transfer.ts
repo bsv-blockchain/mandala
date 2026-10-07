@@ -222,8 +222,9 @@ async function transferPipeline (p: TransferParams): Promise<TransferResult> {
   // ourselves, kept in BASKET, no blinding and no MessageBox. Blinding hides
   // the sender from the recipient, which here is us, and needs the root
   // shared secret with the recipient, which a wallet refuses for itself.
+  // A hand-over to ourselves just stays journaled 'handed_over' until our own
+  // reconcile pass (or submitAfterHandover) submits it.
   const toSelf = recipientKey.toLowerCase() === identityKey.toLowerCase()
-  if (toSelf && handover) throw new Error('A hand-over send needs a recipient other than this wallet')
   // Blind the sender identity toward the recipient (A′ = A + rG). r stays
   // sender-local — never on the recipient output, never in the remittance.
   const blinded = toSelf

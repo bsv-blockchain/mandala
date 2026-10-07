@@ -24,7 +24,7 @@ const { loadFtCandidates } = await import('./ftCandidates.js')
 const { selectFtInputs } = await import('./ftSelect.js')
 const { prepareBlindedPayment } = await import('./blinding.js')
 const { transferTokens } = await import('./transfer.js')
-const { journalClear } = await import('./txJournal.js')
+const { journalClear, journalList } = await import('./txJournal.js')
 const { notifyClear } = await import('./notifyJournal.js')
 const { BASKET } = await import('./constants.js')
 
@@ -230,17 +230,25 @@ describe('transferTokens — a send to our own identity key', () => {
     expect(result.notified).toBe(true)
   })
 
-  it('refuses a hand-over to ourselves before building anything', async () => {
+  it('hands over to ourselves: journals the held tx for our own submit, posts nothing', async () => {
+    const tip = new Transaction()
+    tip.addOutput({ lockingScript: LockingScript.fromASM('OP_TRUE'), satoshis: 1 })
+    const atomic = tip.toAtomicBEEF()
     const wallet = mkWallet()
-    await expect(transferTokens({
+    wallet.signAction.mockResolvedValue({ tx: atomic, txid: tip.id('hex') })
+    const messageBoxClient = { sendMessage: vi.fn() }
+    const result = await transferTokens({
       wallet,
-      messageBoxClient: { sendMessage: vi.fn() },
+      messageBoxClient,
       identityKey: RECIPIENT,
       assetId: ASSET,
       amount: 5,
       recipientKey: RECIPIENT,
-      mode: 'handover'
-    } as any)).rejects.toThrow('A hand-over send needs a recipient other than this wallet')
-    expect(wallet.createAction).not.toHaveBeenCalled()
+      mode: 'handover',
+      evidence: { admissionFor: async () => undefined, linkageFor: async () => undefined }
+    } as any)
+    expect(result.handedOver).toBe(true)
+    expect(messageBoxClient.sendMessage).not.toHaveBeenCalled()
+    expect((await journalList()).find(e => e.txid === tip.id('hex'))).toMatchObject({ stage: 'handed_over', reference: 'ref-1' })
   })
 })
