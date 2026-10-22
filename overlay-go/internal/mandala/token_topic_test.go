@@ -605,7 +605,12 @@ func TestDeployReqPolicy(t *testing.T) {
 		{"req text", base(brc162.CborMap{"req": "x"}), "req must be a map"},
 		{"req null", base(brc162.CborMap{"req": nil}), "req must be a map"},
 		{"ext", base(brc162.CborMap{"req": good, "ext": brc162.CborMap{}}), "ext is not allowed on a Mandala deploy"},
-		{"ext without req", base(brc162.CborMap{"ext": brc162.CborMap{}}), "ext is not allowed on a Mandala deploy"},
+		// contract §4: the req rules (step 2) run before the ext and icon rules (step 3)
+		{"ext without req", base(brc162.CborMap{"ext": brc162.CborMap{}}), "missing key req"},
+		{"ext with req text", base(brc162.CborMap{"req": "x", "ext": brc162.CborMap{}}), "req must be a map"},
+		{"ext with other key", base(brc162.CborMap{"req": colorprofile.MandalaReq(mandalatest.Rogue.Identity), "ext": brc162.CborMap{}}), "req does not match this overlay's Mandala profiles"},
+		{"bad icon without req", base(brc162.CborMap{"icon": "image/png"}), "missing key req"},
+		{"ext and bad icon", base(brc162.CborMap{"req": good, "ext": brc162.CborMap{}, "icon": "image/png"}), "ext is not allowed on a Mandala deploy"},
 		{"bad icon", base(brc162.CborMap{"req": good, "icon": []any{"image/png"}}), "icon must be [mediaType, bytes]"},
 		{"icon swapped", base(brc162.CborMap{"req": good, "icon": []any{[]byte{0x89}, "image/png"}}), "icon must be [mediaType, bytes]"},
 		{"icon text", base(brc162.CborMap{"req": good, "icon": "image/png"}), "icon must be [mediaType, bytes]"},
@@ -640,6 +645,31 @@ func TestDeployReqCheckedAfterDeploySigAndTrust(t *testing.T) {
 	rogue := mandalatest.DeployWithPayload(t, mandalatest.Rogue, noReq)
 	_, err = identifyDeploy(t, rogue)
 	requireReject(t, err, "ERR_UNTRUSTED", "output 0: owner "+mandalatest.Rogue.Identity+" is not a trusted issuer")
+}
+
+// Contract §4 steps 2-3: the ext, icon and req-must-be-a-map rules also run after deploySig and the trusted-issuer
+// rules, so an unsigned or untrusted deploy carrying any of them gets the deploySig / untrusted refusal.
+func TestDeployShapeCheckedAfterDeploySigAndTrust(t *testing.T) {
+	good := colorprofile.MandalaReq(mandalatest.Overlay.Identity)
+	for name, extra := range map[string]brc162.CborMap{
+		"ext":      {"req": good, "ext": brc162.CborMap{}},
+		"bad icon": {"req": good, "icon": "image/png"},
+		"req text": {"req": "x"},
+	} {
+		m := brc162.CborMap{"sym": "TUSD", "dec": uint64(2), "label": "Test Dollar"}
+		for k, v := range extra {
+			m[k] = v
+		}
+		payload := mandalatest.DeployPayloadWith(m)
+		unsigned := mandalatest.Build(t, nil, []mandalatest.Out{{Owner: mandalatest.Issuer, Prover: mandalatest.Issuer, Payload: payload, HasPayload: true}}, nil)
+		_, err := identifyDeploy(t, unsigned)
+		requireReject(t, err, "ERR_AUTHORITY", "output 0: deploy requires a valid deploySig over this txid")
+		_, err = identifyDeploy(t, mandalatest.DeployWithPayload(t, mandalatest.Rogue, payload))
+		requireReject(t, err, "ERR_UNTRUSTED", "output 0: owner "+mandalatest.Rogue.Identity+" is not a trusted issuer")
+		if t.Failed() {
+			t.Fatalf("case %s", name)
+		}
+	}
 }
 
 // Contract §4 step 5: req and ext are deploy-only; an authority {adm} payload is unchanged.

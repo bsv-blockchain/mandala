@@ -127,6 +127,21 @@ func TestCheckAuthorityDeployReqIsTokenOnly(t *testing.T) {
 	}
 	requireReject(t, run(withExt, true), CodeShape, "output 0: deploy payload is not a valid Mandala deploy map (ext is not allowed on a Mandala deploy)")
 	requireReject(t, run(noReq, false), CodeShape, "output 0: deploy payload is not a valid Mandala deploy map (missing key req)")
+	kycWith := func(extra brc162.CborMap, signer *mt.Party) *mt.Built {
+		m := brc162.CborMap{"sym": "KYC", "dec": uint64(0), "label": "Members"}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return mt.Build(t, nil, []mt.Out{{Owner: issuer, Prover: issuer, Payload: mt.DeployPayloadWith(m), HasPayload: true}}, signer)
+	}
+	// a KYC deploy keeps the shared shape rules: req, when present, is a map; then ext; then icon
+	requireReject(t, run(kycWith(brc162.CborMap{"req": "x", "ext": brc162.CborMap{}}, &issuer), true), CodeShape, "output 0: deploy payload is not a valid Mandala deploy map (req must be a map)")
+	requireReject(t, run(kycWith(brc162.CborMap{"icon": "x"}, &issuer), true), CodeShape, "output 0: deploy payload is not a valid Mandala deploy map (icon must be [mediaType, bytes])")
+	if err := run(kycWith(brc162.CborMap{"req": brc162.CborMap{}}, &issuer), true); err != nil {
+		t.Fatalf("KYC deploy with a map req: %v", err)
+	}
+	// and, like a token deploy, runs them only after deploySig
+	requireReject(t, run(kycWith(brc162.CborMap{"ext": brc162.CborMap{}}, nil), true), CodeAuthority, "output 0: deploy requires a valid deploySig over this txid")
 }
 
 func TestCheckAuthorityStep1Deploys(t *testing.T) {

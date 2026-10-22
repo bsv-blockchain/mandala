@@ -72,7 +72,7 @@ func authOwnerAt(owners []VerifiedOwner, index uint32) (VerifiedOwner, error) {
 func authDelta(l *brc162.TokenLedger) *big.Int { return new(big.Int).Sub(l.ValueOut, l.ValueIn) }
 
 // 1. deploys (layer B already put any deploy at output 0). Returns each deploy's parsed metadata
-// for the req check, which runs after the trusted-issuer rules (step 2b).
+// for the req, ext and icon checks, which run after the trusted-issuer rules (step 2b).
 func authRequireDeploys(ctx context.Context, txid string, outputs []brc162.Output, owners []VerifiedOwner, env *Envelope) ([]DeployMetadata, error) {
 	var deploys []DeployMetadata
 	for _, o := range outputs {
@@ -98,15 +98,13 @@ func authRequireDeploys(ctx context.Context, txid string, outputs []brc162.Outpu
 	return deploys, nil
 }
 
-// 2b. the Mandala deploy req (contract §4 step 2): after the existing sym/dec/label/feeRatePerKb,
-// deploySig and trusted-issuer rules, every token deploy's req names exactly this overlay's
-// profiles. A KYC registry deploy is not a color asset and carries no req.
-func authRequireDeployReq(deploys []DeployMetadata, d AuthorityDeps) error {
-	if d.Registry {
-		return nil
-	}
+// 2b. the Mandala deploy shape (contract §4 steps 2-3): after the existing sym/dec/label/feeRatePerKb,
+// deploySig and trusted-issuer rules, every token deploy's req names exactly this overlay's profiles,
+// then ext is absent and icon is [text, bytes]. A KYC registry deploy is not a color asset and needs
+// no req, but keeps the req-is-a-map, ext and icon rules.
+func authRequireDeployShape(deploys []DeployMetadata, d AuthorityDeps) error {
 	for _, md := range deploys {
-		if err := RequireMandalaReq(md, d.OverlayIdentityKey); err != nil {
+		if err := RequireDeployShape(md, !d.Registry, d.OverlayIdentityKey); err != nil {
 			return err
 		}
 	}
@@ -330,7 +328,7 @@ func authLowered(keys map[string]bool) map[string]bool {
 }
 
 // CheckAuthority is layer C for one transaction, steps 1-11 of F/ts-layers §3 in order: deploys,
-// trusted outputs, the Mandala deploy req (1Color, contract §4 step 2), trusted authority inputs, authority inputs, continuity, commitments, registry
+// trusted outputs, the Mandala deploy shape (1Color, contract §4 steps 2-3), trusted authority inputs, authority inputs, continuity, commitments, registry
 // value outputs, delta rule, storage range, reissues, result.
 func CheckAuthority(ctx context.Context, txid string, l *brc162.Ledger, outputs []brc162.Output, owners []VerifiedOwner,
 	inputOwners map[uint32]string, env *Envelope, d AuthorityDeps) (*AuthorityResult, error) {
@@ -343,7 +341,7 @@ func CheckAuthority(ctx context.Context, txid string, l *brc162.Ledger, outputs 
 	if err := authRequireTrustedOutputs(owners, trusted); err != nil {
 		return nil, err
 	}
-	if err := authRequireDeployReq(deploys, d); err != nil {
+	if err := authRequireDeployShape(deploys, d); err != nil {
 		return nil, err
 	}
 	if err := authRequireTrustedInputs(ledgers, inputOwners, trusted); err != nil {

@@ -209,6 +209,19 @@ func TestParseDeployMetadata(t *testing.T) {
 		}
 		requireReject(t, err, CodeShape, reason(c.detail))
 	}
+	// the 1Color rules are RequireDeployShape's (run after deploySig and trust), never the parser's
+	shaped := ok(brc162.CborMap{"sym": "A", "dec": uint64(0), "label": "B", "req": "x", "ext": nil, "icon": "x"})
+	requireReject(t, RequireDeployShape(shaped, false, ""), CodeShape, reason("req must be a map"))
+	shaped = ok(brc162.CborMap{"sym": "A", "dec": uint64(0), "label": "B", "ext": nil, "icon": "x"})
+	requireReject(t, RequireDeployShape(shaped, false, ""), CodeShape, reason("ext is not allowed on a Mandala deploy"))
+	shaped = ok(brc162.CborMap{"sym": "A", "dec": uint64(0), "label": "B", "icon": "x"})
+	requireReject(t, RequireDeployShape(shaped, false, ""), CodeShape, reason("icon must be [mediaType, bytes]"))
+	if shaped.Icon != nil {
+		t.Fatal("a malformed icon is never exposed")
+	}
+	if err := RequireDeployShape(ok(brc162.CborMap{"sym": "A", "dec": uint64(0), "label": "B"}), false, ""); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCommitmentOf(t *testing.T) {

@@ -305,7 +305,9 @@ type DeployIcon struct {
 }
 
 // DeployMetadata is a decoded deploy payload. ReqBytes is the strict re-encoding of the req value
-// (nil when req is absent); RequireMandalaReq compares it with this overlay's expected req.
+// (nil when req is absent, not a map, or not re-encodable); RequireMandalaReq compares it with this
+// overlay's expected req. Icon is nil when icon is absent or malformed. The unexported fields record
+// what RequireDeployShape refuses later (contract §4 steps 2-3 run after deploySig and trust).
 type DeployMetadata struct {
 	Sym          string
 	Dec          int64
@@ -313,6 +315,8 @@ type DeployMetadata struct {
 	FeeRatePerKb *int64
 	Icon         *DeployIcon
 	ReqBytes     []byte
+
+	hasReq, reqNotMap, hasExt, badIcon bool
 }
 
 func detLabel(v any, max int) (string, bool) {
@@ -326,10 +330,9 @@ func detLabel(v any, max int) (string, bool) {
 
 // ParseDeployMetadata reads the deploy payload {sym, dec, label, feeRatePerKb?, icon?, req?} (other
 // keys ignored, except ext) in TS order: missing payload, non-canonical push, strict CBOR under the
-// Mandala policy (65536 bytes, depth 64), sym, dec, label, fee rate; then the 1Color rules (contract
-// §4 steps 3-4), placed after the existing ones so no existing reason changes: icon is exactly
-// [text, bytes], ext is absent, req (when present) is a map. Whether req is present and names this
-// overlay is RequireMandalaReq's job: a KYC deploy carries no req. Every refusal is rDeployPayload(detail).
+// Mandala policy (65536 bytes, depth 64), sym, dec, label, fee rate. Every refusal is
+// rDeployPayload(detail). It only records icon, ext and req: their 1Color rules (contract §4 steps 2-3)
+// are RequireDeployShape's, which layer C runs after deploySig and the trusted-issuer rules.
 func ParseDeployMetadata(payload []byte, hasPayload, canonical bool) (DeployMetadata, error) {
 	if !hasPayload {
 		return DeployMetadata{}, rDeployPayload("missing payload")
@@ -371,27 +374,46 @@ func ParseDeployMetadata(payload []byte, hasPayload, canonical bool) (DeployMeta
 	}
 	md.FeeRatePerKb = fee
 	if v, present := m["icon"]; present {
-		icon, ok := deployIcon(v)
-		if !ok {
-			return DeployMetadata{}, rDeployPayload("icon must be [mediaType, bytes]")
+		md.Icon, md.badIcon = nil, true
+		if icon, ok := deployIcon(v); ok {
+			md.Icon, md.badIcon = icon, false
 		}
-		md.Icon = icon
 	}
-	if _, present := m["ext"]; present {
-		return DeployMetadata{}, rDeployPayload("ext is not allowed on a Mandala deploy")
-	}
+	_, md.hasExt = m["ext"]
 	if v, present := m["req"]; present {
+		md.hasReq = true
 		req, ok := v.(brc162.CborMap)
 		if !ok {
-			return DeployMetadata{}, rDeployPayload("req must be a map")
+			md.reqNotMap = true
+		} else if b, err := brc162.EncodeStrictCborValue(req); err == nil {
+			// a strictly decoded map re-encodes; if it ever did not, ReqBytes stays nil and RequireMandalaReq
+			// answers the final req mismatch
+			md.ReqBytes = b
 		}
-		b, err := brc162.EncodeStrictCborValue(req)
-		if err != nil { // a strictly decoded map re-encodes; if it ever did not, it cannot equal the expected req
-			return DeployMetadata{}, rDeployPayload("req does not match this overlay's Mandala profiles")
-		}
-		md.ReqBytes = b
 	}
 	return md, nil
+}
+
+// RequireDeployShape is contract §4 steps 2-3 for one parsed deploy, run after deploySig and the trusted-issuer
+// rules: req, when present, is a map; a token deploy (requireReq) then needs RequireMandalaReq; then ext is absent;
+// then icon, when present, is [text, bytes]. A KYC registry deploy (requireReq false) carries no req requirement
+// but keeps the map, ext and icon rules. Every refusal is the final rDeployPayload(detail).
+func RequireDeployShape(md DeployMetadata, requireReq bool, overlayIdentityKey string) error {
+	if md.reqNotMap {
+		return rDeployPayload("req must be a map")
+	}
+	if requireReq {
+		if err := RequireMandalaReq(md, overlayIdentityKey); err != nil {
+			return err
+		}
+	}
+	if md.hasExt {
+		return rDeployPayload("ext is not allowed on a Mandala deploy")
+	}
+	if md.badIcon {
+		return rDeployPayload("icon must be [mediaType, bytes]")
+	}
+	return nil
 }
 
 // deployIcon reads icon = [text, bytes], exactly two elements.
@@ -417,8 +439,14 @@ func deployIcon(v any) (*DeployIcon, bool) {
 // with K this overlay's key. The input is never normalized: a non-canonical req already failed the
 // strict decode.
 func RequireMandalaReq(md DeployMetadata, overlayIdentityKey string) error {
-	if md.ReqBytes == nil {
+	if !md.hasReq {
 		return rDeployPayload("missing key req")
+	}
+	if md.reqNotMap {
+		return rDeployPayload("req must be a map")
+	}
+	if md.ReqBytes == nil { // present but not re-encodable: it cannot equal the expected req (fdbdddc)
+		return rDeployPayload("req does not match this overlay's Mandala profiles")
 	}
 	want, err := colorprofile.MandalaReqBytes(overlayIdentityKey)
 	if err != nil {
