@@ -42,7 +42,9 @@ it('exposes the contract §8.1 constants verbatim', () => {
 it('exposes the functions the app calls', () => {
   for (const f of ['configureMandala','decodeToken','sendHandover','deliverHandover','settleHandover','receiveHandovers',
     'journalListHandovers','markHandoverDelivered',
-    'registerAsset','issueTokens','payoutTokens','redeemTokens','submitAdminAction','listAdminAssets','formatAmount'])
+    'registerAsset','issueTokens','payoutTokens','redeemTokens','submitAdminAction','listAdminAssets','formatAmount',
+    // amountDisplay delegates to these (contract §8.1: formatAmountGrouped / formatCurrency stay)
+    'parseAmount','formatAmountGrouped','currencySymbol','formatCurrency'])
     expect(typeof (M as any)[f]).toBe('function')
 })
 it('keeps the lib recovery entry points drainHandovers schedules', async () => {
