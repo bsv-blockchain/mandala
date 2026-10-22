@@ -9,6 +9,7 @@
  *
  * Lock names in use (one per cross-tab-exclusive pipeline):
  *   'mandala.send'             — holder transfer (transfer.ts)
+ *   'mandala.payout'           — issuer payout to a holder (payout.ts payoutTokens)
  *   'mandala.register'         — asset genesis (issuerOps.ts registerAsset);
  *                                registerFlight covers same-tab re-entry only
  *   'mandala.admin.<assetId>'  — per-asset admin-auth spend (adminAuthGate.ts)

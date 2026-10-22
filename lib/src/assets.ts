@@ -1,11 +1,15 @@
 import { Utils, WalletInterface } from '@bsv/sdk'
-import { TREASURY_BASKET } from './constants.js'
+import { OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, TREASURY_BASKET } from './constants.js'
 import { MandalaActionDetails } from './brc162.js'
 import { outpoint } from './tokens.js'
 import { AdmissionReceipt, admissionReceipt } from './overlay.js'
 import { withAdminAuthGate, withAdminAuthGates, assertSpendablePrior } from './adminAuthGate.js'
 import { withIntent } from './txJournal.js'
 import { runAuthorityTx } from './authority.js'
+import { fetchDeployTx } from './overlayLookup.js'
+import { guardPositiveAmount } from './submitGuards.js'
+import { deliverIssuerReceipt, handoverBody, issuerReceipt, MessageBoxSender } from './receipt.js'
+import { checkRecipient, issuerRecipientOutput, requireAttestedOutput } from './payout.js'
 
 const DESCRIPTION_MIN = 5
 const DESCRIPTION_MAX = 50
@@ -129,13 +133,15 @@ export interface SubmitAdminActionParams {
   asset: AdminAsset
   details: MandalaActionDetails
   /**
-   * For reissue: the recipient + exact amount for the value output (the
-   * amount must equal the frozen row's; details must carry {outpoint,
-   * recipient}). Refused until the payout path builds the recipient's
-   * `p color` output and BRC-207 receipt (plan 04 Task 12).
+   * Reissue only: the recipient and exact amount of the replacement output
+   * (the amount must equal the frozen row's; `details` must be
+   * `{kind:'reissue', outpoint, recipient}` with the same recipient). The
+   * output is the recipient's `p color` output, built through the payout
+   * path, and its BRC-207 receipt is delivered through `messageBoxClient`.
    */
   ftOutput?: { recipient: string, amount: bigint }
-  messageBoxClient?: any
+  /** Required when `ftOutput` is set (TypeError before any wallet call otherwise). */
+  messageBoxClient?: MessageBoxSender
   identityKey: string
 }
 
@@ -145,10 +151,10 @@ export interface SubmitAdminActionResult extends AdmissionReceipt {
   /** keyID of the new authority coin. */
   nextAuthKeyID: string
   /**
-   * False when the action committed but a recipient notification is still
+   * False when a reissue committed but its recipient notification is still
    * pending (journaled, retried by reconcileNotifications); the action itself
-   * must never be reported as failed or retried. Always true while no admin
-   * action carries a recipient output (reissue goes through the payout path).
+   * must never be reported as failed or retried. Always true for an action
+   * without a recipient output.
    */
   notified: boolean
 }
@@ -163,24 +169,53 @@ async function spendableBeef (wallet: WalletInterface, priors: string[]): Promis
   return list.BEEF as number[]
 }
 
-/** Thrown for a reissue until the payout path builds its recipient output (Task 12). */
-export const REISSUE_VIA_PAYOUT = 'reissue builds its recipient output through the payout path'
+/**
+ * Refuse a malformed reissue before any gate or wallet call: `ftOutput` and
+ * `details.kind === 'reissue'` go together, the recipient must match
+ * `details.recipient`, the amount must be a positive uint64, and the receipt
+ * needs a MessageBox client.
+ */
+function checkReissue (p: SubmitAdminActionParams): void {
+  const { details, ftOutput } = p
+  if (ftOutput == null) {
+    if (details.kind === 'reissue') throw new TypeError('@bsv/mandala: a reissue needs ftOutput { recipient, amount }')
+    return
+  }
+  if (details.kind !== 'reissue') throw new TypeError(`@bsv/mandala: ftOutput is only valid on a reissue, not ${details.kind}`)
+  if (ftOutput.recipient !== details.recipient) {
+    throw new TypeError('@bsv/mandala: ftOutput.recipient must equal details.recipient (the overlay requires every reissued output to go to it)')
+  }
+  const gate = guardPositiveAmount(ftOutput.amount)
+  if (!gate.ok) throw new Error(gate.reason)
+  checkRecipient({ identityKey: p.identityKey, recipientKey: ftOutput.recipient, messageBoxClient: p.messageBoxClient })
+}
 
 /**
  * Spend the asset's live authority, producing the next authority. Submits to
- * exactly tm_color_<assetId>. A reissue (an `ftOutput`, or `details.kind ===
- * 'reissue'`) is refused before any gate or wallet call: its recipient output
- * must be a holder `p color` output with a BRC-207 receipt, which only the
- * payout path builds.
+ * exactly tm_color_<assetId>.
+ *
+ * A reissue (`ftOutput`) also creates the recipient's `p color` output at
+ * index 0 (unblinded linkage, counterparty = details.recipient) and spends
+ * no value inputs (overlay reissue rule). Its deploy is fetched before any
+ * coin is held; after admission the attested BRC-207 receipt is journaled
+ * and delivered on MESSAGEBOX exactly like a payout. `notified` is false when
+ * the send failed (reconcileNotifications retries); the action itself is
+ * committed and must never be retried.
  */
 export async function submitAdminAction (
   p: SubmitAdminActionParams
 ): Promise<SubmitAdminActionResult> {
   const { wallet, asset, details, ftOutput, identityKey } = p
-  if (ftOutput != null || details.kind === 'reissue') throw new Error(REISSUE_VIA_PAYOUT)
+  checkReissue(p)
+  if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
 
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
+    // The verified deploy, before any coin is held (reissue receipts carry it).
+    const declarationTx = ftOutput != null ? (await fetchDeployTx(asset.assetId)).toBinary() : undefined
     const inputBEEF = await spendableBeef(wallet, [asset.authOutpoint])
+    const foreign = ftOutput != null
+      ? await issuerRecipientOutput(wallet, { identityKey, recipientKey: ftOutput.recipient, assetId: asset.assetId, amount: ftOutput.amount })
+      : undefined
     const res = await runAuthorityTx({
       wallet,
       identityKey,
@@ -189,15 +224,38 @@ export async function submitAdminAction (
         details,
         customInstructions: keyID => adminCustomInstructions(asset.assetId, asset.label, keyID, asset.metadata)
       }],
+      ...(foreign != null
+        ? { foreignOuts: [{ lockingScript: foreign.lockingScript, linkage: foreign.linkage, outputDescription: 'reissued token' }] }
+        : {}),
       inputBEEF,
       description: actionDescription(`${details.kind} ${asset.label}`),
       labels: ['mandala', details.kind]
     })
+
+    let notified = true
+    if (ftOutput != null && foreign != null && declarationTx != null) {
+      const outputIndex = res.foreignIndices[0]
+      const receipt = issuerReceipt({
+        assetId: asset.assetId,
+        derivationPrefix: foreign.derivationPrefix,
+        derivationSuffix: foreign.derivationSuffix,
+        senderIdentityKey: foreign.senderIdentityKey,
+        declarationTx,
+        attestation: requireAttestedOutput(res.admitted, outputIndex, res.txid),
+        offChainValues: res.offChainValues
+      })
+      notified = await deliverIssuerReceipt({
+        messageBoxClient: p.messageBoxClient as MessageBoxSender,
+        recipientKey: ftOutput.recipient,
+        txid: res.txid,
+        body: handoverBody({ assetId: asset.assetId, outputIndex, tx: res.tx, receipt })
+      })
+    }
     return {
       txid: res.txid,
       nextAuthOutpoint: outpoint(res.txid, res.authIndices[0]),
       nextAuthKeyID: res.authKeyIDs[0],
-      notified: true,
+      notified,
       ...admissionReceipt(res.admitted)
     }
   }))

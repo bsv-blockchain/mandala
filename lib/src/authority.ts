@@ -57,9 +57,21 @@ export interface ValueOut {
   outputDescription?: string
 }
 
+/**
+ * An output this tx creates for someone else's key (a reissue's recipient
+ * `p color` output): the caller locks it and supplies its overlay linkage.
+ */
+export interface ForeignOut {
+  lockingScript: string
+  linkage: SpecificLinkage
+  outputDescription: string
+}
+
 export interface AuthorityTxResult {
   txid: string
   tx: number[]
+  /** Output index of each foreign output (same order as foreignOuts; always 0..). */
+  foreignIndices: number[]
   /** Output index of each leg's new authority (same order as legs). */
   authIndices: number[]
   /** Output index of each value output (same order as valueOuts). */
@@ -69,12 +81,47 @@ export interface AuthorityTxResult {
   authKeyIDs: string[]
   /** Hex strict-CBOR details per leg. */
   detailsHex: string[]
+  /** The submitted Mandala envelope bytes (the tx's submission data, for receipts). */
+  offChainValues: number[]
+}
+
+/**
+ * Sign the planned spends of a signable action with the issuer's
+ * ADMIN_PROTOCOL keys and return the `signAction` spends map. Each planned
+ * outpoint is located among the signable tx's inputs; a wallet that hands
+ * back inputs without resolvable sources keeps the planned (positional)
+ * order.
+ */
+export async function signTreasurySpends (
+  wallet: WalletInterface,
+  signableTx: number[],
+  spendPlan: ValueIn[]
+): Promise<Record<string, { unlockingScript: string }>> {
+  const tx = Transaction.fromBEEF(signableTx)
+  const indexOf = (op: string): number => {
+    const dot = op.lastIndexOf('.')
+    const txid = op.slice(0, dot)
+    const vout = Number(op.slice(dot + 1))
+    return tx.inputs.findIndex(i => (i.sourceTXID ?? i.sourceTransaction?.id('hex')) === txid && i.sourceOutputIndex === vout)
+  }
+  const located = spendPlan.map(s => indexOf(s.outpoint))
+  const positional = located.some(i => i < 0) && tx.inputs.length >= spendPlan.length
+  const indices = spendPlan.map((s, k) => {
+    const i = positional ? k : located[k]
+    if (i < 0) throw new Error(`createAction did not spend ${s.outpoint}`)
+    tx.inputs[i].unlockingScriptTemplate = issuerUnlock(wallet, s.keyID, s.counterparty)
+    return i
+  })
+  await tx.sign()
+  const spends: Record<string, { unlockingScript: string }> = {}
+  for (const i of indices) spends[String(i)] = { unlockingScript: tx.inputs[i].unlockingScript!.toHex() }
+  return spends
 }
 
 /**
  * Build, sign, submit (overlay-first) and broadcast one authority tx.
- * Inputs: every leg's prior authority, then value inputs. Outputs: value
- * outputs first, then one authority per leg. Topics: tm_<id> of every token
+ * Inputs: every leg's prior authority, then value inputs. Outputs: foreign
+ * outputs first, then value outputs, then one authority per leg. Topics: tm_<id> of every token
  * touched. Callers hold the admin-auth gate and the intent marker.
  */
 export async function runAuthorityTx (p: {
@@ -83,6 +130,8 @@ export async function runAuthorityTx (p: {
   legs: AuthorityLeg[]
   valueIns?: ValueIn[]
   valueOuts?: ValueOut[]
+  /** Outputs to other keys, placed first (index 0..), before value outputs and authorities. */
+  foreignOuts?: ForeignOut[]
   inputBEEF: number[]
   description: string
   labels: string[]
@@ -92,6 +141,7 @@ export async function runAuthorityTx (p: {
   const { wallet, identityKey, legs } = p
   const valueIns = p.valueIns ?? []
   const valueOuts = p.valueOuts ?? []
+  const foreignOuts = p.foreignOuts ?? []
   if (legs.length === 0) throw new Error('authority tx needs at least one leg')
   // S5: the envelope linkages and the submit need the overlay key; refuse
   // before createAction so no wallet action is left behind.
@@ -100,7 +150,11 @@ export async function runAuthorityTx (p: {
   const detailsBytes = legs.map(l => encodeAdminDetails(l.details))
   const authKeyIDs = detailsBytes.map(commitmentHex)
 
-  const outputs: any[] = []
+  const outputs: any[] = foreignOuts.map(f => ({
+    satoshis: 1,
+    lockingScript: f.lockingScript,
+    outputDescription: f.outputDescription
+  }))
   for (const v of valueOuts) {
     const script = await lockIssuerToken(wallet, v.tokenId, v.amount, v.keyID, v.owner)
     outputs.push({
@@ -137,26 +191,7 @@ export async function runAuthorityTx (p: {
   })
   if (created.signableTransaction == null) throw new Error(`${p.description}: no signableTransaction`)
 
-  const tx = Transaction.fromBEEF(created.signableTransaction.tx as number[])
-  const spends: Record<string, { unlockingScript: string }> = {}
-  const indexOf = (op: string): number => {
-    const dot = op.lastIndexOf('.')
-    const txid = op.slice(0, dot)
-    const vout = Number(op.slice(dot + 1))
-    return tx.inputs.findIndex(i => (i.sourceTXID ?? i.sourceTransaction?.id('hex')) === txid && i.sourceOutputIndex === vout)
-  }
-  // Match each planned spend by outpoint; a wallet that hands back inputs
-  // without resolvable sources keeps the planned (positional) order.
-  const located = spendPlan.map(s => indexOf(s.outpoint))
-  const positional = located.some(i => i < 0) && tx.inputs.length >= spendPlan.length
-  const indices = spendPlan.map((s, k) => {
-    const i = positional ? k : located[k]
-    if (i < 0) throw new Error(`createAction did not spend ${s.outpoint}`)
-    tx.inputs[i].unlockingScriptTemplate = issuerUnlock(wallet, s.keyID, s.counterparty)
-    return i
-  })
-  await tx.sign()
-  for (const i of indices) spends[String(i)] = { unlockingScript: tx.inputs[i].unlockingScript!.toHex() }
+  const spends = await signTreasurySpends(wallet, created.signableTransaction.tx as number[], spendPlan)
 
   const signed = await wallet.signAction({
     reference: created.signableTransaction.reference,
@@ -165,9 +200,10 @@ export async function runAuthorityTx (p: {
   })
   if (signed.tx == null || signed.txid == null) throw new Error(`${p.description}: signAction returned no tx`)
 
-  const valueIndices = valueOuts.map((_, i) => i)
-  const authIndices = legs.map((_, i) => valueOuts.length + i)
-  const outLinks: Array<{ index: number, linkage: SpecificLinkage }> = []
+  const foreignIndices = foreignOuts.map((_, i) => i)
+  const valueIndices = valueOuts.map((_, i) => foreignOuts.length + i)
+  const authIndices = legs.map((_, i) => foreignOuts.length + valueOuts.length + i)
+  const outLinks: Array<{ index: number, linkage: SpecificLinkage }> = foreignOuts.map((f, i) => ({ index: foreignIndices[i], linkage: f.linkage }))
   for (let i = 0; i < valueOuts.length; i++) {
     outLinks.push({ index: valueIndices[i], linkage: await revealIssuerLinkage(wallet, valueOuts[i].keyID, valueOuts[i].owner) })
   }
@@ -189,7 +225,7 @@ export async function runAuthorityTx (p: {
     undefined,
     topics
   )
-  return { txid: signed.txid, tx: signed.tx as number[], authIndices, valueIndices, admitted, authKeyIDs, detailsHex }
+  return { txid: signed.txid, tx: signed.tx as number[], foreignIndices, authIndices, valueIndices, admitted, authKeyIDs, detailsHex, offChainValues: env }
 }
 
 /**

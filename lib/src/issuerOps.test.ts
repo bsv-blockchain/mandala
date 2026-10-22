@@ -3,7 +3,7 @@
  * Mandala `req` naming the overlay key and fails closed without it (S5),
  * issue/redeem carry exact uint64 bigint amounts into the `mandala treasury`
  * basket under ADMIN_PROTOCOL, every lib-built description fits BRC-100's
- * 5..50 UTF-8 bytes, and a reissue `ftOutput` is refused until the payout
+ * 5..50 UTF-8 bytes, and a malformed reissue is refused before the payout
  * path builds it. Wallet and overlay submit are stubbed; the 1Color locks run
  * for real. Merges the former issuerOps.redeem.test.ts pre-flight cases.
  */
@@ -349,7 +349,7 @@ describe('submitAdminAction on 1Color', () => {
     expect(await notifyList()).toEqual([])
   })
 
-  it('a provided ftOutput (reissue) is refused before any wallet call until the payout path builds it', async () => {
+  it('a reissue without a MessageBox client or without an ftOutput is refused before any wallet call (payout.test.ts covers the reissue itself)', async () => {
     const wallet = mkAdminWallet()
     const recipient = '03' + 'cd'.repeat(32)
     await expect(submitAdminAction({
@@ -358,14 +358,14 @@ describe('submitAdminAction on 1Color', () => {
       details: { kind: 'reissue', outpoint: 'f'.repeat(64) + '.0', recipient },
       ftOutput: { recipient, amount: 5n },
       identityKey: ISSUER
-    })).rejects.toThrow('reissue builds its recipient output through the payout path')
-    // A reissue with no recipient output at all is refused the same way.
+    })).rejects.toThrow(/messageBoxClient/)
+    // A reissue with no recipient output at all is refused too.
     await expect(submitAdminAction({
       wallet: wallet as any,
       asset,
       details: { kind: 'reissue', outpoint: 'f'.repeat(64) + '.0', recipient },
       identityKey: ISSUER
-    })).rejects.toThrow('reissue builds its recipient output through the payout path')
+    })).rejects.toThrow(/needs ftOutput/)
     expect(wallet.listOutputs).not.toHaveBeenCalled()
     expect(wallet.createAction).not.toHaveBeenCalled()
     expect(await notifyList()).toEqual([])
