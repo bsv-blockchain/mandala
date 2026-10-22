@@ -133,9 +133,22 @@ func e2eSigma(t *testing.T, topic, txid string, a e2eAdmittance, want []uint32) 
 	if a.AdmissionIdentityKey != mandalatest.Overlay.Identity {
 		t.Fatalf("%s σI identity %q, want the overlay's", topic, a.AdmissionIdentityKey)
 	}
-	ok, err := mandala.VerifyAdmission(topic, txid, want, a.AdmissionSignature, a.AdmissionIdentityKey)
-	if err != nil || !ok {
-		t.Fatalf("%s σI does not verify: %v", topic, err)
+	if !e2eVerifyByScheme(topic, txid, want, a.AdmissionSignature, a.AdmissionIdentityKey) {
+		t.Fatalf("%s σI does not verify under its scheme", topic)
+	}
+}
+
+// e2eVerifyByScheme: a color topic carries the BRC-207 attested v1 signature (BRC-42 child of the overlay key),
+// tm_mandala carries σI v3 under the bare key (contract §3).
+func e2eVerifyByScheme(topic, txid string, outs []uint32, sig, ident string) bool {
+	switch mandala.AdmissionSchemeOf(topic) {
+	case mandala.SchemeAttestedV1:
+		return mandala.VerifyAttestation(topic, txid, outs, sig, ident)
+	case mandala.SchemeMandalaV3:
+		ok, err := mandala.VerifyAdmission(topic, txid, outs, sig, ident)
+		return err == nil && ok
+	default:
+		return false
 	}
 }
 
@@ -188,7 +201,7 @@ func TestE2EFollowAllDeployIssueTransferTwoToken(t *testing.T) {
 	e2eSigma(t, mandala.MandalaTopic, depA.Txid, steak[mandala.MandalaTopic], []uint32{0})
 	e2eSigma(t, tmA, depA.Txid, steak[tmA], []uint32{0})
 	if steak[mandala.MandalaTopic].AdmissionSignature == steak[tmA].AdmissionSignature {
-		t.Fatal("the deploy's two σI are identical: digest v3 must bind the topic")
+		t.Fatal("the deploy's two σI are identical: each scheme must bind the topic")
 	}
 	if !o.app.Tokens.Hosted(depA.Txid + "_0") {
 		t.Fatal("the deploy hook did not register tm_<A>")
@@ -431,5 +444,60 @@ func TestE2EEvictTwoTokenTransfer(t *testing.T) {
 	}
 	if err := json.Unmarshal(body, &e); code != 410 || err != nil || e.Code != "ERR_EVICTED" {
 		t.Fatalf("resubmitting the evicted transfer: %d %s, want 410 ERR_EVICTED", code, body)
+	}
+}
+
+// Review Focus 2: a double-submit of an admitted tm_color_* transaction answers byte-identical attestations (RFC 6979),
+// and /admin/admission serves the same bytes; the deploy's tm_mandala entry stays σI v3 under the bare key.
+func TestE2EReplayReturnsIdenticalAttestation(t *testing.T) {
+	e2eDB(t, e2eNode)
+	o := e2eBoot(t, e2eNode, nil, false)
+	I, H := mandalatest.Issuer, mandalatest.Holder
+
+	dep := mandalatest.Deploy(t, I, "USD")
+	tm := mandala.TokenTopicOfTxid(dep.Txid)
+	depSteak := e2eAdmit(t, o, dep, mandala.MandalaTopic, tm)
+	reg, tok := depSteak[mandala.MandalaTopic], depSteak[tm]
+	if ok, err := mandala.VerifyAdmission(mandala.MandalaTopic, dep.Txid, []uint32{0}, reg.AdmissionSignature, mandalatest.Overlay.Identity); err != nil || !ok {
+		t.Fatalf("deploy tm_mandala entry is not σI v3 under the bare key: %v", err)
+	}
+	if !mandala.VerifyAttestation(tm, dep.Txid, []uint32{0}, tok.AdmissionSignature, mandalatest.Overlay.Identity) {
+		t.Fatal("deploy tm_color entry is not the attested v1 signature")
+	}
+	if ok, _ := mandala.VerifyAdmission(tm, dep.Txid, []uint32{0}, tok.AdmissionSignature, mandalatest.Overlay.Identity); ok {
+		t.Fatal("deploy tm_color entry verifies under the bare key")
+	}
+
+	iss := mandalatest.Issue(t, dep, 0, I, H, 1000)
+	first := e2eAdmit(t, o, iss, tm)[tm]
+	second := e2eAdmit(t, o, iss, tm)[tm]
+	if !slices.Equal(first.OutputsToAdmit, []uint32{0, 1}) || !slices.Equal(second.OutputsToAdmit, first.OutputsToAdmit) {
+		t.Fatalf("outputsToAdmit first %v replay %v, want [0 1] twice", first.OutputsToAdmit, second.OutputsToAdmit)
+	}
+	if first.AdmissionSignature == "" || second.AdmissionSignature != first.AdmissionSignature {
+		t.Fatalf("replay attestation %q differs from %q", second.AdmissionSignature, first.AdmissionSignature)
+	}
+	if first.AdmissionIdentityKey != mandalatest.Overlay.Identity || second.AdmissionIdentityKey != first.AdmissionIdentityKey {
+		t.Fatalf("admissionIdentityKey first %q replay %q, want the overlay root key", first.AdmissionIdentityKey, second.AdmissionIdentityKey)
+	}
+	if !mandala.VerifyAttestation(tm, iss.Txid, first.OutputsToAdmit, first.AdmissionSignature, mandalatest.Overlay.Identity) {
+		t.Fatal("the issue attestation does not verify")
+	}
+
+	code, body := e2eGet(t, o, "/admin/admission/"+iss.Txid)
+	var adm struct {
+		Txid       string `json:"txid"`
+		Admissions map[string]struct {
+			OutputsToAdmit     []uint32 `json:"outputsToAdmit"`
+			AdmissionSignature string   `json:"admissionSignature"`
+		} `json:"admissions"`
+		AdmissionIdentityKey string `json:"admissionIdentityKey"`
+	}
+	if err := json.Unmarshal(body, &adm); code != 200 || err != nil {
+		t.Fatalf("GET /admin/admission: %d %s %v", code, body, err)
+	}
+	if adm.Txid != iss.Txid || len(adm.Admissions) != 1 || adm.AdmissionIdentityKey != mandalatest.Overlay.Identity ||
+		!slices.Equal(adm.Admissions[tm].OutputsToAdmit, first.OutputsToAdmit) || adm.Admissions[tm].AdmissionSignature != first.AdmissionSignature {
+		t.Fatalf("admission map = %+v", adm)
 	}
 }

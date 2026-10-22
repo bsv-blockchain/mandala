@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/go-sdk/wallet"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -51,13 +53,101 @@ func AdmissionDigestV3(topic, txid string, outputsToAdmit []uint32) ([32]byte, e
 	return sha256.Sum256([]byte(AdmissionDigestPrefixV3 + topic + ":" + txid + ":" + strings.Join(parts, ","))), nil
 }
 
-// AdmissionSigner produces σI for one topic's admission.
+// AttestationPrefix opens the BRC-207 attested admission statement (contract §3; 0207:240-275).
+const AttestationPrefix = "1color-admit:v1:"
+
+// AttestationProtocol and AttestationKeyID fix the BRC-42 child that signs the attested statement: invoice
+// "2-color admission attestation-1", counterparty anyone (contract §3).
+var AttestationProtocol = wallet.Protocol{SecurityLevel: wallet.SecurityLevelEveryAppAndCounterparty, Protocol: "color admission attestation"}
+
+// AttestationKeyID is the BRC-43 key id of the attestation child key.
+const AttestationKeyID = "1"
+
+// attestationInvoice is the BRC-43 invoice number of (AttestationProtocol, AttestationKeyID).
+const attestationInvoice = "2-color admission attestation-1"
+
+// ErrUnsignedTopic: the topic's admission scheme carries no signature (tm_mandala_kyc, anything not hosted).
+var ErrUnsignedTopic = errors.New("admission: topic carries no admission signature")
+
+var (
+	lowerHex64      = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	lowerHexBytes   = regexp.MustCompile(`^(?:[0-9a-f]{2})+$`)
+	compressedKeyRe = regexp.MustCompile(`^0[23][0-9a-f]{64}$`)
+)
+
+// AttestationMessage is the attested statement "1color-admit:v1:<topic>:<txid>:<outputs>" (contract §3). topic must
+// be a color topic, txid 64 lowercase hex, outputs non-empty and strictly ascending (already canonical: the
+// statement never reorders what it is given).
+func AttestationMessage(topic, txid string, outputs []uint32) (string, error) {
+	if !IsColorTopic(topic) {
+		return "", fmt.Errorf("attestation: %q is not a color topic", topic)
+	}
+	if !lowerHex64.MatchString(txid) {
+		return "", fmt.Errorf("attestation: txid %q is not 64 lowercase hex", txid)
+	}
+	if len(outputs) == 0 {
+		return "", ErrNoAdmittedOutputs
+	}
+	parts := make([]string, len(outputs))
+	for i, v := range outputs {
+		if i > 0 && v <= outputs[i-1] {
+			return "", fmt.Errorf("attestation: outputs %v are not strictly ascending", outputs)
+		}
+		parts[i] = strconv.FormatUint(uint64(v), 10)
+	}
+	return AttestationPrefix + topic + ":" + txid + ":" + strings.Join(parts, ","), nil
+}
+
+// AttestationSigningKey is the public BRC-42 child that signs (and alone verifies) the attested statement of signer:
+// signer.DeriveChild(anyone = scalar 1, "2-color admission attestation-1").
+func AttestationSigningKey(signer *ec.PublicKey) (*ec.PublicKey, error) {
+	if signer == nil || signer.X == nil || signer.Y == nil || !signer.Validate() {
+		return nil, errors.New("attestation: signer is not a valid public key")
+	}
+	anyone, _ := wallet.AnyoneKey()
+	return signer.DeriveChild(anyone, attestationInvoice)
+}
+
+// VerifyAttestation reports whether sigDERHex is signerHex's attested statement over (topic, txid, outputs). It never
+// errors: anything malformed is false. The signature must be lowercase hex of strict DER with no trailing bytes; the
+// signer a lowercase compressed on-curve key; the outputs canonical. SHA-256(message) is verified against the DERIVED
+// child, never the bare key, with (r, s) exactly as given: low- and high-S both verify (BSV Chronicle, never normalize).
+func VerifyAttestation(topic, txid string, outputs []uint32, sigDERHex, signerHex string) bool {
+	msg, err := AttestationMessage(topic, txid, outputs)
+	if err != nil {
+		return false
+	}
+	if !lowerHexBytes.MatchString(sigDERHex) || !compressedKeyRe.MatchString(signerHex) {
+		return false
+	}
+	der, err := hex.DecodeString(sigDERHex)
+	// ec.ParseDERSignature trims to the encoded length and would accept trailing bytes; refuse them here.
+	if err != nil || len(der) < 2 || int(der[1])+2 != len(der) {
+		return false
+	}
+	sig, err := ec.ParseDERSignature(der)
+	if err != nil {
+		return false
+	}
+	signer, err := ec.PublicKeyFromString(signerHex)
+	if err != nil {
+		return false
+	}
+	child, err := AttestationSigningKey(signer)
+	if err != nil {
+		return false
+	}
+	digest := sha256.Sum256([]byte(msg))
+	return sig.Verify(digest[:], child)
+}
+
+// AdmissionSigner produces the admission signature of one topic's admission.
 type AdmissionSigner interface {
 	SignAdmission(topic, txid string, outputsToAdmit []uint32) (sigDERHex, identityKeyHex string, err error)
 }
 
 // ECAdmissionSigner signs with the overlay identity key. Signing is RFC6979, so re-signing an
-// admission (the dupe path) reproduces byte-identical σI.
+// admission (the dupe path) reproduces byte-identical signatures.
 type ECAdmissionSigner struct {
 	priv *ec.PrivateKey
 }
@@ -73,29 +163,64 @@ func NewECAdmissionSigner(privHex string) (*ECAdmissionSigner, error) {
 	return &ECAdmissionSigner{priv: priv}, nil
 }
 
-// SignAdmission returns the DER hex signature over AdmissionDigestV3(topic, txid, outputs) and the
-// compressed identity key hex; an empty output set is ErrNoAdmittedOutputs.
+// SignAdmission signs the canonical admitted set by the topic's scheme (AdmissionSchemeOf) and returns the DER hex
+// signature with the ROOT compressed identity key (contract §2.1 admissionIdentityKey):
+//
+//	SchemeAttestedV1 (tm_color_*): the attested statement, ProtoWallet.CreateSignature on AttestationProtocol, keyID
+//	                               "1", counterparty anyone (contract §3)
+//	SchemeMandalaV3  (tm_mandala): σI v3, AdmissionDigestV3 under the bare key
+//	SchemeNone:                    ErrUnsignedTopic
+//
+// An empty output set is ErrNoAdmittedOutputs.
 func (s *ECAdmissionSigner) SignAdmission(topic, txid string, outputsToAdmit []uint32) (string, string, error) {
 	if s == nil || s.priv == nil {
 		return "", "", errors.New("admission signer: nil")
 	}
-	digest, err := AdmissionDigestV3(topic, txid, outputsToAdmit)
-	if err != nil {
-		return "", "", err
+	identity := hex.EncodeToString(s.priv.PubKey().Compressed())
+	switch AdmissionSchemeOf(topic) {
+	case SchemeAttestedV1:
+		msg, err := AttestationMessage(topic, txid, CanonicalOutputs(outputsToAdmit))
+		if err != nil {
+			return "", "", err
+		}
+		w, err := wallet.NewProtoWallet(wallet.ProtoWalletArgs{Type: wallet.ProtoWalletArgsTypePrivateKey, PrivateKey: s.priv})
+		if err != nil {
+			return "", "", fmt.Errorf("admission signer: %w", err)
+		}
+		res, err := w.CreateSignature(context.Background(), wallet.CreateSignatureArgs{
+			EncryptionArgs: wallet.EncryptionArgs{
+				ProtocolID:   AttestationProtocol,
+				KeyID:        AttestationKeyID,
+				Counterparty: wallet.Counterparty{Type: wallet.CounterpartyTypeAnyone},
+			},
+			Data: []byte(msg),
+		}, "")
+		if err != nil {
+			return "", "", fmt.Errorf("admission signer: %w", err)
+		}
+		return hex.EncodeToString(res.Signature.Serialize()), identity, nil
+	case SchemeMandalaV3:
+		digest, err := AdmissionDigestV3(topic, txid, outputsToAdmit)
+		if err != nil {
+			return "", "", err
+		}
+		sig, err := s.priv.Sign(digest[:])
+		if err != nil {
+			return "", "", err
+		}
+		der, err := sig.ToDER()
+		if err != nil {
+			return "", "", err
+		}
+		return hex.EncodeToString(der), identity, nil
+	default:
+		return "", "", ErrUnsignedTopic
 	}
-	sig, err := s.priv.Sign(digest[:])
-	if err != nil {
-		return "", "", err
-	}
-	der, err := sig.ToDER()
-	if err != nil {
-		return "", "", err
-	}
-	return hex.EncodeToString(der), hex.EncodeToString(s.priv.PubKey().Compressed()), nil
 }
 
-// VerifyAdmission checks a σI against the v3 digest of (topic, txid, outputs). A malformed
-// signature, key or empty set is an error; a well-formed signature that does not verify is false.
+// VerifyAdmission checks a tm_mandala σI v3 against the digest of (topic, txid, outputs) under the bare identity key.
+// A color topic is verified with VerifyAttestation instead. A malformed signature, key or empty set is an error; a
+// well-formed signature that does not verify is false.
 func VerifyAdmission(topic, txid string, outputsToAdmit []uint32, sigDERHex, identityKeyHex string) (bool, error) {
 	digest, err := AdmissionDigestV3(topic, txid, outputsToAdmit)
 	if err != nil {

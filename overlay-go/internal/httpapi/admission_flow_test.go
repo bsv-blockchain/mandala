@@ -177,13 +177,27 @@ func requireSigma(t *testing.T, e map[string]any, identity, topic, txid string, 
 	if sig == "" || ident != identity {
 		t.Fatalf("entry %v: want a σI by %s", e, identity)
 	}
-	if ok, err := mandala.VerifyAdmission(topic, txid, outs, sig, ident); err != nil || !ok {
-		t.Fatalf("σI does not verify under %s over %v: %v", topic, outs, err)
+	if !verifyByScheme(topic, txid, outs, sig, ident) {
+		t.Fatalf("σI does not verify under %s over %v", topic, outs)
 	}
 	for _, other := range others {
-		if ok, _ := mandala.VerifyAdmission(other, txid, outs, sig, ident); ok {
-			t.Fatalf("the σI of %s also verifies under %s (digest v3 must bind the topic)", topic, other)
+		if verifyByScheme(other, txid, outs, sig, ident) {
+			t.Fatalf("the σI of %s also verifies under %s (the signed statement must bind the topic)", topic, other)
 		}
+	}
+}
+
+// verifyByScheme verifies an entry's signature the way its topic is signed (contract §3): the attested v1 statement
+// against the BRC-42 child on a color topic, σI v3 against the bare key on tm_mandala, nothing else.
+func verifyByScheme(topic, txid string, outs []uint32, sig, ident string) bool {
+	switch mandala.AdmissionSchemeOf(topic) {
+	case mandala.SchemeAttestedV1:
+		return mandala.VerifyAttestation(topic, txid, outs, sig, ident)
+	case mandala.SchemeMandalaV3:
+		ok, err := mandala.VerifyAdmission(topic, txid, outs, sig, ident)
+		return err == nil && ok
+	default:
+		return false
 	}
 }
 

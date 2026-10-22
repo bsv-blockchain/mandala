@@ -105,7 +105,8 @@ func WithBroadcastCompensation(prepare PrepareSubmitCompensation) ServerOption {
 	return func(o *serverOptions) { o.prepareCompensation = prepare }
 }
 
-// WithAdmissionSigner signs σI (digest v3, per topic) on admitted submits and the admission route.
+// WithAdmissionSigner signs admissions on admitted submits and the admission route, by topic scheme (attested v1 on
+// tm_color_*, σI v3 on tm_mandala).
 func WithAdmissionSigner(s mandala.AdmissionSigner) ServerOption {
 	return func(o *serverOptions) { o.admissionSigner = s }
 }

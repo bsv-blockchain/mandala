@@ -663,17 +663,19 @@ func TestValidDeployRegistersThenAdmitsBothTopicsWithTwoSigma(t *testing.T) {
 		if !slices.Equal(e.OutputsToAdmit, []uint32{0}) || e.AdmissionIdentityKey != mandalatest.Overlay.Identity {
 			t.Fatalf("%s entry = %+v", topic, e)
 		}
-		ok, err := mandala.VerifyAdmission(topic, dep.Txid, []uint32{0}, e.AdmissionSignature, e.AdmissionIdentityKey)
-		if err != nil || !ok {
-			t.Fatalf("σI on %s does not verify: %v", topic, err)
+		if !verifyByScheme(topic, dep.Txid, []uint32{0}, e.AdmissionSignature, e.AdmissionIdentityKey) {
+			t.Fatalf("σI on %s does not verify", topic)
 		}
 		sigs[topic] = e.AdmissionSignature
 	}
 	if sigs[mandala.MandalaTopic] == sigs[tm] {
-		t.Fatal("the two σI are identical: digest v3 must bind the topic")
+		t.Fatal("the two σI are identical: each scheme must bind the topic")
 	}
-	if ok, _ := mandala.VerifyAdmission(tm, dep.Txid, []uint32{0}, sigs[mandala.MandalaTopic], mandalatest.Overlay.Identity); ok {
+	if verifyByScheme(tm, dep.Txid, []uint32{0}, sigs[mandala.MandalaTopic], mandalatest.Overlay.Identity) {
 		t.Fatal("the tm_mandala σI verifies under the token topic")
+	}
+	if ok, _ := mandala.VerifyAdmission(tm, dep.Txid, []uint32{0}, sigs[tm], mandalatest.Overlay.Identity); ok {
+		t.Fatal("the token topic's attestation verifies as v3 under the bare key")
 	}
 	rows, err := app.Store.OwnerJournalByOutpoint(ctx, dep.Txid, 0)
 	if err != nil || len(rows) != 1 || rows[0].Topic != tm {

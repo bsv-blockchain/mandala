@@ -321,7 +321,7 @@ func emptyUncoveredSigmaEntry(steak overlay.Steak, known knownState) bool {
 }
 
 // admittedEntries turns the STEAK into wire entries. A σ-topic the engine skipped as applied (in known.proof, entry
-// empty) answers its recorded or stored outputs; every σ-topic entry with outputs is signed with its own v3 digest and
+// empty) answers its recorded or stored outputs; every σ-topic entry with outputs is signed by its topic scheme (attested v1 / v3) and
 // returned in the finalize map. KYC entries are never signed.
 func admittedEntries(steak overlay.Steak, known knownState, signer mandala.AdmissionSigner, txid string, txidOK bool) (map[string]wireAdmittance, map[string]mandala.TopicAdmission, string) {
 	entries := make(map[string]wireAdmittance, len(steak))
@@ -358,7 +358,8 @@ func evictedDescription(txid string) string {
 	return fmt.Sprintf("transaction %s was admitted and later evicted; its inputs are spendable again", txid)
 }
 
-// signAdmission is σI over AdmissionDigestV3(topic, txid, outputs). Best-effort: a failure logs and drops the fields.
+// signAdmission signs (topic, txid, outputs) by the topic's scheme (mandala.ECAdmissionSigner). Best-effort: a
+// failure logs and drops the fields.
 func signAdmission(signer mandala.AdmissionSigner, topic, txid string, outputs []uint32) (sig, ident string) {
 	if signer == nil || len(outputs) == 0 {
 		return "", ""
