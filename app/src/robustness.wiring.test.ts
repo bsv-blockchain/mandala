@@ -4,7 +4,7 @@
  * Reads source as the verifier's static CTA bar.
  */
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -14,6 +14,17 @@ const appSrc = dirname(fileURLToPath(import.meta.url))
 
 function src(rel: string): string {
   return readFileSync(resolve(appSrc, rel), 'utf8')
+}
+
+/** Every shipped `.ts`/`.tsx` under `src`, relative to it (test files excluded). */
+function listSrc(dir = ''): string[] {
+  const out: string[] = []
+  for (const e of readdirSync(resolve(appSrc, dir), { withFileTypes: true })) {
+    const rel = dir === '' ? e.name : `${dir}/${e.name}`
+    if (e.isDirectory()) out.push(...listSrc(rel))
+    else if (/\.tsx?$/.test(e.name) && !/\.test\.tsx?$/.test(e.name)) out.push(rel)
+  }
+  return out
 }
 
 describe('robustness wiring (shipped source)', () => {
@@ -121,15 +132,46 @@ describe('robustness wiring (shipped source)', () => {
     expect(s).toMatch(/resolveAssetState\([^)]*\{\s*force:\s*true\s*\}/)
   })
 
-  it('the note SendTokens captures reaches transferTokens, not just the Review screen', () => {
+  it('sendFlight is acquired before sendAndDeliver; the note reaches sendHandover', () => {
+    const m = src('hooks/useSendMutation.ts')
+    expect(m.indexOf('sendFlight.tryAcquire')).toBeGreaterThan(-1)
+    expect(m).toContain('sendAndDeliver(')
+    expect(m).not.toContain('transferTokens')
+    expect(m).toMatch(/interface SendVars|SendVars/)
+    expect(m).toContain('drainNow')
+    expect(m).not.toMatch(/reconcileBans/)
     const ui = src('components/SendTokens.tsx')
-    const mut = src('hooks/useSendMutation.ts')
-    // The field exists and is shown back on Review (already true) — the gap is
-    // whether it is actually sent anywhere beyond that.
-    expect(ui).toContain('const [note, setNote] = useState')
+    expect(ui).toContain('sendStartedRef')
+    expect(ui).toContain('safeParseAmount(')
     expect(ui).toMatch(/sendMutation\.mutate\(\s*\{[\s\S]*?note[\s\S]*?\}/)
-    expect(mut).toMatch(/interface SendVars\s*\{[\s\S]*?note\??:\s*string/)
-    expect(mut).toMatch(/transferTokens\(\{[\s\S]*?note[\s\S]*?\}/)
+    expect(ui).not.toMatch(/Number\(/)
+    // The note is forwarded by the pipeline to sendHandover and deliverHandover.
+    const p = src('lib/mandala/sendPipeline.ts')
+    expect(p).toMatch(/send\(\{[\s\S]*?note[\s\S]*?\}\)/)
+    expect(src('context/WalletContext.tsx')).toMatch(/addEventListener\('online'/)
+  })
+
+  it('deliver and settle run inside the handover lock; the app never aborts a hand-over', () => {
+    const p = src('lib/mandala/sendPipeline.ts')
+    expect(p).toMatch(/withLock[\s\S]*wait:\s*true[\s\S]*settle\(/)
+    expect(p).not.toContain('abortAction')
+    const dr = src('lib/mandala/handoverDrain.ts')
+    for (const banned of ['abortAction', 'deliverHandover', 'settleHandover', 'resubmitDelivered', 'localStorage']) expect(dr).not.toContain(banned)
+    const w = src('context/WalletContext.tsx')
+    expect(w).toMatch(/setInterval\([\s\S]*drainNow\(\)/)
+    expect(w).toMatch(/drainNow\(\{\s*force:\s*true\s*\}\)/)
+  })
+
+  // Flipped to `it` by Task 12, once useIssuerMutations routes its recovery
+  // through drainNow (it still calls reconcileWallet directly until then).
+  it.skip('one recovery path: reconcileWallet/reconcileNotifications are called only from handoverDrain via drainNow', () => {
+    for (const f of listSrc().filter(f => f !== 'lib/mandala/handoverDrain.ts' && f !== 'context/WalletContext.tsx')) {
+      expect(src(f), f).not.toMatch(/reconcileWallet\(|reconcileNotifications\(/)
+    }
+    const w = src('context/WalletContext.tsx')
+    expect(w).not.toMatch(/reconcileWallet\(|reconcileNotifications\(/)
+    expect(w).toContain('drainHandovers(')
+    for (const f of listSrc()) expect(src(f), f).not.toContain('mandala.app.handover.')
   })
 
   it('A14: IssuerPanel hashes the deposit ref client-side and the issue mutation passes depositHash through the guard + issueTokens', () => {

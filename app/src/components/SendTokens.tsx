@@ -8,13 +8,13 @@ import { useWallet } from '../context/WalletContext'
 import { ChevronLeft, Search, CheckCircle2, Copy, QrCode, Send } from 'lucide-react'
 import { noAutofill } from '../lib/noAutofill'
 import { cn } from '@/lib/utils'
-import { parseAmount, formatAmount, formatAmountPlain } from '@bsv/mandala/amount'
+import { displayAmount, plainAmount, safeParseAmount } from '../lib/mandala/amountDisplay'
+import { describeSettle, explainSendError } from '../lib/mandala/sendPipeline'
 import { useHolderData } from '../hooks/useHolderData'
 import { useContactsData } from '../hooks/useContactsData'
 import { useAssetState } from '../hooks/useAssetState'
 import { useSendMutation } from '../hooks/useSendMutation'
 import { useDevMode } from '../lib/devMode'
-import { reconcileBans } from '@bsv/mandala/reconcileBans'
 import { resolveAssetState } from '@bsv/mandala/adminState'
 import { guardSendSubmit } from '@bsv/mandala/submitGuards'
 import { sendFlight, BusyError } from '@bsv/mandala/singleFlight'
@@ -36,7 +36,11 @@ const CONTACT_LIMIT = 12
 // Component
 // ---------------------------------------------------------------------------
 
-export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string } = {}) {
+/**
+ * `mode` 'holder' (default): a BRC-207 hand-over through useSendMutation.
+ * 'payout' (issuer treasury to a holder, B4) is wired in by the payout task.
+ */
+export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string, mode?: 'holder' | 'payout' } = {}) {
   const locked = lockedAssetId != null && lockedAssetId !== ''
   const { wallet, identityKey } = useWallet()
   // Dev mode bypasses the frontend pause guard so a paused transfer actually
@@ -58,12 +62,13 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
   const [sendError, setSendError] = useState('')
   const [sentTxid, setSentTxid] = useState('')
   const [receiptCopied, setReceiptCopied] = useState(false)
-  const [frozenNote, setFrozenNote] = useState<Array<{ amount: number, reason: string }>>([])
+  const [frozenNote, setFrozenNote] = useState<Array<{ amount: bigint, reason: string }>>([])
 
   // Shared cached data — instant render, background refetch.
   const holder = useHolderData()
-  const balances = (holder.data?.assets ?? []).filter(a => a.balance > 0)
-    .map(a => ({ assetId: a.assetId, amount: a.balance }))
+  // Exact bigint balances; a failed balance view (null) is not sendable.
+  const balances = (holder.data?.assets ?? [])
+    .flatMap(a => (a.balance != null && a.balance > 0n ? [{ assetId: a.assetId, amount: a.balance }] : []))
   const metas = holder.data?.metas ?? {}
   const isLoadingBalances = holder.data == null
   const contactsQuery = useContactsData()
@@ -82,14 +87,6 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
   useEffect(() => {
     if (locked) setAssetId(lockedAssetId as string)
   }, [lockedAssetId, locked])
-
-  // Relinquish any evicted-and-held outputs for the selected asset on mount /
-  // asset change, so stale basket entries clear before the user tries to send.
-  // Fail-open — a reconcile failure shouldn't block the flow.
-  useEffect(() => {
-    if (wallet == null || assetId === '') return
-    void reconcileBans(wallet as any, [assetId]).catch(() => {})
-  }, [wallet, assetId])
 
   // Surface any frozen outputs the current identity owns for the selected
   // asset, with the freeze reason, so the holder understands why part of
@@ -161,7 +158,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
     return name.slice(0, 2).toUpperCase()
   }
 
-  // Core transfer pipeline lives in lib/mandala/transfer.ts (via useSendMutation).
+  // Core send pipeline lives in lib/mandala/sendPipeline.ts (via useSendMutation).
 
   // ---------------------------------------------------------------------------
   // Wizard actions
@@ -169,7 +166,10 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
 
   const selectedBalance = balances.find(b => b.assetId === assetId)
   const decimals = decimalsFor(assetId)
-  const sendAmount = parseAmount(amountStr, decimals)
+  // Exact base units, or null when empty, malformed, over-precise or > MAX_UINT64.
+  const sendAmount = safeParseAmount(amountStr, decimals)
+  const amountOk = sendAmount != null && sendAmount > 0n &&
+    selectedBalance != null && selectedBalance.amount >= sendAmount
 
   // Recipient shortlist shown under the search field — tap to pick, no search
   // needed. History counterparties come first (most recently sent-to/received-from,
@@ -265,7 +265,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
 
   const handleMax = () => {
     if (!selectedBalance) return
-    setAmountStr(formatAmountPlain(selectedBalance.amount, decimals))
+    setAmountStr(plainAmount(selectedBalance.amount, decimals))
   }
 
   // Sync re-entry latch: setStep('sending') is async, so a second click in the
@@ -275,12 +275,16 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
   const handleConfirmAndSend = () => {
     if (sendStartedRef.current || sendMutation.isPending || sendFlight.isHeld()) return
     if (step === 'sending' || step === 'sent') return
+    if (sendAmount == null) {
+      setSendError('Enter a valid amount')
+      return
+    }
 
     const gate = guardSendSubmit({
       assetId,
       recipientKey: recipient,
       amount: sendAmount,
-      balance: selectedBalance?.amount ?? 0,
+      balance: selectedBalance?.amount ?? 0n,
       isPaused,
       pauseBypass: devMode,
       walletReady: wallet != null
@@ -292,14 +296,23 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
 
     setSendError('')
     sendStartedRef.current = true
-    // Flip the UI immediately — the pipeline (build → sign → overlay submit)
-    // runs behind the Sending screen. Overlay accept → Sent; reject → back to
-    // Review with the error (the wallet action was aborted, inputs released).
+    // Flip the UI immediately — the pipeline (sign → deliver → settle) runs
+    // behind the Sending screen. Once signed the hand-over is journaled and the
+    // mutation resolves (→ Sent, with a toast for the settle outcome); only a
+    // failure before or at signing returns to Review with the error.
     setStep('sending')
     sendMutation.mutate(
       { assetId, amount: sendAmount, recipientKey: recipient, note },
       {
         onSuccess: res => {
+          // A final overlay refusal: the lib released the inputs and dropped
+          // the hand-over, so nothing was sent — back to Review with the code.
+          if (res.settle?.status === 'refused') {
+            sendStartedRef.current = false
+            setSendError(describeSettle(res).text)
+            setStep('review')
+            return
+          }
           setSentTxid(res.txid)
           setStep('sent')
           // Keep sendStartedRef true until reset — prevents re-send of same review.
@@ -316,7 +329,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
             return
           }
           console.error('Send error:', e)
-          setSendError(e instanceof Error ? e.message : 'Send failed. Please try again.')
+          setSendError(explainSendError(e))
           setStep('review')
         }
       }
@@ -371,7 +384,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
           Available
         </span>
         <span className="tabular text-[13px] font-semibold">
-          {formatAmount(selectedBalance.amount, decimals)} {labelFor(assetId)}
+          {displayAmount(selectedBalance.amount, decimals)} {labelFor(assetId)}
         </span>
       </div>
     ) : null
@@ -609,7 +622,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
               <option value="">Select a token</option>
               {balances.map(b => (
                 <option key={b.assetId} value={b.assetId}>
-                  {labelFor(b.assetId)} ({formatAmount(b.amount, decimalsFor(b.assetId))} available)
+                  {labelFor(b.assetId)} ({displayAmount(b.amount, decimalsFor(b.assetId))} available)
                 </option>
               ))}
             </Select>
@@ -631,7 +644,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
         {selectedBalance && assetId && (
           <div className="mt-[18px] inline-flex items-center gap-2.5">
             <span className="text-[12px] text-subtle-foreground">
-              {formatAmount(selectedBalance.amount, decimals)} available
+              {displayAmount(selectedBalance.amount, decimals)} available
             </span>
             <button
               type="button"
@@ -650,7 +663,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
         <div className="mx-5 mt-[18px] rounded-md border border-warning/40 bg-warning/10 p-3 text-[12px] text-warning">
           {frozenNote.map((f, i) => (
             <div key={i}>
-              {formatAmount(f.amount, decimals)} {labelFor(assetId)} frozen{f.reason ? ` — ${f.reason}` : ''} (unspendable)
+              {displayAmount(f.amount, decimals)} {labelFor(assetId)} frozen{f.reason ? ` — ${f.reason}` : ''} (unspendable)
             </div>
           ))}
         </div>
@@ -698,11 +711,10 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
 
         <Button
           onClick={() => {
-            if (!assetId || !sendAmount || sendAmount <= 0) return
-            if (!selectedBalance || selectedBalance.amount < sendAmount) return
+            if (!assetId || !amountOk) return
             setStep('review')
           }}
-          disabled={!assetId || !sendAmount || sendAmount <= 0 || !selectedBalance || selectedBalance.amount < sendAmount}
+          disabled={!assetId || !amountOk}
           size="lg"
           className="mt-3 w-full"
         >
@@ -749,7 +761,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
             <div className="flex items-center justify-between py-3 border-t border-separator">
               <span className="text-[12.5px] text-subtle-foreground">Amount</span>
               <span className="tabular text-[17px] font-semibold">
-                {formatAmount(sendAmount, decimals)} {labelFor(assetId)}
+                {displayAmount(sendAmount ?? 0n, decimals)} {labelFor(assetId)}
               </span>
             </div>
             <div className="flex items-center justify-between py-3 border-t border-separator">
@@ -800,10 +812,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
             (isPaused && !devMode) ||
             wallet == null ||
             sendMutation.isPending ||
-            !sendAmount ||
-            sendAmount <= 0 ||
-            !selectedBalance ||
-            selectedBalance.amount < sendAmount
+            !amountOk
           }
           loading={sendMutation.isPending}
           loadingText="Sending…"
@@ -811,7 +820,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
           className="w-full"
         >
           <Send className="h-[17px] w-[17px]" />
-          Send {formatAmount(sendAmount, decimals)} {labelFor(assetId)}
+          Send {displayAmount(sendAmount ?? 0n, decimals)} {labelFor(assetId)}
         </Button>
       </div>
     </div>
@@ -833,7 +842,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
         </div>
         <div className="text-[11px] font-medium tracking-[2px] uppercase text-subtle-foreground">Sending</div>
         <div className="tabular mt-3 text-[44px] font-semibold leading-none tracking-[-1.5px]">
-          {formatAmount(sendAmount, decimals)}
+          {displayAmount(sendAmount ?? 0n, decimals)}
         </div>
         <div className="text-[14px] text-muted-foreground mt-2.5 leading-snug">
           {labelFor(assetId)} to {recipientName || (recipient.slice(0, 12) + '…')}
@@ -862,7 +871,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string }
 
         <div className="text-[11px] font-medium tracking-[2px] uppercase text-subtle-foreground">Sent</div>
         <div className="tabular mt-3 text-[44px] font-semibold leading-none tracking-[-1.5px]">
-          {formatAmount(sendAmount, decimals)}
+          {displayAmount(sendAmount ?? 0n, decimals)}
         </div>
         <div className="text-[14px] text-muted-foreground mt-2.5 leading-snug">
           {labelFor(assetId)} to {recipientName || (recipient.slice(0, 12) + '…')}
