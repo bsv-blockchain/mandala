@@ -31,15 +31,26 @@
  *                flight. Recovery = redeliver the receipt
  *                (notifyJournal reconcileNotifications, after 60 s).
  *   'delivered'— the hand-over was acknowledged (MessageBox sendMessage
- *                resolved, or the host's own ACK). The sender may now submit
+ *                resolved, or the host's own ACK), or it is a self-send,
+ *                which owes no delivery and is journaled 'delivered' at
+ *                once. The sender may now submit
  *                the exact journaled bytes (settleHandover / reconcile):
  *                admitted ⇒ 'accepted'; retryable ⇒ attempts+1; final ⇒
  *                abort + drop (B2, B5, D27). 'handed_over' is removed (G3).
- *   'stranded' — an 'accepted' entry whose broadcast has failed
- *                BROADCAST_RETRY_CAP times. KEPT (the overlay folded this tx
- *                in; it must never be aborted) but never retried automatically
- *                and no longer blocking the bulk sweep. Surfaced by
- *                `journalListStranded()` for an operator to act on.
+ *   'stranded' — parked after a capped number of failed recovery passes,
+ *                KEPT, never aborted, never retried automatically and no
+ *                longer blocking the bulk sweep. Two kinds, told apart by σ:
+ *                - admissionSignature != null: an 'accepted' entry whose
+ *                  broadcast failed BROADCAST_RETRY_CAP times. The overlay
+ *                  folded it in; recovery = broadcast it (sendWith).
+ *                - admissionSignature == null (it carries `submit` and the
+ *                  hand-over fields instead): a 'delivered' hand-over the
+ *                  overlay never admitted, retried RETRY_CAP times. It must
+ *                  NEVER be broadcast (that would put an unadmitted token tx
+ *                  on chain); recovery = re-submit its journaled bytes
+ *                  (resubmitDelivered), and only an admission may lead to a
+ *                  broadcast.
+ *                Surfaced by `journalListStranded()` for an operator.
  *
  * Storage layout: ONE key PER ENTRY (`mandala.txJournal.<id>`). setItem/
  * removeItem are atomic per key, so concurrent writers can add/remove
@@ -212,14 +223,21 @@ export async function journalPromoteSigned (txid: string): Promise<void> {
 }
 
 /**
- * Every entry parked in 'stranded' — overlay-accepted transactions whose
- * broadcast kept failing past BROADCAST_RETRY_CAP (§9.11).
+ * Every entry parked in 'stranded' (§9.11). Two kinds; check σ before acting:
  *
- * These are deliberately NOT retried by reconcile any more: an unbroadcastable
- * accepted tx that stayed in the retry loop wedged the whole pass (it blocked
- * the bulk sweep forever). They are kept — never aborted, since the overlay has
- * already folded them in — and surfaced here so a host can show them, retry one
- * deliberately (`broadcastAcceptedTx`), or escalate.
+ * - `admissionSignature != null`: an overlay-accepted transaction whose
+ *   broadcast kept failing past BROADCAST_RETRY_CAP. Never aborted, since the
+ *   overlay has already folded it in; a host may retry its broadcast
+ *   deliberately (`broadcastAcceptedTx`) or escalate.
+ * - `admissionSignature == null`: a 'delivered' hand-over the overlay never
+ *   admitted (retryable verdicts or transport failures past RETRY_CAP). It
+ *   must NEVER be broadcast (`createAction({ sendWith })` would put a token
+ *   tx the overlay never admitted on chain). A host may only re-submit it
+ *   (`resubmitDelivered`) or escalate; it is never aborted automatically
+ *   either, because the recipient already holds its bytes.
+ *
+ * Neither kind is retried by reconcile any more: an entry that stayed in the
+ * retry loop wedged the whole pass (it blocked the bulk sweep forever).
  */
 export async function journalListStranded (): Promise<JournalEntry[]> {
   return (await journalList()).filter(e => e.stage === 'stranded')

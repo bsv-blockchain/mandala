@@ -159,6 +159,8 @@ export interface ReconcileResult {
   /**
    * Txids parked as 'stranded' this pass — kept, never auto-retried: accepted
    * entries past BROADCAST_RETRY_CAP, and delivered hand-overs past RETRY_CAP.
+   * Only the first kind (admissionSignature set) may ever be broadcast; see
+   * `journalListStranded`.
    */
   stranded: string[]
   /** Stuck nosend mandala actions released by the bulk sweep. */
