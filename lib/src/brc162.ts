@@ -64,20 +64,6 @@ export function decodeToken (script: LockingScript | string, txid?: string, vout
 }
 
 /**
- * A value coin of `tokenId` (amount > 0), else null; null above 2^53.
- * @deprecated Transitional (Task 5): the last 2^53 logic in the lib. Task 16
- * deletes it; use decodeToken (bigint) instead.
- */
-export function decodeValue (script: LockingScript | string, tokenId?: string): { tokenId: string, amount: number } | null {
-  const d = decodeToken(script)
-  if (d == null || d.role !== 'value' || d.assetId == null) return null
-  if (!/^[0-9a-f]{64}_0$/.test(d.assetId)) return null // only 32-byte ids, as before 1Color
-  if (tokenId != null && d.assetId !== tokenId) return null
-  if (d.amount > BigInt(Number.MAX_SAFE_INTEGER)) return null
-  return { tokenId: d.assetId, amount: Number(d.amount) }
-}
-
-/**
  * Lock a Mandala-key (issuer, treasury, authority, deploy, registry) 1Color
  * output: OneColor lockBRC29 to hash160 of the key derived under
  * ADMIN_PROTOCOL. `assetId` null is a deploy. Throws RangeError for an amount

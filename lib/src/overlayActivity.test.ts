@@ -12,7 +12,7 @@ const entry = (over: Partial<ActivityEntry>): ActivityEntry => ({
   kind: 'transfer',
   from: 'alice',
   to: 'bob',
-  amount: 30,
+  amount: 30n,
   proofs: [],
   ...over
 })
@@ -57,10 +57,31 @@ describe('fetchOverlayActivity', () => {
   })
 
   it('returns parsed page with cursor', async () => {
-    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ entries: [entry({})], nextCursor: 'c1' }) })
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ entries: [{ ...entry({}), amount: '30' }], nextCursor: 'c1' }) })
     const page = await fetchOverlayActivity('a.0')
     expect(page.entries).toHaveLength(1)
     expect(page.nextCursor).toBe('c1')
+  })
+
+  it('reads entry amounts as exact bigints, accepts the wire tokenId, and drops a non-string amount with one warning', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const wire = (over: Record<string, unknown>): Record<string, unknown> =>
+      ({ txid: 't', when: 'w', tokenId: 'a.0', kind: 'transfer', from: null, to: null, proofs: [], ...over })
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        entries: [wire({ txid: 'ok', amount: '7' }), wire({ txid: 'num', amount: 7 }), wire({ txid: 'max', amount: '18446744073709551615' })],
+        nextCursor: null
+      })
+    })
+    const page = await fetchOverlayActivity('a.0')
+    expect(page.entries.map(e => e.txid)).toEqual(['ok', 'max'])
+    expect(page.entries[0].amount).toBe(7n)
+    expect(page.entries[0].assetId).toBe('a.0')
+    expect(page.entries[1].amount).toBe(18446744073709551615n)
+    expect(describeActivity(page.entries[0])).toBe('Transferred 7 units')
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
   })
 
   it('throws on a non-ok response', async () => {
@@ -84,22 +105,22 @@ describe('flattenActivityPages', () => {
   })
 
   it('dedupes a boundary tx re-served by the inclusive cursor (first occurrence wins)', () => {
-    const newer = entry({ txid: 'dup', amount: 99 })
-    const older = entry({ txid: 'dup', amount: 1 })
+    const newer = entry({ txid: 'dup', amount: 99n })
+    const older = entry({ txid: 'dup', amount: 1n })
     const out = flattenActivityPages([
       { entries: [entry({ txid: 'a' }), newer], nextCursor: 'c' },
       { entries: [older, entry({ txid: 'b' })], nextCursor: null }
     ])
     expect(out.map(e => e.txid)).toEqual(['a', 'dup', 'b'])
-    expect(out.find(e => e.txid === 'dup')?.amount).toBe(99)
+    expect(out.find(e => e.txid === 'dup')?.amount).toBe(99n)
   })
 })
 
 describe('describeActivity', () => {
   it('describes each kind', () => {
-    expect(describeActivity(entry({ kind: 'issue', amount: 100 }))).toBe('Issued 100 units')
-    expect(describeActivity(entry({ kind: 'transfer', amount: 30 }))).toBe('Transferred 30 units')
-    expect(describeActivity(entry({ kind: 'self', amount: 0 }))).toBe('Transferred 0 units to self')
-    expect(describeActivity(entry({ kind: 'redeem', amount: 25 }))).toBe('Redeemed (burned) 25 units')
+    expect(describeActivity(entry({ kind: 'issue', amount: 100n }))).toBe('Issued 100 units')
+    expect(describeActivity(entry({ kind: 'transfer', amount: 30n }))).toBe('Transferred 30 units')
+    expect(describeActivity(entry({ kind: 'self', amount: 0n }))).toBe('Transferred 0 units to self')
+    expect(describeActivity(entry({ kind: 'redeem', amount: 25n }))).toBe('Redeemed (burned) 25 units')
   })
 })

@@ -12,7 +12,9 @@ describe('removed exports', () => {
     'transferTokens', 'receiveTokens', 'defaultSettle', 'cover', 'canonicalBundleId',
     'collectHandoverEvidence', 'journalEvidenceSource', 'derHex',
     // Task 7: legacy tm_<txid> topic helpers (C§8.1)
-    'tokenTopic', 'tokenLookup', 'tokenTopicOrEmpty', 'isSigmaTopic', 'deployTopics'
+    'tokenTopic', 'tokenLookup', 'tokenTopicOrEmpty', 'isSigmaTopic', 'deployTopics',
+    // Task 16: the last 2^53 decoder (C§8.1)
+    'decodeValue'
   ])('%s is gone', n => {
     expect(n in mod).toBe(false)
   })

@@ -9,7 +9,7 @@ import fRaw from './__fixtures__/1color-deploy.json?raw'
 import { MAX_UINT64 } from './amount.js'
 import { ADMIN_PROTOCOL, ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID } from './constants.js'
 import {
-  authorityKeyIdOf, commitmentPayload, decodeToken, decodeValue, deployPayload, lockIssuerToken, mandalaReq,
+  authorityKeyIdOf, commitmentPayload, decodeToken, deployPayload, lockIssuerToken, mandalaReq,
   parseDeployPayload, readDeploy
 } from './brc162.js'
 
@@ -125,12 +125,6 @@ describe('decodeToken', () => {
     expect(authorityKeyIdOf(new OneColor().lock(ID, 0n, PKH, commitmentPayload([1])))).toBe(Utils.toHex(Hash.sha256([1])))
     expect(authorityKeyIdOf(F.lockingScriptHex)).toBe('deploy')
     expect(authorityKeyIdOf(new OneColor().lock(ID, 5n, PKH))).toBeNull()
-  })
-
-  it('transitional decodeValue keeps the 2^53 cap', () => {
-    expect(decodeValue(new OneColor().lock(ID, 5n, PKH).toHex())).toEqual({ tokenId: ID, amount: 5 })
-    expect(decodeValue(new OneColor().lock(ID, MAX_UINT64, PKH).toHex())).toBeNull()
-    expect(decodeValue(new OneColor().lock(ID, 5n, PKH).toHex(), `${'cd'.repeat(32)}_0`)).toBeNull()
   })
 })
 

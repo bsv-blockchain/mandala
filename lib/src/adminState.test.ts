@@ -18,7 +18,7 @@ const SAMPLE_STATE = {
   accessMode: 'denylist' as const,
   blockedIdentities: ['key1'],
   allowedIdentities: [],
-  frozenOutpoints: [{ outpoint: 'txid.0', amount: 100, owner: 'key2', reason: 'court order' }],
+  frozenOutpoints: [{ outpoint: 'txid.0', amount: '100', owner: 'key2', reason: 'court order' }],
   evictedOutpoints: ['txid2.1']
 }
 
@@ -47,6 +47,7 @@ describe('resolveAssetState', () => {
     expect(result?.frozenOutpoints).toHaveLength(1)
     expect(result?.frozenOutpoints[0].outpoint).toBe('txid.0')
     expect(result?.frozenOutpoints[0].reason).toBe('court order')
+    expect(result?.frozenOutpoints[0].amount).toBe(100n)
     expect(result?.blockedIdentities).toEqual(['key1'])
     expect(result?.evictedOutpoints).toEqual(['txid2.1'])
     expect(mockFetch).toHaveBeenCalledWith(
@@ -128,5 +129,30 @@ describe('resolveAssetState', () => {
     await resolveAssetState('noforce.0')
     await resolveAssetState('noforce.0', { force: false })
     expect(mockFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('reads frozenOutpoints[].amount as an exact bigint and drops a non-string amount with one warning', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...SAMPLE_STATE,
+        assetId: undefined,
+        tokenId: 'frozen.0',
+        frozenOutpoints: [
+          { outpoint: 'a.0', amount: '42', owner: 'k' },
+          { outpoint: 'b.0', amount: '18446744073709551615', owner: 'k' },
+          { outpoint: 'c.0', amount: 42, owner: 'k' },
+          { outpoint: 'd.0', amount: '042', owner: 'k' }
+        ]
+      })
+    })
+    const result = await resolveAssetState('frozen.0')
+    expect(result?.assetId).toBe('frozen.0')
+    expect(result?.frozenOutpoints.map(f => f.outpoint)).toEqual(['a.0', 'b.0'])
+    expect(result?.frozenOutpoints[0].amount).toBe(42n)
+    expect(result?.frozenOutpoints[1].amount).toBe(18446744073709551615n)
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
   })
 })

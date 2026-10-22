@@ -1,4 +1,5 @@
 import { OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
+import { parseDecimalAmount } from './amount.js'
 
 export interface AssetAdminStateView {
   assetId: string
@@ -10,8 +11,25 @@ export interface AssetAdminStateView {
   feeRatePerKb?: number | null
   blockedIdentities: string[]
   allowedIdentities: string[]
-  frozenOutpoints: Array<{ outpoint: string, amount: number, owner: string, reason: string }>
+  /** `amount` is exact; an entry whose wire amount is not a decimal string is dropped (C§0). */
+  frozenOutpoints: Array<{ outpoint: string, amount: bigint, owner: string, reason: string }>
   evictedOutpoints: string[]
+}
+
+type FrozenRef = AssetAdminStateView['frozenOutpoints'][number]
+
+// Never coerced: an entry with a non-canonical amount is dropped, one warning per read.
+function readFrozen (raw: unknown, assetId: string): FrozenRef[] {
+  if (!Array.isArray(raw)) return []
+  const out: FrozenRef[] = []
+  let dropped = 0
+  for (const f of raw) {
+    const amount = parseDecimalAmount(f?.amount)
+    if (amount == null) { dropped++; continue }
+    out.push({ ...f, amount })
+  }
+  if (dropped > 0) console.warn(`[mandala] asset state ${assetId}: dropped ${dropped} frozen outpoint(s) whose amount is not a decimal string`)
+  return out
 }
 
 const cache = new Map<string, { at: number, val: AssetAdminStateView | null }>()
@@ -38,7 +56,7 @@ export async function resolveAssetState (
     if (res.ok) {
       const body = await res.json()
       // The v3 route keys the row by tokenId; keep the assetId view.
-      val = { ...body, assetId: body.assetId ?? body.tokenId } as AssetAdminStateView
+      val = { ...body, assetId: body.assetId ?? body.tokenId, frozenOutpoints: readFrozen(body.frozenOutpoints, assetId) } as AssetAdminStateView
     }
   } catch { val = null }
   cache.set(assetId, { at: Date.now(), val })
