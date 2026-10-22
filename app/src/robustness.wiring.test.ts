@@ -17,6 +17,15 @@ function src(rel: string): string {
 }
 
 describe('robustness wiring (shipped source)', () => {
+  it('main.tsx configures no basket and gates on readMandalaConfig', () => {
+    const m = src('main.tsx')
+    expect(m).not.toMatch(/basket\s*:/)
+    expect(m).not.toContain("'p mandala'")
+    expect(m).toContain('readMandalaConfig(')
+    expect(src('context/WalletContext.tsx')).toContain('configError')
+    expect(src('components/issuer/IdentityRegistry.tsx')).not.toContain('tm_mandala_registry')
+  })
+
   it('SendTokens blocks re-entry with sync ref, sendFlight, and pending disable', () => {
     const s = src('components/SendTokens.tsx')
     expect(s).toContain('sendStartedRef')
