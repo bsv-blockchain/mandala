@@ -13,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
 	"github.com/bsv-blockchain/go-sdk/overlay"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 	"github.com/sirdeggen/mandala/overlay-go/internal/testmongo"
 )
 
@@ -104,7 +105,7 @@ func TestTokenTopicsEnsureRegistersLookupThenManager(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Ensure = %v, %v; want true, nil", ok, err)
 	}
-	if got, want := reg.snapshot(), []string{"lookup ls_" + ttHexA, "manager tm_" + ttHexA}; !slices.Equal(got, want) {
+	if got, want := reg.snapshot(), []string{"lookup ls_color_" + ttIDA, "manager tm_color_" + ttIDA}; !slices.Equal(got, want) {
 		t.Fatalf("registrations = %v, want %v", got, want)
 	}
 	if !tt.Hosted(ttIDA) || tt.Hosted(ttIDB) {
@@ -153,7 +154,7 @@ func TestTokenTopicsEnsureAllowlistRefusesUnlisted(t *testing.T) {
 func TestTokenTopicsEnsureRejectsNonCanonicalID(t *testing.T) {
 	reg, f := newFakeRegistry(), &countingFactory{}
 	tt := NewTokenTopics(reg, nil, false, f.build)
-	for _, id := range []string{ttHexA, ttHexA + "_1", strings.ToUpper(ttHexA) + "_0", "tm_" + ttHexA, ""} {
+	for _, id := range []string{ttHexA, ttHexA + "_1", strings.ToUpper(ttHexA) + "_0", "tm_color_" + ttHexA + "_0", ""} {
 		ok, err := tt.Ensure(id)
 		if ok || err == nil || err.Error() != "not a canonical Mandala token id: "+id {
 			t.Fatalf("Ensure(%q) = %v, %v", id, ok, err)
@@ -220,7 +221,7 @@ func TestTokenTopicsConcurrentEnsureBuildsOnce(t *testing.T) {
 	if n := f.calls.Load(); n != 1 {
 		t.Fatalf("factory builds = %d, want 1", n)
 	}
-	if got, want := reg.snapshot(), []string{"lookup ls_" + ttHexA, "manager tm_" + ttHexA}; !slices.Equal(got, want) {
+	if got, want := reg.snapshot(), []string{"lookup ls_color_" + ttIDA, "manager tm_color_" + ttIDA}; !slices.Equal(got, want) {
 		t.Fatalf("registrations = %v, want %v", got, want)
 	}
 }
@@ -269,7 +270,7 @@ func TestTokenTopicsEnsureDuringInFlightSubmit(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Ensure blocked behind a submit that is inside its manager")
 	}
-	if !eng.HasTopicManager("tm_"+ttHexA) || !eng.HasLookupService("ls_"+ttHexA) {
+	if !eng.HasTopicManager(mandala.TokenTopicOfTxid(ttHexA)) || !eng.HasLookupService("ls_color_"+ttHexA+"_0") {
 		t.Fatal("token topic not registered on the engine")
 	}
 	close(release)
@@ -290,7 +291,7 @@ func TestTokenTopicsBootUnionAndSourceError(t *testing.T) {
 	if got := tt.Registered(); !slices.Equal(got, []string{ttIDA, ttIDB, ttIDC}) {
 		t.Fatalf("Registered = %v", got)
 	}
-	want := []string{"lookup ls_" + ttHexA, "manager tm_" + ttHexA, "lookup ls_" + ttHexB, "manager tm_" + ttHexB, "lookup ls_" + ttHexC, "manager tm_" + ttHexC}
+	want := []string{"lookup ls_color_" + ttIDA, "manager tm_color_" + ttIDA, "lookup ls_color_" + ttIDB, "manager tm_color_" + ttIDB, "lookup ls_color_" + ttIDC, "manager tm_color_" + ttIDC}
 	if got := reg.snapshot(); !slices.Equal(got, want) {
 		t.Fatalf("registration order = %v, want the sorted union %v", got, want)
 	}

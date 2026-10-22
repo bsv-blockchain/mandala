@@ -371,7 +371,7 @@ func TestTokenLookupNamesAndMetaData(t *testing.T) {
 	st, _, _ := lkStore(t)
 	hexID := strings.TrimSuffix(mgrUntouched, "_0")
 	ls := lkToken(t, st, mgrUntouched)
-	if ls.Name() != "ls_"+hexID || ls.Topic() != "tm_"+hexID {
+	if ls.Name() != "ls_color_"+hexID+"_0" || ls.Topic() != TokenTopicOfTxid(hexID) {
 		t.Fatalf("names = %s %s", ls.Name(), ls.Topic())
 	}
 	md := ls.GetMetaData()

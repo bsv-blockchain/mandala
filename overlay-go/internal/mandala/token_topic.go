@@ -27,7 +27,7 @@ type TokenTopicDeps struct {
 	OnOwnerRepair    func(outpoint string, inserted bool) // nil = LogOwnerRepair(<topic>)
 }
 
-// TokenTopicManager is tm_<deploy txid>: one Mandala token (Q2/mandala/MandalaTopicManager.ts).
+// TokenTopicManager is tm_color_<assetId>: one Mandala token (Q2/mandala/MandalaTopicManager.ts).
 type TokenTopicManager struct {
 	tokenID string
 	topic   string

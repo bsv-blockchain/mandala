@@ -38,7 +38,7 @@ func CanonicalOutputs(outs []uint32) []uint32 {
 
 // AdmissionDigestV3 is SHA-256("mandala-admit:v3:" + topic + ":" + txid + ":" + join(canonical
 // outputsToAdmit, ",")) (TT A1.2). The topic binds the signature: a deploy's tm_mandala and
-// tm_<id> σI differ although both admit [0].
+// tm_color_<id> σI differ although both admit [0].
 func AdmissionDigestV3(topic, txid string, outputsToAdmit []uint32) ([32]byte, error) {
 	canonical := CanonicalOutputs(outputsToAdmit)
 	if len(canonical) == 0 {

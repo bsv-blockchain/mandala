@@ -34,8 +34,8 @@ func TestStartBootUnionJournalOnlyNarrowedAndReadFault(t *testing.T) {
 		t.Fatal(err)
 	}
 	journal := []mandala.OwnerRecord{
-		{Txid: y, OutputIndex: 0, Topic: "tm_" + y, TokenID: y + "_0", Role: brc162.RoleDeploy, Amount: amt(0), IdentityKey: mandalatest.Issuer.Identity, CreatedAt: journaled},
-		{Txid: z, OutputIndex: 0, Topic: "tm_" + z, TokenID: z + "_0", Role: brc162.RoleDeploy, Amount: amt(0), IdentityKey: mandalatest.Issuer.Identity, CreatedAt: journaled},
+		{Txid: y, OutputIndex: 0, Topic: mandala.TokenTopicOfTxid(y), TokenID: y + "_0", Role: brc162.RoleDeploy, Amount: amt(0), IdentityKey: mandalatest.Issuer.Identity, CreatedAt: journaled},
+		{Txid: z, OutputIndex: 0, Topic: mandala.TokenTopicOfTxid(z), TokenID: z + "_0", Role: brc162.RoleDeploy, Amount: amt(0), IdentityKey: mandalatest.Issuer.Identity, CreatedAt: journaled},
 		{Txid: k, OutputIndex: 0, Topic: mandala.KYCTopic, TokenID: k + "_0", Role: brc162.RoleDeploy, Amount: amt(0), IdentityKey: mandalatest.Issuer.Identity, CreatedAt: journaled},
 	}
 	if err := app.Store.RecordOwners(ctx, journal); err != nil {
@@ -57,11 +57,11 @@ func TestStartBootUnionJournalOnlyNarrowedAndReadFault(t *testing.T) {
 		t.Fatalf("Registered() = %v, want %v", got, want)
 	}
 	for _, id := range []string{x, y, z} {
-		if !app.Engine.HasTopicManager("tm_"+id) || !app.Engine.HasLookupService("ls_"+id) {
-			t.Fatalf("tm_/ls_%s not registered", id)
+		if !app.Engine.HasTopicManager(mandala.TokenTopicOfTxid(id)) || !app.Engine.HasLookupService("ls_color_"+id+"_0") {
+			t.Fatalf("tm_color_/ls_color_%s_0 not registered", id)
 		}
 	}
-	if app.Engine.HasTopicManager("tm_" + k) {
+	if app.Engine.HasTopicManager(mandala.TokenTopicOfTxid(k)) {
 		t.Fatal("a KYC journal row registered a token topic")
 	}
 	rec, err := app.Store.FindRegistryRecord(ctx, y+"_0")
@@ -82,14 +82,14 @@ func TestStartBootUnionJournalOnlyNarrowedAndReadFault(t *testing.T) {
 	if err := app2.Start(ctx); err != nil {
 		t.Fatalf("Start (narrowed): %v", err)
 	}
-	if !app2.Tokens.Hosted(x+"_0") || app2.Tokens.Hosted(y+"_0") || app2.Engine.HasTopicManager("tm_"+y) {
-		t.Fatalf("narrowed: hosted X=%v Y=%v tm_Y=%v; want X only", app2.Tokens.Hosted(x+"_0"), app2.Tokens.Hosted(y+"_0"), app2.Engine.HasTopicManager("tm_"+y))
+	if !app2.Tokens.Hosted(x+"_0") || app2.Tokens.Hosted(y+"_0") || app2.Engine.HasTopicManager(mandala.TokenTopicOfTxid(y)) {
+		t.Fatalf("narrowed: hosted X=%v Y=%v tm_Y=%v; want X only", app2.Tokens.Hosted(x+"_0"), app2.Tokens.Hosted(y+"_0"), app2.Engine.HasTopicManager(mandala.TokenTopicOfTxid(y)))
 	}
 	rows, err := app2.Store.OwnerJournalByOutpoint(ctx, y, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].Topic != "tm_"+y || rows[0].TokenID != y+"_0" || rows[0].IdentityKey != mandalatest.Issuer.Identity {
+	if len(rows) != 1 || rows[0].Topic != mandala.TokenTopicOfTxid(y) || rows[0].TokenID != y+"_0" || rows[0].IdentityKey != mandalatest.Issuer.Identity {
 		t.Fatalf("Y's journal rows changed by narrowing: %+v", rows)
 	}
 	for _, id := range []string{x, y} {
@@ -108,7 +108,7 @@ func TestStartBootUnionJournalOnlyNarrowedAndReadFault(t *testing.T) {
 	if err == nil || !strings.HasPrefix(err.Error(), "wiring: start: token topics boot: ") {
 		t.Fatalf("Start with a failing read = %v, want a \"wiring: start: token topics boot: \" error", err)
 	}
-	if got := app3.Tokens.Registered(); len(got) != 0 || app3.Engine.HasTopicManager("tm_"+x) {
+	if got := app3.Tokens.Registered(); len(got) != 0 || app3.Engine.HasTopicManager(mandala.TokenTopicOfTxid(x)) {
 		t.Fatalf("a failed boot registered %v", got)
 	}
 }

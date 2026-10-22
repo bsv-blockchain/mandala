@@ -128,7 +128,7 @@ func boundedIntParam(raw string, def, min, max int64) (int64, bool) {
 
 // authoritiesBeefHandler serves the stored BEEF of an authority output so an issuer whose wallet lost the coin's
 // bookkeeping can re-attach it. The route has no token id, so the output is found across topics and served only
-// from a tm_<id> copy: a tm_mandala (registry) or tm_mandala_kyc copy is never an authority of a token.
+// from a tm_color_<id> copy: a tm_mandala (registry) or tm_mandala_kyc copy is never an authority of a token.
 func authoritiesBeefHandler(where OutputBeefWhereFunc) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		if where == nil {

@@ -35,8 +35,8 @@ const vectorTxid = "3f0c9a1b2d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6
 
 // Two token topics the stub submitter hosts (a nil hasTopic hosts every name).
 var (
-	testTopicA = "tm_" + strings.Repeat("a", 64)
-	testTopicB = "tm_" + strings.Repeat("b", 64)
+	testTopicA = mandala.TokenTopicOfTxid(strings.Repeat("a", 64))
+	testTopicB = mandala.TokenTopicOfTxid(strings.Repeat("b", 64))
 )
 
 func testSigner(t *testing.T) *mandala.ECAdmissionSigner {
@@ -208,7 +208,7 @@ func admissionKeys(rec mandala.AdmissionRecord) []string {
 
 func TestSubmit_SignsEachSigmaTopicEntryWithItsOwnDigest(t *testing.T) {
 	beef, txid := submitBeef(t, 0x11)
-	own := "tm_" + txid
+	own := mandala.TokenTopicOfTxid(txid)
 	stub := &stubSubmitter{steak: overlay.Steak{
 		mandala.MandalaTopic: {OutputsToAdmit: []uint32{0}},
 		own:                  {OutputsToAdmit: []uint32{0}},
@@ -370,7 +370,7 @@ func TestSubmit_KnownVerdictNeedsEveryNamedTopicApplied(t *testing.T) {
 // A lost record: the engine's proof covers every named topic, so the replay re-signs each σ-topic and finalizes them.
 func TestSubmit_ReplayFinalizesMissingEntriesFromTheAppliedProof(t *testing.T) {
 	beef, txid := submitBeef(t, 0x17)
-	own := "tm_" + txid
+	own := mandala.TokenTopicOfTxid(txid)
 	stub := &stubSubmitter{}
 	rec := &stubAdmissionStore{}
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)),
@@ -399,7 +399,7 @@ func TestSubmit_ReplayFinalizesMissingEntriesFromTheAppliedProof(t *testing.T) {
 // finalized. A fault on that read is 503, retryable: a retry replays from step 4.
 func TestSubmit_DupeGateRaceAnswersFromTheReReadProof(t *testing.T) {
 	beef, txid := submitBeef(t, 0x21)
-	own := "tm_" + txid
+	own := mandala.TokenTopicOfTxid(txid)
 	stub := &stubSubmitter{steak: overlay.Steak{mandala.MandalaTopic: {}, own: {}}}
 	rec := &stubAdmissionStore{}
 	calls := 0

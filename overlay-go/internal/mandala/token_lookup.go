@@ -118,7 +118,7 @@ var (
 	tokenLookupQueryKeys = append(slices.Clone(tokenLookupTokenKeys), "txid", "outputIndex", "limit", "skip")
 )
 
-// TokenLookupService is ls_<deploy txid> (Q2/mandala/MandalaLookupService.ts), answering formulas
+// TokenLookupService is ls_color_<assetId> (Q2/mandala/MandalaLookupService.ts), answering formulas
 // only (D-9).
 type TokenLookupService struct {
 	tokenID, topic, name string
@@ -360,7 +360,7 @@ func (l *TokenLookupService) Lookup(ctx context.Context, q *lookup.LookupQuestio
 	if err != nil {
 		return nil, err
 	}
-	// ls_<id> answers for its own token only: the store is shared, and another token's rows go stale
+	// ls_color_<id> answers for its own token only: the store is shared, and another token's rows go stale
 	// once that token is no longer hosted (TT §6.3).
 	for _, k := range asked {
 		if k.tokenID != l.tokenID {

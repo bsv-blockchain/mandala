@@ -124,7 +124,7 @@ func reconcileHex(c string) string { return strings.Repeat(c, 64) }
 
 func TestReconcileOutcomes(t *testing.T) {
 	ctx := context.Background()
-	tokA, topicA, topicB := reconcileHex("a")+"_0", "tm_"+reconcileHex("a"), "tm_"+reconcileHex("b")
+	tokA, topicA, topicB := reconcileHex("a")+"_0", TokenTopicOfTxid(reconcileHex("a")), TokenTopicOfTxid(reconcileHex("b"))
 	holder, issuer := mandalatest.Holder.Identity, mandalatest.Issuer.Identity
 	eng := newKeysetEngine(topicA)
 	st := newMemStore()
@@ -134,7 +134,7 @@ func TestReconcileOutcomes(t *testing.T) {
 	st.putToken(TokenRecord{Txid: reconcileHex("1"), OutputIndex: 0, TokenID: tokA, Amount: amt(40), IdentityKey: holder})
 	// ok: the authority row agrees; its topic is not compared (F/ts-layers §14.7).
 	eng.add(t, reconcileHex("2"), 0, reconcileScript(t, tokA, 0))
-	st.putAuthority(AuthorityRecord{Txid: reconcileHex("2"), OutputIndex: 0, Topic: "tm_" + reconcileHex("f"), TokenID: tokA, IdentityKey: issuer})
+	st.putAuthority(AuthorityRecord{Txid: reconcileHex("2"), OutputIndex: 0, Topic: TokenTopicOfTxid(reconcileHex("f")), TokenID: tokA, IdentityKey: issuer})
 	// repaired (inserted, credited once): the value row is missing, the journal agrees.
 	eng.add(t, reconcileHex("3"), 1, reconcileScript(t, tokA, 25))
 	st.putOwner(OwnerRecord{Txid: reconcileHex("3"), OutputIndex: 1, Topic: topicA, TokenID: tokA, Role: brc162.RoleValue, Amount: amt(25), IdentityKey: holder})
@@ -210,7 +210,7 @@ func TestReconcileTheKYCTopic(t *testing.T) {
 // The engine spent the coin between the listing and the repair: the inserted row is taken back, uncredited.
 func TestReconcileTakesBackARepairTheEngineSpentMeanwhile(t *testing.T) {
 	ctx := context.Background()
-	tokA, topicA := reconcileHex("a")+"_0", "tm_"+reconcileHex("a")
+	tokA, topicA := reconcileHex("a")+"_0", TokenTopicOfTxid(reconcileHex("a"))
 	eng := newKeysetEngine(topicA)
 	st := newMemStore()
 	op := eng.add(t, reconcileHex("1"), 0, reconcileScript(t, tokA, 40))
@@ -231,7 +231,7 @@ func TestReconcileTakesBackARepairTheEngineSpentMeanwhile(t *testing.T) {
 
 func TestReconcilePagingAndProgressGuard(t *testing.T) {
 	ctx := context.Background()
-	tokA, topicA := reconcileHex("a")+"_0", "tm_"+reconcileHex("a")
+	tokA, topicA := reconcileHex("a")+"_0", TokenTopicOfTxid(reconcileHex("a"))
 	agreeing := func(n int) (*keysetEngine, *memStore) {
 		eng, st := newKeysetEngine(topicA), newMemStore()
 		for i := 0; i < n; i++ {
@@ -267,7 +267,7 @@ func TestReconcilePagingAndProgressGuard(t *testing.T) {
 // Every engine or store fault propagates; the caller reruns (repairs are idempotent).
 func TestReconcileFaultsPropagate(t *testing.T) {
 	ctx := context.Background()
-	tokA, topicA := reconcileHex("a")+"_0", "tm_"+reconcileHex("a")
+	tokA, topicA := reconcileHex("a")+"_0", TokenTopicOfTxid(reconcileHex("a"))
 	boom := errors.New("boom")
 	setup := func() (*keysetEngine, *memStore) {
 		eng, st := newKeysetEngine(topicA), newMemStore()
@@ -410,9 +410,9 @@ func (s sweepSpends) AppliedTopics(_ context.Context, txid string) ([]string, er
 // as unspent on that token's own topic, debiting a value row's owner, and leaves every other row alone.
 func TestSweepOwnerIndexTakesThePhantomRowsOfRegisteredTokens(t *testing.T) {
 	ctx := context.Background()
-	tokA, topicA := reconcileHex("a")+"_0", "tm_"+reconcileHex("a")
-	tokB, topicB := reconcileHex("b")+"_0", "tm_"+reconcileHex("b")
-	tokU, topicU := reconcileHex("f")+"_0", "tm_"+reconcileHex("f")
+	tokA, topicA := reconcileHex("a")+"_0", TokenTopicOfTxid(reconcileHex("a"))
+	tokB, topicB := reconcileHex("b")+"_0", TokenTopicOfTxid(reconcileHex("b"))
+	tokU, topicU := reconcileHex("f")+"_0", TokenTopicOfTxid(reconcileHex("f"))
 	holder, issuer := mandalatest.Holder.Identity, mandalatest.Issuer.Identity
 	engA, engB := newKeysetEngine(topicA), newKeysetEngine(topicB)
 	eng := topicEngines{topicA: engA, topicB: engB}
@@ -497,7 +497,7 @@ func TestSweepOwnerIndexTakesThePhantomRowsOfRegisteredTokens(t *testing.T) {
 
 func TestSweepOwnerIndexFaultsAndGuards(t *testing.T) {
 	ctx := context.Background()
-	tokA, topicA := reconcileHex("a")+"_0", "tm_"+reconcileHex("a")
+	tokA, topicA := reconcileHex("a")+"_0", TokenTopicOfTxid(reconcileHex("a"))
 	boom := errors.New("boom")
 	setup := func() (*keysetEngine, *memStore) {
 		eng, st := newKeysetEngine(topicA), newMemStore()
@@ -573,7 +573,7 @@ func TestSweepOwnerIndexFaultsAndGuards(t *testing.T) {
 // dead.
 func TestSweepOwnerIndexKeepsARowWhoseSpendIsUncommittedOnItsTopic(t *testing.T) {
 	ctx := context.Background()
-	tokA, topicA, topicB := reconcileHex("a")+"_0", "tm_"+reconcileHex("a"), "tm_"+reconcileHex("b")
+	tokA, topicA, topicB := reconcileHex("a")+"_0", TokenTopicOfTxid(reconcileHex("a")), TokenTopicOfTxid(reconcileHex("b"))
 	holder, issuer := mandalatest.Holder.Identity, mandalatest.Issuer.Identity
 	eng, st := newKeysetEngine(topicA), newMemStore()
 	pending, committed, elsewhere := reconcileHex("c"), reconcileHex("d"), reconcileHex("e")
@@ -629,8 +629,8 @@ func TestSweepOwnerIndexOnTheRealStores(t *testing.T) {
 	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
 	iss := mandalatest.Issue(t, dep, 0, mandalatest.Issuer, mandalatest.Holder, 100)
 	tr := mandalatest.Transfer(t, iss, 1, mandalatest.Holder, 30)
-	tokenID, topic := dep.Txid+"_0", "tm_"+dep.Txid
-	tokU, topicU := reconcileHex("8")+"_0", "tm_"+reconcileHex("8")
+	tokenID, topic := dep.Txid+"_0", TokenTopicOfTxid(dep.Txid)
+	tokU, topicU := reconcileHex("8")+"_0", TokenTopicOfTxid(reconcileHex("8"))
 
 	// The engine: the deploy spent by the issue, the issue's value coin spent by the transfer.
 	for _, c := range []struct {

@@ -250,7 +250,7 @@ func TestJournalTokenIDsFiltersTokenTopics(t *testing.T) {
 		seamValueJournal(coin, 0, seamTopic("b"), 1),
 		seamValueJournal(coin, 0, seamTopic("a"), 1),
 		seamValueJournal(coin, 0, mandala.KYCTopic, 1),
-		seamValueJournal(coin, 0, "tm_"+strings.Repeat("A", 64), 1),
+		seamValueJournal(coin, 0, "tm_color_"+strings.Repeat("A", 64)+"_0", 1),
 	}
 	if err := store.RecordOwners(ctx, rows); err != nil {
 		t.Fatal(err)

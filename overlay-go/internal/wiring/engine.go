@@ -1,6 +1,6 @@
 // Package wiring assembles the Mandala overlay on BRC-162 with token topics on one overlay: Mongo, the v3 mandala
 // store and verifier, the static registry (tm_mandala / ls_mandala) and KYC (tm_mandala_kyc / ls_mandala_kyc) topics,
-// the TokenTopics registrar that alone creates tm_<id> / ls_<id>, the in-repo engine.Storage (enginestore), the two
+// the TokenTopics registrar that alone creates tm_color_<id> / ls_color_<id>, the in-repo engine.Storage (enginestore), the two
 // maintenance gates and the host seams /submit and /arc-ingest use. The overlay neither syncs with peers nor
 // advertises (token-topics design §14 A1.1).
 package wiring

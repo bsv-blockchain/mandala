@@ -91,9 +91,9 @@ func TestRegistry_StoreFaultAndNilStoreAre500(t *testing.T) {
 func TestRegistryBeef_ServesOnlyTheKYCTopic(t *testing.T) {
 	txid := strings.Repeat("dd", 32)
 	app := newServer(&stubSubmitter{}, &stubLookuper{}, &stubAdminStore{}, nil, WithOutputBeefWhere(stubBeefWhere(map[string][]byte{
-		mandala.KYCTopic + "|" + txid + ".0":     {9, 8},
-		mandala.MandalaTopic + "|" + txid + ".0": {7},
-		"tm_" + txid + "|" + txid + ".1":         {1, 2},
+		mandala.KYCTopic + "|" + txid + ".0":               {9, 8},
+		mandala.MandalaTopic + "|" + txid + ".0":           {7},
+		mandala.TokenTopicOfTxid(txid) + "|" + txid + ".1": {1, 2},
 	})))
 	cases := []struct {
 		path   string

@@ -147,14 +147,14 @@ func TestTokenRegistryLookupRestoresMissingRecords(t *testing.T) {
 		}
 	}
 	if err := st.RecordOwners(ctx, []OwnerRecord{
-		row(lost, "tm_"+lost, brc162.RoleDeploy, issuer),
-		row(lost2, "tm_"+lost2, brc162.RoleDeploy, issuer),
-		row(kept, "tm_"+kept, brc162.RoleDeploy, issuer),
-		row(notDeploy, "tm_"+notDeploy, brc162.RoleAuthority, issuer),
+		row(lost, TokenTopicOfTxid(lost), brc162.RoleDeploy, issuer),
+		row(lost2, TokenTopicOfTxid(lost2), brc162.RoleDeploy, issuer),
+		row(kept, TokenTopicOfTxid(kept), brc162.RoleDeploy, issuer),
+		row(notDeploy, TokenTopicOfTxid(notDeploy), brc162.RoleAuthority, issuer),
 		row(elsewhere, KYCTopic, brc162.RoleDeploy, issuer),
-		row(upperKey, "tm_"+upperKey, brc162.RoleDeploy, strings.ToUpper(issuer)),
-		row(foreign, "tm_"+foreign, brc162.RoleDeploy, issuer),
-		row(journalOnly, "tm_"+journalOnly, brc162.RoleDeploy, issuer),
+		row(upperKey, TokenTopicOfTxid(upperKey), brc162.RoleDeploy, strings.ToUpper(issuer)),
+		row(foreign, TokenTopicOfTxid(foreign), brc162.RoleDeploy, issuer),
+		row(journalOnly, TokenTopicOfTxid(journalOnly), brc162.RoleDeploy, issuer),
 	}); err != nil {
 		t.Fatal(err)
 	}

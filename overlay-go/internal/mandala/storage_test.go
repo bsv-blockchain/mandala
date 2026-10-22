@@ -141,7 +141,7 @@ func stOwner(txid string, vout uint32, topic string, role brc162.Role, amount Am
 func TestRecordOwnersIsFirstWriteWinsAndAppendOnly(t *testing.T) {
 	ctx := context.Background()
 	s, db := newTestStore(t)
-	topicA, topicB := "tm_"+stHex(0xaa), "tm_"+stHex(0xbb)
+	topicA, topicB := TokenTopicOfTxid(stHex(0xaa)), TokenTopicOfTxid(stHex(0xbb))
 	if err := s.RecordOwners(ctx, nil); err != nil {
 		t.Fatal("empty batch:", err)
 	}
@@ -206,7 +206,7 @@ func TestRecordOwnersIsFirstWriteWinsAndAppendOnly(t *testing.T) {
 func TestOwnerJournalByOutpointAndDistinctTopics(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTestStore(t)
-	topicA, topicB := "tm_"+stHex(0xaa), "tm_"+stHex(0xbb)
+	topicA, topicB := TokenTopicOfTxid(stHex(0xaa)), TokenTopicOfTxid(stHex(0xbb))
 	if err := s.RecordOwners(ctx, []OwnerRecord{
 		stOwner(stHex(9), 0, topicB, brc162.RoleValue, amt(3), stKeyB),
 		stOwner(stHex(9), 0, topicA, brc162.RoleValue, amt(3), stKeyA),
@@ -420,7 +420,7 @@ func TestIndexedVoutsByTxidUnionsTokensAndAuthorities(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, v := range []uint32{0, 2} {
-		if _, err := s.StoreAuthorityIfAbsent(ctx, AuthorityRecord{Txid: stHex(1), OutputIndex: v, Topic: "tm_" + stHex(0xaa), TokenID: tok, IdentityKey: stKeyA, CreatedAt: stEpoch}); err != nil {
+		if _, err := s.StoreAuthorityIfAbsent(ctx, AuthorityRecord{Txid: stHex(1), OutputIndex: v, Topic: TokenTopicOfTxid(stHex(0xaa)), TokenID: tok, IdentityKey: stKeyA, CreatedAt: stEpoch}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -439,7 +439,7 @@ func TestAuthorityRowsFirstWriteWinsTakeAndList(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTestStore(t)
 	tok := stHex(0xaa) + "_0"
-	topic := "tm_" + stHex(0xaa)
+	topic := TokenTopicOfTxid(stHex(0xaa))
 	row := func(txid string, vout uint32, topic, key string) AuthorityRecord {
 		return AuthorityRecord{Txid: txid, OutputIndex: vout, Topic: topic, TokenID: tok, IdentityKey: key, CreatedAt: stEpoch}
 	}
@@ -474,7 +474,7 @@ func TestAuthorityRowsFirstWriteWinsTakeAndList(t *testing.T) {
 func TestRepairOwnerRow(t *testing.T) {
 	ctx := context.Background()
 	s, db := newTestStore(t)
-	topic := "tm_" + stHex(0xaa)
+	topic := TokenTopicOfTxid(stHex(0xaa))
 	value := stOwner(stHex(1), 1, topic, brc162.RoleValue, amt(40), stKeyA)
 
 	inserted, err := s.RepairOwnerRow(ctx, value)
@@ -536,7 +536,7 @@ func TestRepairOwnerRow(t *testing.T) {
 func TestConcurrentRepairCreditsOnce(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTestStore(t)
-	j := stOwner(stHex(7), 0, "tm_"+stHex(0xaa), brc162.RoleValue, amt(25), stKeyA)
+	j := stOwner(stHex(7), 0, TokenTopicOfTxid(stHex(0xaa)), brc162.RoleValue, amt(25), stKeyA)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	inserts := 0
@@ -599,7 +599,7 @@ func TestRebuildBalancesHealsTheBalanceIndex(t *testing.T) {
 	ctx := context.Background()
 	s, db := newTestStore(t)
 	tok, other := stHex(0xaa)+"_0", stHex(0xbb)+"_0"
-	topic := "tm_" + stHex(0xaa)
+	topic := TokenTopicOfTxid(stHex(0xaa))
 	keyC := "02" + strings.Repeat("c3", 32)
 	keyD := "03" + strings.Repeat("d4", 32)
 	keyE := "02" + strings.Repeat("e5", 32)
@@ -1122,7 +1122,7 @@ func TestListMethodsReturnEmptyNotNil(t *testing.T) {
 	check("DistinctOwnerTopics", len(b), b == nil, err)
 	c, err := s.FindTokensByTokenID(ctx, tok, 10, 0)
 	check("FindTokensByTokenID", len(c), c == nil, err)
-	d, err := s.ListAuthorities(ctx, "tm_"+stHex(0xaa), tok)
+	d, err := s.ListAuthorities(ctx, TokenTopicOfTxid(stHex(0xaa)), tok)
 	check("ListAuthorities", len(d), d == nil, err)
 	e, err := s.ListLinkage(ctx, 10, nil)
 	check("ListLinkage", len(e), e == nil, err)

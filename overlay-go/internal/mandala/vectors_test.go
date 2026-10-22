@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -232,8 +233,18 @@ func caseNamed(t *testing.T, v rejectVectors, id string) rejectCase {
 // vectorOverrides replaces a case's expectation, each entry with a one-line reason.
 
 // vectorTopic maps a topic named in the vector file to the topic this overlay uses. It applies to
-// case.Topic and to every Topic in state.authorities and state.owners.
-func vectorTopic(topic string) string { return topic }
+// case.Topic and to every Topic in state.authorities and state.owners. The file names a token topic
+// tm_<deploy txid>; this overlay names it tm_color_<deploy txid>_0 (contract §0, design C1). Every
+// other name (tm_mandala, tm_mandala_kyc, malformed names) passes through unchanged. No file reason
+// embeds a token topic name, so the rename needs no override.
+func vectorTopic(topic string) string {
+	if m := legacyVectorTopic.FindStringSubmatch(topic); m != nil {
+		return TokenTopicOfTxid(m[1])
+	}
+	return topic
+}
+
+var legacyVectorTopic = regexp.MustCompile(`^tm_([0-9a-f]{64})$`)
 
 // vectorOverride is a reviewed replacement for one case's file expectation.
 type vectorOverride struct {

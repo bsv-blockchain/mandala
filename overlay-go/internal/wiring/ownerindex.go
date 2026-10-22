@@ -37,7 +37,7 @@ type OwnerIndexDeps struct {
 	TokenIDsWithHistory func(ctx context.Context) ([]string, error)
 	RebuildState        func(ctx context.Context, tokenID string) error
 	Reconcile           func(ctx context.Context, topic string) (mandala.ReconcileResult, error)
-	Topics              func() []string // registered tm_<id> (sorted) + mandala.KYCTopic; never tm_mandala
+	Topics              func() []string // registered tm_color_<id> (sorted) + mandala.KYCTopic; never tm_mandala
 	Logf                func(format string, args ...any)
 	// SweepOwnerIndex takes back the index rows of the registered tokens whose coin is not unspent admitted and
 	// returns how many it took (ruling V-13, mandala.SweepOwnerIndex). Required.

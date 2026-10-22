@@ -183,7 +183,7 @@ func TestE2EFollowAllDeployIssueTransferTwoToken(t *testing.T) {
 	I, H, R := mandalatest.Issuer, mandalatest.Holder, mandalatest.Receiver
 
 	depA := mandalatest.Deploy(t, I, "USD")
-	tmA := "tm_" + depA.Txid
+	tmA := mandala.TokenTopicOfTxid(depA.Txid)
 	steak := e2eAdmit(t, o, depA, mandala.MandalaTopic, tmA)
 	e2eSigma(t, mandala.MandalaTopic, depA.Txid, steak[mandala.MandalaTopic], []uint32{0})
 	e2eSigma(t, tmA, depA.Txid, steak[tmA], []uint32{0})
@@ -206,7 +206,7 @@ func TestE2EFollowAllDeployIssueTransferTwoToken(t *testing.T) {
 	e2eSigma(t, tmA, trA.Txid, steak[tmA], []uint32{0, 1})
 
 	depB := mandalatest.Deploy(t, I, "EUR")
-	tmB := "tm_" + depB.Txid
+	tmB := mandala.TokenTopicOfTxid(depB.Txid)
 	steak = e2eAdmit(t, o, depB, mandala.MandalaTopic, tmB)
 	e2eSigma(t, tmB, depB.Txid, steak[tmB], []uint32{0})
 	issB := mandalatest.Issue(t, depB, 0, I, H, 500)
@@ -287,20 +287,20 @@ func TestE2EAllowlistedOverlayRefusesAnUnlistedToken(t *testing.T) {
 	o := e2eBoot(t, e2eAllowNode, []string{depA.Txid}, true) // the allowlist holds deploy txids, not _0 ids
 	ctx := context.Background()
 
-	e2eAdmit(t, o, depA, mandala.MandalaTopic, "tm_"+depA.Txid)
+	e2eAdmit(t, o, depA, mandala.MandalaTopic, mandala.TokenTopicOfTxid(depA.Txid))
 
-	code, body := e2eSubmit(t, o, depB, mandala.MandalaTopic, "tm_"+depB.Txid)
+	code, body := e2eSubmit(t, o, depB, mandala.MandalaTopic, mandala.TokenTopicOfTxid(depB.Txid))
 	var e struct {
 		Code        string `json:"code"`
 		Description string `json:"description"`
 	}
-	if err := json.Unmarshal(body, &e); code != 400 || err != nil || e.Code != "ERR_SHAPE" || e.Description != "unknown-topic: tm_"+depB.Txid {
+	if err := json.Unmarshal(body, &e); code != 400 || err != nil || e.Code != "ERR_SHAPE" || e.Description != "unknown-topic: "+mandala.TokenTopicOfTxid(depB.Txid) {
 		t.Fatalf("unlisted deploy: %d %s", code, body)
 	}
 	if code, body = e2eGet(t, o, "/admin/admission/"+depB.Txid); code != 404 {
 		t.Fatalf("GET /admin/admission of the refused deploy: %d %s, want 404", code, body)
 	}
-	if o.app.Tokens.Hosted(depB.Txid+"_0") || o.app.Engine.HasTopicManager("tm_"+depB.Txid) {
+	if o.app.Tokens.Hosted(depB.Txid+"_0") || o.app.Engine.HasTopicManager(mandala.TokenTopicOfTxid(depB.Txid)) {
 		t.Fatal("an unlisted token was registered")
 	}
 	if outs, err := o.app.EngineStore.FindOutputsByTxid(ctx, depB.Txid); err != nil || len(outs) != 0 {
@@ -320,10 +320,10 @@ func TestE2ERestartReRegistersFromTheBootUnion(t *testing.T) {
 	I, H, R := mandalatest.Issuer, mandalatest.Holder, mandalatest.Receiver
 	first := e2eBoot(t, e2eNode, nil, false)
 	depA := mandalatest.Deploy(t, I, "USD")
-	e2eAdmit(t, first, depA, mandala.MandalaTopic, "tm_"+depA.Txid)
-	e2eAdmit(t, first, mandalatest.Issue(t, depA, 0, I, H, 1000), "tm_"+depA.Txid)
+	e2eAdmit(t, first, depA, mandala.MandalaTopic, mandala.TokenTopicOfTxid(depA.Txid))
+	e2eAdmit(t, first, mandalatest.Issue(t, depA, 0, I, H, 1000), mandala.TokenTopicOfTxid(depA.Txid))
 	depB := mandalatest.Deploy(t, I, "EUR")
-	tmB := "tm_" + depB.Txid
+	tmB := mandala.TokenTopicOfTxid(depB.Txid)
 	e2eAdmit(t, first, depB, mandala.MandalaTopic, tmB)
 	issB := mandalatest.Issue(t, depB, 0, I, H, 500)
 	e2eAdmit(t, first, issB, tmB)
@@ -356,12 +356,12 @@ func TestE2EEvictTwoTokenTransfer(t *testing.T) {
 	I, H, R := mandalatest.Issuer, mandalatest.Holder, mandalatest.Receiver
 
 	depA := mandalatest.Deploy(t, I, "USD")
-	tmA := "tm_" + depA.Txid
+	tmA := mandala.TokenTopicOfTxid(depA.Txid)
 	e2eAdmit(t, o, depA, mandala.MandalaTopic, tmA)
 	issA := mandalatest.Issue(t, depA, 0, I, H, 1000)
 	e2eAdmit(t, o, issA, tmA)
 	depB := mandalatest.Deploy(t, I, "EUR")
-	tmB := "tm_" + depB.Txid
+	tmB := mandala.TokenTopicOfTxid(depB.Txid)
 	e2eAdmit(t, o, depB, mandala.MandalaTopic, tmB)
 	issB := mandalatest.Issue(t, depB, 0, I, H, 500)
 	e2eAdmit(t, o, issB, tmB)

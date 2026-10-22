@@ -51,7 +51,7 @@ func admitAsHost(t *testing.T, app *App, b *mandalatest.Built, topics ...string)
 	admissions := map[string]mandala.TopicAdmission{}
 	ident := ""
 	for topic, ai := range steak {
-		if ai == nil || !mandala.IsSigmaTopic(topic) || len(ai.OutputsToAdmit) == 0 {
+		if ai == nil || mandala.AdmissionSchemeOf(topic) == mandala.SchemeNone || len(ai.OutputsToAdmit) == 0 {
 			continue
 		}
 		outs := mandala.CanonicalOutputs(ai.OutputsToAdmit)
@@ -380,7 +380,7 @@ func TestEvictStampsNothingWhenTheRestoreFails(t *testing.T) {
 	admitAsHost(t, app, t1, topic)
 
 	// An undecodable journal row (fractional amount) under the spent outpoint breaks the journal read.
-	junkTopic := "tm_" + strings.Repeat("e", 64)
+	junkTopic := mandala.TokenTopicOfTxid(strings.Repeat("e", 64))
 	owners := app.Mongo.Collection(mandala.OwnersCollection)
 	if _, err := owners.InsertOne(ctx, bson.D{
 		{Key: "txid", Value: iss.Txid}, {Key: "outputIndex", Value: int64(1)}, {Key: "topic", Value: junkTopic},

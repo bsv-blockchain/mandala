@@ -45,7 +45,7 @@ func seamHash(t *testing.T, fill byte) *chainhash.Hash {
 	return h
 }
 
-func seamTopic(fill string) string { return "tm_" + strings.Repeat(fill, 64) }
+func seamTopic(fill string) string { return mandala.TokenTopicOfTxid(strings.Repeat(fill, 64)) }
 
 // seamValueJournal is a journal row for a value coin of tm_<fill…> owned by the kit's holder.
 func seamValueJournal(txid string, vout uint32, topic string, amount int64) mandala.OwnerRecord {

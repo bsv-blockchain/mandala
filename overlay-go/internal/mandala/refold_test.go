@@ -208,7 +208,7 @@ func TestPurgeAndRefoldRefoldsBeforeDeleting(t *testing.T) {
 func TestRestoreInputRowCreditsOnce(t *testing.T) {
 	st, _, ctx := refoldStore(t)
 	holder := mandalatest.Holder.Identity
-	j := OwnerRecord{Txid: refoldTx(0x71), OutputIndex: 1, Topic: "tm_" + refoldTx(0x1a), TokenID: refoldTx(0x1a) + "_0",
+	j := OwnerRecord{Txid: refoldTx(0x71), OutputIndex: 1, Topic: TokenTopicOfTxid(refoldTx(0x1a)), TokenID: refoldTx(0x1a) + "_0",
 		Role: "value", Amount: amt(100), IdentityKey: holder, CreatedAt: time.Now().UTC()}
 	for i, want := range []bool{true, false} {
 		inserted, err := RestoreInputRow(ctx, st, j)
@@ -233,7 +233,7 @@ func TestRetireOutputsDebitsOnceAndKeepsKYCRows(t *testing.T) {
 	if err := st.AdjustBalance(ctx, holder, amt(100)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.StoreAuthorityIfAbsent(ctx, AuthorityRecord{Txid: tx, OutputIndex: 0, Topic: "tm_" + tx, TokenID: tok, IdentityKey: issuer, CreatedAt: now}); err != nil {
+	if _, err := st.StoreAuthorityIfAbsent(ctx, AuthorityRecord{Txid: tx, OutputIndex: 0, Topic: TokenTopicOfTxid(tx), TokenID: tok, IdentityKey: issuer, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.StoreMetadata(ctx, MetadataRecord{TokenID: tok, Txid: tx, OutputIndex: 0, Sym: "USD", Dec: 2, Label: "US Dollar"}); err != nil {

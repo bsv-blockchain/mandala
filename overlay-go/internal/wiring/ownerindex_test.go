@@ -431,7 +431,7 @@ func TestOwnerIndexTopicsAreTheRegisteredTokensPlusKYC(t *testing.T) {
 		}
 	}
 	got := ownerIndexTopics(tokens)()
-	if want := []string{"tm_" + a, "tm_" + b, mandala.KYCTopic}; !reflect.DeepEqual(got, want) {
+	if want := []string{mandala.TokenTopicOfTxid(a), mandala.TokenTopicOfTxid(b), mandala.KYCTopic}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("topics = %v, want %v", got, want)
 	}
 	if slices.Contains(got, mandala.MandalaTopic) {
@@ -452,7 +452,7 @@ func TestAppStartReconcilesTheBootUnionThenArmsTheInterval(t *testing.T) {
 	}
 	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
 	iss := mandalatest.Issue(t, dep, 0, mandalatest.Issuer, mandalatest.Holder, 100)
-	tokenID, topic := dep.Txid+"_0", "tm_"+dep.Txid
+	tokenID, topic := dep.Txid+"_0", mandala.TokenTopicOfTxid(dep.Txid)
 	if _, err := app.Store.StoreRegistryRecord(ctx, mandala.TokenRegistryRecord{
 		TokenID: tokenID, DeployTxid: dep.Txid, Sym: "USD", Dec: 2, Label: "US Dollar", Issuer: mandalatest.Issuer.Identity, CreatedAt: time.Now(),
 	}); err != nil {
@@ -684,7 +684,7 @@ func TestAppStartSweepsPhantomRowsAndRebuildsBalances(t *testing.T) {
 	holder := mandalatest.Holder.Identity
 	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
 	iss := mandalatest.Issue(t, dep, 0, mandalatest.Issuer, mandalatest.Holder, 100)
-	tokenID, topic := dep.Txid+"_0", "tm_"+dep.Txid
+	tokenID, topic := dep.Txid+"_0", mandala.TokenTopicOfTxid(dep.Txid)
 	phantom, unhosted := strings.Repeat("9", 64), strings.Repeat("8", 64)
 	if _, err := app.Store.StoreRegistryRecord(ctx, mandala.TokenRegistryRecord{
 		TokenID: tokenID, DeployTxid: dep.Txid, Sym: "USD", Dec: 2, Label: "US Dollar", Issuer: mandalatest.Issuer.Identity, CreatedAt: time.Now(),

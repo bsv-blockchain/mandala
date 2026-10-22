@@ -229,14 +229,14 @@ var (
 // row of an unspent admitted output, the sweep takes back a row whose output is not one. A row can outlive its coin
 // when a repair's insert (or its take-back) faults while a conflicting spend lands; nothing else would ever remove it,
 // and CirculatingSupply and RebuildBalances would count it. For each token in d.TokenIDs (never tm_mandala, never
-// tm_mandala_kyc) it lists the unspent admitted outpoints of the token's own topic tm_<deploy txid>, then takes back,
+// tm_mandala_kyc) it lists the unspent admitted outpoints of the token's own topic tm_color_<assetId>, then takes back,
 // through TakeBackRepair, every value row of the token (ListTokenRowsByTokenID: a plain {tokenId} listing, so a dead
 // row is seen even when its outpoint is in the asset state's evictedOutpoints) and every authority row on that topic
 // (ListAuthorities) whose outpoint is not listed; a value row's owner is debited. Rows of a listed outpoint stay
 // whatever the asset state says (a reissued coin that is still live keeps its row).
 //
-// One kind of unlisted row is not dead (final review §C11): a row whose coin is marked spent on tm_<id> by a
-// transaction that has no engine applied record ON tm_<id> and was never evicted. That spend is not committed on this
+// One kind of unlisted row is not dead (final review §C11): a row whose coin is marked spent on tm_color_<id> by a
+// transaction that has no engine applied record ON tm_color_<id> and was never evicted. That spend is not committed on this
 // topic — the engine marks inputs spent (step 7) before its lookups take their rows, broadcasts and writes the applied
 // record last, so a fault or crash in between leaves exactly this — and the transaction's resubmit, which only the
 // conflicting-spend guard's self rule lets through, still spends the coin through the row. Taking it would turn a

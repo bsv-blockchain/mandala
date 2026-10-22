@@ -19,8 +19,8 @@ import (
 const admTxid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 var (
-	admTopicA = "tm_" + strings.Repeat("a", 64)
-	admTopicB = "tm_" + strings.Repeat("b", 64)
+	admTopicA = TokenTopicOfTxid(strings.Repeat("a", 64))
+	admTopicB = TokenTopicOfTxid(strings.Repeat("b", 64))
 )
 
 func admissionStore(t *testing.T) (*Store, *mongo.Database) {
@@ -28,6 +28,10 @@ func admissionStore(t *testing.T) (*Store, *mongo.Database) {
 	db := testmongo.DB(t, "mandala3_test_admissions")
 	return mustStore(t, db), db
 }
+
+// admLegacyTokenTopic is the pre-1Color token topic spelling the TT A1.2 vectors were verified on. The v3
+// digest hashes its topic argument as given, so the cross-verified bytes stay pinned on that string.
+const admLegacyTokenTopic = "tm_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 // The verified vectors of the Global Constraints (TT A1.2).
 func TestAdmissionDigestV3Vectors(t *testing.T) {
@@ -37,8 +41,8 @@ func TestAdmissionDigestV3Vectors(t *testing.T) {
 		want  string
 	}{
 		{"tm_mandala", []uint32{0}, "2dd76e2fbb8234967159f842f463b58bd0a76efcc49e7c8372bdbc8a9931db5c"},
-		{"tm_" + admTxid, []uint32{0}, "654768162ffd1d0011e33cff4f8e553cf34a159c6006e627f4987f57c2891d0d"},
-		{"tm_" + admTxid, []uint32{1, 0, 1}, "d75c8da798a7347ef623e57cc827c3188c36acd8e84f9b9f69f531d1ebe335b1"},
+		{admLegacyTokenTopic, []uint32{0}, "654768162ffd1d0011e33cff4f8e553cf34a159c6006e627f4987f57c2891d0d"},
+		{admLegacyTokenTopic, []uint32{1, 0, 1}, "d75c8da798a7347ef623e57cc827c3188c36acd8e84f9b9f69f531d1ebe335b1"},
 	} {
 		got, err := AdmissionDigestV3(c.topic, admTxid, c.outs)
 		if err != nil || hex.EncodeToString(got[:]) != c.want {

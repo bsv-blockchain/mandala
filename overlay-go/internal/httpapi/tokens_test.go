@@ -297,7 +297,7 @@ func TestAuthoritiesListsTheTokenTopicSortedByOutpointString(t *testing.T) {
 	for _, r := range []mandala.AuthorityRecord{
 		{Txid: tx1, OutputIndex: 2, Topic: topicA, TokenID: tokA, IdentityKey: tokKey},
 		{Txid: tx1, OutputIndex: 10, Topic: topicA, TokenID: tokA, IdentityKey: tokKey},
-		{Txid: strings.Repeat("0f", 32), OutputIndex: 1, Topic: "tm_" + strings.Repeat("99", 32), TokenID: tokA, IdentityKey: tokKey},
+		{Txid: strings.Repeat("0f", 32), OutputIndex: 1, Topic: mandala.TokenTopicOfTxid(strings.Repeat("99", 32)), TokenID: tokA, IdentityKey: tokKey},
 	} {
 		if _, err := s.StoreAuthorityIfAbsent(ctx, r); err != nil {
 			t.Fatal(err)
@@ -504,7 +504,7 @@ func tokBeefWhere(docs map[string][]tokBeefDoc, fault error) OutputBeefWhereFunc
 func TestAuthoritiesBeefServesOnlyATokenTopicCopy(t *testing.T) {
 	deployTx, regOnly, kycTx := strings.Repeat("aa", 32), strings.Repeat("bb", 32), strings.Repeat("cc", 32)
 	docs := map[string][]tokBeefDoc{
-		deployTx + ".0": {{mandala.MandalaTopic, []byte{1, 2}}, {"tm_" + deployTx, []byte{3, 4}}},
+		deployTx + ".0": {{mandala.MandalaTopic, []byte{1, 2}}, {mandala.TokenTopicOfTxid(deployTx), []byte{3, 4}}},
 		regOnly + ".0":  {{mandala.MandalaTopic, []byte{5}}},
 		kycTx + ".0":    {{mandala.KYCTopic, []byte{6}}},
 	}

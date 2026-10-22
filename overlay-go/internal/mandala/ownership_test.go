@@ -166,7 +166,7 @@ func newRepairFixture(t *testing.T) *repairFixture {
 	d := mt.Deploy(t, mt.Issuer, "USD")
 	is := mt.Issue(t, d, 0, mt.Issuer, mt.Holder, 100)
 	tr := mt.Transfer(t, is, 1, mt.Receiver, 100)
-	f := &repairFixture{topic: "tm_" + d.Txid, tok: d.Txid + "_0", is: is, tr: tr, store: newMemStore()}
+	f := &repairFixture{topic: TokenTopicOfTxid(d.Txid), tok: d.Txid + "_0", is: is, tr: tr, store: newMemStore()}
 	f.inputs = brc162.ClassifyAdmittedInputs(tr.Tx, []uint32{0})
 	if len(f.inputs) != 1 || f.inputs[0].Role != brc162.RoleValue || f.inputs[0].Amount != 100 {
 		t.Fatalf("classified inputs: %+v", f.inputs)
@@ -415,7 +415,7 @@ func TestRepairOfASpentDeployUsesTheScriptRole(t *testing.T) {
 	ctx := context.Background()
 	d := mt.Deploy(t, mt.Issuer, "USD")
 	is := mt.Issue(t, d, 0, mt.Issuer, mt.Holder, 100)
-	topic, tok := "tm_"+d.Txid, d.Txid+"_0"
+	topic, tok := TokenTopicOfTxid(d.Txid), d.Txid+"_0"
 	inputs := brc162.ClassifyAdmittedInputs(is.Tx, []uint32{0})
 	if inputs[0].Role != brc162.RoleAuthority || inputs[0].SourceRole != brc162.RoleDeploy {
 		t.Fatalf("a spent deploy is an authority input with source role deploy: %+v", inputs[0])
@@ -448,7 +448,7 @@ func TestRepairOfASpentDeployUsesTheScriptRole(t *testing.T) {
 // payload push is non-minimal (PUSHDATA1 of one byte) still repairs.
 func TestRepairComparesRawSourceBytes(t *testing.T) {
 	ctx := context.Background()
-	topic := "tm_" + strings.Repeat("ab", 32)
+	topic := TokenTopicOfTxid(strings.Repeat("ab", 32))
 	id, _ := hex.DecodeString(strings.Repeat("ab", 32))
 	raw := append([]byte{0x20}, id...)        // 32-byte id (byte order irrelevant here)
 	raw = append(raw, 0x01, 0x64, 0x6d)       // amount 100, OP_2DROP
@@ -478,7 +478,7 @@ func TestInputLinkageMustControlTheCoinAndNameItsOwner(t *testing.T) {
 	ctx := context.Background()
 	d := mt.Deploy(t, mt.Issuer, "USD")
 	is := mt.Issue(t, d, 0, mt.Issuer, mt.Holder, 100)
-	tok, topic := d.Txid+"_0", "tm_"+d.Txid
+	tok, topic := d.Txid+"_0", TokenTopicOfTxid(d.Txid)
 	tr := mt.Build(t, []mt.In{{Src: is, Vout: 1, WithLinkage: true}}, []mt.Out{{Owner: mt.Receiver, Prover: mt.Holder, TokenID: tok, Amount: 100}}, nil)
 	inputs := brc162.ClassifyAdmittedInputs(tr.Tx, []uint32{0})
 	stored := func(owner string) *memStore {

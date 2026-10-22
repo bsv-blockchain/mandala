@@ -80,10 +80,10 @@ type SubmitVerdict struct {
 }
 
 // Persistable is A1.3: a refusal becomes the transaction's recorded verdict (for this payload) only when a manager
-// typed it with a final code, the refusing topic is tm_mandala or a tm_<id>, and it is not ERR_INPUT_SPENT, which is a
+// typed it with a final code, the refusing topic is tm_mandala or a tm_color_<assetId>, and it is not ERR_INPUT_SPENT, which is a
 // statement about live state that an eviction of the competitor undoes.
 func (s SubmitVerdict) Persistable() bool {
-	return s.Typed && s.Verdict.Final && mandala.IsSigmaTopic(s.Topic) && s.Verdict.Code != CodeInputSpent
+	return s.Typed && s.Verdict.Final && mandala.AdmissionSchemeOf(s.Topic) != mandala.SchemeNone && s.Verdict.Code != CodeInputSpent
 }
 
 // VerdictForSubmitError classifies an engine.Submit error. A typed manager refusal answers its row; an untyped one, or

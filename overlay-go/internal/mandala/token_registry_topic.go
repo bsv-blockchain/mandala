@@ -14,7 +14,7 @@ import (
 
 // TokenRegistryTopicManager is tm_mandala, the token registry (Q2/mandala/MandalaRegistryTopicManager.ts):
 // it admits output 0 of a deploy and nothing else, after running the deploy token's own check as a
-// dry run, so it refuses whatever tm_<txid> refuses.
+// dry run, so it refuses whatever tm_color_<txid>_0 refuses.
 type TokenRegistryTopicManager struct {
 	deps    TokenTopicDeps
 	trusted map[string]bool
@@ -49,7 +49,7 @@ func (m *TokenRegistryTopicManager) IdentifyAdmissibleOutputs(ctx context.Contex
 	hexID := txid.String()
 	// <txid>_0 is the token a deploy at vout 0 creates; without one, its topic sees only what
 	// cannot be scoped to one token, refuses that as every token topic does, and admits nothing.
-	inner := &TokenTopicManager{tokenID: hexID + "_0", topic: "tm_" + hexID, deps: m.deps, trusted: m.trusted, exempt: m.exempt}
+	inner := &TokenTopicManager{tokenID: hexID + "_0", topic: TokenTopicOfTxid(hexID), deps: m.deps, trusted: m.trusted, exempt: m.exempt}
 	if _, err := inner.identify(ctx, beef, txid, previousCoins, false); err != nil {
 		return overlay.AdmittanceInstructions{}, WithTopic(err, MandalaTopic)
 	}

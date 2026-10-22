@@ -6,7 +6,7 @@ Module path: `github.com/sirdeggen/mandala/overlay-go`.
 Status: BRC-162 with Mandala token topics on one overlay (Q3). `cmd/overlay/main.go` is the entrypoint
 (env config, `wiring.Build`, the boot via `App.Start`, graceful shutdown). The pinned `go-overlay-services`
 engine runs three kinds of topic behind a hand-written Fiber HTTP layer that keeps the TS overlay's wire shapes:
-`tm_mandala` (the token registry), one `tm_<deployTxid>` per token, and `tm_mandala_kyc` (the identity registry).
+`tm_mandala` (the token registry), one `tm_color_<deployTxid>_0` per token, and `tm_mandala_kyc` (the identity registry).
 GASP, SHIP/SLAP advertising and cross-operator sync are off (design A1.1); token topics are registered in memory
 by `wiring.TokenTopics` at boot and by the `/submit` deploy hook.
 
@@ -15,12 +15,12 @@ by `wiring.TokenTopics` at boot and by the `/submit` deploy hook.
 | Topic | Lookup | Admits |
 |---|---|---|
 | `tm_mandala` | `ls_mandala` | Deploys only: vout 0 of a deploy by a trusted issuer with a valid deploySig. The registry record is permanent. |
-| `tm_<deployTxid>` | `ls_<deployTxid>` | One token's deploy, authority and value outputs under BRC-162 layers A–D, the owner journal and §4.2a repair. |
+| `tm_color_<deployTxid>_0` | `ls_color_<deployTxid>_0` | One token's deploy, authority and value outputs under BRC-162 layers A–D, the owner journal and §4.2a repair. |
 | `tm_mandala_kyc` | `ls_mandala_kyc` | The identity registry: one authority chain that admits and revokes identities. |
 
-A deploy is one submit naming `["tm_mandala", "tm_<own txid>"]`; any other submit naming `tm_mandala` is refused
-(400 `ERR_SHAPE`). A token transaction names one `tm_<id>` per token it touches; a KYC action names
-`["tm_mandala_kyc"]`. Each `tm_mandala` / `tm_<id>` STEAK entry with admitted outputs carries its own σI
+A deploy is one submit naming `["tm_mandala", "tm_color_<own txid>_0"]`; any other submit naming `tm_mandala` is refused
+(400 `ERR_SHAPE`). A token transaction names one `tm_color_<assetId>` per token it touches; a KYC action names
+`["tm_mandala_kyc"]`. Each `tm_mandala` / `tm_color_<assetId>` STEAK entry with admitted outputs carries its own σI
 (digest v3 binds the topic).
 
 | Route | Access | Notes |
@@ -29,7 +29,7 @@ A deploy is one submit naming `["tm_mandala", "tm_<own txid>"]`; any other submi
 | `POST /lookup` | public | Outputs only. |
 | `GET /admin/tokens?limit&skip` | public | The registry list with a `hosted` flag (`limit` 1–100, `skip` 0–100000). |
 | `GET /admin/authorities/:tokenId`, `/admin/asset-state/:tokenId`, `/admin/admin-history/:tokenId`, `/admin/admin-history-page/:tokenId?limit&offset`, `/admin/admin-summary/:tokenId` | public | 400 `invalid tokenId`; 404 `token not hosted`. |
-| `GET /admin/authorities/beef/:txid?vout=` | public | Served only from a `tm_<id>` copy. |
+| `GET /admin/authorities/beef/:txid?vout=` | public | Served only from a `tm_color_<assetId>` copy. |
 | `GET /admin/registry/beef/:txid?vout=` | public | KYC registry outputs. |
 | `GET /admin/registry`, `/admin/activity?tokenId&limit&before`, `/admin/admission/:txid?payloadHash=` | `ADMIN_API_TOKEN` | Narrowed CORS. |
 | `POST /arc-ingest` | Arcade callback token | Mounted only with Arcade and a non-empty token. |

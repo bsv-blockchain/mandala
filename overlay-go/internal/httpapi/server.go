@@ -129,7 +129,7 @@ func WithAdminCORSOrigins(origins []string) ServerOption {
 }
 
 // WithDeployHook mounts the /submit host rules (steps 2a and 2b): the pairing rule (V-1) and the deploy hook that
-// registers tm_<txid> after tm_mandala's dry run admits vout 0 (V-2). Unset, neither runs (stub tests); New(app)
+// registers tm_color_<txid>_0 after tm_mandala's dry run admits vout 0 (V-2). Unset, neither runs (stub tests); New(app)
 // always sets it.
 func WithDeployHook(reg TokenRegistrar, precheck DeployPrecheck) ServerOption {
 	return func(o *serverOptions) {

@@ -62,8 +62,8 @@ func NewTokenTopics(eng EngineRegistry, allowlistTxids []string, allowlistSet bo
 // Ensure, under the registrar mutex: non-canonical id -> error "not a canonical Mandala token id: <id>";
 // already registered -> true; allowlist set and the txid not in it -> false, nil (factory never called);
 // factory error -> false, fmt.Errorf("token topic %s: %w", tokenID, err);
-// else RegisterLookupService(ls_<hex>) THEN RegisterTopicManager(tm_<hex>) -> true.
-// The lookup goes first so no submit can admit on tm_<hex> before ls_<hex> hears it. A factory that
+// else RegisterLookupService(ls_color_<hex>_0) THEN RegisterTopicManager(tm_color_<hex>_0) -> true.
+// The lookup goes first so no submit can admit on tm_color_<hex>_0 before ls_color_<hex>_0 hears it. A factory that
 // returns a nil manager or lookup is a factory error (nothing is registered).
 func (r *TokenTopics) Ensure(tokenID string) (registered bool, err error) {
 	topic, err := mandala.TokenTopic(tokenID)
