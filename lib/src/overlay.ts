@@ -1,22 +1,31 @@
 import { Beef, Utils, WalletInterface } from '@bsv/sdk'
-import { OVERLAY_URL, OVERLAY_URL_UNSET, OVERLAY_IDENTITY_KEY } from './constants.js'
-import { isSigmaTopic } from './brc162.js'
+import {
+  OVERLAY_URL, OVERLAY_URL_UNSET, OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, REGISTRY_TOPIC, TOPIC
+} from './constants.js'
 import { verifyAdmission } from './admission.js'
+import { type Attestation, attestationFromSteak, verifyAttestation } from './attestation.js'
+import { isColorTopic } from './naming.js'
 import { journalPut, journalRemove } from './txJournal.js'
 
+/**
+ * The verified primary STEAK entry of a submit (contract gap G8: C§8.1 types
+ * the result as the raw STEAK; the lib keeps the verified primary). Every
+ * per-topic entry was verified before this resolves.
+ */
 export interface OverlayAdmitResult {
-  /** The STEAK topic this receipt (and its σI) speaks for — the first token topic submitted. */
+  /** The primary topic: the first `tm_color_*` submitted, else the first topic. */
   topic?: string
   /**
-   * The submitted topic's own admitted output indexes — for a token submission
-   * this is the `tm_mandala` entry's set, which is exactly what σ_I commits to
-   * (admission.ts; FIX A). Never trust an admission for an output that is not
-   * in here.
+   * The primary topic's own admitted output indexes: exactly the set its
+   * attestation (or, on `tm_mandala`, its σI v3) commits to. Never trust an
+   * admission for an output that is not in here.
    */
   outputsToAdmit: number[]
-  /** Overlay ECDSA signature over admissionDigestV3(topic, txid, outputsToAdmit). */
+  /** The primary topic's signature: attested v1 on `tm_color_*`, σI v3 on `tm_mandala`, none on KYC. */
   admissionSignature?: string
   admissionIdentityKey?: string
+  /** The verified BRC-207 attestation; set iff the primary topic is a color topic (C§3). */
+  attestation?: Attestation
 }
 
 /**
@@ -25,7 +34,7 @@ export interface OverlayAdmitResult {
  * without the set it signed over and the key that signed it.
  */
 export interface AdmissionReceipt {
-  /** Topic the σI was taken for (`tm_<deployTxid>`). */
+  /** Topic the signature was taken for (`tm_color_<assetId>` or `tm_mandala`). */
   topic?: string
   admissionSignature?: string
   admissionIdentityKey?: string
@@ -103,6 +112,31 @@ function isTransientStatus (httpStatus: number | undefined): boolean {
 }
 
 /**
+ * Codes that never prove the overlay applied nothing: ERR_UNAVAILABLE covers
+ * storage and broadcast faults that may follow a fold, and the two client-side
+ * codes are raised on a 200 STEAK that ADMITTED outputs (the overlay folded and
+ * broadcast the tx; only its signature is missing or unverifiable).
+ */
+const AMBIGUOUS_CODES = new Set(['ERR_UNAVAILABLE', 'ERR_NO_ADMISSION', 'ERR_BAD_ADMISSION'])
+
+/**
+ * What a refusal proves about the overlay's state:
+ * - `'refused'`: a typed `{status:'error', code}` verdict with a 4xx status.
+ *   Only the topic manager's own reject produces one (wire contract), so the
+ *   overlay folded nothing and broadcast nothing.
+ * - `'unknown'`: everything else. A transport fault (the request may have
+ *   arrived), a 5xx, an untyped body, an unparseable 200, or a 200 that
+ *   admitted outputs without a verifying signature. The overlay MAY have
+ *   applied (and broadcast) these bytes, so the action must never be aborted
+ *   on it and nobody may be told "nothing was committed".
+ */
+export type OverlayRefusalOutcome = 'refused' | 'unknown'
+
+function refusalOutcome (code: string, httpStatus: number | undefined): OverlayRefusalOutcome {
+  return httpStatus != null && httpStatus >= 400 && httpStatus < 500 && !AMBIGUOUS_CODES.has(code) ? 'refused' : 'unknown'
+}
+
+/**
  * A structured refusal from `POST /submit` (wire contract §2).
  *
  * `retryable` is the only field callers should branch on for liveness: a
@@ -119,15 +153,30 @@ export class OverlayRefusedError extends Error {
   readonly spendTxid?: string
   /** 0 when the request never produced a response (network fault). */
   readonly httpStatus: number
+  /**
+   * Whether this refusal PROVES the overlay applied nothing (`'refused'`) or
+   * leaves it open (`'unknown'`); see `OverlayRefusalOutcome`. Branch on this,
+   * not on `retryable`, before releasing an action or telling a user that
+   * nothing happened.
+   */
+  readonly outcome: OverlayRefusalOutcome
 
-  constructor (p: { code: string, description?: string, retryable?: boolean, spendTxid?: string, httpStatus?: number }) {
+  constructor (p: { code: string, description?: string, retryable?: boolean, spendTxid?: string, httpStatus?: number, outcome?: OverlayRefusalOutcome }) {
     super(p.description != null && p.description !== '' ? `overlay refused (${p.code}): ${p.description}` : `overlay refused (${p.code})`)
     this.name = 'OverlayRefusedError'
     this.code = p.code
     this.retryable = (RETRYABLE_BY_CODE[p.code] ?? p.retryable === true) || isTransientStatus(p.httpStatus)
     this.spendTxid = p.spendTxid
     this.httpStatus = p.httpStatus ?? 0
+    // An explicit 'unknown' always wins; 'refused' must also satisfy the rule.
+    const derived = refusalOutcome(p.code, this.httpStatus)
+    this.outcome = p.outcome === 'unknown' ? 'unknown' : derived
   }
+}
+
+/** True when `e` is a refusal that leaves open whether the overlay applied the bytes. */
+export function isOutcomeUnknown (e: unknown): boolean {
+  return e instanceof OverlayRefusedError && e.outcome === 'unknown'
 }
 
 /**
@@ -157,7 +206,9 @@ export function overlayErrorFromResponse (httpStatus: number, body: string | nul
     code: 'ERR_UNAVAILABLE',
     description: `overlay returned ${httpStatus} with no structured error body`,
     retryable: true,
-    httpStatus
+    httpStatus,
+    // No typed verdict: a proxy, a crash mid-request, anything. Not proof.
+    outcome: 'unknown'
   })
 }
 
@@ -177,7 +228,7 @@ function asRefusal (e: unknown): OverlayRefusedError {
 // ---------------------------------------------------------------------------
 
 interface OverlayBroadcastFacilitator {
-  send: (url: string, taggedBEEF: { beef: number[], topics: string[], offChainValues?: number[] }) => Promise<Record<string, OverlayAdmitResult>>
+  send: (url: string, taggedBEEF: { beef: number[], topics: string[], offChainValues?: number[] }) => Promise<Record<string, any>>
 }
 
 /** The slice of `Response` the facilitator needs (keeps it mockable + RN-safe). */
@@ -206,7 +257,9 @@ export function createOverlayFacilitator (fetchImpl?: OverlayFetch): OverlayBroa
         'X-Topics': JSON.stringify(taggedBEEF.topics)
       }
       let body: Uint8Array
-      if (Array.isArray(taggedBEEF.offChainValues)) {
+      // C§6: the header and the varint framing iff there ARE off-chain values;
+      // an empty list is the bare BEEF, exactly as the overlay reads it.
+      if (Array.isArray(taggedBEEF.offChainValues) && taggedBEEF.offChainValues.length > 0) {
         headers['x-includes-off-chain-values'] = 'true'
         const w = new Utils.Writer()
         w.writeVarIntNum(taggedBEEF.beef.length)
@@ -243,18 +296,50 @@ export function createOverlayFacilitator (fetchImpl?: OverlayFetch): OverlayBroa
   }
 }
 
+/** The topic families a Mandala submit may name (C§0); anything else is refused before sending. */
+function isSubmitTopic (t: unknown): t is string {
+  return typeof t === 'string' && (isColorTopic(t) || t === TOPIC || t === REGISTRY_TOPIC)
+}
+
+/**
+ * POST the BEEF to the overlay and verify every per-topic STEAK entry before
+ * resolving (C§3, C§6).
+ *
+ * Fails closed (S5): with no effective signer (`expectedSigner`, default the
+ * configured overlay identity key) it throws `OVERLAY_IDENTITY_KEY_UNSET`
+ * before `facilitator.send`, so nothing is sent that could not be verified.
+ * Topics are exactly `tm_color_<assetId>`, `tm_mandala` and `tm_mandala_kyc`;
+ * a legacy `tm_<txid>` or any other name is a `TypeError` before sending.
+ *
+ * Per topic:
+ * - `tm_color_<assetId>`: must admit ≥ 1 output and carry the attested v1
+ *   statement by exactly the expected signer (missing ⇒ `ERR_NO_ADMISSION`,
+ *   anything unverifiable ⇒ `ERR_BAD_ADMISSION`, both retryable);
+ * - `tm_mandala`: must admit ≥ 1 output and carry σI v3 by the bare key;
+ * - `tm_mandala_kyc`: unsigned; must admit only when it is the sole topic.
+ */
 export async function submitToOverlay (
   beef: number[],
   offChainValues?: number[],
   facilitator: OverlayBroadcastFacilitator = createOverlayFacilitator(),
-  /** Required: `[tokenTopic(assetId)]`, `deployTopics(txid)` or `[REGISTRY_TOPIC]`. */
-  topics: string[] = []
+  /** Required: `[colorTopic(assetId)]`, `[TOPIC, colorTopic(`${txid}_0`)]` or `[REGISTRY_TOPIC]`. */
+  topics: string[] = [],
+  /** The overlay key every signature must verify under; default the configured OVERLAY_IDENTITY_KEY. */
+  expectedSigner?: string
 ): Promise<OverlayAdmitResult> {
-  if (!Array.isArray(topics) || topics.length === 0) throw new Error('submitToOverlay: topics are required (tokenTopic(assetId))')
+  if (!Array.isArray(topics) || topics.length === 0) throw new Error('submitToOverlay: topics are required (colorTopic(assetId))')
+  for (const t of topics) {
+    if (!isSubmitTopic(t)) {
+      throw new TypeError(`submitToOverlay: refusing topic ${JSON.stringify(t)} (expected tm_color_<assetId>, ${TOPIC} or ${REGISTRY_TOPIC})`)
+    }
+  }
   // Fail loudly: without configureMandala this would POST to a relative /submit.
   if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
+  // S5: an answer that cannot be verified is never asked for.
+  const signer = expectedSigner ?? OVERLAY_IDENTITY_KEY
+  if (typeof signer !== 'string' || signer === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
   const taggedBEEF = { beef, topics, offChainValues }
-  let steak: Record<string, OverlayAdmitResult>
+  let steak: Record<string, any>
   try {
     steak = await facilitator.send(OVERLAY_URL, taggedBEEF)
   } catch (e) {
@@ -262,88 +347,103 @@ export async function submitToOverlay (
     // so a retryable fault is never mistaken for a permanent refusal (FIX D).
     throw asRefusal(e)
   }
-  // Every submitted σI topic must admit: a multi-token tx that one token
-  // topic refused is not admitted (the overlay applies per topic). A
-  // non-σI topic (tm_mandala_kyc) only needs to admit when it is the sole
-  // topic. The primary receipt is the first token topic (tm_<64 hex>), else
-  // the first topic.
+  if (steak == null || typeof steak !== 'object') steak = {}
+  const entryOf = (t: string): any => Object.prototype.hasOwnProperty.call(steak, t) ? steak[t] : undefined
+  const admittedOf = (t: string): number[] => {
+    const o = entryOf(t)?.outputsToAdmit
+    return Array.isArray(o) ? o : []
+  }
+  // Every signed topic must admit: a tx that one topic refused is not
+  // admitted (the overlay applies per topic). KYC only needs to admit when it
+  // is the sole topic.
   for (const t of topics) {
-    if ((isSigmaTopic(t) || topics.length === 1) && (steak[t]?.outputsToAdmit?.length ?? 0) === 0) {
+    if ((t !== REGISTRY_TOPIC || topics.length === 1) && admittedOf(t).length === 0) {
       throw new Error(`overlay rejected the transaction on ${t}`)
     }
   }
-  const primary = topics.find(t => /^tm_[0-9a-f]{64}$/.test(t)) ?? topics[0]
-  const entry = steak[primary]
-  const result: OverlayAdmitResult = {
-    topic: primary,
-    outputsToAdmit: entry.outputsToAdmit,
-    admissionSignature: entry.admissionSignature,
-    admissionIdentityKey: entry.admissionIdentityKey
-  }
-  // σI v3 is per topic and only on tm_mandala / tm_<id> (never tm_mandala_kyc,
-  // whose chain is authenticated by spending its live head). Verify EVERY
-  // signed topic, not only the primary.
+  // Verify EVERY signed topic, not only the primary. The txid is read from the
+  // submitted bytes, never from the answer, and only when a signature needs it.
+  let txid: string | undefined
+  const attestations = new Map<string, Attestation>()
   for (const t of topics) {
-    if (!isSigmaTopic(t) || steak[t] == null) continue
-    const e = steak[t]
-    requireVerifiedAdmission(beef, t, {
-      outputsToAdmit: e.outputsToAdmit,
-      admissionSignature: e.admissionSignature,
-      admissionIdentityKey: e.admissionIdentityKey
-    })
+    if (t === REGISTRY_TOPIC) continue
+    txid ??= submittedTxid(beef)
+    const a = requireVerifiedAdmission(txid, t, entryOf(t), steak, signer)
+    if (a != null) attestations.set(t, a)
   }
-  return result
+  const primary = topics.find(t => isColorTopic(t)) ?? topics[0]
+  const entry = entryOf(primary) ?? {}
+  const attestation = attestations.get(primary)
+  return {
+    topic: primary,
+    outputsToAdmit: admittedOf(primary),
+    ...(typeof entry.admissionSignature === 'string' ? { admissionSignature: entry.admissionSignature } : {}),
+    ...(typeof entry.admissionIdentityKey === 'string' ? { admissionIdentityKey: entry.admissionIdentityKey } : {}),
+    ...(attestation != null ? { attestation } : {})
+  }
 }
 
-let warnedUnverifiable = false
-
-/**
- * An admitted set is not an admission. Only the overlay operator's σ_I over
- * (txid, outputsToAdmit), verifying under the CONFIGURED overlay identity key,
- * proves the operator folded this transaction into its state — an answer
- * without one could come from a misconfigured node, a stale deployment or a
- * man in the middle, and a wallet that broadcast on it would put an
- * unadmitted transaction on chain (2026-09-15 review). So an unsigned or
- * unverifiable "admitted" answer is a retryable refusal, never a success.
- *
- * With no identity key configured the answer cannot be checked at all; the
- * host is warned once, and the call behaves as before. Every production host
- * configures the key (`configureMandala({ overlayIdentityKey })`).
- */
-function requireVerifiedAdmission (beef: number[], topic: string, r: OverlayAdmitResult): void {
-  if (OVERLAY_IDENTITY_KEY === '') {
-    if (!warnedUnverifiable) {
-      warnedUnverifiable = true
-      console.warn('[mandala] overlayIdentityKey is not configured: admission signatures cannot be verified')
-    }
-    return
-  }
-  const sig = r.admissionSignature
-  const signer = r.admissionIdentityKey
-  if (sig == null || sig === '' || signer == null || signer === '') {
-    throw new OverlayRefusedError({
-      code: 'ERR_NO_ADMISSION',
-      description: 'the overlay admitted outputs but returned no admission signature',
-      httpStatus: 200
-    })
-  }
-  let txid: string
+/** The submitted transaction's id (AtomicBEEF subject, else the last tx). */
+function submittedTxid (beef: number[]): string {
   try {
     const parsed = Beef.fromBinary(beef)
-    txid = parsed.atomicTxid ?? parsed.txs[parsed.txs.length - 1].txid
+    const txid = parsed.atomicTxid ?? parsed.txs[parsed.txs.length - 1].txid
+    if (typeof txid !== 'string' || !/^[0-9a-f]{64}$/.test(txid)) throw new Error('no txid')
+    return txid
   } catch {
     throw new OverlayRefusedError({ code: 'ERR_BAD_ADMISSION', description: 'could not read the submitted txid', httpStatus: 200 })
   }
-  const ok =
-    signer.toLowerCase() === OVERLAY_IDENTITY_KEY.toLowerCase() &&
-    verifyAdmission({ topic, txid, outputsToAdmit: r.outputsToAdmit, signature: sig, signerKey: signer })
-  if (!ok) {
+}
+
+/**
+ * An admitted set is not an admission. Only the overlay operator's signature
+ * over (topic, txid, outputsToAdmit), verifying under the expected overlay
+ * identity key, proves the operator folded this transaction into its state:
+ * an answer without one could come from a misconfigured node, a stale
+ * deployment or a man in the middle, and a wallet that broadcast on it would
+ * put an unadmitted transaction on chain (2026-09-15 review). So an unsigned
+ * or unverifiable "admitted" answer is a retryable refusal, never a success.
+ *
+ * The scheme is fixed by the topic and never falls back (C§3): attested v1
+ * (BRC-42 child, exact lowercase signer, canonical outputs) on
+ * `tm_color_<assetId>`, σI v3 (bare key) on `tm_mandala`. Returns the
+ * verified attestation for a color topic.
+ */
+function requireVerifiedAdmission (
+  txid: string,
+  topic: string,
+  entry: any,
+  steak: Record<string, any>,
+  expectedSigner: string
+): Attestation | undefined {
+  const sig = entry?.admissionSignature
+  const signer = entry?.admissionIdentityKey
+  if (typeof sig !== 'string' || sig === '' || typeof signer !== 'string' || signer === '') {
     throw new OverlayRefusedError({
-      code: 'ERR_BAD_ADMISSION',
-      description: 'the admission signature does not verify under the configured overlay identity key',
+      code: 'ERR_NO_ADMISSION',
+      description: `the overlay admitted outputs on ${topic} but returned no admission signature`,
       httpStatus: 200
     })
   }
+  const bad = (): OverlayRefusedError => new OverlayRefusedError({
+    code: 'ERR_BAD_ADMISSION',
+    description: `the admission signature on ${topic} does not verify under the expected overlay identity key`,
+    httpStatus: 200
+  })
+  if (isColorTopic(topic)) {
+    const assetId = topic.slice('tm_color_'.length)
+    // Configuration may spell the key in any case; the wire signer must be
+    // exactly lowercase (verifyAttestation compares exactly).
+    const a = attestationFromSteak(txid, assetId, steak)
+    if (a == null || !verifyAttestation(a, assetId, expectedSigner.toLowerCase())) throw bad()
+    return a
+  }
+  // tm_mandala: σI v3 by the bare overlay key.
+  const ok =
+    signer.toLowerCase() === expectedSigner.toLowerCase() &&
+    verifyAdmission({ topic, txid, outputsToAdmit: entry.outputsToAdmit, signature: sig, signerKey: signer })
+  if (!ok) throw bad()
+  return undefined
 }
 
 /**
@@ -395,6 +495,14 @@ export function isAlreadyBroadcast (e: unknown): boolean {
   return /already|known|duplicate|mempool|txn-already/i.test(String(e))
 }
 
+export interface SubmitAndBroadcastOptions {
+  /**
+   * Default true: a retryable refusal keeps the noSend action and journals
+   * 'retryable' for reconcile. False: abort like a final refusal (see below).
+   */
+  holdRetryable?: boolean
+}
+
 /**
  * Overlay-gated finalize. The transaction must already be created + signed with
  * `noSend` (built, not broadcast). Submit it to the overlay FIRST; only when the
@@ -408,8 +516,10 @@ export function isAlreadyBroadcast (e: unknown): boolean {
  * protection — a failure keeps the 'accepted' entry and reconcileWallet
  * retries it; it must never be aborted (that would desync wallet from overlay).
  *
- * **Nothing is ever broadcast after an `OverlayRefusedError`** — retryable or
- * not, a refusal means the overlay has not folded these bytes into its state.
+ * **Nothing is ever broadcast by the wallet after an `OverlayRefusedError`**
+ * — the lib only broadcasts on a verified admission. A refusal with outcome
+ * `'refused'` means the overlay has not folded these bytes; one with outcome
+ * `'unknown'` means it may have, which is why it is never aborted either.
  *
  * **A RETRYABLE refusal does not abort the action.** Pause, freeze, screening,
  * membership and plain unavailability all lift; the same transaction may be
@@ -418,6 +528,27 @@ export function isAlreadyBroadcast (e: unknown): boolean {
  * error is rethrown with `retryable: true` so the caller can back off and
  * retry, and the action stays alive for it. Only a FINAL verdict (or any
  * non-refusal failure, e.g. an unconfigured overlay URL) aborts.
+ *
+ * **An UNKNOWN outcome is always held** (`OverlayRefusedError.outcome`): a
+ * transport fault after the send, a 5xx, an untyped or unparseable body, or a
+ * 200 that admitted outputs without a verifying signature (ERR_NO_ADMISSION /
+ * ERR_BAD_ADMISSION — the overlay folded and broadcast the tx). The overlay
+ * may have applied these bytes, so the action is never aborted: a
+ * `'retryable'` entry with the exact bytes is journaled, and reconcile's
+ * idempotent re-POST settles it ('accepted' + broadcast, or abort on a
+ * final verdict).
+ *
+ * **`holdRetryable: false`** (receipt-bearing txs: issuer payouts, reissues)
+ * turns the hold off for refusals that PROVE nothing was applied (a typed 4xx
+ * verdict such as ERR_PAUSED / ERR_FROZEN): they take the final path (abort,
+ * `'abort'` journal entry if the abort fails) and NO `'retryable'` entry is
+ * written. Holding one would let reconcile admit the tx later while the
+ * operator, told "retry later", re-runs the payout and pays twice. The error
+ * keeps its code and `retryable: true` (the condition still lifts) and its
+ * message says nothing was committed, so re-running the whole operation is
+ * the retry. An unknown outcome is still held (see above) and its message
+ * says the outcome is unknown and NOT to re-run; the caller must keep its
+ * receipt intent (R6) so the receipt can be completed if the tx lands.
  *
  * `reference` is the `createAction` signableTransaction.reference; pass it for
  * signable actions so a rejected tx's inputs are released. Genesis/register
@@ -431,16 +562,30 @@ export async function submitAndBroadcast (
   reference?: string,
   facilitator?: OverlayBroadcastFacilitator,
   /** Required (see submitToOverlay). */
-  topics: string[] = []
+  topics: string[] = [],
+  options: SubmitAndBroadcastOptions = {}
 ): Promise<OverlayAdmitResult> {
   let admitted: OverlayAdmitResult
   try {
     admitted = await submitToOverlay(signed.tx, offChainValues, facilitator, topics)
   } catch (e) {
     // Retryable: keep the inputs held so the identical tx can be re-submitted
-    // once the overlay's condition lifts.
+    // once the overlay's condition lifts — unless the caller opted out.
+    // Unknown outcome: ALWAYS keep them held. The overlay may already have
+    // folded (and broadcast) these bytes; aborting would desync the wallet
+    // from the chain, and only a reconcile pass can tell which it was.
     const retryable = e instanceof OverlayRefusedError && e.retryable
-    if (retryable) {
+    const unknown = isOutcomeUnknown(e)
+    const hold = unknown || (retryable && options.holdRetryable !== false)
+    if (options.holdRetryable === false && e instanceof OverlayRefusedError) {
+      e.message += unknown
+        ? ': outcome unknown — the overlay may have applied this transaction, so its action is held (not aborted) ' +
+          'and reconcileWallet settles it; do NOT re-run the operation'
+        : retryable
+          ? ': the inputs were released and nothing was committed; re-run the operation once the condition lifts'
+          : ''
+    }
+    if (hold) {
       // §9.11. A live noSend action with NO durable record was the hole: the
       // caller is told "retry later", and if it never does (crash, tab closed,
       // user walks away) the inputs stay held by an action nothing remembers,
@@ -464,7 +609,8 @@ export async function submitAndBroadcast (
         }
       })
     } else if (reference != null) {
-      // Final refusal — release the held inputs.
+      // A refusal that proves nothing was applied (or a failure before the
+      // send) — release the held inputs.
       try {
         await wallet.abortAction({ reference })
       } catch {

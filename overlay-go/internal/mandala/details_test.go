@@ -209,6 +209,19 @@ func TestParseDeployMetadata(t *testing.T) {
 		}
 		requireReject(t, err, CodeShape, reason(c.detail))
 	}
+	// the 1Color rules are RequireDeployShape's (run after deploySig and trust), never the parser's
+	shaped := ok(brc162.CborMap{"sym": "A", "dec": uint64(0), "label": "B", "req": "x", "ext": nil, "icon": "x"})
+	requireReject(t, RequireDeployShape(shaped, false, ""), CodeShape, reason("req must be a map"))
+	shaped = ok(brc162.CborMap{"sym": "A", "dec": uint64(0), "label": "B", "ext": nil, "icon": "x"})
+	requireReject(t, RequireDeployShape(shaped, false, ""), CodeShape, reason("ext is not allowed on a Mandala deploy"))
+	shaped = ok(brc162.CborMap{"sym": "A", "dec": uint64(0), "label": "B", "icon": "x"})
+	requireReject(t, RequireDeployShape(shaped, false, ""), CodeShape, reason("icon must be [mediaType, bytes]"))
+	if shaped.Icon != nil {
+		t.Fatal("a malformed icon is never exposed")
+	}
+	if err := RequireDeployShape(ok(brc162.CborMap{"sym": "A", "dec": uint64(0), "label": "B"}), false, ""); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCommitmentOf(t *testing.T) {
@@ -233,5 +246,84 @@ func TestCommitmentOf(t *testing.T) {
 		if ok {
 			t.Fatalf("%s: committed", name)
 		}
+	}
+}
+
+// deployPayloadOfSize is a valid deploy map {sym, dec, label} padded with the ignored key "zz" so
+// that its strict-CBOR encoding is exactly n bytes.
+func deployPayloadOfSize(t *testing.T, n int) []byte {
+	t.Helper()
+	pad := n
+	for range 8 {
+		b, err := brc162.EncodeStrictCbor(brc162.CborMap{"sym": "A", "dec": uint64(2), "label": "B", "zz": strings.Repeat("x", pad)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(b) == n {
+			return b
+		}
+		pad += n - len(b)
+	}
+	t.Fatalf("no padding gives %d bytes", n)
+	return nil
+}
+
+// nestedDetails is {kind: "pause", zz: [[...[1]...]]}: depth = 1 (the map) + depth arrays.
+func nestedDetails(depth int) []byte {
+	var v any = uint64(1)
+	for range depth - 1 {
+		v = []any{v}
+	}
+	return mt.Details(brc162.CborMap{"kind": "pause", "zz": v})
+}
+
+// TestMandalaCborSizePolicy: the codec has no size cap and a 1024 depth bound; Mandala policy reads
+// a deploy payload of at most 65536 bytes, admin details and authority payloads of at most 4096,
+// each at depth at most 64 (contract §4.1, D14).
+func TestMandalaCborSizePolicy(t *testing.T) {
+	over := mt.Details(brc162.CborMap{"kind": "pause", "reason": strings.Repeat("x", 4090)})
+	if len(over) <= MaxAdminDetailsBytes {
+		t.Fatalf("fixture is %d bytes", len(over))
+	}
+	_, _, err := DecodeAdminDetails(hex.EncodeToString(over), AdminKinds, 1)
+	requireReject(t, err, "ERR_SHAPE", "output 1: admin details violate the schema (input exceeds 4096 bytes)")
+	at := mt.Details(brc162.CborMap{"kind": "pause", "reason": strings.Repeat("x", 4096-len(over)+4090)})
+	if len(at) != MaxAdminDetailsBytes {
+		t.Fatalf("boundary fixture is %d bytes", len(at))
+	}
+	if _, _, err := DecodeAdminDetails(hex.EncodeToString(at), AdminKinds, 1); err != nil {
+		t.Fatalf("4096-byte details: %v", err)
+	}
+
+	_, err = ParseDeployMetadata(deployPayloadOfSize(t, MaxDeployPayloadBytes+1), true, true)
+	requireReject(t, err, "ERR_SHAPE", "output 0: deploy payload is not a valid Mandala deploy map (input exceeds 65536 bytes)")
+	if _, err := ParseDeployMetadata(deployPayloadOfSize(t, MaxDeployPayloadBytes), true, true); err != nil {
+		t.Fatalf("65536-byte deploy payload: %v", err)
+	}
+	// The payload-push checks still run first.
+	_, err = ParseDeployMetadata(deployPayloadOfSize(t, MaxDeployPayloadBytes+1), true, false)
+	requireReject(t, err, "ERR_SHAPE", "output 0: deploy payload is not a valid Mandala deploy map (non-canonical payload push)")
+
+	// Depth 64 is policy, not the codec bound.
+	_, _, err = DecodeAdminDetails(hex.EncodeToString(nestedDetails(65)), AdminKinds, 2)
+	requireReject(t, err, "ERR_SHAPE", "output 2: admin details violate the schema (nesting deeper than 64)")
+	_, _, err = DecodeAdminDetails(hex.EncodeToString(nestedDetails(64)), AdminKinds, 2)
+	requireReject(t, err, "ERR_SHAPE", "output 2: admin details violate the schema (unknown key zz)")
+
+	// An authority payload follows the details limits: over the limit or too deep is no commitment.
+	var c [32]byte
+	adm := func(extra any) []byte { return mt.Details(brc162.CborMap{"adm": c[:], "zz": extra}) }
+	if _, ok := CommitmentOf(adm(strings.Repeat("x", 4000)), true, true); !ok {
+		t.Fatal("a 4 KB authority payload carries its commitment")
+	}
+	if _, ok := CommitmentOf(adm(strings.Repeat("x", 4096)), true, true); ok {
+		t.Fatal("an authority payload over 4096 bytes carries no commitment")
+	}
+	var deep any = uint64(1)
+	for range 64 {
+		deep = []any{deep}
+	}
+	if _, ok := CommitmentOf(adm(deep), true, true); ok {
+		t.Fatal("an authority payload deeper than 64 carries no commitment")
 	}
 }

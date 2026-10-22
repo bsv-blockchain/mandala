@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { ArrowLeft, Send, Download, Clock } from 'lucide-react'
 import { Button } from '../ui/button'
-import { formatCurrency } from '@bsv/mandala/amount'
+import { formatCurrency } from '../../lib/mandala/amountDisplay'
 import { useHolderData } from '../../hooks/useHolderData'
 import AlertBanners from './AlertBanners'
 import ReceivePanel from './ReceivePanel'
@@ -13,7 +13,8 @@ type Tab = 'send' | 'receive' | 'history'
 
 interface Props {
   assetId: string
-  balance: number
+  /** Exact units, as selected from the holder view. */
+  balance: bigint
   decimals?: number
   ticker?: string
   label?: string
@@ -27,6 +28,11 @@ export default function AssetAccount({ assetId, balance, decimals: decimalsProp 
   const meta = data?.metas[assetId]
   const decimals = meta?.decimals ?? decimalsProp
   const ticker = meta?.ticker ?? tickerProp
+  // The live holder row wins over the balance captured at selection time, so a
+  // refetch after a send or receive never leaves a stale header. A row whose
+  // balance view failed shows "—" rather than the old figure.
+  const row = data?.assets.find(a => a.assetId === assetId)
+  const current = row != null ? row.balance : balance
 
   return (
     <div className="space-y-4">
@@ -40,7 +46,7 @@ export default function AssetAccount({ assetId, balance, decimals: decimalsProp 
             {label ?? `${assetId.slice(0, 10)}…`}
           </h2>
           <p className="tabular text-[13px] text-muted-foreground">
-            {formatCurrency(balance, decimals, ticker)}
+            {current === null ? '— · Balance unavailable' : formatCurrency(current, decimals, ticker)}
           </p>
         </div>
       </div>

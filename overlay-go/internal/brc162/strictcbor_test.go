@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"math"
+	"math/big"
 	"reflect"
+	"runtime"
 	"testing"
 )
 
@@ -70,6 +72,8 @@ func TestVectorCommitments(t *testing.T) {
 }
 
 func TestEncodeStrictCborTable(t *testing.T) {
+	minus2p64, _ := new(big.Int).SetString("-18446744073709551616", 10)
+	deep := CborMap{"a": CborMap{"b": CborMap{"c": CborMap{"d": CborMap{"e": uint64(1)}}}}}
 	for _, c := range []struct {
 		name string
 		m    CborMap
@@ -88,11 +92,21 @@ func TestEncodeStrictCborTable(t *testing.T) {
 		{"2^64-1", CborMap{"a": uint64(math.MaxUint64)}, "a161611bffffffffffffffff"},
 		{"MAX_SAFE_INTEGER as int64", CborMap{"a": int64(9007199254740991)}, "a161611b001fffffffffffff"},
 		{"int and uint32", CborMap{"a": 1, "b": uint32(2)}, "a2616101616202"},
+		{"negative int", CborMap{"a": -1}, "a1616120"},
+		{"negative int64 -256", CborMap{"a": int64(-256)}, "a1616138ff"},
+		{"min int64", CborMap{"a": int64(math.MinInt64)}, "a161613b7fffffffffffffff"},
+		{"big -1", CborMap{"a": big.NewInt(-1)}, "a1616120"},
+		{"big -2^64", CborMap{"a": minus2p64}, "a161613bffffffffffffffff"},
+		{"big 2^64-1", CborMap{"a": new(big.Int).SetUint64(math.MaxUint64)}, "a161611bffffffffffffffff"},
+		{"float 1.5", CborMap{"a": 1.5}, "a16161fb3ff8000000000000"},
+		{"integral float stays a float", CborMap{"a": 1.0}, "a16161fb3ff0000000000000"},
+		{"array", CborMap{"a": []any{uint64(1), -1, 1.5, []any{}}}, "a16161840120fb3ff800000000000080"},
+		{"link", CborMap{"a": CborLink{CID: []byte{0}}}, "a16161d82a4100"},
 		{"every kind, keys sorted", CborMap{"b": []byte{1, 2}, "n": nil, "t": true, "f": false, "m": CborMap{"x": uint64(1)}},
 			"a561624201026166f4616da1617801616ef66174f5"},
 		{"euro", CborMap{"€": "€"}, "a163e282ac63e282ac"},
 		{"emoji", CborMap{"a": "😀"}, "a1616164f09f9880"},
-		{"depth 4", CborMap{"a": CborMap{"b": CborMap{"c": CborMap{"d": uint64(1)}}}}, "a16161a16162a16163a1616401"},
+		{"depth 5", deep, "a16161a16162a16163a16164a1616501"},
 		{"length-first keys", CborMap{"bb": uint64(1), "c": uint64(2)}, "a261630262626201"},
 	} {
 		got, err := EncodeStrictCbor(c.m)
@@ -100,33 +114,131 @@ func TestEncodeStrictCborTable(t *testing.T) {
 			t.Errorf("%s: %x, %v; want %s", c.name, got, err, c.hex)
 		}
 	}
+	out, err := EncodeStrictCbor(CborMap{"a": make([]byte, 4091)})
+	if err != nil || len(out) != 4097 {
+		t.Fatalf("4091-byte value: len %d, %v (the codec has no size cap)", len(out), err)
+	}
 }
 
 func TestEncodeStrictCborRefusals(t *testing.T) {
-	deep := CborMap{"a": CborMap{"b": CborMap{"c": CborMap{"d": CborMap{"e": uint64(1)}}}}}
+	below, _ := new(big.Int).SetString("-18446744073709551617", 10)
+	above, _ := new(big.Int).SetString("18446744073709551616", 10)
+	tooDeep := any(uint64(1))
+	for i := 0; i < StrictCborMaxDepth; i++ {
+		tooDeep = []any{tooDeep}
+	}
 	for _, c := range []struct {
 		name string
 		m    CborMap
 		want string
 	}{
 		{"nil top level", nil, "top level must be a map"},
-		{"depth 5", deep, "map nesting deeper than 4"},
-		{"negative int", CborMap{"a": -1}, "integer outside 0..2^64-1"},
-		{"negative int64", CborMap{"a": int64(-1)}, "integer outside 0..2^64-1"},
-		{"float", CborMap{"a": 1.5}, "unsupported value type"},
-		{"array", CborMap{"a": []any{uint64(1)}}, "unsupported value type"},
+		{"depth 1025", CborMap{"a": tooDeep}, "nesting deeper than 1024"},
+		{"big below -2^64", CborMap{"a": below}, "integer outside -2^64..2^64-1"},
+		{"big at 2^64", CborMap{"a": above}, "integer outside -2^64..2^64-1"},
+		{"nil big", CborMap{"a": (*big.Int)(nil)}, "unsupported value type"},
+		{"NaN", CborMap{"a": math.NaN()}, "number must be a safe integer or a finite float"},
+		{"+Inf", CborMap{"a": math.Inf(1)}, "number must be a safe integer or a finite float"},
+		{"float32", CborMap{"a": float32(1.5)}, "unsupported value type"},
+		{"invalid CID: empty", CborMap{"a": CborLink{}}, "invalid CID"},
+		{"invalid CID: prefix", CborMap{"a": CborLink{CID: []byte{1}}}, "invalid CID"},
+		{"array of strings", CborMap{"a": []string{"x"}}, "unsupported value type"},
 		{"invalid UTF-8 value", CborMap{"a": "\xff"}, "invalid UTF-8"},
 		{"invalid UTF-8 key", CborMap{"\xff": uint64(1)}, "invalid UTF-8"},
-		{"4091-byte bytes", CborMap{"a": make([]byte, 4091)}, "encoding exceeds 4096 bytes"},
+		{"invalid UTF-8 in an array", CborMap{"a": []any{"\xff"}}, "invalid UTF-8"},
 	} {
 		_, err := EncodeStrictCbor(c.m)
 		if got := cborErr(t, err); got != c.want {
 			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
 	}
-	out, err := EncodeStrictCbor(CborMap{"a": make([]byte, 4090)})
-	if err != nil || len(out) != 4096 {
-		t.Fatalf("4090-byte value: len %d, %v", len(out), err)
+}
+
+// TestDecodeStrictCborFullTypes: every decoded value type, and every decoded value re-encodes to
+// its input bytes.
+func TestDecodeStrictCborFullTypes(t *testing.T) {
+	cases := []struct {
+		hex   string
+		check func(any) bool
+	}{
+		{"a1616120", func(v any) bool { b, ok := v.(*big.Int); return ok && b.Cmp(big.NewInt(-1)) == 0 }},
+		{"a161613bffffffffffffffff", func(v any) bool {
+			b, ok := v.(*big.Int)
+			want, _ := new(big.Int).SetString("-18446744073709551616", 10)
+			return ok && b.Cmp(want) == 0
+		}},
+		{"a16161fb3ff8000000000000", func(v any) bool { f, ok := v.(float64); return ok && f == 1.5 }},
+		{"a16161fb3ff0000000000000", func(v any) bool { f, ok := v.(float64); return ok && f == 1 }},
+		{"a16161fb8000000000000000", func(v any) bool { f, ok := v.(float64); return ok && f == 0 && math.Signbit(f) }},
+		{"a16161d82a420001", func(v any) bool { l, ok := v.(CborLink); return ok && bytes.Equal(l.CID, []byte{0, 1}) }},
+		{"a161618201a0", func(v any) bool {
+			a, ok := v.([]any)
+			if !ok || len(a) != 2 || a[0] != uint64(1) {
+				return false
+			}
+			m, ok := a[1].(CborMap)
+			return ok && len(m) == 0
+		}},
+		{"a1616180", func(v any) bool { a, ok := v.([]any); return ok && len(a) == 0 }},
+	}
+	for _, c := range cases {
+		in := mustHex(t, c.hex)
+		m, err := DecodeStrictCbor(in)
+		if err != nil || !c.check(m["a"]) {
+			t.Fatalf("%s: %v %#v", c.hex, err, m)
+		}
+		again, err := EncodeStrictCbor(m)
+		if err != nil || !bytes.Equal(again, in) {
+			t.Fatalf("%s: re-encode %x %v", c.hex, again, err)
+		}
+	}
+}
+
+func TestDecodeStrictCborLimit(t *testing.T) {
+	nest := func(n int) []byte {
+		b := []byte{0xa1, 0x61, 0x61}
+		for i := 0; i < n-1; i++ {
+			b = append(b, 0x81)
+		}
+		return append(b, 0x01)
+	}
+	if _, err := DecodeStrictCborLimit(nest(64), 64); err != nil {
+		t.Fatalf("depth 64: %v", err)
+	}
+	if _, err := DecodeStrictCborLimit(nest(65), 64); cborErr(t, err) != "nesting deeper than 64" {
+		t.Fatal(err)
+	}
+	if _, err := DecodeStrictCbor(nest(1024)); err != nil {
+		t.Fatalf("depth 1024: %v", err)
+	}
+	if _, err := DecodeStrictCbor(nest(1025)); cborErr(t, err) != "nesting deeper than 1024" {
+		t.Fatal(err)
+	}
+}
+
+// TestDecodeStrictCborDoesNotPreallocateClaimedCounts: a container count is checked against the
+// whole input, so a nested chain of large claimed counts must not reserve memory per level.
+func TestDecodeStrictCborDoesNotPreallocateClaimedCounts(t *testing.T) {
+	for name, level := range map[string][]byte{
+		"arrays": {0x99, 0xff, 0xff},             // an array of 65535 entries
+		"maps":   {0xb9, 0xff, 0xff, 0x61, 0x61}, // a map of 65535 entries, first key "a"
+	} {
+		in := []byte{0xa1, 0x61, 0x61}
+		for i := 0; i < 1000; i++ {
+			in = append(in, level...)
+		}
+		in = append(in, make([]byte, 65535)...)
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		before := ms.TotalAlloc
+		_, err := DecodeStrictCbor(in)
+		runtime.ReadMemStats(&ms)
+		if err == nil {
+			t.Fatalf("%s: accepted a truncated chain", name)
+		}
+		if grew := ms.TotalAlloc - before; grew > 64<<20 {
+			t.Fatalf("%s: decode allocated %d bytes for a %d-byte input", name, grew, len(in))
+		}
 	}
 }
 

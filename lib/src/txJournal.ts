@@ -16,26 +16,45 @@
  *   'abort'    — the overlay rejected the tx and the abortAction that releases
  *                its inputs failed. Recovery = retry the abort.
  *   'retryable'— the overlay refused with a LIFTABLE condition (pause, freeze,
- *                screening, membership, plain unavailability). The noSend
+ *                screening, membership, plain unavailability), or the submit's
+ *                outcome is UNKNOWN (transport fault, 5xx, a 200 that admitted
+ *                outputs without a verifying σ: the overlay may have folded
+ *                these bytes; always held, even with holdRetryable false,
+ *                and an issuer receipt intent for the txid waits on it). The noSend
  *                action is still alive and its inputs are still held — on
  *                purpose, so the identical bytes can be re-submitted — which
  *                means it needs a durable record or a crash leaks the action
  *                forever (amendment v2.1 §9.11). Recovery = re-POST `submit`;
  *                after RETRY_CAP passes reconcile aborts the reference instead.
- *   'handed_over' — the tx was built, signed noSend and handed to the payee
- *                OFFLINE; the overlay has never seen it and the payee is the
- *                party responsible for submitting it (offline settlement
- *                §0.1 rules 1-3). Its inputs stay held on purpose: the payee
- *                holds evidence over these exact bytes, so releasing them
- *                would invalidate a payment that has already been made.
- *                Recovery (rule 6, the payer's OPTIONAL later submit) is
- *                identical to 'retryable': re-POST the stored bytes when
- *                online, RETRY_CAP applies, a final refusal aborts.
- *   'stranded' — an 'accepted' entry whose broadcast has failed
- *                BROADCAST_RETRY_CAP times. KEPT (the overlay folded this tx
- *                in; it must never be aborted) but never retried automatically
- *                and no longer blocking the bulk sweep. Surfaced by
- *                `journalListStranded()` for an operator to act on.
+ *   'signed'   — a holder hand-over (handover.ts sendHandover) was built and
+ *                signed noSend through the color module, and its bytes and
+ *                receipt are journaled here, but the recipient has not
+ *                acknowledged delivery yet. NEVER submitted, aborted or swept
+ *                automatically: the recipient may already hold these bytes,
+ *                so releasing the inputs would invalidate a payment in
+ *                flight. Recovery = redeliver the receipt
+ *                (notifyJournal reconcileNotifications, after 60 s).
+ *   'delivered'— the hand-over was acknowledged (MessageBox sendMessage
+ *                resolved, or the host's own ACK), or it is a self-send,
+ *                which owes no delivery and is journaled 'delivered' at
+ *                once. The sender may now submit
+ *                the exact journaled bytes (settleHandover / reconcile):
+ *                admitted ⇒ 'accepted'; retryable ⇒ attempts+1; final ⇒
+ *                abort + drop (B2, B5, D27). 'handed_over' is removed (G3).
+ *   'stranded' — parked after a capped number of failed recovery passes,
+ *                KEPT, never aborted, never retried automatically and no
+ *                longer blocking the bulk sweep. Two kinds, told apart by σ:
+ *                - admissionSignature != null: an 'accepted' entry whose
+ *                  broadcast failed BROADCAST_RETRY_CAP times. The overlay
+ *                  folded it in; recovery = broadcast it (sendWith).
+ *                - admissionSignature == null (it carries `submit` and the
+ *                  hand-over fields instead): a 'delivered' hand-over the
+ *                  overlay never admitted, retried RETRY_CAP times. It must
+ *                  NEVER be broadcast (that would put an unadmitted token tx
+ *                  on chain); recovery = re-submit its journaled bytes
+ *                  (resubmitDelivered), and only an admission may lead to a
+ *                  broadcast.
+ *                Surfaced by `journalListStranded()` for an operator.
  *
  * Storage layout: ONE key PER ENTRY (`mandala.txJournal.<id>`). setItem/
  * removeItem are atomic per key, so concurrent writers can add/remove
@@ -65,24 +84,27 @@ export interface JournalSubmit {
 
 export interface JournalEntry {
   txid: string
-  stage: 'intent' | 'accepted' | 'abort' | 'retryable' | 'stranded' | 'handed_over'
+  stage: 'intent' | 'accepted' | 'abort' | 'retryable' | 'stranded' | 'signed' | 'delivered'
   /** createAction signableTransaction.reference — needed to retry an abort. */
   reference?: string
   /** Failed recovery attempts so far (reconcile increments; see caps there). */
   attempts?: number
   /** The overlay verdict code that produced a 'retryable' entry (diagnostics). */
   code?: string
-  /** Present on 'retryable' / 'handed_over' entries whose bytes were journaled (§9.11). */
+  /** Present on 'retryable' / 'signed' / 'delivered' entries whose bytes were journaled (§9.11). */
   submit?: JournalSubmit
-  /**
-   * The off-chain linkage payload for THIS txid, hex. Written on 'accepted'
-   * and 'handed_over' entries so a later hand-over can forward the linkage
-   * bytes of an ancestor it never submitted (offline settlement §1.1: a txid
-   * with no σ_I travels as `linkage`, not as `admissions`). Duplicated on
-   * 'handed_over' inside `submit` because that copy is what reconcile
-   * re-POSTs; this one is what the evidence source reads.
-   */
+  /** The off-chain envelope for THIS txid, hex; written on 'accepted' entries. */
   offChainHex?: string
+  /** Hand-over entries ('signed' / 'delivered'): the asset moved. */
+  assetId?: string
+  /** Hand-over entries: the recipient identity key the receipt is delivered to. */
+  recipientKey?: string
+  /** Hand-over entries: the recipient output index in the tip. */
+  outputIndex?: number
+  /** Hand-over entries: the sender's note, carried in the redelivered body. */
+  note?: string
+  /** Hand-over entries: the BRC-207 receipt instruction, as a JSON string (C§7.1). */
+  receipt?: string
   /**
    * σ_I, on 'accepted' entries only (A12). The overlay's acceptance proof is
    * written at the commit point, which it already reaches before the
@@ -144,14 +166,82 @@ export async function journalList (): Promise<JournalEntry[]> {
 }
 
 /**
- * Every entry parked in 'stranded' — overlay-accepted transactions whose
- * broadcast kept failing past BROADCAST_RETRY_CAP (§9.11).
+ * A journaled holder hand-over (C§8.1): 'signed' (not yet acknowledged) or
+ * 'delivered' (acknowledged; the sender may submit). Carries everything a
+ * redelivery or a resubmit needs: the exact bytes, envelope, topic and the
+ * receipt.
+ */
+export type HandoverJournalEntry = JournalEntry & {
+  stage: 'signed' | 'delivered'
+  assetId: string
+  recipientKey: string
+  outputIndex: number
+  receipt: string
+  reference: string
+  submit: { txHex: string, offChainHex: string, topics: string[] }
+}
+
+/** True for a well-formed 'signed' / 'delivered' hand-over entry (every field a redelivery or resubmit reads). */
+export function isHandoverEntry (e: JournalEntry): e is HandoverJournalEntry {
+  return (e.stage === 'signed' || e.stage === 'delivered') &&
+    typeof e.assetId === 'string' && typeof e.recipientKey === 'string' &&
+    typeof e.outputIndex === 'number' && typeof e.receipt === 'string' &&
+    typeof e.reference === 'string' && typeof e.submit?.txHex === 'string' &&
+    typeof e.submit.offChainHex === 'string' && Array.isArray(e.submit.topics)
+}
+
+/** Every well-formed 'signed' and 'delivered' hand-over entry, oldest first. */
+export async function journalListHandovers (): Promise<HandoverJournalEntry[]> {
+  return (await journalList()).filter(isHandoverEntry)
+}
+
+/**
+ * The entry for one txid, or undefined (absent or corrupt). Reads the
+ * store directly: never a cached copy. A legacy single-array blob is
+ * migrated first so an unmigrated entry is still found.
+ */
+export async function journalGet (txid: string): Promise<JournalEntry | undefined> {
+  const store = getStorage()
+  await migrateLegacy(store)
+  const raw = await store.getItem(PREFIX + txid)
+  if (raw == null) return undefined
+  try {
+    const entry = JSON.parse(raw) as JournalEntry
+    return entry?.txid === txid && typeof entry.stage === 'string' ? entry : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 'signed' → 'delivered' for one txid (the body of `markHandoverDelivered`,
+ * here so notifyJournal's redelivery can promote without importing
+ * handover.ts). Idempotent. With no entry or any other stage it resolves
+ * without writing: a 'delivered', 'accepted' or 'abort' entry is never
+ * moved backwards, and a payout notification (no 'signed' entry) is a no-op.
+ */
+export async function journalPromoteSigned (txid: string): Promise<void> {
+  const entry = await journalGet(txid)
+  if (entry?.stage !== 'signed') return
+  await journalPut({ ...entry, stage: 'delivered' })
+}
+
+/**
+ * Every entry parked in 'stranded' (§9.11). Two kinds; check σ before acting:
  *
- * These are deliberately NOT retried by reconcile any more: an unbroadcastable
- * accepted tx that stayed in the retry loop wedged the whole pass (it blocked
- * the bulk sweep forever). They are kept — never aborted, since the overlay has
- * already folded them in — and surfaced here so a host can show them, retry one
- * deliberately (`broadcastAcceptedTx`), or escalate.
+ * - `admissionSignature != null`: an overlay-accepted transaction whose
+ *   broadcast kept failing past BROADCAST_RETRY_CAP. Never aborted, since the
+ *   overlay has already folded it in; a host may retry its broadcast
+ *   deliberately (`broadcastAcceptedTx`) or escalate.
+ * - `admissionSignature == null`: a 'delivered' hand-over the overlay never
+ *   admitted (retryable verdicts or transport failures past RETRY_CAP). It
+ *   must NEVER be broadcast (`createAction({ sendWith })` would put a token
+ *   tx the overlay never admitted on chain). A host may only re-submit it
+ *   (`resubmitDelivered`) or escalate; it is never aborted automatically
+ *   either, because the recipient already holds its bytes.
+ *
+ * Neither kind is retried by reconcile any more: an entry that stayed in the
+ * retry loop wedged the whole pass (it blocked the bulk sweep forever).
  */
 export async function journalListStranded (): Promise<JournalEntry[]> {
   return (await journalList()).filter(e => e.stage === 'stranded')
@@ -162,9 +252,9 @@ export async function journalListStranded (): Promise<JournalEntry[]> {
  *
  * The question a HOST must ask before it touches a noSend action of its own
  * accord (its settlement drain, its own sweep): an entry — 'intent',
- * 'accepted', 'retryable', 'handed_over', 'stranded' or 'abort' alike — means
- * this library still owns the transaction's fate, and aborting the action under
- * it releases inputs the overlay (or a payee) is already counting on.
+ * 'accepted', 'retryable', 'signed', 'delivered', 'stranded' or 'abort' alike —
+ * means this library still owns the transaction's fate, and aborting the action
+ * under it releases inputs the overlay (or a payee) is already counting on.
  *
  * A read failure answers `true`. Fail-safe, exactly like `hasFreshIntent`: not
  * knowing what is live is not a licence to abort.

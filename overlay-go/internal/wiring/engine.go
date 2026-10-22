@@ -1,6 +1,6 @@
 // Package wiring assembles the Mandala overlay on BRC-162 with token topics on one overlay: Mongo, the v3 mandala
 // store and verifier, the static registry (tm_mandala / ls_mandala) and KYC (tm_mandala_kyc / ls_mandala_kyc) topics,
-// the TokenTopics registrar that alone creates tm_<id> / ls_<id>, the in-repo engine.Storage (enginestore), the two
+// the TokenTopics registrar that alone creates tm_color_<id> / ls_color_<id>, the in-repo engine.Storage (enginestore), the two
 // maintenance gates and the host seams /submit and /arc-ingest use. The overlay neither syncs with peers nor
 // advertises (token-topics design §14 A1.1).
 package wiring
@@ -194,6 +194,8 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 		Screening:        mandala.NoSanctions{},
 		Membership:       mandala.KYCMembership{Store: store},
 		Spends:           spends,
+		// the K every deploy's req must name (contract §4): this overlay's SERVER_PRIVATE_KEY pub
+		OverlayIdentityKey: overlayPriv.PubKey().ToDERHex(),
 	}
 	registry, err := mandala.NewTokenRegistryTopicManager(deps)
 	if err != nil {
@@ -232,7 +234,7 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 
 	gate := maintenance.NewGate(maintenance.DefaultDrainTimeout)
 	reconcileLock := maintenance.NewGate(maintenance.DefaultDrainTimeout)
-	tokens := NewTokenTopics(eng, cfg.TokenAllowlist, cfg.TokenAllowlistSet, tokenTopicFactory(deps, verifier, store))
+	tokens := NewTokenTopics(eng, cfg.TokenAllowlist, cfg.TokenAllowlistSet, tokenTopicFactory(deps, verifier, store, es))
 	ownerIndex := NewOwnerIndexMaintenance(OwnerIndexDeps{
 		Gate:                gate,
 		ReconcileLock:       reconcileLock,
@@ -302,14 +304,15 @@ func (a *App) Close() {
 }
 
 // tokenTopicFactory builds one token's manager and lookup on the shared store with the shared deps (one spend checker,
-// one trusted set, one membership provider for every token topic).
-func tokenTopicFactory(deps mandala.TokenTopicDeps, v *mandala.Verifier, store *mandala.Store) TokenTopicFactory {
+// one trusted set, one membership provider for every token topic); the lookup reads the engine's outputs for the
+// color-* queries.
+func tokenTopicFactory(deps mandala.TokenTopicDeps, v *mandala.Verifier, store *mandala.Store, es *enginestore.Store) TokenTopicFactory {
 	return func(tokenID string) (engine.TopicManager, engine.LookupService, error) {
 		tm, err := mandala.NewTokenTopicManager(tokenID, deps)
 		if err != nil {
 			return nil, nil, err
 		}
-		ls, err := mandala.NewTokenLookupService(tokenID, v, store)
+		ls, err := mandala.NewTokenLookupService(tokenID, v, store, es)
 		if err != nil {
 			return nil, nil, err
 		}

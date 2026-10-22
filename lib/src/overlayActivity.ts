@@ -6,6 +6,7 @@
  * the engine's raw-tx store. See overlay/src/activity.ts.
  */
 import { adminAuthHeaders, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
+import { parseDecimalAmount } from './amount.js'
 
 export type ActivityKind = 'issue' | 'transfer' | 'self' | 'redeem'
 
@@ -24,7 +25,8 @@ export interface ActivityEntry {
   kind: ActivityKind
   from: string | null
   to: string | null
-  amount: number
+  /** Net units moved, exact. */
+  amount: bigint
   proofs: ActivityProof[]
 }
 
@@ -50,7 +52,17 @@ export async function fetchOverlayActivity (
   if (!res.ok) throw new Error(`activity fetch failed: ${res.status}`)
   const data = await res.json()
   if (data == null || !Array.isArray(data.entries)) return { entries: [], nextCursor: null }
-  return { entries: data.entries as ActivityEntry[], nextCursor: data.nextCursor ?? null }
+  // Never coerced (C§0): an entry whose amount is not a decimal string is dropped.
+  const entries: ActivityEntry[] = []
+  let dropped = 0
+  for (const e of data.entries) {
+    const amount = parseDecimalAmount(e?.amount)
+    if (amount == null) { dropped++; continue }
+    // The overlay keys entries by `tokenId` (the asset id); keep the assetId view.
+    entries.push({ ...e, assetId: e.assetId ?? e.tokenId, amount } as ActivityEntry)
+  }
+  if (dropped > 0) console.warn(`[mandala] activity: dropped ${dropped} entr${dropped === 1 ? 'y' : 'ies'} whose amount is not a decimal string`)
+  return { entries, nextCursor: data.nextCursor ?? null }
 }
 
 /**
@@ -74,9 +86,9 @@ export function flattenActivityPages (pages: ActivityPage[]): ActivityEntry[] {
 /** One-line human description of an entry, e.g. for tooltips/tests. */
 export function describeActivity (e: ActivityEntry): string {
   switch (e.kind) {
-    case 'issue': return `Issued ${e.amount} units`
-    case 'transfer': return `Transferred ${e.amount} units`
+    case 'issue': return `Issued ${e.amount.toString()} units`
+    case 'transfer': return `Transferred ${e.amount.toString()} units`
     case 'self': return 'Transferred 0 units to self'
-    case 'redeem': return `Redeemed (burned) ${e.amount} units`
+    case 'redeem': return `Redeemed (burned) ${e.amount.toString()} units`
   }
 }

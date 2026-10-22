@@ -2,12 +2,12 @@ import { describe, it, expect } from 'vitest'
 import {
   Hash, PrivateKey, PublicKey, ProtoWallet, Utils
 } from '@bsv/sdk'
+import * as blinding from './blinding.js'
 import {
-  addBlind, blindedSharedSecret, changeCustomInstructions, childOffset,
-  invoiceNumber, outputPublicKey, prepareBlindedPayment,
-  recipientCustomInstructions, sampleBlindingFactor
+  addBlind, blindedSharedSecret, childOffset,
+  invoiceNumber, outputPublicKey, rootSharedSecret, sampleBlindingFactor
 } from './blinding.js'
-import { configureMandala, FT_PROTOCOL } from './constants.js'
+import { ADMIN_PROTOCOL } from './constants.js'
 
 describe('sender identity blinding (A′ = A + rG)', () => {
   it('opens: A′ − rG equals A', () => {
@@ -47,11 +47,11 @@ describe('sender identity blinding (A′ = A + rG)', () => {
     const keyID = 'xfer-test'
     const S = a.deriveSharedSecret(PublicKey.fromString(B))
     const Sprime = blindedSharedSecret(S, r, PublicKey.fromString(B))
-    const k = childOffset(Sprime, FT_PROTOCOL, keyID)
+    const k = childOffset(Sprime, ADMIN_PROTOCOL, keyID)
     const Pout = outputPublicKey(PublicKey.fromString(B), k)
 
     const { publicKey: fromBob } = await recipient.getPublicKey({
-      protocolID: FT_PROTOCOL,
+      protocolID: ADMIN_PROTOCOL,
       keyID,
       counterparty: Aprime,
       forSelf: true
@@ -60,7 +60,7 @@ describe('sender identity blinding (A′ = A + rG)', () => {
 
     // Unblinded derivation against A must NOT match.
     const { publicKey: unblinded } = await recipient.getPublicKey({
-      protocolID: FT_PROTOCOL,
+      protocolID: ADMIN_PROTOCOL,
       keyID,
       counterparty: A,
       forSelf: true
@@ -69,7 +69,7 @@ describe('sender identity blinding (A′ = A + rG)', () => {
   })
 
   it('invoiceNumber matches BRC-43', () => {
-    expect(invoiceNumber(FT_PROTOCOL, 'k1')).toBe('2-p mandala token-k1')
+    expect(invoiceNumber(ADMIN_PROTOCOL, 'k1')).toBe('2-mandala admin-k1')
   })
 
   it('sampleBlindingFactor is a 32-byte scalar', () => {
@@ -77,48 +77,24 @@ describe('sender identity blinding (A′ = A + rG)', () => {
     expect(r.toHex().length).toBe(64)
   })
 
-  it('prepareBlindedPayment locks to the key Bob derives from A′', async () => {
+  it('rootSharedSecret equals a·B (ProtoWallet key deriver path)', async () => {
     const a = PrivateKey.fromRandom()
     const b = PrivateKey.fromRandom()
-    const overlay = PrivateKey.fromRandom()
-    configureMandala({ overlayIdentityKey: overlay.toPublicKey().toString() })
-    const sender = new ProtoWallet(a)
-    const recipient = new ProtoWallet(b)
-    const identityKey = (await sender.getPublicKey({ identityKey: true })).publicKey
-    const recipientKey = (await recipient.getPublicKey({ identityKey: true })).publicKey
-    const prepared = await prepareBlindedPayment(sender as any, {
-      identityKey,
-      recipientKey,
-      keyID: 'xfer-prep'
-    })
-    const { publicKey: fromBob } = await recipient.getPublicKey({
-      protocolID: FT_PROTOCOL,
-      keyID: 'xfer-prep',
-      counterparty: prepared.senderBlinded,
-      forSelf: true
-    })
-    expect(Hash.hash160(Utils.toArray(fromBob, 'hex'))).toEqual(prepared.pubKeyHash)
-    expect(prepared.linkage.counterparty).toBe(recipientKey)
-    expect(prepared.r).toHaveLength(64)
+    const S = await rootSharedSecret(new ProtoWallet(a) as any, b.toPublicKey().toString())
+    expect(S.toString()).toBe(a.deriveSharedSecret(b.toPublicKey()).toString())
   })
 
-  it('does not put r on the recipient output CI', () => {
-    const rec = JSON.parse(recipientCustomInstructions({
-      keyID: 'k', recipientKey: '02aa', senderBlinded: '02bb'
-    }))
-    const ch = JSON.parse(changeCustomInstructions({
-      keyID: 'c', identityKey: '02aa', recipientKey: '03cc',
-      sentAmount: 5, r: 'dd'.repeat(32), senderBlinded: '02bb'
-    }))
-    expect(rec.blindingR).toBeUndefined()
-    expect(ch.blindingR).toBe('dd'.repeat(32))
+  it('the holder-side CI/payment builders are gone (recipientLinkage replaces them)', () => {
+    for (const n of ['prepareBlindedPayment', 'recipientCustomInstructions', 'changeCustomInstructions']) {
+      expect(n in blinding).toBe(false)
+    }
   })
 })
 
 describe('HMAC offset is 32 bytes', () => {
   it('childOffset length', () => {
     const S = PrivateKey.fromRandom().toPublicKey()
-    const k = childOffset(S, FT_PROTOCOL, 'abc')
+    const k = childOffset(S, ADMIN_PROTOCOL, 'abc')
     expect(k.length).toBe(32)
     expect(Hash.sha256hmac).toBeTypeOf('function')
     expect(Utils.toHex(k).length).toBe(64)

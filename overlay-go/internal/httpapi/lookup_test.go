@@ -3,14 +3,21 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
 	"github.com/bsv-blockchain/go-sdk/overlay/lookup"
+	"github.com/bsv-blockchain/go-sdk/transaction"
+
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
 
 // stubLookuper is a Lookuper test double: it records what it was called
@@ -73,7 +80,7 @@ func TestLookup_OutputListAnswer(t *testing.T) {
 		answer: &lookup.LookupAnswer{
 			Type: lookup.AnswerTypeOutputList,
 			Outputs: []*lookup.OutputListItem{
-				{Beef: []byte{1, 2, 3}, OutputIndex: 7},
+				{Beef: atomicFixture, OutputIndex: 7},
 			},
 		},
 	}
@@ -85,8 +92,8 @@ func TestLookup_OutputListAnswer(t *testing.T) {
 	}
 
 	raw := readRawBody(t, resp)
-	if !strings.Contains(string(raw), `"beef":[1,2,3]`) {
-		t.Fatalf("body = %s, want to contain \"beef\":[1,2,3]", raw)
+	if !strings.Contains(string(raw), atomicFixtureJSON) {
+		t.Fatalf("body = %s, want to contain the AtomicBEEF bytes", raw)
 	}
 	if !strings.Contains(string(raw), `"type":"output-list"`) {
 		t.Fatalf("body = %s, want to contain \"type\":\"output-list\"", raw)
@@ -115,7 +122,7 @@ func TestLookup_AggregationHeaderIgnored(t *testing.T) {
 		answer: &lookup.LookupAnswer{
 			Type: lookup.AnswerTypeOutputList,
 			Outputs: []*lookup.OutputListItem{
-				{Beef: []byte{1, 2, 3}, OutputIndex: 7},
+				{Beef: atomicFixture, OutputIndex: 7},
 			},
 		},
 	}
@@ -134,8 +141,8 @@ func TestLookup_AggregationHeaderIgnored(t *testing.T) {
 	}
 
 	raw := readRawBody(t, resp)
-	if !strings.Contains(string(raw), `"beef":[1,2,3]`) {
-		t.Fatalf("body = %s, want to contain \"beef\":[1,2,3] even with X-Aggregation set", raw)
+	if !strings.Contains(string(raw), atomicFixtureJSON) {
+		t.Fatalf("body = %s, want to contain the AtomicBEEF bytes even with X-Aggregation set", raw)
 	}
 }
 
@@ -163,20 +170,19 @@ func TestLookup_ForwardsServiceAndRawQuery(t *testing.T) {
 	}
 }
 
+// An untyped lookup error is a fault, never a final refusal: 503 ERR_UNAVAILABLE retryable (contract §6).
 func TestLookup_EngineError(t *testing.T) {
 	stub := &stubLookuper{err: errors.New("boom")}
 	app := newServer(&stubSubmitter{}, stub, nil, nil)
 
 	resp := doRequest(t, app, lookupRequest(`{"service":"ls_mandala","query":{"metadataAssetId":"abc.0"}}`))
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 (body: %s)", resp.StatusCode, readRawBody(t, resp))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body: %s)", resp.StatusCode, readRawBody(t, resp))
 	}
 	body := decodeJSON(t, resp)
-	if body["status"] != "error" {
-		t.Fatalf("body = %v, want status:error", body)
-	}
-	if _, ok := body["message"]; !ok {
-		t.Fatalf("body = %v, missing message field", body)
+	if body["status"] != "error" || body["code"] != "ERR_UNAVAILABLE" || body["retryable"] != true ||
+		body["message"] != "lookup unavailable: ls_mandala: boom" {
+		t.Fatalf("body = %v", body)
 	}
 }
 
@@ -194,5 +200,141 @@ func TestLookup_EmptyOutputsIsEmptyArrayNotNull(t *testing.T) {
 	raw := readRawBody(t, resp)
 	if !strings.Contains(string(raw), `"outputs":[]`) {
 		t.Fatalf("body = %s, want \"outputs\":[] (never null)", raw)
+	}
+}
+
+// atomicFixture is an AtomicBEEF header (01010101 ‖ subject txid in internal byte order) plus one trailing byte;
+// atomicFixtureTxid is that subject in display hex (reversed).
+var (
+	atomicFixture, atomicFixtureTxid, atomicFixtureJSON = func() ([]byte, string, string) {
+		b := []byte{1, 1, 1, 1}
+		for i := 0; i < 32; i++ {
+			b = append(b, byte(i))
+		}
+		b = append(b, 0xef)
+		disp := make([]byte, 32)
+		for i := range disp {
+			disp[i] = byte(31 - i)
+		}
+		parts := make([]string, len(b))
+		for i, v := range b {
+			parts[i] = strconv.Itoa(int(v))
+		}
+		return b, hex.EncodeToString(disp), `"beef":[` + strings.Join(parts, ",") + `]`
+	}()
+)
+
+func TestLookupItemCarriesAtomicBeefTxid(t *testing.T) {
+	stub := &stubLookuper{answer: &lookup.LookupAnswer{Type: lookup.AnswerTypeOutputList,
+		Outputs: []*lookup.OutputListItem{{Beef: atomicFixture, OutputIndex: 7}, {Beef: atomicFixture, OutputIndex: 0}}}}
+	app := newServer(&stubSubmitter{}, stub, nil, nil)
+	resp := doRequest(t, app, lookupRequest(`{"service":"ls_mandala","query":{}}`))
+	raw := readRawBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (%s)", resp.StatusCode, raw)
+	}
+	var got struct {
+		Outputs []struct {
+			OutputIndex uint32 `json:"outputIndex"`
+			Txid        string `json:"txid"`
+		} `json:"outputs"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil || len(got.Outputs) != 2 ||
+		got.Outputs[0].Txid != atomicFixtureTxid || got.Outputs[0].OutputIndex != 7 || got.Outputs[1].Txid != atomicFixtureTxid {
+		t.Fatalf("outputs = %+v (%v) from %s", got.Outputs, err, raw)
+	}
+}
+
+// A non-atomic BEEF item cannot name its subject: the answer fails closed with 500, never an item without txid.
+func TestLookupNonAtomicBeefIs500(t *testing.T) {
+	for name, beef := range map[string][]byte{
+		"plain BEEF":       {0x02, 0x00, 0xbe, 0xef, 0x00},
+		"short header":     atomicFixture[:35],
+		"empty":            {},
+		"bad atomic magic": append([]byte{1, 1, 1, 2}, atomicFixture[4:]...),
+	} {
+		stub := &stubLookuper{answer: &lookup.LookupAnswer{Type: lookup.AnswerTypeOutputList,
+			Outputs: []*lookup.OutputListItem{{Beef: atomicFixture, OutputIndex: 1}, {Beef: beef, OutputIndex: 0}}}}
+		resp := doRequest(t, newServer(&stubSubmitter{}, stub, nil, nil), lookupRequest(`{"service":"ls_mandala","query":{}}`))
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("%s: status = %d, want 500", name, resp.StatusCode)
+		}
+		body := decodeJSON(t, resp)
+		if body["status"] != "error" || body["message"] != "lookup answer: output is not AtomicBEEF" {
+			t.Fatalf("%s: body = %v", name, body)
+		}
+	}
+}
+
+// A lookup store or engine read fault is retryable: 503 ERR_UNAVAILABLE (contract §6); a *LookupQueryError stays 400.
+func TestLookupStoreFaultIs503(t *testing.T) {
+	stub := &stubLookuper{err: fmt.Errorf("%w: x", mandala.ErrLookupUnavailable)}
+	resp := doRequest(t, newServer(&stubSubmitter{}, stub, nil, nil), lookupRequest(`{"service":"ls_mandala","query":{}}`))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	body := decodeJSON(t, resp)
+	if body["status"] != "error" || body["code"] != "ERR_UNAVAILABLE" || body["retryable"] != true ||
+		body["description"] != "lookup unavailable: x" || body["message"] != "lookup unavailable: x" {
+		t.Fatalf("body = %v", body)
+	}
+	stub.err = fmt.Errorf("ls_x: %w", mandala.NewLookupQueryError("Invalid lookup query: x"))
+	resp = doRequest(t, newServer(&stubSubmitter{}, stub, nil, nil), lookupRequest(`{"service":"ls_mandala","query":{}}`))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a query error status = %d, want 400", resp.StatusCode)
+	}
+	if body := decodeJSON(t, resp); body["message"] != "ls_x: Invalid lookup query: x" || body["code"] != nil {
+		t.Fatalf("query error body = %v", body)
+	}
+}
+
+// faultStorage is an engine.Storage whose FindOutput always faults; nothing else is called by Engine.Lookup.
+type faultStorage struct{ engine.Storage }
+
+var errHydrationDown = errors.New("mongo: server selection timeout")
+
+func (faultStorage) FindOutput(context.Context, *transaction.Outpoint, *string, *bool, bool) (*engine.Output, error) {
+	return nil, errHydrationDown
+}
+
+// formulaLookup answers one formula, as ls_color_<assetId> answers a color-admission query.
+type formulaLookup struct {
+	engine.LookupService
+	op *transaction.Outpoint
+}
+
+func (l formulaLookup) Lookup(context.Context, *lookup.LookupQuestion) (*lookup.LookupAnswer, error) {
+	return &lookup.LookupAnswer{Type: lookup.AnswerTypeFormula, Formulas: []lookup.LookupFormula{{Outpoint: l.op}}}, nil
+}
+
+// The real v1.3.7 engine returns a hydration (FindOutput) fault unwrapped: POST /lookup must still answer 503
+// ERR_UNAVAILABLE retryable, never a 400 a client takes as final. An unknown service stays 400 unknown-topic.
+func TestLookupEngineHydrationFaultIs503(t *testing.T) {
+	id := strings.Repeat("ab", 32) + "_0"
+	op, err := transaction.OutpointFromString(strings.Repeat("cd", 32) + ".0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := engine.NewEngine(&engine.Config{
+		Storage:        faultStorage{},
+		LookupServices: map[string]engine.LookupService{"ls_color_" + id: formulaLookup{op: op}},
+	})
+	app := newServer(&stubSubmitter{}, eng, nil, nil)
+	query := `{"type":"color-admission","version":1,"assetId":"` + id + `","topic":"tm_color_` + id + `","outpoints":["` + op.String() + `"]}`
+	resp := doRequest(t, app, lookupRequest(`{"service":"ls_color_`+id+`","query":`+query+`}`))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body: %s)", resp.StatusCode, readRawBody(t, resp))
+	}
+	body := decodeJSON(t, resp)
+	if body["status"] != "error" || body["code"] != "ERR_UNAVAILABLE" || body["retryable"] != true ||
+		body["message"] != "lookup unavailable: ls_color_"+id+": "+errHydrationDown.Error() {
+		t.Fatalf("body = %v", body)
+	}
+	resp = doRequest(t, app, lookupRequest(`{"service":"ls_nope","query":{}}`))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown service status = %d, want 400", resp.StatusCode)
+	}
+	if body := decodeJSON(t, resp); body["message"] != "unknown-topic" || body["code"] != nil {
+		t.Fatalf("unknown service body = %v", body)
 	}
 }

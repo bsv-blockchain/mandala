@@ -1,10 +1,12 @@
 import { describe, it, expect } from 'vitest'
+import { decodeStrictCbor } from '@bsv/templates'
 import {
   parseRegistryCI,
   registryCustomInstructions,
   parseRegistryRows,
   registryIsLive,
-  nextRegistryPlan
+  nextRegistryPlan,
+  REGISTRY_DEPLOY_PAYLOAD
 } from './registry.js'
 
 describe('registry customInstructions', () => {
@@ -52,5 +54,14 @@ describe('nextRegistryPlan', () => {
   it('recovers instead of opening a second genesis when the overlay is already live', () => {
     expect(nextRegistryPlan(null, issuer, issuer, true)).toBe('recover')
     expect(nextRegistryPlan(null, issuer, peer, true)).toBe('recover-then-admit')
+  })
+})
+
+describe('KYC registry deploy payload', () => {
+  it('carries no req or ext (C§4: tm_mandala_kyc deploys are not policed)', () => {
+    const m = decodeStrictCbor(REGISTRY_DEPLOY_PAYLOAD()) as Record<string, unknown>
+    expect(m).toEqual({ sym: 'KYC', dec: 0n, label: 'Mandala identity registry' })
+    expect('req' in m).toBe(false)
+    expect('ext' in m).toBe(false)
   })
 })

@@ -20,6 +20,7 @@ import (
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
+	"github.com/sirdeggen/mandala/overlay-go/internal/colorprofile"
 )
 
 // AdminKinds are the token admin kinds (TS ADMIN_KINDS, order kept).
@@ -119,13 +120,14 @@ func detPublicKey(v any) (string, bool) {
 	return hex.EncodeToString(b), true
 }
 
-// detFeeRate: CBOR null -> (nil, true); a uint 1..2^53-1 -> its value.
+// detFeeRate: CBOR null -> (nil, true); a uint 1..2^53-1 -> its value. The fee rate is a sats/kB
+// rate (a JSON number, contract §0), not a token amount, so it keeps the JS safe-integer bound.
 func detFeeRate(v any) (*int64, bool) {
 	if v == nil {
 		return nil, true
 	}
 	n, ok := v.(uint64)
-	if !ok || n < 1 || n > MaxSafeAmount {
+	if !ok || n < 1 || n > maxSafeInteger {
 		return nil, false
 	}
 	x := int64(n)
@@ -140,8 +142,26 @@ func detKeyLess(a, b string) int {
 	return bytes.Compare([]byte(a), []byte(b))
 }
 
-func detDecodeMap(b []byte, fail func(string) error) (brc162.CborMap, error) {
-	m, err := brc162.DecodeStrictCbor(b)
+// Mandala CBOR policy (contract §4.1, D14). The codec reads full strict DAG-CBOR with no size cap
+// and a 1024 depth bound (templates parity); Mandala reads a deploy payload of at most 65536 bytes,
+// admin details and authority payloads of at most 4096, each nested at most 64 deep.
+const (
+	MaxDeployPayloadBytes = 65536
+	MaxAdminDetailsBytes  = 4096
+	MandalaCborMaxDepth   = 64
+)
+
+// decodeMandalaCbor applies the Mandala size limit, then reads strict DAG-CBOR at depth <= 64.
+// Every error is a *brc162.StrictCborError.
+func decodeMandalaCbor(b []byte, maxBytes int) (brc162.CborMap, error) {
+	if len(b) > maxBytes {
+		return nil, &brc162.StrictCborError{Message: fmt.Sprintf("input exceeds %d bytes", maxBytes)}
+	}
+	return brc162.DecodeStrictCborLimit(b, MandalaCborMaxDepth)
+}
+
+func detDecodeMap(b []byte, maxBytes int, fail func(string) error) (brc162.CborMap, error) {
+	m, err := decodeMandalaCbor(b, maxBytes)
 	if err != nil {
 		var se *brc162.StrictCborError
 		if errors.As(err, &se) {
@@ -152,9 +172,9 @@ func detDecodeMap(b []byte, fail func(string) error) (brc162.CborMap, error) {
 	return m, nil
 }
 
-// DecodeAdminDetails reads admin details against D §3.3 in TS order: lowercase hex, strict CBOR,
-// kind, the first unknown key in CBOR key order, then each key of the kind (required, optional,
-// reason), then sha256 of the bytes. Every refusal is rDetailsSchema(outputIndex, detail).
+// DecodeAdminDetails reads admin details against D §3.3 in TS order: lowercase hex, strict CBOR
+// under the Mandala policy (4096 bytes, depth 64), kind, the first unknown key in CBOR key order,
+// then each key of the kind (required, optional, reason), then sha256 of the bytes. Every refusal is rDetailsSchema(outputIndex, detail).
 func DecodeAdminDetails(detailsHex string, allowed []string, outputIndex uint32) (AdminDetails, [32]byte, error) {
 	fail := func(detail string) error { return rDetailsSchema(outputIndex, detail) }
 	if !detHexPairs.MatchString(detailsHex) {
@@ -164,7 +184,7 @@ func DecodeAdminDetails(detailsHex string, allowed []string, outputIndex uint32)
 	if err != nil {
 		return AdminDetails{}, [32]byte{}, fail("details must be lowercase hex")
 	}
-	m, err := detDecodeMap(raw, fail)
+	m, err := detDecodeMap(raw, MaxAdminDetailsBytes, fail)
 	if err != nil {
 		return AdminDetails{}, [32]byte{}, err
 	}
@@ -278,12 +298,25 @@ func EncodeAdminDetails(d AdminDetails) ([]byte, error) {
 	return brc162.EncodeStrictCbor(m)
 }
 
-// DeployMetadata is a decoded deploy payload.
+// DeployIcon is a deploy's optional icon [mediaType, bytes] (contract §4).
+type DeployIcon struct {
+	MediaType string
+	Bytes     []byte
+}
+
+// DeployMetadata is a decoded deploy payload. ReqBytes is the strict re-encoding of the req value
+// (nil when req is absent, not a map, or not re-encodable); RequireMandalaReq compares it with this
+// overlay's expected req. Icon is nil when icon is absent or malformed. The unexported fields record
+// what RequireDeployShape refuses later (contract §4 steps 2-3 run after deploySig and trust).
 type DeployMetadata struct {
 	Sym          string
 	Dec          int64
 	Label        string
 	FeeRatePerKb *int64
+	Icon         *DeployIcon
+	ReqBytes     []byte
+
+	hasReq, reqNotMap, hasExt, badIcon bool
 }
 
 func detLabel(v any, max int) (string, bool) {
@@ -295,9 +328,11 @@ func detLabel(v any, max int) (string, bool) {
 	return s, n >= 1 && n <= max
 }
 
-// ParseDeployMetadata reads the deploy payload {sym, dec, label, feeRatePerKb?} (unknown keys
-// ignored) in TS order: missing payload, non-canonical push, strict CBOR, sym, dec, label, fee
-// rate. Every refusal is rDeployPayload(detail).
+// ParseDeployMetadata reads the deploy payload {sym, dec, label, feeRatePerKb?, icon?, req?} (other
+// keys ignored, except ext) in TS order: missing payload, non-canonical push, strict CBOR under the
+// Mandala policy (65536 bytes, depth 64), sym, dec, label, fee rate. Every refusal is
+// rDeployPayload(detail). It only records icon, ext and req: their 1Color rules (contract §4 steps 2-3)
+// are RequireDeployShape's, which layer C runs after deploySig and the trusted-issuer rules.
 func ParseDeployMetadata(payload []byte, hasPayload, canonical bool) (DeployMetadata, error) {
 	if !hasPayload {
 		return DeployMetadata{}, rDeployPayload("missing payload")
@@ -305,7 +340,7 @@ func ParseDeployMetadata(payload []byte, hasPayload, canonical bool) (DeployMeta
 	if !canonical {
 		return DeployMetadata{}, rDeployPayload("non-canonical payload push")
 	}
-	m, err := detDecodeMap(payload, func(detail string) error { return rDeployPayload(detail) })
+	m, err := detDecodeMap(payload, MaxDeployPayloadBytes, func(detail string) error { return rDeployPayload(detail) })
 	if err != nil {
 		return DeployMetadata{}, err
 	}
@@ -338,17 +373,100 @@ func ParseDeployMetadata(payload []byte, hasPayload, canonical bool) (DeployMeta
 		return DeployMetadata{}, rDeployPayload(detFeeRateRule)
 	}
 	md.FeeRatePerKb = fee
+	if v, present := m["icon"]; present {
+		md.Icon, md.badIcon = nil, true
+		if icon, ok := deployIcon(v); ok {
+			md.Icon, md.badIcon = icon, false
+		}
+	}
+	_, md.hasExt = m["ext"]
+	if v, present := m["req"]; present {
+		md.hasReq = true
+		req, ok := v.(brc162.CborMap)
+		if !ok {
+			md.reqNotMap = true
+		} else if b, err := brc162.EncodeStrictCborValue(req); err == nil {
+			// a strictly decoded map re-encodes; if it ever did not, ReqBytes stays nil and RequireMandalaReq
+			// answers the final req mismatch
+			md.ReqBytes = b
+		}
+	}
 	return md, nil
 }
 
+// RequireDeployShape is contract §4 steps 2-3 for one parsed deploy, run after deploySig and the trusted-issuer
+// rules: req, when present, is a map; a token deploy (requireReq) then needs RequireMandalaReq; then ext is absent;
+// then icon, when present, is [text, bytes]. A KYC registry deploy (requireReq false) carries no req requirement
+// but keeps the map, ext and icon rules. Every refusal is the final rDeployPayload(detail).
+func RequireDeployShape(md DeployMetadata, requireReq bool, overlayIdentityKey string) error {
+	if md.reqNotMap {
+		return rDeployPayload("req must be a map")
+	}
+	if requireReq {
+		if err := RequireMandalaReq(md, overlayIdentityKey); err != nil {
+			return err
+		}
+	}
+	if md.hasExt {
+		return rDeployPayload("ext is not allowed on a Mandala deploy")
+	}
+	if md.badIcon {
+		return rDeployPayload("icon must be [mediaType, bytes]")
+	}
+	return nil
+}
+
+// deployIcon reads icon = [text, bytes], exactly two elements.
+func deployIcon(v any) (*DeployIcon, bool) {
+	arr, ok := v.([]any)
+	if !ok || len(arr) != 2 {
+		return nil, false
+	}
+	mediaType, ok := arr[0].(string)
+	if !ok {
+		return nil, false
+	}
+	b, ok := arr[1].([]byte)
+	if !ok {
+		return nil, false
+	}
+	return &DeployIcon{MediaType: mediaType, Bytes: slices.Clone(b)}, true
+}
+
+// RequireMandalaReq is the Mandala deploy req policy (contract §4 step 2): req is present and its
+// strict re-encoding is byte-identical to colorprofile.MandalaReqBytes(overlayIdentityKey), i.e.
+// exactly attested v1 {identityKey: K, trustMode: "identity"} and issuer-v1 v1 {identityKey: K}
+// with K this overlay's key. The input is never normalized: a non-canonical req already failed the
+// strict decode.
+func RequireMandalaReq(md DeployMetadata, overlayIdentityKey string) error {
+	if !md.hasReq {
+		return rDeployPayload("missing key req")
+	}
+	if md.reqNotMap {
+		return rDeployPayload("req must be a map")
+	}
+	if md.ReqBytes == nil { // present but not re-encodable: it cannot equal the expected req (fdbdddc)
+		return rDeployPayload("req does not match this overlay's Mandala profiles")
+	}
+	want, err := colorprofile.MandalaReqBytes(overlayIdentityKey)
+	if err != nil {
+		return fmt.Errorf("expected req encode: %w", err)
+	}
+	if !bytes.Equal(md.ReqBytes, want) {
+		return rDeployPayload("req does not match this overlay's Mandala profiles")
+	}
+	return nil
+}
+
 // CommitmentOf reads the authority payload {adm: bytes(32)} (other keys ignored). A missing,
-// non-canonical or non-strict payload is simply no commitment, never a refusal.
+// non-canonical or non-strict payload, or one outside the Mandala limits (4096 bytes, depth 64), is
+// simply no commitment, never a refusal.
 func CommitmentOf(payload []byte, hasPayload, canonical bool) ([32]byte, bool) {
 	if !hasPayload || !canonical {
 		return [32]byte{}, false
 	}
-	m, ok := brc162.TryDecodeStrictCbor(payload)
-	if !ok {
+	m, err := decodeMandalaCbor(payload, MaxAdminDetailsBytes)
+	if err != nil {
 		return [32]byte{}, false
 	}
 	adm, ok := m["adm"].([]byte)

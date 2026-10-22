@@ -45,14 +45,14 @@ func seamHash(t *testing.T, fill byte) *chainhash.Hash {
 	return h
 }
 
-func seamTopic(fill string) string { return "tm_" + strings.Repeat(fill, 64) }
+func seamTopic(fill string) string { return mandala.TokenTopicOfTxid(strings.Repeat(fill, 64)) }
 
 // seamValueJournal is a journal row for a value coin of tm_<fill…> owned by the kit's holder.
 func seamValueJournal(txid string, vout uint32, topic string, amount int64) mandala.OwnerRecord {
 	tokenID, _ := mandala.TokenIDOfTopic(topic)
 	return mandala.OwnerRecord{
 		Txid: txid, OutputIndex: vout, Topic: topic, TokenID: tokenID, Role: brc162.RoleValue,
-		Amount: mandala.Amount(amount), IdentityKey: mandalatest.Holder.Identity, CreatedAt: time.Now(),
+		Amount: amt(amount), IdentityKey: mandalatest.Holder.Identity, CreatedAt: time.Now(),
 	}
 }
 
@@ -108,7 +108,7 @@ func TestRestoreLiveInputsRestoresEachRowUnderItsOwnTopic(t *testing.T) {
 			t.Fatalf("row for %s: %v %v", c.h, row, err)
 		}
 		wantID, _ := mandala.TokenIDOfTopic(c.topic)
-		if row.TokenID != wantID || int64(row.Amount) != c.amount || row.IdentityKey != mandalatest.Holder.Identity {
+		if row.TokenID != wantID || row.Amount.Cmp(amt(c.amount)) != 0 || row.IdentityKey != mandalatest.Holder.Identity {
 			t.Fatalf("row = %+v, want token %s amount %d owned by the holder", row, wantID, c.amount)
 		}
 	}
@@ -117,7 +117,7 @@ func TestRestoreLiveInputsRestoresEachRowUnderItsOwnTopic(t *testing.T) {
 			t.Fatalf("a coin that is not live got a row back: %+v", row)
 		}
 	}
-	if bal, err := store.GetBalance(ctx, mandalatest.Holder.Identity); err != nil || bal != 100 {
+	if bal, err := store.GetBalance(ctx, mandalatest.Holder.Identity); err != nil || bal.Cmp(amt(100)) != 0 {
 		t.Fatalf("holder balance = %d (%v), want 100 (40 + 60, credited once each)", bal, err)
 	}
 
@@ -126,7 +126,7 @@ func TestRestoreLiveInputsRestoresEachRowUnderItsOwnTopic(t *testing.T) {
 	if err != nil || again != 0 {
 		t.Fatalf("second run restored %d (%v), want 0", again, err)
 	}
-	if bal, _ := store.GetBalance(ctx, mandalatest.Holder.Identity); bal != 100 {
+	if bal, _ := store.GetBalance(ctx, mandalatest.Holder.Identity); bal.Cmp(amt(100)) != 0 {
 		t.Fatalf("holder balance after a repeat = %d, want 100", bal)
 	}
 }

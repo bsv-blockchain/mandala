@@ -18,7 +18,7 @@ type StateStore interface {
 	RepairOwnerRow(ctx context.Context, journal OwnerRecord) (inserted bool, err error)
 	TakeToken(ctx context.Context, txid string, vout uint32) (*TokenRecord, error)
 	TakeAuthority(ctx context.Context, txid string, vout uint32) (*AuthorityRecord, error)
-	AdjustBalance(ctx context.Context, identityKey string, delta int64) error
+	AdjustBalance(ctx context.Context, identityKey string, delta Amount) error
 	CirculatingSupply(ctx context.Context, tokenID string) (*big.Int, error)
 }
 
@@ -26,7 +26,7 @@ type StateStore interface {
 type RepairUndoStore interface {
 	TakeToken(ctx context.Context, txid string, vout uint32) (*TokenRecord, error)
 	TakeAuthority(ctx context.Context, txid string, vout uint32) (*AuthorityRecord, error)
-	AdjustBalance(ctx context.Context, identityKey string, delta int64) error
+	AdjustBalance(ctx context.Context, identityKey string, delta Amount) error
 }
 
 // EngineOutputReader is the engine's admitted-output view (TS types.ts EngineOutputReader). It
@@ -42,6 +42,12 @@ type EngineOutputReader interface {
 	// ListUnspentAdmittedOutputs pages {topic, spent:false} by the keyset (txid, outputIndex)
 	// ascending, strictly after `after` (nil = from the start).
 	ListUnspentAdmittedOutputs(ctx context.Context, topic string, after *transaction.Outpoint, limit int) ([]transaction.Outpoint, error)
+}
+
+// AdmissionReader reads a txid's admission record (nil when it has none); *Store implements it. The color-*
+// lookups read it to tell an admitted output from one whose transaction was evicted.
+type AdmissionReader interface {
+	GetAdmission(ctx context.Context, txid string) (*AdmissionRecord, error)
 }
 
 // ScreeningProvider answers the sanctions screen (layer D).

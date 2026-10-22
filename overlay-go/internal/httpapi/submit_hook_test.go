@@ -97,7 +97,7 @@ func (r *hookStubRegistrar) Ensure(tokenID string) (bool, error) {
 		return false, r.err
 	}
 	if r.result && r.sub != nil {
-		r.sub.host("tm_" + strings.TrimSuffix(tokenID, "_0"))
+		r.sub.host(mandala.TokenTopicOfTxid(strings.TrimSuffix(tokenID, "_0")))
 	}
 	return r.result, nil
 }
@@ -263,7 +263,9 @@ func hookRequireError(t *testing.T, code int, body []byte, wantStatus int, wantC
 	}
 }
 
-func hookPairing(txid string) string { return "X-Topics naming tm_mandala must also name tm_" + txid }
+func hookPairing(txid string) string {
+	return "X-Topics naming tm_mandala must also name " + mandala.TokenTopicOfTxid(txid)
+}
 
 // hookDeploy builds an issuer-owned deploy with the given amount, linkage and deploySig signer.
 func hookDeploy(t *testing.T, amount uint64, noLinkage bool, sigBy *mandalatest.Party) *mandalatest.Built {
@@ -330,13 +332,13 @@ func hookRequireNothingWritten(t *testing.T, app *wiring.App, txid string) {
 	if rec != nil {
 		t.Fatalf("admission record written for %s: %+v", txid, rec)
 	}
-	for _, topic := range []string{mandala.MandalaTopic, "tm_" + txid} {
+	for _, topic := range []string{mandala.MandalaTopic, mandala.TokenTopicOfTxid(txid)} {
 		if hookApplied(t, app, topic, txid) {
 			t.Fatalf("%s applied on %s", txid, topic)
 		}
 	}
-	if app.Tokens.Hosted(txid+"_0") || app.Engine.HasTopicManager("tm_"+txid) {
-		t.Fatalf("tm_%s was registered", txid)
+	if app.Tokens.Hosted(txid+"_0") || app.Engine.HasTopicManager(mandala.TokenTopicOfTxid(txid)) {
+		t.Fatalf("%s was registered", mandala.TokenTopicOfTxid(txid))
 	}
 }
 
@@ -359,7 +361,7 @@ func TestSubmitNamingRegistryWithoutOwnTokenTopicIsRefused(t *testing.T) {
 	dep := mandalatest.Deploy(t, I, "USD")
 	iss := mandalatest.Issue(t, dep, 0, I, H, 1000)
 	tr := mandalatest.Transfer(t, iss, 1, R, 400)
-	tmDep := "tm_" + dep.Txid
+	tmDep := mandala.TokenTopicOfTxid(dep.Txid)
 
 	t.Run("stub: Submit, the registrar, the precheck and the store are never reached", func(t *testing.T) {
 		for _, c := range []struct {
@@ -447,7 +449,7 @@ func TestSubmitNamingRegistryWithoutOwnTokenTopicIsRefused(t *testing.T) {
 
 func TestDeployHookOutcomes(t *testing.T) {
 	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
-	tm := "tm_" + dep.Txid
+	tm := mandala.TokenTopicOfTxid(dep.Txid)
 	authority := &mandala.RejectError{Code: mandala.CodeAuthority, Reason: "output 0: deploy requires a valid deploySig over this txid", Topic: mandala.MandalaTopic}
 	untrusted := &mandala.RejectError{Code: mandala.CodeUntrusted, Reason: "output 0: owner 02ab is not a trusted issuer", Topic: mandala.MandalaTopic}
 	cases := []struct {
@@ -577,10 +579,10 @@ func TestRefusedDeployRegistersNoTopic(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			for attempt := 1; attempt <= 2; attempt++ { // a retry earns the same answer from the same rules
-				code, body := hookSubmit(t, f, c.b, mandala.MandalaTopic, "tm_"+c.b.Txid)
+				code, body := hookSubmit(t, f, c.b, mandala.MandalaTopic, mandala.TokenTopicOfTxid(c.b.Txid))
 				hookRequireError(t, code, body, c.status, c.code, c.reason)
 			}
-			if app.Engine.HasTopicManager("tm_"+c.b.Txid) || app.Tokens.Hosted(c.b.Txid+"_0") {
+			if app.Engine.HasTopicManager(mandala.TokenTopicOfTxid(c.b.Txid)) || app.Tokens.Hosted(c.b.Txid+"_0") {
 				t.Fatal("a refused deploy registered its token topic")
 			}
 			if hookApplied(t, app, mandala.MandalaTopic, c.b.Txid) {
@@ -606,12 +608,12 @@ func TestRefusedDeployRegistersNoTopic(t *testing.T) {
 
 	t.Run("a valid deploy afterwards is unaffected", func(t *testing.T) {
 		good := mandalatest.Deploy(t, I, "USD")
-		code, body := hookSubmit(t, f, good, mandala.MandalaTopic, "tm_"+good.Txid)
+		code, body := hookSubmit(t, f, good, mandala.MandalaTopic, mandala.TokenTopicOfTxid(good.Txid))
 		if code != 200 {
 			t.Fatalf("valid deploy: %d %s", code, body)
 		}
 		steak := hookDecodeSteak(t, body)
-		for _, topic := range []string{mandala.MandalaTopic, "tm_" + good.Txid} {
+		for _, topic := range []string{mandala.MandalaTopic, mandala.TokenTopicOfTxid(good.Txid)} {
 			if !slices.Equal(steak[topic].OutputsToAdmit, []uint32{0}) {
 				t.Fatalf("%s admitted %v, want [0]", topic, steak[topic].OutputsToAdmit)
 			}
@@ -628,8 +630,8 @@ func TestAllowlistedOutDeployIsUnknownTopicAndLeavesNothing(t *testing.T) {
 	f := New(app)
 	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
 
-	code, body := hookSubmit(t, f, dep, mandala.MandalaTopic, "tm_"+dep.Txid)
-	hookRequireError(t, code, body, 400, "ERR_SHAPE", "unknown-topic: tm_"+dep.Txid)
+	code, body := hookSubmit(t, f, dep, mandala.MandalaTopic, mandala.TokenTopicOfTxid(dep.Txid))
+	hookRequireError(t, code, body, 400, "ERR_SHAPE", "unknown-topic: "+mandala.TokenTopicOfTxid(dep.Txid))
 	hookRequireNothingWritten(t, app, dep.Txid)
 	recs, err := app.Store.ListRegistryRecords(context.Background(), 100, 0)
 	if err != nil || len(recs) != 0 {
@@ -642,7 +644,7 @@ func TestValidDeployRegistersThenAdmitsBothTopicsWithTwoSigma(t *testing.T) {
 	f := New(app)
 	ctx := context.Background()
 	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
-	tm := "tm_" + dep.Txid
+	tm := mandala.TokenTopicOfTxid(dep.Txid)
 
 	if app.Engine.HasTopicManager(tm) {
 		t.Fatal("token topic registered before its deploy")
@@ -661,17 +663,19 @@ func TestValidDeployRegistersThenAdmitsBothTopicsWithTwoSigma(t *testing.T) {
 		if !slices.Equal(e.OutputsToAdmit, []uint32{0}) || e.AdmissionIdentityKey != mandalatest.Overlay.Identity {
 			t.Fatalf("%s entry = %+v", topic, e)
 		}
-		ok, err := mandala.VerifyAdmission(topic, dep.Txid, []uint32{0}, e.AdmissionSignature, e.AdmissionIdentityKey)
-		if err != nil || !ok {
-			t.Fatalf("σI on %s does not verify: %v", topic, err)
+		if !verifyByScheme(topic, dep.Txid, []uint32{0}, e.AdmissionSignature, e.AdmissionIdentityKey) {
+			t.Fatalf("σI on %s does not verify", topic)
 		}
 		sigs[topic] = e.AdmissionSignature
 	}
 	if sigs[mandala.MandalaTopic] == sigs[tm] {
-		t.Fatal("the two σI are identical: digest v3 must bind the topic")
+		t.Fatal("the two σI are identical: each scheme must bind the topic")
 	}
-	if ok, _ := mandala.VerifyAdmission(tm, dep.Txid, []uint32{0}, sigs[mandala.MandalaTopic], mandalatest.Overlay.Identity); ok {
+	if verifyByScheme(tm, dep.Txid, []uint32{0}, sigs[mandala.MandalaTopic], mandalatest.Overlay.Identity) {
 		t.Fatal("the tm_mandala σI verifies under the token topic")
+	}
+	if ok, _ := mandala.VerifyAdmission(tm, dep.Txid, []uint32{0}, sigs[tm], mandalatest.Overlay.Identity); ok {
+		t.Fatal("the token topic's attestation verifies as v3 under the bare key")
 	}
 	rows, err := app.Store.OwnerJournalByOutpoint(ctx, dep.Txid, 0)
 	if err != nil || len(rows) != 1 || rows[0].Topic != tm {
@@ -693,6 +697,8 @@ func TestDoubleClickedDeployOverHTTP(t *testing.T) {
 		Engine:           app.EngineStore,
 		Screening:        mandala.NoSanctions{},
 		Membership:       mandala.KYCMembership{Store: app.Store},
+		// contract §4: the K every deploy's req names
+		OverlayIdentityKey: mandalatest.Overlay.Identity,
 		// Spends is nil: a deploy spends no token coin, so the conflicting-spend guard is not exercised here.
 	}
 	app.Tokens = wiring.NewTokenTopics(app.Engine, nil, false, func(id string) (engine.TopicManager, engine.LookupService, error) {
@@ -701,7 +707,7 @@ func TestDoubleClickedDeployOverHTTP(t *testing.T) {
 		if err != nil {
 			return nil, nil, err
 		}
-		ls, err := mandala.NewTokenLookupService(id, app.Verifier, app.Store)
+		ls, err := mandala.NewTokenLookupService(id, app.Verifier, app.Store, app.EngineStore)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -710,7 +716,7 @@ func TestDoubleClickedDeployOverHTTP(t *testing.T) {
 	f := New(app)
 	ctx := context.Background()
 	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
-	tm := "tm_" + dep.Txid
+	tm := mandala.TokenTopicOfTxid(dep.Txid)
 	hdr := hookTopics(t, mandala.MandalaTopic, tm)
 	body := mandalatest.SubmitBody(dep)
 
@@ -917,5 +923,33 @@ func TestNewHoldsTheSubmitGateForTheWholeRequest(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the request never finished")
+	}
+}
+
+// Contract §0/§6: a per-asset topic names vout 0 only; tm_color_<deploy txid>_1 is not hosted.
+func TestSubmitUnhostedVoutOneColorTopic(t *testing.T) {
+	app := newHookApp(t, nil, false)
+	f := New(app)
+	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
+	if code, body := hookSubmit(t, f, dep, mandala.MandalaTopic, "tm_color_"+dep.Txid+"_0"); code != 200 {
+		t.Fatalf("deploy naming tm_mandala and tm_color_<txid>_0: %d %s", code, body)
+	}
+	iss := mandalatest.Issue(t, dep, 0, mandalatest.Issuer, mandalatest.Holder, 1000)
+	vout1 := "tm_color_" + dep.Txid + "_1"
+	code, body := hookSubmit(t, f, iss, vout1)
+	hookRequireError(t, code, body, 400, "ERR_SHAPE", "unknown-topic: "+vout1)
+}
+
+// The pairing refusal names the per-asset topic of the deploy (contract §0).
+func TestSubmitPairingRuleNamesColorTopic(t *testing.T) {
+	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
+	sub := newHookStubSubmitter(mandala.MandalaTopic)
+	reg := &hookStubRegistrar{result: true, sub: sub}
+	pre := &hookStubPrecheck{admit: []uint32{0}}
+	f := newServer(sub, nil, nil, nil, WithDeployHook(reg, pre.run))
+	code, body := hookSubmit(t, f, dep, mandala.MandalaTopic)
+	hookRequireError(t, code, body, 400, "ERR_SHAPE", "X-Topics naming tm_mandala must also name tm_color_"+dep.Txid+"_0")
+	if n := sub.calls.Load(); n != 0 {
+		t.Fatalf("Submit called %d times", n)
 	}
 }

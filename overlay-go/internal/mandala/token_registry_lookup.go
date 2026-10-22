@@ -2,7 +2,6 @@ package mandala
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -74,10 +73,10 @@ func (l *TokenRegistryLookupService) OutputAdmittedByTopic(ctx context.Context, 
 
 // RestoreMissingRecords is the registry's boot repair, a host duty before submissions start (Q2
 // 258180169; D-21). The engine notifies this lookup once and only logs an error, so a record whose
-// write failed, or a deploy tm_mandala refused only transiently while tm_<deploy txid> admitted it,
+// write failed, or a deploy tm_mandala refused only transiently while tm_color_<assetId> admitted it,
 // would be missing from GET /admin/tokens for good although the token is hosted. For every token
-// with deploy metadata (written by its own ls_<id>) and an agreeing owner-journal row of the deploy at
-// output 0 on tm_<deploy txid>, it writes the record: the issuer is the journalled owner, createdAt
+// with deploy metadata (written by its own ls_color_<id>) and an agreeing owner-journal row of the deploy at
+// output 0 on tm_color_<deploy txid>_0, it writes the record: the issuer is the journalled owner, createdAt
 // the journal row's. First write wins, so an existing record never changes and a rerun is harmless.
 // It returns the token ids it restored, in tokenId order.
 func (l *TokenRegistryLookupService) RestoreMissingRecords(ctx context.Context) ([]string, error) {
@@ -106,10 +105,10 @@ func (l *TokenRegistryLookupService) RestoreMissingRecords(ctx context.Context) 
 }
 
 // recordFromJournal is the record of a deploy its own token topic admitted, or nil without an
-// agreeing journal row (TS recordFromJournal): tm_<txid> must name the metadata's token, and the
+// agreeing journal row (TS recordFromJournal): tm_color_<txid>_0 must name the metadata's token, and the
 // journal row at output 0 on that topic must be a deploy of the token owned by a compressed key.
 func (l *TokenRegistryLookupService) recordFromJournal(ctx context.Context, md MetadataRecord) (*TokenRegistryRecord, error) {
-	topic := "tm_" + md.Txid
+	topic := TokenTopicOfTxid(md.Txid)
 	if id, ok := TokenIDOfTopic(topic); !ok || id != md.TokenID {
 		return nil, nil
 	}
@@ -150,7 +149,9 @@ func (l *TokenRegistryLookupService) OutputBlockHeightUpdated(context.Context, *
 }
 
 // Lookup: every key validated first; {tokenId} answers the deploy outpoint or nothing; {list:
-// true} answers a page of deploy outpoints in record order; anything else is "Unsupported query".
+// true} answers a page of deploy outpoints in record order; anything else is "Unsupported query". A refusal is a
+// *LookupQueryError (400); a store read fault wraps ErrLookupUnavailable (503 retryable). Read-only: a retry or a
+// concurrent query changes nothing.
 func (l *TokenRegistryLookupService) Lookup(ctx context.Context, q *lookup.LookupQuestion) (*lookup.LookupAnswer, error) {
 	query, err := RequireLookupQuery(q, MandalaLookup, tokenRegistryLookupQueryKeys)
 	if err != nil {
@@ -175,7 +176,7 @@ func (l *TokenRegistryLookupService) Lookup(ctx context.Context, q *lookup.Looku
 	if hasToken {
 		r, err := l.store.FindRegistryRecord(ctx, tokenID)
 		if err != nil {
-			return nil, err
+			return nil, lookupUnavailable(MandalaLookup, err)
 		}
 		if r == nil {
 			return lookupFormulas()
@@ -183,11 +184,11 @@ func (l *TokenRegistryLookupService) Lookup(ctx context.Context, q *lookup.Looku
 		return lookupFormulas(Outpoint{Txid: r.DeployTxid, OutputIndex: 0})
 	}
 	if !list {
-		return nil, errors.New("Unsupported query")
+		return nil, errUnsupportedQuery()
 	}
 	records, err := l.store.ListRegistryRecords(ctx, limit, skip)
 	if err != nil {
-		return nil, err
+		return nil, lookupUnavailable(MandalaLookup, err)
 	}
 	ops := make([]Outpoint, 0, len(records))
 	for _, r := range records {

@@ -2,7 +2,7 @@
 import { it, expect } from 'vitest'
 import { deriveContacts } from './contacts.js'
 
-const h = (counterparty: string, when: number) => ({ txid: 't', assetId: 'x.0', direction: 'sent' as const, amount: 1, counterparty, when, kind: 'transfer' })
+const h = (counterparty: string, when: number) => ({ txid: 't', assetId: 'x.0', direction: 'sent' as const, amount: 1n, counterparty, when, kind: 'transfer' })
 
 it('dedups by identity key, orders by recency then frequency, drops empties', () => {
   const rows = [h('02a', 100), h('02b', 50), h('02a', 200), h('', 999)]

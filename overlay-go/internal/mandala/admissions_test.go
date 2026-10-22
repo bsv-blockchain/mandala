@@ -2,6 +2,7 @@ package mandala
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/go-sdk/wallet"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
@@ -19,8 +21,8 @@ import (
 const admTxid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 var (
-	admTopicA = "tm_" + strings.Repeat("a", 64)
-	admTopicB = "tm_" + strings.Repeat("b", 64)
+	admTopicA = TokenTopicOfTxid(strings.Repeat("a", 64))
+	admTopicB = TokenTopicOfTxid(strings.Repeat("b", 64))
 )
 
 func admissionStore(t *testing.T) (*Store, *mongo.Database) {
@@ -28,6 +30,10 @@ func admissionStore(t *testing.T) (*Store, *mongo.Database) {
 	db := testmongo.DB(t, "mandala3_test_admissions")
 	return mustStore(t, db), db
 }
+
+// admLegacyTokenTopic is the pre-1Color token topic spelling the TT A1.2 vectors were verified on. The v3
+// digest hashes its topic argument as given, so the cross-verified bytes stay pinned on that string.
+const admLegacyTokenTopic = "tm_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 // The verified vectors of the Global Constraints (TT A1.2).
 func TestAdmissionDigestV3Vectors(t *testing.T) {
@@ -37,8 +43,8 @@ func TestAdmissionDigestV3Vectors(t *testing.T) {
 		want  string
 	}{
 		{"tm_mandala", []uint32{0}, "2dd76e2fbb8234967159f842f463b58bd0a76efcc49e7c8372bdbc8a9931db5c"},
-		{"tm_" + admTxid, []uint32{0}, "654768162ffd1d0011e33cff4f8e553cf34a159c6006e627f4987f57c2891d0d"},
-		{"tm_" + admTxid, []uint32{1, 0, 1}, "d75c8da798a7347ef623e57cc827c3188c36acd8e84f9b9f69f531d1ebe335b1"},
+		{admLegacyTokenTopic, []uint32{0}, "654768162ffd1d0011e33cff4f8e553cf34a159c6006e627f4987f57c2891d0d"},
+		{admLegacyTokenTopic, []uint32{1, 0, 1}, "d75c8da798a7347ef623e57cc827c3188c36acd8e84f9b9f69f531d1ebe335b1"},
 	} {
 		got, err := AdmissionDigestV3(c.topic, admTxid, c.outs)
 		if err != nil || hex.EncodeToString(got[:]) != c.want {
@@ -62,6 +68,7 @@ func TestAdmissionDigestV3Vectors(t *testing.T) {
 	}
 }
 
+// tm_mandala keeps σI v3 with the bare key; a color topic carries the attested v1 signature (contract §3).
 func TestSignAndVerifyAdmissionPerTopic(t *testing.T) {
 	privHex := strings.Repeat("0a", 32)
 	s, err := NewECAdmissionSigner(privHex)
@@ -69,37 +76,53 @@ func TestSignAndVerifyAdmissionPerTopic(t *testing.T) {
 		t.Fatal(err)
 	}
 	priv, _ := ec.PrivateKeyFromHex(privHex)
-	sig, key, err := s.SignAdmission(admTopicA, admTxid, []uint32{2, 0})
+	sig, key, err := s.SignAdmission(MandalaTopic, admTxid, []uint32{2, 0})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if key != hex.EncodeToString(priv.PubKey().Compressed()) {
 		t.Fatalf("identity key %s", key)
 	}
-	if ok, err := VerifyAdmission(admTopicA, admTxid, []uint32{0, 2}, sig, key); err != nil || !ok {
+	if ok, err := VerifyAdmission(MandalaTopic, admTxid, []uint32{0, 2}, sig, key); err != nil || !ok {
 		t.Fatalf("own topic: %v %v", ok, err)
 	}
-	if ok, err := VerifyAdmission(admTopicB, admTxid, []uint32{0, 2}, sig, key); err != nil || ok {
+	if ok, err := VerifyAdmission(admTopicA, admTxid, []uint32{0, 2}, sig, key); err != nil || ok {
 		t.Fatalf("another topic's digest must not verify: %v %v", ok, err)
 	}
-	if ok, _ := VerifyAdmission(admTopicA, admTxid, []uint32{0}, sig, key); ok {
+	if ok, _ := VerifyAdmission(MandalaTopic, admTxid, []uint32{0}, sig, key); ok {
 		t.Fatal("another output set must not verify")
 	}
-	again, _, _ := s.SignAdmission(admTopicA, admTxid, []uint32{0, 2, 2})
+	again, _, _ := s.SignAdmission(MandalaTopic, admTxid, []uint32{0, 2, 2})
 	if again != sig {
 		t.Fatal("RFC6979: re-signing the same admission must give the same σI")
 	}
-	if _, _, err := s.SignAdmission(admTopicA, admTxid, nil); !errors.Is(err, ErrNoAdmittedOutputs) {
-		t.Fatalf("empty set: %v", err)
+	for _, topic := range []string{MandalaTopic, admTopicA} {
+		if _, _, err := s.SignAdmission(topic, admTxid, nil); !errors.Is(err, ErrNoAdmittedOutputs) {
+			t.Fatalf("%s empty set: %v", topic, err)
+		}
 	}
-	if _, err := VerifyAdmission(admTopicA, admTxid, []uint32{0}, "zz", key); err == nil {
+	if _, err := VerifyAdmission(MandalaTopic, admTxid, []uint32{0}, "zz", key); err == nil {
 		t.Fatal("a non-hex signature is an error")
 	}
-	if _, err := VerifyAdmission(admTopicA, admTxid, []uint32{0}, sig, "02zz"); err == nil {
+	if _, err := VerifyAdmission(MandalaTopic, admTxid, []uint32{0}, sig, "02zz"); err == nil {
 		t.Fatal("a bad identity key is an error")
 	}
 	if _, err := NewECAdmissionSigner("not hex"); err == nil {
 		t.Fatal("a bad private key is an error")
+	}
+
+	att, attKey, err := s.SignAdmission(admTopicA, admTxid, []uint32{2, 0})
+	if err != nil || attKey != key {
+		t.Fatalf("color topic: %v, identity %s (must be the root key)", err, attKey)
+	}
+	if !VerifyAttestation(admTopicA, admTxid, []uint32{0, 2}, att, key) {
+		t.Fatal("attested σI on its own topic")
+	}
+	if VerifyAttestation(admTopicB, admTxid, []uint32{0, 2}, att, key) {
+		t.Fatal("attested σI verifies under another color topic")
+	}
+	if ok, _ := VerifyAdmission(admTopicA, admTxid, []uint32{0, 2}, att, key); ok {
+		t.Fatal("a color topic's σI verifies as v3 under the bare key")
 	}
 }
 
@@ -422,5 +445,188 @@ func TestMergeRestoreSnapshot(t *testing.T) {
 	}
 	if PayloadHashHex(nil) != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
 		t.Fatal("an absent payload hashes the empty string")
+	}
+}
+
+// BRC-207 attested admission statement, C.0 vectors (0207:10224-10264; contract §3).
+const (
+	c0Topic  = "tm_color_c7d0f61946bc8bde6c01219c67bb99cbf2f89a39bcaea9c2ecf67c54224edb4f_0"
+	c0Txid   = "05fabadb4a03eb7d5e54713824a483161a82ecc7061b124e99a13e9778131931"
+	c0Signer = "02798b81951a6a8c7ef8beda09b06a23031d7efaf37b663265e0188ab378124046"
+	c0Tweak  = "6ef21748a4f6f5034842184e25f68e8df8663e036622ad9b3d061c6dd81ea93b" // 0207:10230
+	c0Child  = "033520aaa77b6914019796e974d1737acc890c5283c0921ddcfc2d5c815db8fb90"
+	c0Digest = "9f61b417ec979c3c057313fe56f3c6056d2962b6bceaaa8272377bb9a80d8f9d"
+	c0Low    = "3045022100d1f48fc13a1ffd18196bcb6166aff936b8dc6cb7b0866fe9226ef1db89fb06be02203eff5870ae5215047d1d624733b29f563d5037660ce5c4ed0ce4ac52cc56758a"
+	c0High   = "3046022100d1f48fc13a1ffd18196bcb6166aff936b8dc6cb7b0866fe9226ef1db89fb06be022100c100a78f51adeafb82e29db8cc4d60a87d5ea580a262db4eb2edb23a03dfcbb7"
+	msgC0    = "1color-admit:v1:" + c0Topic + ":" + c0Txid + ":0,2"
+)
+
+// c0Priv is the public test integer 5555 (0207:10224); never for funds.
+func c0Priv(t *testing.T) *ec.PrivateKey {
+	t.Helper()
+	b := make([]byte, 32)
+	b[30], b[31] = 0x15, 0xb3
+	p, _ := ec.PrivateKeyFromBytes(b)
+	return p
+}
+
+// signWith signs data through ProtoWallet.CreateSignature on the attestation protocol with keyID, counterparty anyone.
+func signWith(t *testing.T, priv *ec.PrivateKey, keyID, data string) string {
+	t.Helper()
+	w, err := wallet.NewProtoWallet(wallet.ProtoWalletArgs{Type: wallet.ProtoWalletArgsTypePrivateKey, PrivateKey: priv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := w.CreateSignature(context.Background(), wallet.CreateSignatureArgs{
+		EncryptionArgs: wallet.EncryptionArgs{
+			ProtocolID:   AttestationProtocol,
+			KeyID:        keyID,
+			Counterparty: wallet.Counterparty{Type: wallet.CounterpartyTypeAnyone},
+		},
+		Data: []byte(data),
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(res.Signature.Serialize())
+}
+
+// bareSign signs sha256(msg) with the root key itself (no BRC-42 child).
+func bareSign(t *testing.T, priv *ec.PrivateKey, msg string) string {
+	t.Helper()
+	d := sha256.Sum256([]byte(msg))
+	sig, err := priv.Sign(d[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(sig.Serialize())
+}
+
+func TestAttestationC0Vectors(t *testing.T) {
+	priv := c0Priv(t)
+	if priv.PubKey().ToDERHex() != c0Signer {
+		t.Fatal("signer")
+	}
+	// BRC-42 HMAC tweak, asserted on its own: key = compressed shared secret of (anyone = scalar 1, signer), which is
+	// the signer point itself; msg = utf8 invoice "2-color admission attestation-1". If this passes and the child
+	// fails, the fault is point addition; if this fails, it is the invoice string or the HMAC key.
+	anyPriv, _ := wallet.AnyoneKey()
+	shared, err := anyPriv.DeriveSharedSecret(priv.PubKey())
+	if err != nil || !shared.IsEqual(priv.PubKey()) {
+		t.Fatal("shared secret with scalar 1 must be the signer point", err)
+	}
+	mac := hmac.New(sha256.New, shared.Compressed())
+	mac.Write([]byte("2-color admission attestation-1"))
+	if got := hex.EncodeToString(mac.Sum(nil)); got != c0Tweak {
+		t.Fatalf("HMAC tweak %s (invoice or HMAC key wrong)", got)
+	}
+	child, err := AttestationSigningKey(priv.PubKey())
+	if err != nil || child.ToDERHex() != c0Child {
+		t.Fatal(child, err)
+	}
+	msg, err := AttestationMessage(c0Topic, c0Txid, []uint32{0, 2})
+	if err != nil || msg != msgC0 {
+		t.Fatal(msg, err)
+	}
+	if d := sha256.Sum256([]byte(msg)); hex.EncodeToString(d[:]) != c0Digest {
+		t.Fatal("digest")
+	}
+	s := &ECAdmissionSigner{priv: priv}
+	sig, ident, err := s.SignAdmission(c0Topic, c0Txid, []uint32{2, 0, 2}) // canonicalised by the signer
+	if err != nil || sig != c0Low || ident != c0Signer {
+		t.Fatal(sig, ident, err)
+	}
+	if !VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, c0Low, c0Signer) {
+		t.Fatal("low-S")
+	}
+	if !VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, c0High, c0Signer) {
+		t.Fatal("high-S (BSV Chronicle: never normalize S)")
+	}
+}
+
+func TestAttestationC0Negatives(t *testing.T) {
+	other := "tm_color_" + strings.Repeat("00", 32) + "_0"
+	priv := c0Priv(t)
+	for name, ok := range map[string]bool{
+		"reordered":        VerifyAttestation(c0Topic, c0Txid, []uint32{2, 0}, c0Low, c0Signer),
+		"duplicate":        VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2, 2}, c0Low, c0Signer),
+		"missing 2":        VerifyAttestation(c0Topic, c0Txid, []uint32{0}, c0Low, c0Signer),
+		"empty":            VerifyAttestation(c0Topic, c0Txid, nil, c0Low, c0Signer),
+		"other topic":      VerifyAttestation(other, c0Txid, []uint32{0, 2}, c0Low, c0Signer),
+		"tm_mandala topic": VerifyAttestation(MandalaTopic, c0Txid, []uint32{0, 2}, c0Low, c0Signer),
+		"uppercase sig":    VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, strings.ToUpper(c0Low), c0Signer),
+		"uppercase signer": VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, c0Low, strings.ToUpper(c0Signer)),
+		"uppercase txid":   VerifyAttestation(c0Topic, strings.ToUpper(c0Txid), []uint32{0, 2}, c0Low, c0Signer),
+		"uncompressed":     VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, c0Low, hex.EncodeToString(priv.PubKey().Uncompressed())),
+		"off-curve signer": VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, c0Low, "02"+strings.Repeat("00", 32)),
+		"trailing":         VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, c0Low+"00", c0Signer),
+		"truncated":        VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, c0Low[:len(c0Low)-2], c0Signer),
+		"keyID 2":          VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, signWith(t, priv, "2", msgC0), c0Signer),
+		"newline":          VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, signWith(t, priv, "1", msgC0+"\n"), c0Signer),
+		"bare key":         VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, bareSign(t, priv, msgC0), c0Signer),
+		"child as signer":  VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, c0Low, c0Child),
+	} {
+		if ok {
+			t.Errorf("%s verified", name)
+		}
+	}
+	// The positive control for the helpers: keyID "1" over the exact message is the C.0 low-S signature.
+	if got := signWith(t, priv, "1", msgC0); got != c0Low {
+		t.Fatalf("signWith control %s", got)
+	}
+	der, _ := hex.DecodeString(c0Low)
+	sig, _ := ec.ParseDERSignature(der)
+	if d := sha256.Sum256([]byte(msgC0)); sig.Verify(d[:], priv.PubKey()) {
+		t.Fatal("C.0 signature verifies against the bare key")
+	}
+	s := &ECAdmissionSigner{priv: priv}
+	if _, _, err := s.SignAdmission(KYCTopic, c0Txid, []uint32{0}); !errors.Is(err, ErrUnsignedTopic) {
+		t.Fatal(err)
+	}
+	if _, _, err := s.SignAdmission("tm_"+strings.Repeat("c7", 32), c0Txid, []uint32{0}); !errors.Is(err, ErrUnsignedTopic) {
+		t.Fatal("a legacy token topic is unsigned:", err)
+	}
+	if _, _, err := s.SignAdmission(c0Topic, c0Txid, nil); !errors.Is(err, ErrNoAdmittedOutputs) {
+		t.Fatal("empty set:", err)
+	}
+	for _, c := range []struct {
+		topic, txid string
+		outs        []uint32
+	}{
+		{MandalaTopic, c0Txid, []uint32{0}},
+		{"tm_color_" + strings.Repeat("c7", 32) + "_1", c0Txid, []uint32{0}},
+		{c0Topic, strings.ToUpper(c0Txid), []uint32{0}},
+		{c0Topic, c0Txid[:63], []uint32{0}},
+		{c0Topic, c0Txid, nil},
+		{c0Topic, c0Txid, []uint32{2, 0}},
+		{c0Topic, c0Txid, []uint32{0, 0}},
+	} {
+		if _, err := AttestationMessage(c.topic, c.txid, c.outs); err == nil {
+			t.Errorf("AttestationMessage(%q, %q, %v) accepted", c.topic, c.txid, c.outs)
+		}
+	}
+	if m, err := AttestationMessage(c0Topic, c0Txid, []uint32{4294967295}); err != nil || !strings.HasSuffix(m, ":4294967295") {
+		t.Fatal(m, err)
+	}
+}
+
+// The attested signature is RFC6979-deterministic: the replay and /admin/admission paths re-sign to the same bytes.
+func TestAttestationDeterministicAndRootIdentity(t *testing.T) {
+	priv := c0Priv(t)
+	s := &ECAdmissionSigner{priv: priv}
+	a, ka, _ := s.SignAdmission(c0Topic, c0Txid, []uint32{0, 2})
+	b, kb, _ := s.SignAdmission(c0Topic, c0Txid, []uint32{2, 0})
+	if a != b || ka != kb || ka != c0Signer {
+		t.Fatal("re-signing must reproduce the bytes and report the root identity key")
+	}
+	m, km, err := s.SignAdmission(MandalaTopic, c0Txid, []uint32{0, 2})
+	if err != nil || km != c0Signer || m == a {
+		t.Fatal("tm_mandala keeps v3 with the bare key", m, err)
+	}
+	if ok, err := VerifyAdmission(MandalaTopic, c0Txid, []uint32{0, 2}, m, c0Signer); err != nil || !ok {
+		t.Fatal("v3 on tm_mandala", err)
+	}
+	if VerifyAttestation(c0Topic, c0Txid, []uint32{0, 2}, m, c0Signer) {
+		t.Fatal("a v3 σI verifies as an attestation")
 	}
 }

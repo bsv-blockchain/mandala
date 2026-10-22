@@ -112,7 +112,7 @@ func admissionHandler(rec AdmissionRecorder, proof AppliedAdmissionProof, signer
 			}
 			adm := map[string]mandala.TopicAdmission{}
 			for topic, outs := range applied {
-				if canonical := mandala.CanonicalOutputs(outs); mandala.IsSigmaTopic(topic) && len(canonical) > 0 {
+				if canonical := mandala.CanonicalOutputs(outs); mandala.AdmissionSchemeOf(topic) != mandala.SchemeNone && len(canonical) > 0 {
 					adm[topic] = mandala.TopicAdmission{OutputsToAdmit: canonical}
 				}
 			}

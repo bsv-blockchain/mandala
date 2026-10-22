@@ -208,7 +208,7 @@ func splitSubmitBody(body []byte, framed bool) ([]byte, []byte, string) {
 
 func namesSigmaTopic(topics []string) bool {
 	for _, t := range topics {
-		if mandala.IsSigmaTopic(t) {
+		if mandala.AdmissionSchemeOf(t) != mandala.SchemeNone {
 			return true
 		}
 	}
@@ -289,7 +289,7 @@ func serveKnownVerdict(c *fiber.Ctx, ctx context.Context, d submitDeps, txid, pa
 	for _, topic := range topics {
 		outs := k.appliedOutputs(topic)
 		w := wireAdmittance{OutputsToAdmit: nonNilUint32(outs), CoinsToRetain: []uint32{}}
-		if mandala.IsSigmaTopic(topic) && len(outs) > 0 {
+		if mandala.AdmissionSchemeOf(topic) != mandala.SchemeNone && len(outs) > 0 {
 			if sig, key := signAdmission(d.signer, topic, txid, outs); sig != "" {
 				w.AdmissionSignature, w.AdmissionIdentityKey = sig, key
 				ident = key
@@ -313,7 +313,7 @@ func serveKnownVerdict(c *fiber.Ctx, ctx context.Context, d submitDeps, txid, pa
 // shape a dupe-gate hit leaves when a concurrent submit of the txid committed after step 4 (D-20).
 func emptyUncoveredSigmaEntry(steak overlay.Steak, known knownState) bool {
 	for topic, ai := range steak {
-		if mandala.IsSigmaTopic(topic) && (ai == nil || len(ai.OutputsToAdmit) == 0) && !known.applied(topic) {
+		if mandala.AdmissionSchemeOf(topic) != mandala.SchemeNone && (ai == nil || len(ai.OutputsToAdmit) == 0) && !known.applied(topic) {
 			return true
 		}
 	}
@@ -321,7 +321,7 @@ func emptyUncoveredSigmaEntry(steak overlay.Steak, known knownState) bool {
 }
 
 // admittedEntries turns the STEAK into wire entries. A σ-topic the engine skipped as applied (in known.proof, entry
-// empty) answers its recorded or stored outputs; every σ-topic entry with outputs is signed with its own v3 digest and
+// empty) answers its recorded or stored outputs; every σ-topic entry with outputs is signed by its topic scheme (attested v1 / v3) and
 // returned in the finalize map. KYC entries are never signed.
 func admittedEntries(steak overlay.Steak, known knownState, signer mandala.AdmissionSigner, txid string, txidOK bool) (map[string]wireAdmittance, map[string]mandala.TopicAdmission, string) {
 	entries := make(map[string]wireAdmittance, len(steak))
@@ -341,7 +341,7 @@ func admittedEntries(steak overlay.Steak, known knownState, signer mandala.Admis
 			outs = known.appliedOutputs(topic)
 			w.OutputsToAdmit = nonNilUint32(outs)
 		}
-		if txidOK && mandala.IsSigmaTopic(topic) && len(outs) > 0 {
+		if txidOK && mandala.AdmissionSchemeOf(topic) != mandala.SchemeNone && len(outs) > 0 {
 			if sig, key := signAdmission(signer, topic, txid, outs); sig != "" {
 				w.AdmissionSignature, w.AdmissionIdentityKey = sig, key
 				admissions[topic] = mandala.TopicAdmission{OutputsToAdmit: outs, AdmissionSignature: sig}
@@ -358,7 +358,8 @@ func evictedDescription(txid string) string {
 	return fmt.Sprintf("transaction %s was admitted and later evicted; its inputs are spendable again", txid)
 }
 
-// signAdmission is σI over AdmissionDigestV3(topic, txid, outputs). Best-effort: a failure logs and drops the fields.
+// signAdmission signs (topic, txid, outputs) by the topic's scheme (mandala.ECAdmissionSigner). Best-effort: a
+// failure logs and drops the fields.
 func signAdmission(signer mandala.AdmissionSigner, topic, txid string, outputs []uint32) (sig, ident string) {
 	if signer == nil || len(outputs) == 0 {
 		return "", ""
@@ -533,18 +534,20 @@ func submitHostRulesMiddleware(h hostRules) fiber.Handler {
 		}
 		txid := txHash.String()
 
-		// 2a. Pairing (V-1). A deploy names tm_mandala AND tm_<own txid> (TT T5). Anything else naming tm_mandala is
-		// either a deploy whose coin would never enter its own topic (unissuable token, permanent registry record) or
-		// a token tx whose tm_mandala entry retains no coin and deletes the registry's engine doc (G8, G16).
-		if !slices.Contains(topics, "tm_"+txid) {
+		// 2a. Pairing (V-1). A deploy names tm_mandala AND tm_color_<own txid>_0 (TT T5, contract §0). Anything else
+		// naming tm_mandala is either a deploy whose coin would never enter its own topic (unissuable token, permanent
+		// registry record) or a token tx whose tm_mandala entry retains no coin and deletes the registry's engine doc
+		// (G8, G16). txid is a chainhash string, so own is never "".
+		own := mandala.TokenTopicOfTxid(txid)
+		if own == "" || !slices.Contains(topics, own) {
 			return verdictResponse(c, hostRuleVerdict(mandala.CodeShape),
-				"X-Topics naming tm_mandala must also name tm_"+txid, "")
+				"X-Topics naming tm_mandala must also name tm_color_"+txid+"_0", "")
 		}
 
-		// 2b. Deploy hook (V-2): register tm_<txid> only after tm_mandala's own rules (trusted issuer, deploySig,
-		// shape) admit vout 0, so junk deploys cannot grow the topic set or the lookup fan-out (G18).
+		// 2b. Deploy hook (V-2): register tm_color_<txid>_0 only after tm_mandala's own rules (trusted issuer,
+		// deploySig, shape) admit vout 0, so junk deploys cannot grow the topic set or the lookup fan-out (G18).
 		tokenID, ok := mandala.DeployTokenOf(topics, txid)
-		if !ok || h.submitter.HasTopicManager("tm_"+txid) {
+		if !ok || h.submitter.HasTopicManager(own) {
 			return c.Next()
 		}
 		ctx := mandala.WithOffChainValues(c.UserContext(), offChain)
@@ -566,10 +569,10 @@ func submitHostRulesMiddleware(h hostRules) fiber.Handler {
 			return verdictResponse(c, sv.Verdict, sv.Description, sv.SpendTxid)
 		}
 		if !slices.Equal(admit.OutputsToAdmit, []uint32{0}) {
-			return c.Next() // no deploy at vout 0: the step-3 pre-check answers unknown-topic: tm_<txid>
+			return c.Next() // no deploy at vout 0: the step-3 pre-check answers unknown-topic: tm_color_<txid>_0
 		}
 		// Shared gate slot held (step 0) → registrar mutex (inside Ensure). A false result (allowlisted out) falls
-		// through to the pre-check, which answers 400 unknown-topic: tm_<txid> and writes nothing.
+		// through to the pre-check, which answers 400 unknown-topic: tm_color_<txid>_0 and writes nothing.
 		if _, err := h.registrar.Ensure(tokenID); err != nil {
 			return verdictResponse(c, hostRuleVerdict(mandala.CodeUnavailable), "token topic registration failed: "+err.Error(), "")
 		}

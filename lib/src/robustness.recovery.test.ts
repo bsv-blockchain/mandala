@@ -1,13 +1,11 @@
 /**
  * Recovery-machinery regression tests for the robustness audit fixes:
  * per-entry journal atomicity, intent markers, abort retention,
- * already-broadcast detection, notification retry, receive verification,
- * and cross-tab lock semantics.
+ * already-broadcast detection, notification retry, and cross-tab lock
+ * semantics.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { PrivateKey, Hash, Transaction, P2PKH, LockingScript, UnlockingScript } from '@bsv/sdk'
-import { MandalaToken } from './__fixtures__/token.js'
-import type { MandalaActionDetails } from './brc162.js'
+import { Beef, LockingScript, PrivateKey, Transaction, Utils } from '@bsv/sdk'
 import {
   journalPut,
   journalList,
@@ -23,18 +21,15 @@ import {
   notifyPut,
   notifyList,
   notifyClear,
-  reconcileNotifications,
-  PendingNotification
+  reconcileNotifications
 } from './notifyJournal.js'
-import { receiveTokens, InvalidTransferError } from './receive.js'
 import { tryWithLock } from './webLocks.js'
 import { isAlreadyBroadcast, submitAndBroadcast } from './overlay.js'
-import { submitAdminAction } from './assets.js'
-import type { AdminAsset } from './assets.js'
 import { registerAsset } from './issuerOps.js'
-import { clearAdminAuthGates } from './adminAuthGate.js'
 import { BusyError } from './singleFlight.js'
-import { MESSAGEBOX } from './constants.js'
+import { configureMandala, MESSAGEBOX } from './constants.js'
+import { handoverBody } from './receipt.js'
+import { colorTopic } from './naming.js'
 
 // Label lookup only; an unconfigured overlay URL now throws (see overlayUrlGuard.test.ts),
 // and these tests are about journal/receive ordering, not metadata.
@@ -125,14 +120,14 @@ describe('reconcile abort retention', () => {
 
 describe('notification journal', () => {
   it('retries pending notifications and clears on delivery', async () => {
-    await notifyPut({ txid: 't1', recipient: '02ab', messageBox: 'mandala-payments', body: { assetId: 'a.0' }, at: 1 })
+    await notifyPut({ txid: 't1', recipient: '02ab', messageBox: MESSAGEBOX, body: { assetId: 'a.0' }, at: 1 })
     const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
     const delivered = await reconcileNotifications(mbc)
     expect(delivered).toEqual(['t1'])
     expect(await notifyList()).toEqual([])
     expect(mbc.sendMessage).toHaveBeenCalledWith({
       recipient: '02ab',
-      messageBox: 'mandala-payments',
+      messageBox: MESSAGEBOX,
       body: { assetId: 'a.0' }
     })
   })
@@ -146,72 +141,133 @@ describe('notification journal', () => {
   })
 })
 
-describe('receive verification', () => {
-  const pkh = Hash.hash160(PrivateKey.fromRandom().toPublicKey().encode(true) as number[])
-  const assetId = `${'a'.repeat(64)}_0`
+// ---------------------------------------------------------------------------
+// Task 15: hand-over redelivery. A 'signed' entry (crash between sign and
+// deliver, or a deliver whose journal write was lost) is redelivered from the
+// journal; a successful resend promotes 'signed' to 'delivered'.
+// ---------------------------------------------------------------------------
 
-  const mkMbc = (messages: Array<{ messageId: string, body: any }>) => ({
-    listMessages: vi.fn().mockResolvedValue(messages),
-    acknowledgeMessage: vi.fn().mockResolvedValue({})
+describe('reconcileNotifications — hand-over redelivery', () => {
+  const ASSET = `${'c7'.repeat(32)}_0`
+  const RECIPIENT = '02' + '7b'.repeat(32)
+  const tip = new Transaction()
+  tip.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
+  const tipBeef = new Beef(); tipBeef.mergeTransaction(tip)
+  const TXID = tip.id('hex')
+  const TX = tipBeef.toBinaryAtomic(TXID)
+  const RECEIPT = {
+    version: 1 as const,
+    assetId: ASSET,
+    derivationPrefix: 'cHJlZml4',
+    derivationSuffix: 'c3VmZml4',
+    senderIdentityKey: '02' + '11'.repeat(32),
+    profileData: { 'https://brc.dev/207/attested': { [ASSET]: { submissions: [] } } }
+  }
+  const signedEntry = (over: Record<string, unknown> = {}): any => ({
+    txid: TXID,
+    stage: 'signed',
+    at: Date.now() - 61_000,
+    reference: 'ref-s',
+    assetId: ASSET,
+    recipientKey: RECIPIENT,
+    outputIndex: 0,
+    note: 'for lunch',
+    receipt: JSON.stringify(RECEIPT),
+    submit: { txHex: Utils.toHex(TX), offChainHex: '0708', topics: [colorTopic(ASSET)] },
+    ...over
+  })
+  const stageOf = async (txid: string): Promise<string | undefined> => (await journalList()).find(e => e.txid === txid)?.stage
+
+  it('redelivers a signed entry older than 60 s that has no pending notification, rebuilt from the journal, and promotes it', async () => {
+    await journalPut(signedEntry())
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    const delivered = await reconcileNotifications(mbc)
+    expect(mbc.sendMessage).toHaveBeenCalledTimes(1)
+    const sent = mbc.sendMessage.mock.calls[0][0]
+    expect(sent.recipient).toBe(RECIPIENT)
+    expect(sent.messageBox).toBe(MESSAGEBOX)
+    expect(sent.body.v).toBe(3)
+    expect(sent.body).toEqual(handoverBody({ assetId: ASSET, outputIndex: 0, tx: TX, receipt: RECEIPT, note: 'for lunch' }))
+    expect(delivered).toEqual([TXID])
+    expect(await stageOf(TXID)).toBe('delivered')
+    expect(await notifyList()).toEqual([])
   })
 
-  it('acks and drops a message whose transaction does not parse (poisoned)', async () => {
-    const mbc = mkMbc([{
-      messageId: 'm1',
-      body: { assetId, amount: '25', sender: '02ab', keyID: 'k', protocolID: [2, 'p mandala token'], transaction: [1, 2, 3], outputIndex: 0 }
-    }])
-    const wallet = mkWallet()
-    const { accepted, failed } = await receiveTokens({ wallet: wallet as any, messageBoxClient: mbc })
-    expect(accepted).toEqual([])
-    expect(failed).toHaveLength(1)
-    expect(failed[0].error).toBeInstanceOf(InvalidTransferError)
-    // Poisoned message is acknowledged so it never replays.
-    expect(mbc.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m1'] })
-    // And the wallet was never touched.
-    expect(wallet.internalizeAction).not.toHaveBeenCalled()
+  it('leaves a signed entry aged 10 s alone (a live send is still delivering it)', async () => {
+    await journalPut(signedEntry({ at: Date.now() - 10_000 }))
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    expect(await reconcileNotifications(mbc)).toEqual([])
+    expect(mbc.sendMessage).not.toHaveBeenCalled()
+    expect(await stageOf(TXID)).toBe('signed')
   })
 
-  it('treats an already-internalized output as success and acknowledges', async () => {
-    const { Transaction: Tx, P2PKH, UnlockingScript } = await import('@bsv/sdk')
-    const src = new Tx()
-    src.addOutput({ satoshis: 2, lockingScript: new P2PKH().lock(pkh) })
-    const tx = new Tx()
-    tx.addInput({ sourceTransaction: src, sourceOutputIndex: 0, unlockingScript: new UnlockingScript([]), sequence: 0xffffffff })
-    tx.addOutput({ satoshis: 1, lockingScript: new MandalaToken().lock(assetId, 25, pkh) })
-    const atomic = tx.toAtomicBEEF(true)
-
-    const mbc = mkMbc([{
-      messageId: 'm2',
-      body: { assetId, amount: '25', sender: '02ab', keyID: 'k', protocolID: [2, 'p mandala token'], transaction: atomic, outputIndex: 0 }
-    }])
-    const wallet = mkWallet({
-      internalizeAction: vi.fn().mockRejectedValue(new Error('output already exists in basket'))
-    })
-    const { accepted, failed } = await receiveTokens({ wallet: wallet as any, messageBoxClient: mbc })
-    expect(failed).toEqual([])
-    expect(accepted).toHaveLength(1)
-    expect(mbc.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m2'] })
+  it('a pending mandala-color notification for a signed entry is resent once (not rebuilt too) and promotes the entry', async () => {
+    await journalPut(signedEntry())
+    const body = handoverBody({ assetId: ASSET, outputIndex: 0, tx: TX, receipt: RECEIPT })
+    await notifyPut({ txid: TXID, recipient: RECIPIENT, messageBox: MESSAGEBOX, body, at: 1 })
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    expect(await reconcileNotifications(mbc)).toEqual([TXID])
+    expect(mbc.sendMessage).toHaveBeenCalledTimes(1)
+    expect(mbc.sendMessage.mock.calls[0][0].body).toEqual(body)
+    expect(await stageOf(TXID)).toBe('delivered')
   })
 
-  it('rejects a body/output mismatch (wrong amount) without wallet work', async () => {
-    const { Transaction: Tx, P2PKH, UnlockingScript } = await import('@bsv/sdk')
-    const src = new Tx()
-    src.addOutput({ satoshis: 2, lockingScript: new P2PKH().lock(pkh) })
-    const tx = new Tx()
-    tx.addInput({ sourceTransaction: src, sourceOutputIndex: 0, unlockingScript: new UnlockingScript([]), sequence: 0xffffffff })
-    tx.addOutput({ satoshis: 1, lockingScript: new MandalaToken().lock(assetId, 25, pkh) })
-    const atomic = tx.toAtomicBEEF(true)
+  it('a failed redelivery journals the notification (attempts 1) and keeps the entry signed; the next pass resends it once', async () => {
+    await journalPut(signedEntry())
+    const down = { sendMessage: vi.fn().mockRejectedValue(new Error('box down')) }
+    expect(await reconcileNotifications(down)).toEqual([])
+    expect(down.sendMessage).toHaveBeenCalledTimes(1)
+    expect(await notifyList()).toMatchObject([{ txid: TXID, recipient: RECIPIENT, messageBox: MESSAGEBOX, attempts: 1 }])
+    expect(await stageOf(TXID)).toBe('signed')
 
-    const mbc = mkMbc([{
-      messageId: 'm3',
-      body: { assetId, amount: '1000000', sender: '02ab', keyID: 'k', protocolID: [2, 'p mandala token'], transaction: atomic, outputIndex: 0 }
-    }])
-    const wallet = mkWallet()
-    const { accepted, failed } = await receiveTokens({ wallet: wallet as any, messageBoxClient: mbc })
-    expect(accepted).toEqual([])
-    expect(failed[0].error).toBeInstanceOf(InvalidTransferError)
-    expect(String(failed[0].error)).toMatch(/amount mismatch/)
-    expect(wallet.internalizeAction).not.toHaveBeenCalled()
+    const up = { sendMessage: vi.fn().mockResolvedValue({}) }
+    expect(await reconcileNotifications(up)).toEqual([TXID])
+    expect(up.sendMessage).toHaveBeenCalledTimes(1)
+    expect(await stageOf(TXID)).toBe('delivered')
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('a resend never touches a txid whose entry is not signed (payout notifications, accepted entries)', async () => {
+    await journalPut({ txid: TXID, stage: 'accepted', at: 1 })
+    await notifyPut({ txid: TXID, recipient: RECIPIENT, messageBox: MESSAGEBOX, body: {}, at: 1 })
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    expect(await reconcileNotifications(mbc)).toEqual([TXID])
+    expect(await stageOf(TXID)).toBe('accepted')
+  })
+
+  it('never redelivers a signed entry whose journaled bytes do not hash to its txid', async () => {
+    await journalPut(signedEntry({ txid: 'f'.repeat(64) }))
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      expect(await reconcileNotifications(mbc)).toEqual([])
+    } finally {
+      warn.mockRestore()
+    }
+    expect(mbc.sendMessage).not.toHaveBeenCalled()
+    expect(await stageOf('f'.repeat(64))).toBe('signed')
+  })
+
+  it('a signed self-send entry (receipt sender = recipient) aged 61 s is promoted to delivered without any send', async () => {
+    await journalPut(signedEntry({ recipientKey: RECEIPT.senderIdentityKey }))
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    expect(await reconcileNotifications(mbc)).toEqual([])
+    expect(mbc.sendMessage).not.toHaveBeenCalled()
+    expect(await stageOf(TXID)).toBe('delivered')
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('two concurrent passes deliver once', async () => {
+    await journalPut(signedEntry())
+    let release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    const mbc = { sendMessage: vi.fn().mockImplementation(async () => { await gate; return {} }) }
+    const first = reconcileNotifications(mbc)
+    const second = reconcileNotifications(mbc)
+    release()
+    const [a, b] = await Promise.all([first, second])
+    expect(mbc.sendMessage).toHaveBeenCalledTimes(1)
+    expect([...a, ...b]).toEqual([TXID])
   })
 })
 
@@ -236,133 +292,25 @@ describe('webLocks', () => {
 // Admin pipelines driven end-to-end with the wallet + templates stubbed.
 // ---------------------------------------------------------------------------
 
-const ASSET_ID = 'a'.repeat(64) + '_0'
-const PRIOR = 'b'.repeat(64) + '.1'
 const ISSUER = '02' + 'ab'.repeat(32)
-const RECIPIENT = '03' + 'cd'.repeat(32)
-const COMMIT_TXID = 'c'.repeat(64)
-
-/** A signable BEEF with `n` inputs — what createAction hands back for signing. */
-function signableBeef (n = 1): number[] {
-  const pkh = Hash.hash160(PrivateKey.fromRandom().toPublicKey().encode(true) as number[])
-  const src = new Transaction()
-  for (let i = 0; i < n; i++) src.addOutput({ satoshis: 2, lockingScript: new P2PKH().lock(pkh) })
-  const tx = new Transaction()
-  for (let i = 0; i < n; i++) {
-    tx.addInput({ sourceTransaction: src, sourceOutputIndex: i, unlockingScript: new UnlockingScript([]), sequence: 0xffffffff })
-  }
-  tx.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(pkh) })
-  return tx.toBEEF(true)
-}
 
 // BRC-162 locks/unlocks run for real against these wallet key stubs.
 function stubTemplates (): void {}
 const STUB_KEY = PrivateKey.fromHex('11'.repeat(32))
+// A wallet's revelation echoes the request (BRC-72), as revealIssuerLinkage checks.
+const revealStub = () => vi.fn(async (a: { counterparty: string, verifier: string, protocolID: [2, string], keyID: string }) => ({
+  prover: STUB_KEY.toPublicKey().toString(),
+  verifier: a.verifier,
+  counterparty: a.counterparty,
+  protocolID: a.protocolID,
+  keyID: a.keyID,
+  encryptedLinkage: [1],
+  encryptedLinkageProof: [2],
+  proofType: 0
+}))
 const keyStubs = () => ({
   getPublicKey: vi.fn().mockResolvedValue({ publicKey: STUB_KEY.toPublicKey().toString() }),
   createSignature: vi.fn().mockResolvedValue({ signature: STUB_KEY.sign([1, 2, 3]).toDER() as number[] })
-})
-
-const mkAdminWallet = () => ({
-  listOutputs: vi.fn().mockResolvedValue({ outputs: [{ outpoint: PRIOR }], BEEF: [1] }),
-  createAction: vi.fn().mockResolvedValue({ signableTransaction: { tx: signableBeef(1), reference: 'ref-1' } }),
-  signAction: vi.fn().mockResolvedValue({ tx: [9, 9, 9], txid: COMMIT_TXID }),
-  revealSpecificKeyLinkage: vi.fn().mockResolvedValue({ keyID: 'k' }),
-  abortAction: vi.fn().mockResolvedValue({ aborted: true }),
-  listActions: vi.fn().mockResolvedValue({ actions: [] }),
-  ...keyStubs()
-})
-
-const asset: AdminAsset = {
-  assetId: ASSET_ID,
-  label: 'USD',
-  authOutpoint: PRIOR,
-  authKeyID: 'deploy'
-}
-
-describe('A08 reissue notification is journaled before the send (submitAdminAction)', () => {
-  const reissue: MandalaActionDetails = {
-    kind: 'reissue', outpoint: 'f'.repeat(64) + '.0', recipient: RECIPIENT
-  }
-  const run = (messageBoxClient: any, details: MandalaActionDetails = reissue, ftOutput?: { recipient: string, amount: number }) =>
-    submitAdminAction({
-      wallet: mkAdminWallet() as any,
-      asset,
-      details,
-      ftOutput: ftOutput ?? (details.kind === 'reissue' ? { recipient: RECIPIENT, amount: 5 } : undefined),
-      messageBoxClient,
-      identityKey: ISSUER
-    })
-
-  beforeEach(() => {
-    clearAdminAuthGates()
-    stubTemplates()
-    vi.mocked(submitAndBroadcast).mockReset().mockResolvedValue({ outputsToAdmit: [0, 1] })
-  })
-  afterEach(() => vi.restoreAllMocks())
-
-  it('writes the journal entry before sendMessage, with outputIndex + senderMode, and clears it on success', async () => {
-    const seenAtSend: PendingNotification[] = []
-    const mbc = { sendMessage: vi.fn(async () => { seenAtSend.push(...(await notifyList())); return {} }) }
-
-    const res = await run(mbc)
-
-    expect(res.notified).toBe(true)
-    expect(res.txid).toBe(COMMIT_TXID)
-    // Journaled BEFORE the send — a crash between the two is recovered at boot.
-    expect(seenAtSend).toHaveLength(1)
-    expect(seenAtSend[0].txid).toBe(COMMIT_TXID)
-    expect(seenAtSend[0].recipient).toBe(RECIPIENT)
-    expect(seenAtSend[0].body).toMatchObject({
-      assetId: ASSET_ID,
-      amount: 5,
-      transaction: [9, 9, 9],
-      outputIndex: 0,
-      sender: ISSUER,
-      senderMode: 'unblinded'
-    })
-    expect(mbc.sendMessage).toHaveBeenCalledWith({ recipient: RECIPIENT, messageBox: MESSAGEBOX, body: seenAtSend[0].body })
-    // Delivered → entry cleared.
-    expect(await notifyList()).toEqual([])
-  })
-
-  it('a throwing sendMessage keeps the entry, does not throw out of the committed action, and reconcileNotifications retries it', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const mbc = { sendMessage: vi.fn().mockRejectedValue(new Error('messagebox down')) }
-
-    const res = await run(mbc)
-
-    expect(res.notified).toBe(false)
-    expect(res.nextAuthOutpoint).toBe(`${COMMIT_TXID}.1`)
-    expect(warn).toHaveBeenCalled()
-    const pending = await notifyList()
-    expect(pending).toHaveLength(1)
-    expect(pending[0].txid).toBe(COMMIT_TXID)
-
-    const retry = { sendMessage: vi.fn().mockResolvedValue({}) }
-    expect(await reconcileNotifications(retry)).toEqual([COMMIT_TXID])
-    expect(retry.sendMessage).toHaveBeenCalledWith({
-      recipient: RECIPIENT,
-      messageBox: MESSAGEBOX,
-      body: expect.objectContaining({ outputIndex: 0, senderMode: 'unblinded', sender: ISSUER })
-    })
-    expect(await notifyList()).toEqual([])
-  })
-
-  it('a reissue with no MessageBox client is still journaled for the boot-time retry', async () => {
-    const res = await run(undefined)
-    expect(res.notified).toBe(false)
-    expect((await notifyList()).map(n => n.txid)).toEqual([COMMIT_TXID])
-  })
-
-  it('actions without an FT output journal nothing and report notified', async () => {
-    const mbc = { sendMessage: vi.fn() }
-    const res = await run(mbc, { kind: 'pause' })
-    expect(res.notified).toBe(true)
-    expect(res.nextAuthOutpoint).toBe(`${COMMIT_TXID}.0`)
-    expect(mbc.sendMessage).not.toHaveBeenCalled()
-    expect(await notifyList()).toEqual([])
-  })
 })
 
 describe('A15 registerAsset runs under an intent marker and the mandala.register lock', () => {
@@ -371,7 +319,7 @@ describe('A15 registerAsset runs under an intent marker and the mandala.register
     createAction: vi.fn().mockResolvedValue({ tx: [1, 2, 3], txid: REG_TXID }),
     listActions: vi.fn().mockResolvedValue({ actions: [{ txid: 'stuck' }] }),
     abortAction: vi.fn().mockResolvedValue({ aborted: true }),
-    revealSpecificKeyLinkage: vi.fn().mockResolvedValue({ keyID: 'deploy' }),
+    revealSpecificKeyLinkage: revealStub(),
     ...keyStubs()
   })
   const params = (wallet: ReturnType<typeof mkRegWallet>) =>
@@ -380,8 +328,21 @@ describe('A15 registerAsset runs under an intent marker and the mandala.register
   beforeEach(() => {
     stubTemplates()
     vi.mocked(submitAndBroadcast).mockReset()
+    // The deploy payload's req names K = the overlay identity key (C§4).
+    configureMandala({ overlayIdentityKey: STUB_KEY.toPublicKey().toString() })
   })
-  afterEach(() => vi.restoreAllMocks())
+  afterEach(() => {
+    configureMandala({ overlayIdentityKey: '' })
+    vi.restoreAllMocks()
+  })
+
+  it('refuses before createAction while the overlay identity key is unset (no req K)', async () => {
+    configureMandala({ overlayIdentityKey: '' })
+    const wallet = mkRegWallet()
+    await expect(registerAsset(params(wallet))).rejects.toThrow(/overlay identity key/)
+    expect(wallet.createAction).not.toHaveBeenCalled()
+    expect(await hasFreshIntent()).toBe(false)
+  })
 
   it('a crash after createAction leaves a fresh intent that the reconcile sweep respects until TTL', async () => {
     // "Crash" = the overlay round-trip never returns; the pipeline is stuck
@@ -430,6 +391,8 @@ describe('A15 registerAsset runs under an intent marker and the mandala.register
 
     await expect(registerAsset(params(wallet))).rejects.toThrow('overlay rejected')
     expect(vi.mocked(submitAndBroadcast).mock.calls[0][3]).toBe('reg-ref')
+    // Deploy submit topics are exactly [tm_mandala, tm_color_<txid>_0] (C§0).
+    expect(vi.mocked(submitAndBroadcast).mock.calls[0][5]).toEqual(['tm_mandala', `tm_color_${REG_TXID}_0`])
     // Intent cleared on settle either way.
     expect(await hasFreshIntent()).toBe(false)
   })

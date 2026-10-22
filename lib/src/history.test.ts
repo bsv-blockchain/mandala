@@ -1,383 +1,285 @@
-import { describe, it, expect } from 'vitest'
-import { MandalaToken } from './__fixtures__/token.js'
-import { parseActionsToHistory, exportTransactionsCsv } from './history.js'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { OneColor } from '@bsv/templates'
+import { parseActionsToHistory, exportTransactionsCsv, loadHistory } from './history.js'
+import { MAX_UINT64 } from './amount.js'
+import { assetTag } from './naming.js'
+import { commitmentPayload } from './brc162.js'
+import { TREASURY_BASKET } from './constants.js'
 
-// Real MandalaToken locking script (decodable), arbitrary pkh.
-// assetId must be outpoint-shaped: 64-hex txid + '.' + vout.
-const ASSET = `${'ab'.repeat(32)}_0`
+const ID = `${'ab'.repeat(32)}_0`
+const OTHER = `${'cd'.repeat(32)}_0`
 const PKH = Array.from({ length: 20 }, (_, i) => i + 1)
-const ftScript = (assetId: string, amount: number): string =>
-  new MandalaToken().lock(assetId, amount, PKH).toHex()
+const lock = (assetId: string, amount: bigint): string => new OneColor().lock(assetId, amount, PKH).toHex()
+const authority = (assetId: string): string => new OneColor().lock(assetId, 0n, PKH, commitmentPayload([1])).toHex()
+const BASKET = `p color ${assetTag(ID)}`
+const SENDER = '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798'
+const custody = (sender: string): string => JSON.stringify({
+  version: 1, assetId: ID, derivationPrefix: 'cHJl', derivationSuffix: 'c3Vm', senderIdentityKey: sender
+})
 
-const actions = [
-  {
-    txid: 't1',
-    description: 'Send tokens',
-    satoshis: 0,
-    status: 'completed',
-    isOutgoing: true,
-    version: 1,
-    lockTime: 0,
-    labels: ['mandala', 'transfer'],
-    outputs: [
-      {
-        outputIndex: 0,
-        outputDescription: 'FT to recipient',
-        basket: 'mandala',
-        satoshis: 1,
-        spendable: false,
-        tags: ['mandala', 'sent', 'x.0'],
-        customInstructions: JSON.stringify({
-          keyID: 'k',
-          counterparty: '02recip',
-          direction: 'sent',
-          recipient: '02recip',
-          assetId: 'x.0'
-        })
-      }
-    ]
-  },
-  {
-    txid: 't2',
-    description: 'Receive tokens',
-    satoshis: 0,
-    status: 'completed',
-    isOutgoing: false,
-    version: 1,
-    lockTime: 0,
-    labels: ['mandala', 'receive'],
-    outputs: [
-      {
-        outputIndex: 0,
-        outputDescription: 'received FT',
-        basket: 'mandala',
-        satoshis: 1,
-        spendable: true,
-        tags: ['mandala', 'received', 'x.0'],
-        customInstructions: JSON.stringify({
-          keyID: 'k',
-          counterparty: '02sender',
-          assetId: 'x.0'
-        })
-      }
-    ]
-  },
+afterEach(() => { vi.restoreAllMocks() })
+
+// Treasury actions as the issuer flows write them (labels 'mandala' + kind).
+const treasury = [
   {
     txid: 't3',
     description: 'Issue tokens',
-    satoshis: 0,
-    status: 'completed',
     isOutgoing: true,
-    version: 1,
-    lockTime: 0,
     labels: ['mandala', 'issue'],
     outputs: [
       {
         outputIndex: 0,
         outputDescription: 'issued FT',
-        basket: 'mandala',
+        basket: TREASURY_BASKET,
         satoshis: 1,
         spendable: true,
         tags: ['mandala', 'issued', 'y.0'],
-        customInstructions: JSON.stringify({
-          keyID: 'k2',
-          counterparty: '02holder',
-          assetId: 'y.0'
-        })
+        customInstructions: JSON.stringify({ keyID: 'k2', counterparty: '02holder', assetId: 'y.0' })
       }
     ]
   },
   {
     txid: 't4',
-    description: 'Redeem tokens',
-    satoshis: 0,
-    status: 'completed',
+    description: 'Redeem 25 Test Dollar',
     isOutgoing: true,
-    version: 1,
-    lockTime: 0,
     labels: ['mandala', 'redeem'],
     outputs: [
       {
         outputIndex: 0,
         outputDescription: 'redeem FT',
-        basket: 'mandala',
+        basket: TREASURY_BASKET,
         satoshis: 1,
         spendable: false,
         tags: ['mandala', 'redeemed', 'y.0'],
-        customInstructions: JSON.stringify({
-          keyID: 'k3',
-          counterparty: '02issuer',
-          assetId: 'y.0'
-        })
-      }
-    ]
-  },
-  {
-    txid: 't5',
-    description: 'Transfer receive side',
-    satoshis: 0,
-    status: 'completed',
-    isOutgoing: false,
-    version: 1,
-    lockTime: 0,
-    labels: ['mandala', 'transfer'],
-    outputs: [
-      {
-        outputIndex: 0,
-        outputDescription: 'FT received from sender',
-        basket: 'mandala',
-        satoshis: 1,
-        spendable: true,
-        tags: ['mandala', 'received', 'x.0'],
-        customInstructions: JSON.stringify({
-          keyID: 'k4',
-          counterparty: '02sender2',
-          direction: 'received',
-          assetId: 'x.0'
-        })
+        customInstructions: JSON.stringify({ keyID: 'k3', counterparty: '02issuer', assetId: 'y.0' })
       }
     ]
   }
 ]
 
-describe('parseActionsToHistory', () => {
-  it('classifies sent vs received and extracts counterparty + assetId', () => {
-    const rows = parseActionsToHistory(actions as any)
-    const sent = rows.find(r => r.txid === 't1')!
-    const recv = rows.find(r => r.txid === 't2')!
-    expect(sent.direction).toBe('sent')
-    expect(sent.counterparty).toBe('02recip')
-    expect(sent.assetId).toBe('x.0')
-    expect(recv.direction).toBe('received')
-    expect(recv.counterparty).toBe('02sender')
-  })
+// Holder actions as sendHandover / receiveHandovers write them.
+const sendAction = {
+  txid: 'send1',
+  description: 'Mandala token payment',
+  isOutgoing: true,
+  labels: ['p color plan 0 1 deadbeef', 'mandala', 'transfer'],
+  outputs: [
+    { outputIndex: 0, satoshis: 1, lockingScript: lock(ID, 400n) },
+    { outputIndex: 1, satoshis: 1, basket: BASKET, lockingScript: lock(ID, 600n), customInstructions: custody('02self') }
+  ]
+}
+const receiveAction = {
+  txid: 'recv1',
+  description: 'Mandala token payment',
+  isOutgoing: false,
+  labels: ['mandala', 'receive'],
+  outputs: [{ outputIndex: 0, satoshis: 1, basket: BASKET, lockingScript: lock(ID, 250n), customInstructions: custody(SENDER) }]
+}
 
-  it('classifies issue and redeem correctly', () => {
-    const rows = parseActionsToHistory(actions as any)
+describe('parseActionsToHistory: treasury kinds', () => {
+  it('classifies issue and redeem; redeem reads the description prefix', () => {
+    const rows = parseActionsToHistory(treasury as any)
     const issued = rows.find(r => r.txid === 't3')!
     const redeemed = rows.find(r => r.txid === 't4')!
     expect(issued.direction).toBe('issued')
     expect(issued.assetId).toBe('y.0')
+    expect(issued.kind).toBe('issue')
     expect(redeemed.direction).toBe('redeemed')
     expect(redeemed.assetId).toBe('y.0')
+    expect(redeemed.kind).toBe('redeem')
+    expect(redeemed.amount).toBe(25n)
   })
 
-  it('classifies transfer receive side as received', () => {
-    const rows = parseActionsToHistory(actions as any)
-    const recv = rows.find(r => r.txid === 't5')!
-    expect(recv.direction).toBe('received')
-    expect(recv.counterparty).toBe('02sender2')
-    expect(recv.assetId).toBe('x.0')
+  it('an issue whose minted output decodes MAX_UINT64 reports it exactly', () => {
+    const rows = parseActionsToHistory([{
+      txid: 'big',
+      labels: ['mandala', 'issue'],
+      outputs: [
+        { outputIndex: 0, lockingScript: authority(ID) },
+        { outputIndex: 1, lockingScript: lock(ID, MAX_UINT64) }
+      ]
+    }] as any)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ direction: 'issued', assetId: ID, amount: MAX_UINT64 })
+    expect(exportTransactionsCsv(rows)).toContain('18446744073709551615')
   })
 
-  it('skips outputs with no assetId', () => {
-    const noAsset = [
-      {
-        txid: 'bad',
-        description: 'No asset',
-        satoshis: 0,
-        status: 'completed',
-        isOutgoing: false,
-        version: 1,
-        lockTime: 0,
-        labels: ['mandala', 'transfer'],
-        outputs: [
-          {
-            outputIndex: 0,
-            outputDescription: 'no asset output',
-            basket: 'mandala',
-            satoshis: 1,
-            spendable: true,
-            tags: ['mandala'],
-            customInstructions: JSON.stringify({ keyID: 'k' })
-          }
-        ]
-      }
+  it('issue sums above 2^64 exactly', () => {
+    const rows = parseActionsToHistory([{
+      txid: 'sum',
+      labels: ['mandala', 'issue'],
+      outputs: [{ outputIndex: 0, lockingScript: lock(ID, MAX_UINT64) }, { outputIndex: 1, lockingScript: lock(ID, MAX_UINT64) }]
+    }] as any)
+    expect(rows[0].amount).toBe(2n * MAX_UINT64)
+  })
+
+  it('a redeem with only an authority output takes its asset id from the authority', () => {
+    const rows = parseActionsToHistory([{
+      txid: 'r2',
+      description: 'Redeem 18446744073709551615 Test Dollar',
+      labels: ['mandala', 'redeem'],
+      outputs: [{ outputIndex: 0, lockingScript: authority(ID) }, { outputIndex: 1, satoshis: 900 }]
+    }] as any)
+    expect(rows).toEqual([expect.objectContaining({ direction: 'redeemed', assetId: ID, amount: MAX_UINT64 })])
+  })
+
+  it('a redeem description outside the uint64 range reads 0, never throws', () => {
+    const rows = parseActionsToHistory([{
+      txid: 'r3',
+      description: 'Redeem 18446744073709551616 x',
+      labels: ['mandala', 'redeem'],
+      outputs: [{ outputIndex: 0, lockingScript: authority(ID) }]
+    }] as any)
+    expect(rows[0].amount).toBe(0n)
+  })
+
+  // payoutTokens: output 0 = recipient (no basket), output 1 = treasury change.
+  const payout = (txid: string, amount: bigint, change: bigint, baskets = true): any => ({
+    txid,
+    description: `Payout ${amount} Test Dollar`,
+    labels: ['mandala', 'payout'],
+    outputs: [
+      { outputIndex: 0, satoshis: 1, lockingScript: lock(ID, amount) },
+      ...(change > 0n
+        ? [{ outputIndex: 1, satoshis: 1, lockingScript: lock(ID, change), ...(baskets ? { basket: TREASURY_BASKET } : {}) }]
+        : [])
     ]
-    const rows = parseActionsToHistory(noAsset as any)
-    expect(rows.find(r => r.txid === 'bad')).toBeUndefined()
   })
 
-  it('returns correct kind label from labels', () => {
-    const rows = parseActionsToHistory(actions as any)
-    expect(rows.find(r => r.txid === 't1')!.kind).toBe('transfer')
-    expect(rows.find(r => r.txid === 't3')!.kind).toBe('issue')
-    expect(rows.find(r => r.txid === 't4')!.kind).toBe('redeem')
-  })
-})
-
-
-describe('multi-output change (split change strategy)', () => {
-  const changeOut = (index: number, amount: number): any => ({
-    outputIndex: index,
-    outputDescription: 'FT change',
-    basket: 'mandala',
-    satoshis: 1,
-    spendable: true,
-    lockingScript: ftScript(ASSET, amount),
-    customInstructions: JSON.stringify({
-      keyID: `change-1-${index}`,
-      counterparty: '02self',
-      direction: 'change',
-      recipient: '02recip',
-      sentAmount: 25
-    })
+  it('a payout reports the recipient amount, not recipient + treasury change', () => {
+    const rows = parseActionsToHistory([payout('p1', 10n, 990n)])
+    expect(rows).toEqual([expect.objectContaining({ txid: 'p1', kind: 'payout', direction: 'admin', assetId: ID, amount: 10n })])
+    expect(exportTransactionsCsv(rows).split('\n')[1]).toBe(`"p1","${ID}",admin,payout,10,"",0`)
   })
 
-  it('reports the recipient amount once, ignoring N change outputs', () => {
-    const rows = parseActionsToHistory([
-      {
-        txid: 'multi1',
-        description: 'Send 25 of x.0',
-        isOutgoing: true,
-        labels: ['mandala', 'transfer'],
-        outputs: [
-          {
-            outputIndex: 2,
-            outputDescription: 'FT to recipient',
-            satoshis: 1,
-            spendable: false,
-            lockingScript: ftScript(ASSET, 25),
-            customInstructions: JSON.stringify({
-              keyID: 'xfer-1', counterparty: '02recip', direction: 'sent', recipient: '02recip'
-            })
-          },
-          changeOut(0, 40),
-          changeOut(1, 10),
-          changeOut(3, 5)
-        ]
-      }
-    ] as any)
-    expect(rows).toHaveLength(1)
-    const row = rows[0]
-    expect(row.direction).toBe('sent')
-    expect(row.amount).toBe(25)
-    expect(row.counterparty).toBe('02recip')
+  it('a payout listed without baskets falls back to output 0 (the pinned recipient)', () => {
+    const rows = parseActionsToHistory([payout('p2', 10n, 990n, false)])
+    expect(rows[0].amount).toBe(10n)
   })
 
-  it('falls back to sentAmount when only change outputs remain (recipient output dropped)', () => {
-    // The recipient output is not basket-tracked and drops out of listActions;
-    // the change outputs decode as FTs but must NOT be mistaken for the send.
-    const rows = parseActionsToHistory([
-      {
-        txid: 'multi2',
-        description: 'Send 25 of x.0',
-        isOutgoing: true,
-        labels: ['mandala', 'transfer'],
-        outputs: [changeOut(1, 40), changeOut(2, 10)]
-      }
-    ] as any)
-    expect(rows).toHaveLength(1)
-    const row = rows[0]
-    expect(row.direction).toBe('sent')
-    expect(row.amount).toBe(25) // sentAmount, not the 40-unit change output
-    expect(row.counterparty).toBe('02recip')
+  it('a payout with no change reports its single recipient output', () => {
+    const rows = parseActionsToHistory([payout('p3', 1000n, 0n)])
+    expect(rows[0].amount).toBe(1000n)
   })
 
-  it('never mistakes a SPENT change output (CI erased) for the recipient', () => {
-    // Spending a change output erases its customInstructions; only its
-    // outputDescription survives. The 40-unit spent change must not be
-    // reported as the sent amount — the intact change CI carries sentAmount.
-    const spentChange = {
-      outputIndex: 0,
-      outputDescription: 'FT change',
-      satoshis: 1,
-      spendable: false,
-      lockingScript: ftScript(ASSET, 40)
-      // no customInstructions — erased on spend
-    }
-    const rows = parseActionsToHistory([
-      {
-        txid: 'multi4',
-        description: 'Send 25 of x.0',
-        isOutgoing: true,
-        labels: ['mandala', 'transfer'],
-        outputs: [spentChange, changeOut(1, 10)]
-      }
-    ] as any)
-    expect(rows).toHaveLength(1)
-    expect(rows[0].amount).toBe(25) // sentAmount, not the spent 40-unit change
+  it('a payout of MAX_UINT64 with change reports exactly MAX_UINT64', () => {
+    const rows = parseActionsToHistory([payout('p4', MAX_UINT64, 5n), payout('p5', MAX_UINT64, 5n, false)])
+    expect(rows.map(r => r.amount)).toEqual([MAX_UINT64, MAX_UINT64])
+    const csv = exportTransactionsCsv(rows).split('\n')
+    expect(csv[1]).toContain(',payout,18446744073709551615,')
+    expect(csv[2]).toContain(',payout,18446744073709551615,')
   })
 
-  it('falls back to sentAmount when change outputs carry CI but no locking scripts', () => {
-    const bare = (index: number): any => ({
-      outputIndex: index,
-      outputDescription: 'FT change',
-      satoshis: 1,
-      spendable: true,
-      tags: ['mandala', 'x.0'],
-      customInstructions: JSON.stringify({
-        keyID: `change-1-${index}`, counterparty: '02self', direction: 'change', recipient: '02recip', sentAmount: 25
-      })
-    })
-    const rows = parseActionsToHistory([
-      {
-        txid: 'multi3',
-        description: 'Send 25 of x.0',
-        isOutgoing: true,
-        labels: ['mandala', 'transfer'],
-        outputs: [bare(1), bare(2)]
-      }
-    ] as any)
-    expect(rows).toHaveLength(1)
-    expect(rows[0].amount).toBe(25)
-    expect(rows[0].counterparty).toBe('02recip')
+  it('skips a treasury action with no asset id', () => {
+    const rows = parseActionsToHistory([{
+      txid: 'bad',
+      labels: ['mandala', 'pause'],
+      outputs: [{ outputIndex: 0, tags: ['mandala'], customInstructions: JSON.stringify({ keyID: 'k' }) }]
+    }] as any)
+    expect(rows).toEqual([])
   })
 })
 
-describe('counterparty from persistent action labels', () => {
-  const KEY = '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798'
-
-  it('sent: reads the to-<key> label when outputs carry no customInstructions (spent/relinquished)', () => {
-    const rows = parseActionsToHistory([
-      {
-        txid: 'old-send',
-        description: 'Send 22 of x.0',
-        isOutgoing: true,
-        labels: ['mandala', 'transfer', `to-${KEY}`],
-        outputs: [
-          { outputIndex: 0, outputDescription: 'FT to recipient', tags: ['mandala', 'sent', 'x.0'] }
-        ]
-      }
-    ] as any)
-    const row = rows.find(r => r.txid === 'old-send')!
-    expect(row.direction).toBe('sent')
-    expect(row.counterparty).toBe(KEY)
+describe('parseActionsToHistory: holder kinds', () => {
+  it('a send reports the basket-less recipient output, never the module change; plan labels do not set the kind', () => {
+    const rows = parseActionsToHistory([sendAction] as any)
+    expect(rows).toEqual([expect.objectContaining({ txid: 'send1', direction: 'sent', kind: 'transfer', amount: 400n, assetId: ID, counterparty: '' })])
   })
 
-  it('received: reads the from-<key> label when customInstructions are gone', () => {
-    const rows = parseActionsToHistory([
-      {
-        txid: 'old-recv',
-        description: 'Receive 40 of x.0',
-        isOutgoing: false,
-        labels: ['mandala', 'receive', `from-${KEY}`],
-        outputs: [
-          { outputIndex: 0, outputDescription: 'received FT', tags: ['mandala', 'received', 'x.0'] }
-        ]
-      }
-    ] as any)
-    const row = rows.find(r => r.txid === 'old-recv')!
-    expect(row.direction).toBe('received')
-    expect(row.counterparty).toBe(KEY)
+  it('a receive sums the p color outputs and reads the custody senderIdentityKey', () => {
+    const rows = parseActionsToHistory([receiveAction] as any)
+    expect(rows).toEqual([expect.objectContaining({ txid: 'recv1', direction: 'received', kind: 'receive', amount: 250n, assetId: ID, counterparty: SENDER })])
   })
 
-  it('kind classification ignores the counterparty labels regardless of order', () => {
+  it('a self-send whose output 0 is an owned p color output falls back to output 0', () => {
+    const rows = parseActionsToHistory([{
+      txid: 'self1',
+      labels: ['mandala', 'transfer'],
+      outputs: [
+        { outputIndex: 1, basket: BASKET, lockingScript: lock(ID, 70n), customInstructions: custody('02me') },
+        { outputIndex: 0, basket: BASKET, lockingScript: lock(ID, 30n), customInstructions: custody('02me') }
+      ]
+    }] as any)
+    expect(rows).toEqual([expect.objectContaining({ direction: 'sent', amount: 30n, counterparty: '02me' })])
+  })
+
+  it('a send at MAX_UINT64 is exact', () => {
+    const rows = parseActionsToHistory([{
+      txid: 'maxsend',
+      labels: ['mandala', 'transfer'],
+      outputs: [{ outputIndex: 0, lockingScript: lock(ID, MAX_UINT64) }]
+    }] as any)
+    expect(rows[0].amount).toBe(MAX_UINT64)
+  })
+
+  it('skips holder actions that decode no value of one asset, with one warning per call', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const rows = parseActionsToHistory([
-      {
-        txid: 'ordered',
-        isOutgoing: true,
-        labels: ['mandala', `to-${KEY}`, 'transfer'],
-        outputs: [{ outputIndex: 0, tags: ['mandala', 'x.0'] }]
-      }
+      { txid: 'none', labels: ['mandala', 'transfer'], outputs: [{ outputIndex: 0, tags: ['mandala', 'x.0'] }] },
+      { txid: 'two', labels: ['mandala', 'receive'], outputs: [
+        { outputIndex: 0, basket: BASKET, lockingScript: lock(ID, 1n) },
+        { outputIndex: 1, basket: `p color ${assetTag(OTHER)}`, lockingScript: lock(OTHER, 1n) }
+      ] },
+      { txid: 'nobasket', labels: ['mandala', 'receive'], outputs: [{ outputIndex: 0, lockingScript: lock(ID, 1n) }] },
+      receiveAction
     ] as any)
-    expect(rows.find(r => r.txid === 'ordered')!.kind).toBe('transfer')
+    expect(rows.map(r => r.txid)).toEqual(['recv1'])
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('loadHistory', () => {
+  const issueAction = {
+    txid: 'iss1',
+    labels: ['mandala', 'issue'],
+    outputs: [{ outputIndex: 0, lockingScript: lock(ID, 1000n) }]
+  }
+  const walletWith = (actions: unknown[]): any => ({
+    listActions: vi.fn().mockResolvedValue({ totalActions: actions.length, actions }),
+    listOutputs: vi.fn().mockResolvedValue({ outputs: [] })
+  })
+
+  it('holder scope: one listing labelled mandala (any), no basket listing, sent and received rows', async () => {
+    const w = walletWith([issueAction, sendAction, receiveAction])
+    const rows = await loadHistory(w, { scope: 'holder' })
+    expect(rows).toMatchObject([
+      { direction: 'sent', kind: 'transfer', amount: 400n, assetId: ID },
+      { direction: 'received', kind: 'receive', amount: 250n, assetId: ID }
+    ])
+    expect(rows).toHaveLength(2)
+    expect(w.listActions).toHaveBeenCalledTimes(1)
+    expect(w.listActions.mock.calls[0][0]).toMatchObject({
+      labels: ['mandala'], labelQueryMode: 'any', includeLabels: true, includeOutputs: true, includeOutputLockingScripts: true, limit: 1000
+    })
+    expect(w.listOutputs).not.toHaveBeenCalled()
+  })
+
+  it('treasury scope drops both holder rows and joins treasury customInstructions', async () => {
+    const w = walletWith([issueAction, sendAction, receiveAction])
+    const rows = await loadHistory(w, { scope: 'treasury' })
+    expect(rows.map(r => r.txid)).toEqual(['iss1'])
+    expect(rows[0].amount).toBe(1000n)
+    expect(w.listOutputs).toHaveBeenCalledWith(expect.objectContaining({ basket: TREASURY_BASKET, includeCustomInstructions: true }))
+  })
+
+  it('default scope returns treasury and holder rows; assetId filters', async () => {
+    const w = walletWith([issueAction, sendAction, receiveAction])
+    expect((await loadHistory(w)).map(r => r.txid)).toEqual(['iss1', 'send1', 'recv1'])
+    expect(w.listOutputs).toHaveBeenCalledTimes(1)
+    expect(await loadHistory(w, { assetId: OTHER })).toEqual([])
+    expect((await loadHistory(w, { assetId: ID, scope: 'holder' })).map(r => r.txid)).toEqual(['send1', 'recv1'])
+  })
+
+  it('never lists a p color basket', async () => {
+    const w = walletWith([sendAction, receiveAction])
+    await loadHistory(w)
+    for (const [args] of w.listOutputs.mock.calls) expect(String(args.basket).startsWith('p color')).toBe(false)
   })
 })
 
 describe('exportTransactionsCsv', () => {
   it('CSV has a header and one row per history entry', () => {
-    const rows = parseActionsToHistory(actions as any)
+    const rows = parseActionsToHistory([...treasury, sendAction, receiveAction] as any)
     const csv = exportTransactionsCsv(rows)
     const lines = csv.split('\n')
     expect(lines).toHaveLength(rows.length + 1) // header + N data rows
@@ -386,19 +288,13 @@ describe('exportTransactionsCsv', () => {
     expect(lines[0]).toContain('counterparty')
   })
 
-  it('CSV header + 2 rows for the basic fixture (2 actions)', () => {
-    const twoActions = actions.slice(0, 2)
-    const csv = exportTransactionsCsv(parseActionsToHistory(twoActions as any))
-    expect(csv.split('\n')).toHaveLength(3) // header + 2
-  })
-
   it('escapes double quotes in CSV fields', () => {
     const rows = [
       {
         txid: 'tx-"quoted"',
         assetId: 'a.0',
         direction: 'sent' as const,
-        amount: 0,
+        amount: 0n,
         counterparty: 'addr"with"quotes',
         when: 0,
         kind: 'transfer'

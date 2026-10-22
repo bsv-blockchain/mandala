@@ -68,6 +68,18 @@ func rInvalidTokenOutput(i uint32, detail string) *RejectError {
 	return newReject(CodeShape, "output %d: token-shaped output is not a valid BRC-162 token output (%s)", i, detail)
 }
 
+// rLegacyTokenID is Mandala policy, not a codec failure: the OneColor codec parses a canonical
+// 36-byte id, and Mandala serves 32-byte ids only (design §3, §4.2; contract §4 step 0; 0162:113-115).
+func rLegacyTokenID(i uint32, tokenID string) *RejectError {
+	return newReject(CodeShape, "output %d: legacy 36-byte token id %s is refused by Mandala policy (32-byte ids only)", i, tokenID)
+}
+
+// rProfileKeysOnNonDeploy is Mandala policy (contract §4 step 5, D14): req and ext belong on a
+// deploy only, so a non-deploy output whose payload is a strict map naming either is refused.
+func rProfileKeysOnNonDeploy(i uint32) *RejectError {
+	return newReject(CodeShape, "output %d: req and ext are deploy-only under Mandala policy", i)
+}
+
 func rNonP2pkhRemainder(i uint32) *RejectError {
 	return newReject(CodeShape, "output %d: token output remainder must be a P2PKH lock", i)
 }
@@ -76,16 +88,11 @@ func rOneSat(i uint32) *RejectError {
 	return newReject(CodeSatoshis, "output %d: token output must carry exactly 1 satoshi", i)
 }
 
-func rAmountCap(i uint32) *RejectError {
-	return newReject(CodeShape, "output %d: token amount exceeds 2^53-1", i)
-}
-
-func rSumCap(tokenID string) *RejectError {
-	return newReject(CodeShape, "token %s: value sum exceeds 2^53-1", tokenID)
-}
-
-func rSupplyCap(tokenID string) *RejectError {
-	return newReject(CodeShape, "token %s: circulating supply would exceed 2^53-1", tokenID)
+// rAggregateRange replaces the 2^53 caps (uint64 end to end; design §2 goal 2, 0162:140-143). An
+// output amount is any uint64; only an aggregate past the Decimal128 storage range (10^34-1) is
+// refused, because Mongo could no longer hold it exactly (contract §6, D13).
+func rAggregateRange(tokenID string) *RejectError {
+	return newReject(CodeShape, "token %s: amount aggregate exceeds storage range", tokenID)
 }
 
 func rNoLinkage(i uint32) *RejectError {

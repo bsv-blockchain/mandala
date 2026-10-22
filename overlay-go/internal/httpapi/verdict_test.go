@@ -110,7 +110,7 @@ func TestSubmitVerdictPersistableFollowsA13(t *testing.T) {
 		{"unavailable", sv(mandala.CodeUnavailable, testTopicA), false},
 		{"untyped", sv("", testTopicA), false},
 		{"engine unknown topic", VerdictForSubmitError(engine.ErrUnknownTopic), false},
-		{"not a topic name", sv(mandala.CodeShape, "tm_"+strings.Repeat("A", 64)), false},
+		{"not a topic name", sv(mandala.CodeShape, "tm_color_"+strings.Repeat("A", 64)+"_0"), false},
 	}
 	for _, c := range cases {
 		if got := c.v.Persistable(); got != c.want {

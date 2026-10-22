@@ -101,7 +101,7 @@ func TestSubmit_StrippedPayloadCannotPoisonTheTxid(t *testing.T) {
 // The A1.3 matrix: only typed, final refusals by tm_mandala or a tm_<id> are persisted, with the refusing topic.
 func TestSubmit_PersistenceFollowsA13(t *testing.T) {
 	beef, txid := submitBeef(t, 0x32)
-	own := "tm_" + txid
+	own := mandala.TokenTopicOfTxid(txid)
 	reject := func(code mandala.Code, reason, topic string) *mandala.RejectError {
 		return &mandala.RejectError{Code: code, Reason: reason, Topic: topic}
 	}

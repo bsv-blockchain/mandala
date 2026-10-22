@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 )
 
 type amountDoc struct {
@@ -14,77 +16,63 @@ type amountDoc struct {
 	P *Amount `bson:"p,omitempty"`
 }
 
-func TestAmountWritesABSONDouble(t *testing.T) {
-	raw, err := bson.Marshal(amountDoc{A: Amount(MaxSafeAmount)})
+// Every record amount is a Decimal128 with exponent 0 (contract §6, D13); a nil *Amount with
+// omitempty (AdminHistoryEntry.FrozenAmount on a non-freeze row) stays absent.
+func TestAmountWritesADecimal128(t *testing.T) {
+	raw, err := bson.Marshal(amountDoc{A: amount.FromUint64(math.MaxUint64)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	v := bson.Raw(raw).Lookup("a")
-	if v.Type != bson.TypeDouble {
-		t.Fatalf("amount written as %v, want double", v.Type)
+	if v.Type != bson.TypeDecimal128 {
+		t.Fatalf("amount written as %v, want decimal128", v.Type)
 	}
-	if f := v.Double(); f != 9007199254740991 {
-		t.Fatalf("amount = %v", f)
+	if d := v.Decimal128(); d.String() != "18446744073709551615" {
+		t.Fatalf("amount = %v", d)
 	}
 	if bson.Raw(raw).Lookup("p").Type != 0 {
 		t.Fatal("a nil *Amount with omitempty must be absent")
 	}
-}
-
-func TestAmountReadsInt32Int64AndIntegralDouble(t *testing.T) {
-	for name, doc := range map[string]bson.D{
-		"int32":  {{Key: "a", Value: int32(42)}},
-		"int64":  {{Key: "a", Value: int64(42)}},
-		"double": {{Key: "a", Value: float64(42)}},
-	} {
-		raw, err := bson.Marshal(doc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var got amountDoc
-		if err := bson.Unmarshal(raw, &got); err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if got.A != 42 {
-			t.Fatalf("%s: %d", name, got.A)
-		}
-	}
-	raw, _ := bson.Marshal(bson.D{{Key: "a", Value: float64(-40)}})
-	var neg amountDoc
-	if err := bson.Unmarshal(raw, &neg); err != nil || neg.A != -40 {
-		t.Fatalf("negative delta: %d %v", neg.A, err)
+	var back amountDoc
+	if err := bson.Unmarshal(raw, &back); err != nil || back.A.String() != "18446744073709551615" || back.P != nil {
+		t.Fatalf("%+v %v", back, err)
 	}
 }
 
-func TestAmountRefusesFractionalHugeOrNonNumeric(t *testing.T) {
+// Review Focus 5: an old-format record (int32/int64/double amount) does not decode; it is never
+// read as 0 or a truncated value.
+func TestRecordRefusesOldAmountShapes(t *testing.T) {
 	for name, v := range map[string]any{
-		"fraction":   1.5,
-		"above 2^53": float64(1 << 54),
-		"NaN":        math.NaN(),
-		"string":     "42",
+		"int32":    int32(42),
+		"int64":    int64(42),
+		"double":   float64(42),
+		"fraction": 1.5,
+		"NaN":      math.NaN(),
+		"string":   "42",
 	} {
-		raw, err := bson.Marshal(bson.D{{Key: "a", Value: v}})
+		raw, err := bson.Marshal(bson.D{{Key: "txid", Value: "aa"}, {Key: "amount", Value: v}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		var got amountDoc
+		var got OwnerRecord
 		if err := bson.Unmarshal(raw, &got); err == nil {
-			t.Fatalf("%s decoded as %d", name, got.A)
+			t.Fatalf("%s decoded as %s", name, got.Amount)
 		}
 	}
 }
 
-func TestAmountJSONIsAPlainInteger(t *testing.T) {
-	b, err := json.Marshal(struct {
-		A Amount `json:"amount"`
-	}{A: 9007199254740991})
-	if err != nil || string(b) != `{"amount":9007199254740991}` {
+// Every record-sourced amount is a canonical decimal string in JSON (contract §0, §6).
+func TestAmountJSONIsADecimalString(t *testing.T) {
+	b, err := json.Marshal(FrozenRef{Outpoint: "x.0", Amount: amount.FromUint64(math.MaxUint64), Owner: "k"})
+	if err != nil || !strings.Contains(string(b), `"amount":"18446744073709551615"`) {
 		t.Fatalf("%s %v", b, err)
 	}
-	var back struct {
-		A Amount `json:"amount"`
+	b, err = json.Marshal(AdminHistoryEntry{Delta: amt(-40)})
+	if err != nil || !strings.Contains(string(b), `"delta":"-40"`) || strings.Contains(string(b), "frozenAmount") {
+		t.Fatalf("%s %v", b, err)
 	}
-	if err := json.Unmarshal([]byte(`{"amount":100}`), &back); err != nil || back.A != 100 {
+	var back FrozenRef
+	if err := json.Unmarshal([]byte(`{"amount":"100"}`), &back); err != nil || back.Amount.String() != "100" {
 		t.Fatalf("%+v %v", back, err)
 	}
 }

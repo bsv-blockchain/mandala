@@ -1,0 +1,416 @@
+<!--
+Pinned verbatim copy of tokens/0162.md from https://github.com/bitcoin-sv/BRCs/blob/5119a9b5148e9ec90eb4865b16f9f732a29703df/tokens/0162.md, fetched 2026-10-21 (final/published). Do not edit.
+-->
+
+# BRC-162: 1Color
+
+Open Protocol Labs (info@opl.dev)
+
+**Authors:** David Case (dcase@opl.dev), Deggen (d.kellenschwiler@bsvassociation.org)
+
+**Contributors:** Luke Rohenaz (luke@opl.dev), Kurt Wuckert Jr. (kurt@opl.dev), Michael Boyd (root@opl.dev), Dan Wagner (dan@opl.dev)
+
+## Abstract
+
+**1Color** is a fungible token protocol for Bitcoin SV. Balances live in UTXOs. Each token is identified by the outpoint of its **deploy** output. Token data is a fixed **script prefix** of data pushes — readable and constructible in Bitcoin script without parsing JSON.
+
+Two supply models:
+
+1. **Fixed supply** — the entire supply is created in one deploy output.
+2. **Authority** — deploy creates minting authority; later authority spends mint new supply.
+
+1Color is the **binary encoding** of the BSV-21 token model. BSV-21, the JSON inscription encoding of the same model, is [BRC-161](./0161.md). Token id, supply models, and balance/authority economics are the same; only the on-output encoding differs. A BSV-21 token may also have 1Color outputs, under the same id; a token deployed under this document is a 1Color token.
+
+## Motivation
+
+Issuers need fungible tokens that:
+
+* have a **stable id** that is not a global ticker race,
+* move as **UTXOs** (split, merge, parallel spends), and
+* support both **fixed supply** and **issuer-controlled minting**.
+
+1Color, like BSV-21, identifies each token by its **deploy outpoint** and carries balances on outputs. The token fields are a **prefix on the locking script**: they do not replace the spend condition. Any script can follow — P2PKH, multisig, covenants, marketplace templates, and other contract locks — so token value and Bitcoin script stay **composable**. Indexers enforce per-token supply and authority rules; consensus does not run a separate token VM.
+
+This document defines a **binary** prefix: token id and amount as fixed pushes (amount as a script number; id as the deploy's 32-byte txid, or a 36-byte outpoint for tokens first deployed under BRC-161 at a non-zero output), plus an optional payload. Wallets and contracts can build and check token outputs in script without assembling an inscription or parsing JSON.
+
+Fungible token designs on BSV have converged on the same shape: a token identified by an outpoint, an amount pushed as a script number, and pushed data dropped so that any locking script can follow. The original Mandala Token Protocol ([BRC-92](./0092.md), now withdrawn) and BSV-21 ([BRC-161](./0161.md)) reached that shape separately, with different encodings, so wallets, overlays and contracts have had to support each one. Going forward this document unifies them. 1Color uses the BSV-21 token model with the push-and-drop prefix that BRC-92 introduced. New fungible tokens SHOULD be issued under this document rather than BRC-92 or BRC-161.
+
+## Name, history and scope
+
+**1Color** is the name of the token standard defined by this specification. It
+acknowledges the 1Sat Ordinals lineage and the broader Colored Coins history;
+"one color" also reflects that validation and amount accounting apply separately
+to each issuance ID, including in multi-asset transactions.
+
+Earlier asset-on-Bitcoin designs include Meni Rosenfeld's 2012
+[Overview of Colored Coins](https://bitcoil.co.il/BitcoinX.pdf) and
+[Open Assets](https://github.com/OpenAssets/open-assets-protocol/blob/master/specification.mediawiki).
+Their encodings and coloring rules differ. 1Color does not claim compatibility
+with the original Colored Coins project. Earlier revisions of this binary
+specification used the names Mandala Tokens and Colored Tokens. The naming
+change leaves token IDs, scripts, amounts and BRC-161 interoperability unchanged.
+Mandala's governance or application layer remains separate from this format.
+
+The name **1Color** is reserved exclusively for this token standard. Use of
+"1Color" to identify an incompatible, alternative or unrelated token standard
+is prohibited. Tokens, encodings and implementations that do not conform MUST
+NOT be presented as 1Color. An implementation claiming 1Color conformance MUST implement this
+specification's applicable rules; a product name or token symbol is not evidence
+of conformance. This is a protocol naming and conformance requirement.
+
+Vendors, wallets and applications MAY use their own product names and user-facing
+terminology without displaying the 1Color name. No vendor, operator, application
+brand or proprietary service is required. Internal primitives remain generic:
+[BRC-207](../wallet/0207.md) uses `p color`, `tm_color`, asset-specific
+`tm_color_<assetId>` / `ls_color_<assetId>` and the `brc207-color` capability.
+The standard's title introduces no wire alias or alternative key derivation.
+
+## Relationship to other documents
+
+| Concern | Document |
+|---------|----------|
+| UTXOs as tokens (philosophy) | [BRC-45](./0045.md) |
+| Outpoint formats | [BRC-36](../outpoints/0036.md) |
+| JSON inscription encoding | [BRC-161](./0161.md) |
+| Offline BEEF validity proofs | [BRC-176](./0176.md) |
+
+This BRC does **not** define marketplace locks, overlay topic naming, or BRC-100 basket profiles.
+
+## Specification
+
+### Wire format
+
+Every token output begins with:
+
+```
+<push token id | OP_0> <push amount | OP_0> OP_2DROP [<push payload> OP_DROP] <rest of script>
+```
+
+| Element | Encoding |
+|---------|----------|
+| Token id | Push of the canonical token id (32 or 36 bytes, see [Token identification](#token-identification)), or `OP_0` on deploys |
+| Amount | Minimally encoded script number (> 0 = value), or `OP_0` for authority |
+| `OP_2DROP` | Drops id and amount |
+| Payload (optional) | Any single push (see [Payload](#payload)) |
+| `OP_DROP` | Drops the payload. Present exactly when the payload is present |
+| Rest | Remainder of the locking script (any valid Bitcoin script — e.g. P2PKH, multisig, covenant, marketplace lock) |
+
+Rules:
+
+* The id and amount pushes are always present; empty values use `OP_0`.
+* The payload is optional on every output. If the script after the `OP_2DROP` begins with a single push operation followed by `OP_DROP`, that push **is** the payload and is recorded as such; the remainder of the script begins after the `OP_DROP`. Otherwise there is no payload and the remainder begins immediately after the `OP_2DROP`. A push operation is any push opcode: `OP_0`, `OP_1NEGATE`, `OP_1`–`OP_16`, or a data push.
+* Every value the prefix pushes is dropped, so the remainder of the script runs as if alone.
+* A script is a 1Color output when it begins with this layout. There is no tag: the layout itself is the protocol marker. Id and amount define the role; the payload never affects balance or authority admission.
+* A decoder consumes the prefix, including the payload when present; everything after it is ordinary locking-script content for whatever spend path the output uses.
+* **Encoders:** when the remainder of the script itself begins with `<push> OP_DROP` and no payload is intended, write an explicit empty payload — `OP_0 OP_DROP` — so the remainder's first push is not read as the payload. Otherwise omit the payload when there is nothing to carry.
+* Binary wins: when a script carries a valid binary prefix, it is a 1Color output, even if the remainder of the script also parses as a [BRC-161](./0161.md) JSON inscription. Such a JSON inscription is locking-script content and is ignored for token purposes.
+
+### Token identification
+
+* A **token id** is the outpoint of the deploy output that created the token.
+* Binary deploys MUST be output **0** of their transaction, so a binary-native token id is always `<deploy txid>.0` (outpoint string per [BRC-36](../outpoints/0036.md)).
+* On the wire the id is written in its **canonical** form:
+  * **32 bytes** — the deploy txid in natural/internal byte order — when the deploy output index is 0. The index is implied.
+  * **36 bytes** — txid in natural/internal byte order ‖ `uint32` little-endian vout, the same layout as outpoints in sighash preimages — when the deploy output index is non-zero. This only occurs for tokens first deployed under [BRC-161](./0161.md) at a non-zero output, and exists for compatibility only. Indexers that do not support legacy BRC-161 deploys MAY ignore outputs carrying a 36-byte id; this allowance does not apply to BRC-207 `color` services.
+  * A 36-byte id whose vout is 0 is non-canonical and **invalid**. Every token has exactly one wire form, so scripts that compare id bytes agree on token identity.
+* Deploy leaves the id field empty (`OP_0`); that output's own outpoint **is** the token id.
+* Every later output for the token carries the canonical id.
+* The token id is fixed for the life of the token. A BRC-161 token deployed at output 0 is written as `<txid>_0` in its JSON outputs and as the 32-byte txid in binary outputs; both are the same token.
+* Indexers SHOULD treat every token id as a full outpoint, expanding a 32-byte id to `<txid>` with vout 0.
+* For display and APIs, the string form is `<txid>_<vout>` (64 hex chars in display txid byte order, **underscore** separator) — the same form used by the JSON encoding ([BRC-161](./0161.md)); this id form is fixed for BSV-21 and 1Color and is not the general dual-form outpoint convention in [BRC-159](./0159.md), so a token presents identically under either encoding. Converting between the wire form and that string reverses the 32 txid bytes and, for a 32-byte id, appends `_0`.
+
+### UTXO model
+
+Balances are carried on transaction outputs. Spending valid value or authority inputs and creating valid value or authority outputs is how supply moves, splits, merges, mints, or burns. Any Bitcoin locking script MAY lock a token output (P2PKH, multisig, covenant, marketplace template, …).
+
+### Roles
+
+Each output's role is determined only by whether the token id is present and by the amount:
+
+| Token id | Amount | Role |
+|----------|--------|------|
+| Empty | > 0 | **Deploy (fixed supply)** — entire initial supply in this output |
+| Empty | 0 | **Deploy (authority)** — first minting authority; no initial value |
+| Present | 0 | **Authority** — minting capability for this token |
+| Present | > 0 | **Value** — spendable token balance |
+
+### Amounts
+
+* Bitcoin script numbers: minimally encoded, non-negative, little-endian.
+* Domain: `0` … `2^64 - 1`. The maximum encodes in nine bytes (eight value bytes + high zero sign byte).
+* Amounts above the maximum, negative values, or non-minimal encodings are **invalid**.
+* Amount zero marks **authority**, not value.
+* The uint64 limit applies to each output, not total supply or an aggregate balance. Validators MUST sum amounts exactly in a sufficiently wide integer domain. Splitting or combining outputs does not permit any resulting output to exceed the limit.
+
+### Payload
+
+* The payload is optional on every output and may be any bytes. It is **not validated**: its presence, absence or contents never make an output invalid and never affect balance or authority admission.
+* Defined attributes are read from a payload only when it is a map encoded as [DAG-CBOR](https://ipld.io/specs/codecs/dag-cbor/spec/). Defined attributes are the wallet processing fields and deploy display fields below. DAG-CBOR gives every value exactly one encoding (definite lengths, string keys in a single canonical order, minimal integers, no undefined/NaN/Infinity, no tags other than 42), so every indexer reads the same attributes from the same bytes. Readers MUST decode strictly; a payload that is not a valid DAG-CBOR map carries no defined attributes.
+* Payload maps SHOULD NOT use tag 42 (CID links) unless a defined attribute requires it.
+* Encoders SHOULD omit the payload when there is nothing to carry, except when the remainder of the script begins with `<push> OP_DROP`: then write `OP_0 OP_DROP` (see [Wire format](#wire-format)).
+* Unknown keys are ignored for the base token-validity rules. Wallet processing
+  requirements use the extension convention below; ignoring them does not
+  establish that a wallet may sign for or take custody of the asset.
+
+### Wallet processing extensions
+
+The payload may describe additional processing requirements without changing
+this document's token identity, quantities, supply or authority rules. Base
+indexers MAY ignore these fields. A wallet implementing [BRC-207](../wallet/0207.md)
+MUST apply its required-profile rules before treating an asset as supported.
+Base token admission and support for a wallet operation are separate results.
+[BRC-209](../wallet/0209.md) can explicitly select resource-only wallet handling
+without a base-token validity claim. It does not alter this document's indexer
+rules or require an indexer to admit otherwise invalid token transitions.
+[BRC-207's attested-admission profile](../wallet/0207.md#attested-admission-and-offline-token-graphs)
+may instead authorize signature-anchored offline wallet handling while retaining
+these token-validity rules. It requires an immutable deploy `req` declaration;
+a wallet setting or a later output cannot opt an undeclared asset into it.
+Neither profile changes this payload encoding or the base indexer's obligations.
+
+The following keys are reserved in the payload's DAG-CBOR map:
+
+| Key | Meaning |
+| --- | --- |
+| `req` | Map of required processing-profile identifiers to descriptors. Absent or empty means no additional profile requirements. |
+| `ext` | Map of profile identifiers to profile-defined data for this output. Its absence means an empty map. |
+
+A profile identifier is a case-sensitive ASCII URI, 1 through 200 bytes, with
+a lowercase scheme matching `[a-z][a-z0-9+.-]*`, a colon, and a nonempty remainder
+of visible ASCII characters without spaces. It is an identifier, not an
+instruction to fetch or execute code. A descriptor is exactly
+`{"version": positiveUint32, "params": value}`. `value` is any DAG-CBOR value,
+including null. Versions identify exact contracts, not minimum supported versions.
+Profile identifiers, versions and parameter values MUST NOT be normalized or
+silently substituted. Implementers defining new profiles MUST use identifiers
+under their control and publish their validation and authorization semantics.
+
+The authoritative `req` map is in the **deploy** payload. It is immutable for
+that asset. Later outputs inherit it through the asset ID, even if they omit
+`req`; if they repeat `req`, its canonical DAG-CBOR encoding MUST equal the
+deploy's map, treating an absent deploy map as empty. A later output cannot add,
+remove or change these requirements. A required profile can define changing
+state and authorized transitions through its own entry in `ext`, including
+which operations require additional capabilities. Only a required profile may
+give its `ext` entry mandatory processing semantics. Other `ext` entries and
+other payload keys are advisory and cannot independently change wallet
+authorization, token validity or required checks.
+
+Profile requirements apply to value and authority outputs, to all subsequent
+encodings of the asset, and to both incoming and outgoing operations. Changing
+the script, basket, display data or encoding does not remove them. This
+convention does not define any particular identity system, contract language,
+evidence service or business model.
+
+These extensions require a BRC-162 binary deploy. BRC-161 JSON has no carrier
+for `req` or `ext`; its extra JSON members cannot declare processing profiles.
+A legacy deploy has an empty requirement map, and later binary outputs cannot
+add requirements to that asset. Applications needing profiles MUST use a new
+BRC-162 deployment. A binary-deployed asset retains its requirements across
+encoding changes; a later JSON output supplies no extension state and must still
+satisfy every required profile. Binary-prefix precedence remains unchanged.
+
+Malformed extension data does not alter base indexer admission. BRC-207 enforces
+the deploy's requirements even when a later output has an opaque or invalid
+payload, and rejects malformed reserved fields in a valid payload map.
+Understanding a profile name without enforcing its version and parameters is
+not support.
+
+### Deploy display fields
+
+Optional metadata on the **deploy** output only. Later outputs inherit display data from deploy. Missing or malformed display fields do **not** invalidate the deploy. These keys have no protocol meaning on non-deploy outputs. Additional keys MAY be defined later.
+
+#### Symbol (`sym`)
+
+| | |
+|--|--|
+| DAG-CBOR type | text string |
+| Presence | Optional |
+| Meaning | Short human-readable ticker / name for UI |
+| Uniqueness | **Not** enforced. Applications MUST key tokens by deploy outpoint id. |
+
+#### Icon (`icon`)
+
+| | |
+|--|--|
+| DAG-CBOR type | array of two items: text string, byte string |
+| Presence | Optional |
+| Meaning | The token's display image, embedded in the deploy |
+
+`icon` is `[mediaType, bytes]`: `mediaType` is a media type ([RFC 6838](https://www.rfc-editor.org/rfc/rfc6838)) such as `image/png`, and `bytes` is the image content. The deploy carries its own image, so displaying it needs nothing beyond the deploy transaction. Any other shape is treated as absent.
+
+```
+{"dec": 8, "sym": "GOLD", "icon": ["image/png", h'89504e470d0a1a0a…']}
+```
+
+#### Decimals (`dec`)
+
+| | |
+|--|--|
+| DAG-CBOR type | unsigned integer |
+| Presence | Optional |
+| Range | 0–18; default 0 |
+
+### Supply models
+
+#### Fixed supply
+
+Deploy with empty id and amount > 0. That amount is the entire initial supply held in the deploy output. No authority is created unless a separate authority deploy is used (a token has one deploy outpoint).
+
+#### Authority supply
+
+Deploy with empty id and amount 0. That output is the first **authority**. Later spends of authority may create value outputs (mint) and/or further authority outputs.
+
+### Deploy under a contract
+
+The **deploy** output may be locked with a covenant (or other contract) in the same transaction that creates the token.
+
+In the fixed-supply model, the whole initial supply is born under the contract’s spend rules. In the authority model, minting capability is born the same way. Later holders still receive ordinary value outputs; what the contract enforces is whatever it locks (deploy, authority, or both).
+
+### Authority operations
+
+Authority outputs (id present, amount 0) may be:
+
+* **Split** — one authority in → many authority out
+* **Combine** — many in → one out
+* **Transfer** — re-lock to a new script
+* **End** — spend without a replacement authority out (that authority is destroyed)
+
+Minting for the token ends only when **no** authority outputs remain.
+
+### Value operations
+
+Value outputs (id present, amount > 0) move existing supply or, when an authority input is present, create new supply (mint). Split and merge are ordinary multi-input / multi-output spends under the balance rules below.
+
+### Validation rules
+
+Validation is **per token id** within a transaction. Indexers admit or reject outputs; consensus miners do not enforce these rules.
+
+**Deploy** (empty id):
+
+* Valid as genesis (no token-input check) only when it is output 0 of its transaction. A deploy prefix at any other output is not a valid deploy.
+* Token id := this output's outpoint (`<txid>_0`), written on the wire as the 32-byte txid.
+
+**Authority** (id present, amount 0):
+
+* Valid only when the transaction spends a valid authority of the same token.
+* Deploy with amount 0 is the token's first authority.
+* Authority inputs contribute **0** to token balance.
+
+**Value** (id present, amount > 0):
+
+* If the transaction spends a valid authority for the token: value outputs are valid **without** input balance coverage (mint).
+* Otherwise: let `I` = sum of amounts on valid value inputs of this token; let `O` = sum of amounts on value outputs of this token.
+  * Admit value outputs only when `I >= O` (all value outs for the token, or none — all-or-nothing).
+  * If `O > I`: value outputs are invalid; input tokens are **burned**.
+  * If `I > O`: the difference is burned (implicit burn).
+
+Circulating supply is the sum of admitted unspent value UTXOs.
+
+**Display metadata:**
+
+* `sym`, `icon`, and `dec` are set at deploy only.
+* An invalid `icon` does not affect balance or authority admission.
+
+### Locking scripts
+
+Any valid locking script is allowed after the prefix. This protocol does not constrain spend conditions beyond the prefix fields and the validation rules above.
+
+### Satoshi value (convention)
+
+By convention, token outputs often hold **1 satoshi**. That is ecosystem practice for indexing and wallet UX, not a protocol rule. Validators MAY apply a 1-sat service policy when admitting outputs, but it does not change base token validity. Conforming BRC-207 `color` services admit valid outputs regardless of carrier satoshi value.
+
+## Examples
+
+### Output scripts
+
+Fixed supply deploy (P2PKH), metadata in a DAG-CBOR payload:
+
+```
+OP_0 21000000 OP_2DROP <DAG-CBOR {"sym":"GOLD","dec":8}> OP_DROP
+OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG
+```
+
+Authority deploy:
+
+```
+OP_0 OP_0 OP_2DROP <DAG-CBOR {"sym":"STABLE","dec":2}> OP_DROP
+OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG
+```
+
+Value output:
+
+```
+<32-byte token id> 5000 OP_2DROP <locking script>
+```
+
+Authority output:
+
+```
+<32-byte token id> OP_0 OP_2DROP <locking script>
+```
+
+### Fixed supply lifecycle
+
+1. **Deploy** — empty id, amount 10 000 → token id = this outpoint.
+2. **Split** — spend deploy; two value outs of 5 000.
+3. **Pay** — spend one 5 000; value 4 900 to recipient + 100 change.
+
+### Authority lifecycle
+
+1. **Deploy** — empty id, amount 0 (genesis authority).
+2. **Mint** — spend authority; value 1 000 000 + authority (continue).
+3. **Distribute** — split the value output.
+4. **Delegate** — spend authority → two authority outs (admin A, admin B).
+5. **End authority** — spend an authority with no authority out. Minting stops only when the last authority is ended.
+
+### Balance checks
+
+Valid transfer:
+
+```
+In:  1_000 + 500 value
+Out: 800 + 600 + 100 value
+```
+
+Invalid (no authority; outs rejected; inputs burned):
+
+```
+In:  500
+Out: 300 + 400
+```
+
+Implicit burn:
+
+```
+In:  1_000
+Out: 250
+→ 750 burned
+```
+
+Mint (authority present; value need not be covered by value inputs):
+
+```
+In:  authority
+Out: value 1_000_000 + authority
+```
+
+## Security considerations
+
+* **Indexer trust** — validity is not miner-enforced; wallets rely on overlays / indexers that implement these rules.
+* **Symbol collision** — `sym` is not unique; always key tokens by deploy outpoint id.
+* **Auth compromise** — holder of an authority UTXO can mint unbounded supply until that authority is ended.
+* **Over-output burn** — creating value outputs that exceed inputs (without authority) burns the inputs.
+* **Display spoofing** — `sym` / `icon` are unauthenticated claims.
+
+## Implementations
+
+None yet.
+
+## References
+
+1. [DAG-CBOR](https://ipld.io/specs/codecs/dag-cbor/spec/) — IPLD codec specification, a strict profile of RFC 8949 CBOR
+2. [BRC-36](../outpoints/0036.md) — Outpoints
+3. [BRC-45](./0045.md) — UTXOs as tokens
+4. [BRC-161](./0161.md) — BSV-21 Fungible Tokens (JSON / Legacy)
+5. [BRC-176](./0176.md) — BSV-21 Validity Proofs

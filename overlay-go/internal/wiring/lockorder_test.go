@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/overlay"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/maintenance"
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 	"github.com/sirdeggen/mandala/overlay-go/internal/testmongo"
 )
 
@@ -29,7 +30,7 @@ func TestLockOrderConcurrentDeploysWithMaintenance(t *testing.T) {
 	eng, es := newProbeEngine(t, db, map[string]engine.TopicManager{}, nil)
 	deploy := probeSource(t, 3001)
 	txid := deploy.TxID().String()
-	tokenID, topic := txid+"_0", "tm_"+txid
+	tokenID, topic := txid+"_0", mandala.TokenTopicOfTxid(txid)
 	beef := atomicBEEF(t, deploy)
 
 	factory := &countingFactory{}
@@ -115,7 +116,7 @@ func TestLockOrderConcurrentDeploysWithMaintenance(t *testing.T) {
 	if n := factory.calls.Load(); n != 1 {
 		t.Fatalf("factory builds = %d, want exactly 1", n)
 	}
-	if !tokens.Hosted(tokenID) || !eng.HasTopicManager(topic) || !eng.HasLookupService("ls_"+txid) {
+	if !tokens.Hosted(tokenID) || !eng.HasTopicManager(topic) || !eng.HasLookupService("ls_color_"+txid+"_0") {
 		t.Fatal("the token topic is not registered")
 	}
 	if ok, err := es.DoesAppliedTransactionExist(ctx, &overlay.AppliedTransaction{Txid: deploy.TxID(), Topic: topic}); err != nil || !ok {

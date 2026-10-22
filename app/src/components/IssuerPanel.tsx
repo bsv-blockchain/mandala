@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Hash, Utils } from '@bsv/sdk'
-import { parseAmount } from '@bsv/mandala/amount'
 import { useAdminAssets } from '../hooks/useAdminAssets'
 import { useIssuerMutations } from '../hooks/useIssuerMutations'
-import { useHolderData } from '../hooks/useHolderData'
+import { useTreasuryBalances } from '../hooks/useTreasuryBalances'
+import { safeParseAmount } from '../lib/mandala/amountDisplay'
+import { decimalsOf } from '../lib/mandala/loadHolderData'
 import { guardIssueSubmit, guardRedeemSubmit } from '@bsv/mandala/submitGuards'
 import { isAdminAuthInFlight } from '@bsv/mandala/adminAuthGate'
 import { Sparkles, Flame } from 'lucide-react'
@@ -34,7 +35,9 @@ export default function IssuerPanel({ assetId: controlledAssetId }: IssuerPanelP
   // Shared cached admin-asset list; mutations invalidate it on settle.
   const { data } = useAdminAssets()
   const assets = data ?? []
-  const { data: holderData } = useHolderData()
+  // Issue mints into, and redeem burns from, the issuer treasury
+  // (TREASURY_BASKET), not the holder `p color` balance.
+  const { data: treasury } = useTreasuryBalances()
   const { issue, redeem } = useIssuerMutations()
   // Issue/Redeem are independent actions — only the pressed button shows its
   // spinner, but both stay mutually exclusive. Sync refs block double-click
@@ -62,7 +65,13 @@ export default function IssuerPanel({ assetId: controlledAssetId }: IssuerPanelP
       toast.error('Admin action already in progress for this asset')
       return
     }
-    const amount = parseAmount(issueAmount, Number(asset.metadata?.decimals) || 0)
+    // Exact bigint at the asset's dec: malformed, over-precise or > MAX_UINT64
+    // input is refused, never rounded or wrapped.
+    const amount = safeParseAmount(issueAmount, decimalsOf(asset.metadata?.decimals))
+    if (amount == null) {
+      toast.error('Enter a valid amount')
+      return
+    }
     const ref = issueRef.trim()
     const depositHash = ref === '' ? undefined : Utils.toHex(Hash.sha256(Utils.toArray(ref, 'utf8')))
     const gate = guardIssueSubmit({
@@ -93,8 +102,14 @@ export default function IssuerPanel({ assetId: controlledAssetId }: IssuerPanelP
       toast.error('Admin action already in progress for this asset')
       return
     }
-    const amount = parseAmount(redeemAmount, Number(asset.metadata?.decimals) || 0)
-    const held = holderData?.assets.find(a => a.assetId === asset.assetId)?.balance
+    const amount = safeParseAmount(redeemAmount, decimalsOf(asset.metadata?.decimals))
+    if (amount == null) {
+      toast.error('Enter a valid amount')
+      return
+    }
+    // Absent row = balance unknown (refetch pending): the guard skips the cap
+    // and the mutation re-gates on the cache at the boundary.
+    const held = treasury?.[asset.assetId]
     const gate = guardRedeemSubmit({
       assetId: asset.assetId,
       amount,
@@ -169,9 +184,9 @@ export default function IssuerPanel({ assetId: controlledAssetId }: IssuerPanelP
               <label className={labelCls} htmlFor="issue-amount">Amount</label>
               <Input
                 id="issue-amount"
-                type="number"
-                min="0"
-                step="any"
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
                 value={issueAmount}
                 onChange={e => setIssueAmount(e.target.value)}
                 className={inputCls}
@@ -228,9 +243,9 @@ export default function IssuerPanel({ assetId: controlledAssetId }: IssuerPanelP
               <label className={labelCls} htmlFor="redeem-amount">Amount</label>
               <Input
                 id="redeem-amount"
-                type="number"
-                min="0"
-                step="any"
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
                 value={redeemAmount}
                 onChange={e => setRedeemAmount(e.target.value)}
                 className={inputCls}

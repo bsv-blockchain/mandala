@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 	"github.com/sirdeggen/mandala/overlay-go/internal/testmongo"
 )
@@ -295,7 +297,7 @@ func TestAuthoritiesListsTheTokenTopicSortedByOutpointString(t *testing.T) {
 	for _, r := range []mandala.AuthorityRecord{
 		{Txid: tx1, OutputIndex: 2, Topic: topicA, TokenID: tokA, IdentityKey: tokKey},
 		{Txid: tx1, OutputIndex: 10, Topic: topicA, TokenID: tokA, IdentityKey: tokKey},
-		{Txid: strings.Repeat("0f", 32), OutputIndex: 1, Topic: "tm_" + strings.Repeat("99", 32), TokenID: tokA, IdentityKey: tokKey},
+		{Txid: strings.Repeat("0f", 32), OutputIndex: 1, Topic: mandala.TokenTopicOfTxid(strings.Repeat("99", 32)), TokenID: tokA, IdentityKey: tokKey},
 	} {
 		if _, err := s.StoreAuthorityIfAbsent(ctx, r); err != nil {
 			t.Fatal(err)
@@ -317,13 +319,13 @@ func TestAssetStateFlagsFrozenRows(t *testing.T) {
 	st := mandala.DefaultAssetState(tokA, nil)
 	st.IsPaused = true
 	st.FrozenOutpoints = []mandala.FrozenRef{
-		{Outpoint: withRow + ".3", Amount: 5, Owner: tokKey},
-		{Outpoint: strings.Repeat("de", 32) + ".1", Amount: 7, Owner: tokKey},
+		{Outpoint: withRow + ".3", Amount: amt(5), Owner: tokKey},
+		{Outpoint: strings.Repeat("de", 32) + ".1", Amount: amt(7), Owner: tokKey},
 	}
 	if err := s.PutAssetState(ctx, st); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.StoreTokenIfAbsent(ctx, mandala.TokenRecord{Txid: withRow, OutputIndex: 3, TokenID: tokA, Amount: 5, IdentityKey: tokKey, CreatedAt: time.Now()}); err != nil {
+	if _, err := s.StoreTokenIfAbsent(ctx, mandala.TokenRecord{Txid: withRow, OutputIndex: 3, TokenID: tokA, Amount: amt(5), IdentityKey: tokKey, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	f := newServer(nil, nil, s, nil, WithTokenHosting(tokHosting(tokA, tokC)))
@@ -335,7 +337,7 @@ func TestAssetStateFlagsFrozenRows(t *testing.T) {
 		AccessMode      string `json:"accessMode"`
 		FrozenOutpoints []struct {
 			Outpoint     string `json:"outpoint"`
-			Amount       int64  `json:"amount"`
+			Amount       string `json:"amount"`
 			Owner        string `json:"owner"`
 			HasFrozenRow bool   `json:"hasFrozenRow"`
 		} `json:"frozenOutpoints"`
@@ -345,7 +347,7 @@ func TestAssetStateFlagsFrozenRows(t *testing.T) {
 	}
 	if got.TokenID != tokA || !got.IsPaused || got.AccessMode != "denylist" || len(got.FrozenOutpoints) != 2 ||
 		!got.FrozenOutpoints[0].HasFrozenRow || got.FrozenOutpoints[1].HasFrozenRow ||
-		got.FrozenOutpoints[0].Amount != 5 || got.FrozenOutpoints[1].Owner != tokKey {
+		got.FrozenOutpoints[0].Amount != "5" || got.FrozenOutpoints[1].Owner != tokKey {
 		t.Fatalf("asset-state = %+v", got)
 	}
 	code, _, body = tokGet(t, f, "/admin/asset-state/"+tokC, nil) // hosted, no state yet: the default, not persisted
@@ -358,10 +360,10 @@ func TestAdminHistoryRoutesReadTheToken(t *testing.T) {
 	s := tokStore(t)
 	ctx := context.Background()
 	for i, e := range []mandala.AdminHistoryEntry{
-		{TokenID: tokA, Txid: strings.Repeat("01", 32), OutputIndex: 0, Kind: "issue", Delta: 500, Height: 10, AdmitSeq: 1},
-		{TokenID: tokA, Txid: strings.Repeat("02", 32), OutputIndex: 0, Kind: "redeem", Delta: -200, Height: 11, AdmitSeq: 2},
-		{TokenID: tokA, Txid: strings.Repeat("03", 32), OutputIndex: 0, Kind: "pause", Delta: 0, Height: 12, AdmitSeq: 3},
-		{TokenID: tokB, Txid: strings.Repeat("04", 32), OutputIndex: 0, Kind: "issue", Delta: 9, Height: 13, AdmitSeq: 4},
+		{TokenID: tokA, Txid: strings.Repeat("01", 32), OutputIndex: 0, Kind: "issue", Delta: amt(500), Height: 10, AdmitSeq: 1},
+		{TokenID: tokA, Txid: strings.Repeat("02", 32), OutputIndex: 0, Kind: "redeem", Delta: amt(-200), Height: 11, AdmitSeq: 2},
+		{TokenID: tokA, Txid: strings.Repeat("03", 32), OutputIndex: 0, Kind: "pause", Delta: amt(0), Height: 12, AdmitSeq: 3},
+		{TokenID: tokB, Txid: strings.Repeat("04", 32), OutputIndex: 0, Kind: "issue", Delta: amt(9), Height: 13, AdmitSeq: 4},
 	} {
 		e.CreatedAt = time.Date(2026, 10, 5, 12, i, 0, 0, time.UTC)
 		if _, err := s.AppendAdminHistory(ctx, e); err != nil {
@@ -382,8 +384,9 @@ func TestAdminHistoryRoutesReadTheToken(t *testing.T) {
 		}
 		return out
 	}
-	if code, _, body := tokGet(t, f, "/admin/admin-history/"+tokA, nil); code != 200 || strings.Join(kinds(body), ",") != "issue,redeem,pause" {
-		t.Fatalf("history (fold order): %d %s", code, body)
+	if code, _, body := tokGet(t, f, "/admin/admin-history/"+tokA, nil); code != 200 || strings.Join(kinds(body), ",") != "issue,redeem,pause" ||
+		!strings.Contains(string(body), `"delta":"-200"`) || !strings.Contains(string(body), `"delta":"500"`) {
+		t.Fatalf("history (fold order, string deltas): %d %s", code, body)
 	}
 	if code, _, body := tokGet(t, f, "/admin/admin-history-page/"+tokA+"?limit=2", nil); code != 200 || strings.Join(kinds(body), ",") != "pause,redeem" {
 		t.Fatalf("history page (newest first): %d %s", code, body)
@@ -392,7 +395,7 @@ func TestAdminHistoryRoutesReadTheToken(t *testing.T) {
 		t.Fatalf("history page offset: %d %s", code, body)
 	}
 	code, _, body := tokGet(t, f, "/admin/admin-summary/"+tokA, nil)
-	tokRequireJSON(t, code, body, 200, `{"totalIssued":500,"totalRedeemed":200,"actionCount":3}`)
+	tokRequireJSON(t, code, body, 200, `{"totalIssued":"500","totalRedeemed":"200","actionCount":3}`)
 	code, _, body = tokGet(t, f, "/admin/admin-history/"+tokC, nil)
 	tokRequireJSON(t, code, body, 200, `[]`)
 }
@@ -418,15 +421,61 @@ func TestAdminHistoryPageClampsLikeTS(t *testing.T) {
 }
 
 func TestSummarizeAdminHistoryDedupesPerOutpoint(t *testing.T) {
-	got := summarizeAdminHistory([]mandala.AdminHistoryEntry{
-		{Txid: "a", OutputIndex: 1, Kind: "issue", Delta: 500},
-		{Txid: "a", OutputIndex: 1, Kind: "issue", Delta: 500},
-		{Txid: "b", OutputIndex: 1, Kind: "redeem", Delta: -200},
-		{Txid: "c", OutputIndex: 1, Kind: "pause", Delta: 0},
-		{Txid: "d", OutputIndex: 1, Kind: "reissue", Delta: 50},
+	got, err := summarizeAdminHistory([]mandala.AdminHistoryEntry{
+		{Txid: "a", OutputIndex: 1, Kind: "issue", Delta: amt(500)},
+		{Txid: "a", OutputIndex: 1, Kind: "issue", Delta: amt(500)},
+		{Txid: "b", OutputIndex: 1, Kind: "redeem", Delta: amt(-200)},
+		{Txid: "c", OutputIndex: 1, Kind: "pause", Delta: amt(0)},
+		{Txid: "d", OutputIndex: 1, Kind: "reissue", Delta: amt(50)},
 	})
-	if got != (adminSummary{TotalIssued: 550, TotalRedeemed: 200, ActionCount: 4}) {
-		t.Fatalf("summary = %+v", got)
+	if err != nil || got.TotalIssued.String() != "550" || got.TotalRedeemed.String() != "200" || got.ActionCount != 4 {
+		t.Fatalf("summary = %+v, %v", got, err)
+	}
+}
+
+// Every token amount in JSON is a decimal string (contract §0, §6); actionCount stays a number.
+func TestAdminSummaryTotalsAreStrings(t *testing.T) {
+	s := tokStore(t)
+	ctx := context.Background()
+	for i, e := range []mandala.AdminHistoryEntry{
+		{TokenID: tokA, Txid: strings.Repeat("01", 32), OutputIndex: 0, Kind: "issue", Delta: amount.FromUint64(math.MaxUint64), Height: 10, AdmitSeq: 1},
+		{TokenID: tokA, Txid: strings.Repeat("02", 32), OutputIndex: 0, Kind: "redeem", Delta: amt(-5), Height: 11, AdmitSeq: 2},
+	} {
+		e.CreatedAt = time.Date(2026, 10, 5, 12, i, 0, 0, time.UTC)
+		if _, err := s.AppendAdminHistory(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f := newServer(nil, nil, s, nil, WithTokenHosting(tokHosting(tokA)))
+	code, _, body := tokGet(t, f, "/admin/admin-summary/"+tokA, nil)
+	tokRequireJSON(t, code, body, 200, `{"totalIssued":"18446744073709551615","totalRedeemed":"5","actionCount":2}`)
+	// Σ issued past 2^64 is exact
+	two, err := summarizeAdminHistory([]mandala.AdminHistoryEntry{
+		{Txid: "a", OutputIndex: 0, Delta: amount.FromUint64(math.MaxUint64)},
+		{Txid: "b", OutputIndex: 0, Delta: amount.FromUint64(math.MaxUint64)},
+	})
+	if err != nil || two.TotalIssued.String() != "36893488147419103230" || two.TotalRedeemed.String() != "0" {
+		t.Fatalf("summary = %+v, %v", two, err)
+	}
+	// a total beyond the storage range is an error, never a clamp
+	max, _ := amount.FromBig(amount.MaxStorable())
+	if got, err := summarizeAdminHistory([]mandala.AdminHistoryEntry{{Txid: "a", Delta: max}, {Txid: "b", Delta: amt(1)}}); err == nil {
+		t.Fatalf("summary beyond 10^34-1 = %+v", got)
+	}
+}
+
+func TestAssetStateFrozenAmountIsString(t *testing.T) {
+	s := tokStore(t)
+	ctx := context.Background()
+	st := mandala.DefaultAssetState(tokA, nil)
+	st.FrozenOutpoints = []mandala.FrozenRef{{Outpoint: strings.Repeat("dd", 32) + ".3", Amount: amount.FromUint64(math.MaxUint64), Owner: tokKey}}
+	if err := s.PutAssetState(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	f := newServer(nil, nil, s, nil, WithTokenHosting(tokHosting(tokA)))
+	code, _, body := tokGet(t, f, "/admin/asset-state/"+tokA, nil)
+	if code != 200 || !strings.Contains(string(body), `"amount":"18446744073709551615"`) {
+		t.Fatalf("asset-state: %d %s", code, body)
 	}
 }
 
@@ -455,7 +504,7 @@ func tokBeefWhere(docs map[string][]tokBeefDoc, fault error) OutputBeefWhereFunc
 func TestAuthoritiesBeefServesOnlyATokenTopicCopy(t *testing.T) {
 	deployTx, regOnly, kycTx := strings.Repeat("aa", 32), strings.Repeat("bb", 32), strings.Repeat("cc", 32)
 	docs := map[string][]tokBeefDoc{
-		deployTx + ".0": {{mandala.MandalaTopic, []byte{1, 2}}, {"tm_" + deployTx, []byte{3, 4}}},
+		deployTx + ".0": {{mandala.MandalaTopic, []byte{1, 2}}, {mandala.TokenTopicOfTxid(deployTx), []byte{3, 4}}},
 		regOnly + ".0":  {{mandala.MandalaTopic, []byte{5}}},
 		kycTx + ".0":    {{mandala.KYCTopic, []byte{6}}},
 	}

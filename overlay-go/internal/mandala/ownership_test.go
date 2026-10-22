@@ -7,12 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"math"
+	"math/big"
 	"strings"
 	"testing"
 
 	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 	mt "github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
 )
@@ -32,11 +35,14 @@ func TestRequireValidTokenOutputsIsRuleMajor(t *testing.T) {
 	// Codec refusals first (vector precedence-codec-before-satoshis).
 	err := RequireValidTokenOutputs([]brc162.InvalidOutput{{Index: 3, Detail: "truncated push"}}, []brc162.Output{twoSats})
 	requireReject(t, err, CodeShape, "output 3: token-shaped output is not a valid BRC-162 token output (truncated push)")
-	// Satoshis before the amount cap (vector precedence-satoshis-before-amount-cap).
+	// No amount cap (uint64 end to end): a 2^64-1 output passes; the satoshi rule still fires
+	// (vector precedence-satoshis-before-amount-cap).
 	huge := obOut(1)
-	huge.Amount = MaxSafeAmount + 1
+	huge.Amount = math.MaxUint64
 	requireReject(t, RequireValidTokenOutputs(nil, []brc162.Output{huge, twoSats}), CodeSatoshis, "output 0: token output must carry exactly 1 satoshi")
-	requireReject(t, RequireValidTokenOutputs(nil, []brc162.Output{huge}), CodeShape, "output 1: token amount exceeds 2^53-1")
+	if err := RequireValidTokenOutputs(nil, []brc162.Output{huge}); err != nil {
+		t.Fatalf("2^64-1 is a valid amount: %v", err)
+	}
 	// Rule-major: the deploy rule scans every output before the P2PKH rule looks at output 0.
 	noP2pkh := obOut(0)
 	noP2pkh.RestPubKeyHash = nil
@@ -45,10 +51,10 @@ func TestRequireValidTokenOutputsIsRuleMajor(t *testing.T) {
 	requireReject(t, RequireValidTokenOutputs(nil, []brc162.Output{noP2pkh, deployAt1}), CodeShape, "output 1: a deploy must be output 0")
 	requireReject(t, RequireValidTokenOutputs(nil, []brc162.Output{twoSats, func() brc162.Output { o := obOut(1); o.RestPubKeyHash = nil; return o }()}),
 		CodeShape, "output 1: token output remainder must be a P2PKH lock")
-	maxSafe := obOut(0)
-	maxSafe.Amount = MaxSafeAmount
-	if err := RequireValidTokenOutputs(nil, []brc162.Output{maxSafe}); err != nil {
-		t.Fatalf("2^53-1 itself is allowed: %v", err)
+	past53 := obOut(0)
+	past53.Amount = 1<<53 + 1
+	if err := RequireValidTokenOutputs(nil, []brc162.Output{past53}); err != nil {
+		t.Fatalf("2^53+1 is allowed: %v", err)
 	}
 }
 
@@ -160,13 +166,13 @@ func newRepairFixture(t *testing.T) *repairFixture {
 	d := mt.Deploy(t, mt.Issuer, "USD")
 	is := mt.Issue(t, d, 0, mt.Issuer, mt.Holder, 100)
 	tr := mt.Transfer(t, is, 1, mt.Receiver, 100)
-	f := &repairFixture{topic: "tm_" + d.Txid, tok: d.Txid + "_0", is: is, tr: tr, store: newMemStore()}
+	f := &repairFixture{topic: TokenTopicOfTxid(d.Txid), tok: d.Txid + "_0", is: is, tr: tr, store: newMemStore()}
 	f.inputs = brc162.ClassifyAdmittedInputs(tr.Tx, []uint32{0})
 	if len(f.inputs) != 1 || f.inputs[0].Role != brc162.RoleValue || f.inputs[0].Amount != 100 {
 		t.Fatalf("classified inputs: %+v", f.inputs)
 	}
 	f.op = is.Txid + ".1"
-	f.journal = OwnerRecord{Txid: is.Txid, OutputIndex: 1, Topic: f.topic, TokenID: f.tok, Role: brc162.RoleValue, Amount: 100, IdentityKey: mt.Holder.Identity}
+	f.journal = OwnerRecord{Txid: is.Txid, OutputIndex: 1, Topic: f.topic, TokenID: f.tok, Role: brc162.RoleValue, Amount: amt(100), IdentityKey: mt.Holder.Identity}
 	f.store.putOwner(f.journal)
 	f.engine = engineFor(f.topic, tr.Tx, []uint32{0})
 	return f
@@ -190,7 +196,7 @@ func (f *repairFixture) resolve(t *testing.T, s StateStore) (map[uint32]string, 
 
 func TestResolveInputOwnersAcceptsAnAgreeingRow(t *testing.T) {
 	f := newRepairFixture(t)
-	f.store.putToken(TokenRecord{Txid: f.is.Txid, OutputIndex: 1, TokenID: f.tok, Amount: 100, IdentityKey: mt.Holder.Identity})
+	f.store.putToken(TokenRecord{Txid: f.is.Txid, OutputIndex: 1, TokenID: f.tok, Amount: amt(100), IdentityKey: mt.Holder.Identity})
 	owners, err := f.resolve(t, f.store)
 	if err != nil || owners[0] != mt.Holder.Identity || len(f.repairs) != 0 {
 		t.Fatalf("owners %v err %v repairs %v", owners, err, f.repairs)
@@ -213,12 +219,12 @@ func TestRepairInsertsAMissingRowAndCreditsOnce(t *testing.T) {
 
 func TestRepairCorrectsAWrongRowWithoutACredit(t *testing.T) {
 	f := newRepairFixture(t)
-	f.store.putToken(TokenRecord{Txid: f.is.Txid, OutputIndex: 1, TokenID: f.tok, Amount: 99, IdentityKey: mt.Holder.Identity})
+	f.store.putToken(TokenRecord{Txid: f.is.Txid, OutputIndex: 1, TokenID: f.tok, Amount: amt(99), IdentityKey: mt.Holder.Identity})
 	if _, err := f.resolve(t, f.store); err != nil {
 		t.Fatal(err)
 	}
 	row, _ := f.store.GetTokenRow(context.Background(), f.is.Txid, 1)
-	if row.Amount != 100 || strings.Join(f.repairs, ";") != f.op+" corrected" || f.store.balance(mt.Holder.Identity) != 0 {
+	if row.Amount.Cmp(amt(100)) != 0 || strings.Join(f.repairs, ";") != f.op+" corrected" || f.store.balance(mt.Holder.Identity) != 0 {
 		t.Fatalf("row %+v repairs %v balance %d", row, f.repairs, f.store.balance(mt.Holder.Identity))
 	}
 }
@@ -227,7 +233,7 @@ func TestUnrepairableInputsAreUnavailable(t *testing.T) {
 	want := func(f *repairFixture) string { return "owner index unavailable for " + f.op }
 	for name, setup := range map[string]func(f *repairFixture){
 		"row and journal missing":     func(f *repairFixture) { f.store.owners = nil },
-		"journal disagrees":           func(f *repairFixture) { f.store.owners[0].Amount = 99 },
+		"journal disagrees":           func(f *repairFixture) { f.store.owners[0].Amount = amt(99) },
 		"journal names another token": func(f *repairFixture) { f.store.owners[0].TokenID = strings.Repeat("bb", 32) + "_0" },
 		"journal key not an identity": func(f *repairFixture) { f.store.owners[0].IdentityKey = strings.ToUpper(mt.Holder.Identity) },
 		"journal on another topic":    func(f *repairFixture) { f.store.owners[0].Topic = KYCTopic },
@@ -308,7 +314,7 @@ func TestRepairTreatsACoinSpentByTheTransactionItselfAsAdmitted(t *testing.T) {
 	// The same checks as for an unspent coin.
 	for name, setup := range map[string]func(f *repairFixture){
 		"journal missing":       func(f *repairFixture) { f.store.owners = nil },
-		"journal disagrees":     func(f *repairFixture) { f.store.owners[0].Amount = 99 },
+		"journal disagrees":     func(f *repairFixture) { f.store.owners[0].Amount = amt(99) },
 		"engine script differs": func(f *repairFixture) { f.engine.coins[f.op] = append([]byte{0x51}, f.engine.coins[f.op]...) },
 		"spent on another topic": func(f *repairFixture) {
 			f.engine.topic = KYCTopic
@@ -409,7 +415,7 @@ func TestRepairOfASpentDeployUsesTheScriptRole(t *testing.T) {
 	ctx := context.Background()
 	d := mt.Deploy(t, mt.Issuer, "USD")
 	is := mt.Issue(t, d, 0, mt.Issuer, mt.Holder, 100)
-	topic, tok := "tm_"+d.Txid, d.Txid+"_0"
+	topic, tok := TokenTopicOfTxid(d.Txid), d.Txid+"_0"
 	inputs := brc162.ClassifyAdmittedInputs(is.Tx, []uint32{0})
 	if inputs[0].Role != brc162.RoleAuthority || inputs[0].SourceRole != brc162.RoleDeploy {
 		t.Fatalf("a spent deploy is an authority input with source role deploy: %+v", inputs[0])
@@ -420,7 +426,7 @@ func TestRepairOfASpentDeployUsesTheScriptRole(t *testing.T) {
 		return err
 	}
 	s := newMemStore()
-	s.putOwner(OwnerRecord{Txid: d.Txid, OutputIndex: 0, Topic: topic, TokenID: tok, Role: brc162.RoleDeploy, Amount: 0, IdentityKey: mt.Issuer.Identity})
+	s.putOwner(OwnerRecord{Txid: d.Txid, OutputIndex: 0, Topic: topic, TokenID: tok, Role: brc162.RoleDeploy, Amount: amt(0), IdentityKey: mt.Issuer.Identity})
 	if err := resolve(s); err != nil {
 		t.Fatalf("deploy journal: %v", err)
 	}
@@ -428,7 +434,7 @@ func TestRepairOfASpentDeployUsesTheScriptRole(t *testing.T) {
 		t.Fatalf("repaired authority row: %+v", a)
 	}
 	wrongRole := newMemStore()
-	wrongRole.putOwner(OwnerRecord{Txid: d.Txid, OutputIndex: 0, Topic: topic, TokenID: tok, Role: brc162.RoleAuthority, Amount: 0, IdentityKey: mt.Issuer.Identity})
+	wrongRole.putOwner(OwnerRecord{Txid: d.Txid, OutputIndex: 0, Topic: topic, TokenID: tok, Role: brc162.RoleAuthority, Amount: amt(0), IdentityKey: mt.Issuer.Identity})
 	requireReject(t, resolve(wrongRole), CodeUnavailable, "owner index unavailable for "+d.Txid+".0")
 	// The stored authority row's topic is not compared (F/ts-layers §14.7).
 	other := newMemStore()
@@ -442,7 +448,7 @@ func TestRepairOfASpentDeployUsesTheScriptRole(t *testing.T) {
 // payload push is non-minimal (PUSHDATA1 of one byte) still repairs.
 func TestRepairComparesRawSourceBytes(t *testing.T) {
 	ctx := context.Background()
-	topic := "tm_" + strings.Repeat("ab", 32)
+	topic := TokenTopicOfTxid(strings.Repeat("ab", 32))
 	id, _ := hex.DecodeString(strings.Repeat("ab", 32))
 	raw := append([]byte{0x20}, id...)        // 32-byte id (byte order irrelevant here)
 	raw = append(raw, 0x01, 0x64, 0x6d)       // amount 100, OP_2DROP
@@ -461,7 +467,7 @@ func TestRepairComparesRawSourceBytes(t *testing.T) {
 	}
 	tokID := inputs[0].TokenID
 	s := newMemStore()
-	s.putOwner(OwnerRecord{Txid: src.TxID().String(), OutputIndex: 0, Topic: topic, TokenID: tokID, Role: brc162.RoleValue, Amount: 100, IdentityKey: mt.Holder.Identity})
+	s.putOwner(OwnerRecord{Txid: src.TxID().String(), OutputIndex: 0, Topic: topic, TokenID: tokID, Role: brc162.RoleValue, Amount: amt(100), IdentityKey: mt.Holder.Identity})
 	owners, err := ResolveInputOwners(ctx, inputs, &Envelope{}, InputOwnerDeps{Store: s, Engine: engineFor(topic, spend, []uint32{0}), Verifier: overlayVerifier(t), Topic: topic, OnRepair: func(string, bool) {}})
 	if err != nil || owners[0] != mt.Holder.Identity {
 		t.Fatalf("owners %v err %v", owners, err)
@@ -472,12 +478,12 @@ func TestInputLinkageMustControlTheCoinAndNameItsOwner(t *testing.T) {
 	ctx := context.Background()
 	d := mt.Deploy(t, mt.Issuer, "USD")
 	is := mt.Issue(t, d, 0, mt.Issuer, mt.Holder, 100)
-	tok, topic := d.Txid+"_0", "tm_"+d.Txid
+	tok, topic := d.Txid+"_0", TokenTopicOfTxid(d.Txid)
 	tr := mt.Build(t, []mt.In{{Src: is, Vout: 1, WithLinkage: true}}, []mt.Out{{Owner: mt.Receiver, Prover: mt.Holder, TokenID: tok, Amount: 100}}, nil)
 	inputs := brc162.ClassifyAdmittedInputs(tr.Tx, []uint32{0})
 	stored := func(owner string) *memStore {
 		s := newMemStore()
-		s.putToken(TokenRecord{Txid: is.Txid, OutputIndex: 1, TokenID: tok, Amount: 100, IdentityKey: owner})
+		s.putToken(TokenRecord{Txid: is.Txid, OutputIndex: 1, TokenID: tok, Amount: amt(100), IdentityKey: owner})
 		return s
 	}
 	resolve := func(s *memStore, off []byte) error {
@@ -524,7 +530,7 @@ func TestJournalOwnersWritesOneRowPerOwner(t *testing.T) {
 	if err := JournalOwners(ctx, s, "tm_x", "ab", owners); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.owners) != 2 || s.owners[1].Topic != "tm_x" || s.owners[1].Amount != 100 || s.owners[1].Role != brc162.RoleValue || !s.owners[0].CreatedAt.Equal(s.owners[1].CreatedAt) {
+	if len(s.owners) != 2 || s.owners[1].Topic != "tm_x" || s.owners[1].Amount.Cmp(amt(100)) != 0 || s.owners[1].Role != brc162.RoleValue || !s.owners[0].CreatedAt.Equal(s.owners[1].CreatedAt) {
 		t.Fatalf("journal rows: %+v", s.owners)
 	}
 	s.failNext("RecordOwners", errStoreDown)
@@ -537,7 +543,7 @@ func TestJournalOwnersWritesOneRowPerOwner(t *testing.T) {
 func TestTakeBackRepairDebitsOnlyWhatItRemoves(t *testing.T) {
 	ctx := context.Background()
 	s := newMemStore()
-	s.putToken(TokenRecord{Txid: "aa", OutputIndex: 1, TokenID: "t_0", Amount: 40, IdentityKey: mt.Holder.Identity})
+	s.putToken(TokenRecord{Txid: "aa", OutputIndex: 1, TokenID: "t_0", Amount: amt(40), IdentityKey: mt.Holder.Identity})
 	s.putAuthority(AuthorityRecord{Txid: "aa", OutputIndex: 0, TokenID: "t_0", IdentityKey: mt.Issuer.Identity})
 	for i := 0; i < 2; i++ {
 		if err := TakeBackRepair(ctx, s, "aa", 1, brc162.RoleValue); err != nil {
@@ -556,18 +562,31 @@ func TestTakeBackRepairDebitsOnlyWhatItRemoves(t *testing.T) {
 }
 
 func TestJournalAgrees(t *testing.T) {
-	j := &OwnerRecord{TokenID: "t_0", Role: brc162.RoleValue, Amount: 5, IdentityKey: mt.Holder.Identity}
+	j := &OwnerRecord{TokenID: "t_0", Role: brc162.RoleValue, Amount: amt(5), IdentityKey: mt.Holder.Identity}
 	if !journalAgrees(j, "t_0", brc162.RoleValue, 5) {
 		t.Fatal("agreeing journal")
+	}
+	// Exact uint64 compare: amounts past 2^53 agree exactly; 2^64+5 never agrees with 5 (no wrap).
+	for _, u := range []uint64{1<<53 + 1, math.MaxUint64} {
+		if !journalAgrees(&OwnerRecord{TokenID: "t_0", Role: brc162.RoleValue, Amount: amount.FromUint64(u), IdentityKey: mt.Holder.Identity}, "t_0", brc162.RoleValue, u) {
+			t.Fatalf("journal of %d must agree exactly", u)
+		}
+		if journalAgrees(&OwnerRecord{TokenID: "t_0", Role: brc162.RoleValue, Amount: amount.FromUint64(u), IdentityKey: mt.Holder.Identity}, "t_0", brc162.RoleValue, u-1) {
+			t.Fatalf("journal of %d agreed with %d", u, u-1)
+		}
+	}
+	beyondUint64, err := amount.FromBig(new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 64), big.NewInt(5)))
+	if err != nil {
+		t.Fatal(err)
 	}
 	for name, ok := range map[string]bool{
 		"nil":           journalAgrees(nil, "t_0", brc162.RoleValue, 5),
 		"token":         journalAgrees(j, "u_0", brc162.RoleValue, 5),
 		"role":          journalAgrees(j, "t_0", brc162.RoleAuthority, 5),
 		"amount":        journalAgrees(j, "t_0", brc162.RoleValue, 6),
-		"unsafe":        journalAgrees(&OwnerRecord{TokenID: "t_0", Role: brc162.RoleValue, Amount: Amount(MaxSafeAmount + 1), IdentityKey: mt.Holder.Identity}, "t_0", brc162.RoleValue, MaxSafeAmount+1),
-		"negative":      journalAgrees(&OwnerRecord{TokenID: "t_0", Role: brc162.RoleValue, Amount: -5, IdentityKey: mt.Holder.Identity}, "t_0", brc162.RoleValue, 5),
-		"uppercase key": journalAgrees(&OwnerRecord{TokenID: "t_0", Role: brc162.RoleValue, Amount: 5, IdentityKey: strings.ToUpper(mt.Holder.Identity)}, "t_0", brc162.RoleValue, 5),
+		"beyond uint64": journalAgrees(&OwnerRecord{TokenID: "t_0", Role: brc162.RoleValue, Amount: beyondUint64, IdentityKey: mt.Holder.Identity}, "t_0", brc162.RoleValue, 5),
+		"negative":      journalAgrees(&OwnerRecord{TokenID: "t_0", Role: brc162.RoleValue, Amount: amt(-5), IdentityKey: mt.Holder.Identity}, "t_0", brc162.RoleValue, 5),
+		"uppercase key": journalAgrees(&OwnerRecord{TokenID: "t_0", Role: brc162.RoleValue, Amount: amt(5), IdentityKey: strings.ToUpper(mt.Holder.Identity)}, "t_0", brc162.RoleValue, 5),
 	} {
 		if ok {
 			t.Fatalf("%s: agreed", name)

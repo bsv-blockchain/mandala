@@ -9,7 +9,8 @@ vi.mock('./constants', () => ({
   OVERLAY_URL: 'http://test-overlay'
 }))
 
-import { describeAction, exportAdminHistoryCsv, resolveAdminHistory } from './adminHistory.js'
+import { describeAction, exportAdminHistoryCsv, resolveAdminHistory, resolveAdminSummary } from './adminHistory.js'
+import { MAX_UINT64 } from './amount.js'
 import type { AdminHistoryRow } from './adminHistory.js'
 
 describe('describeAction', () => {
@@ -98,8 +99,14 @@ describe('exportAdminHistoryCsv', () => {
     actionDetails: { kind: 'pause' },
     detailsHex: '',
     commitment: '',
-    delta: 0
+    delta: 0n
   }
+
+  it('prints a bigint delta exactly', () => {
+    const csv = exportAdminHistoryCsv([{ ...row, actionDetails: { kind: 'issue' }, delta: MAX_UINT64 }])
+    expect(csv).toContain(',18446744073709551615,')
+    expect(csv).toContain('Issued 18446744073709551615 units')
+  })
 
 
 
@@ -123,6 +130,46 @@ describe('resolveAdminHistory', () => {
     vi.clearAllMocks()
   })
 
+
+  const body = (over: Record<string, unknown>): Record<string, unknown> => ({
+    tokenId: 'x.0', txid: 't1', outputIndex: 0, kind: 'issue', detailsHex: '', commitment: '', height: 1, offset: 0, delta: '0', ...over
+  })
+
+  it('reads delta as an exact signed bigint and drops a non-string delta with one warning', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => [
+        body({ txid: 'max', delta: '18446744073709551615' }),
+        body({ txid: 'neg', kind: 'redeem', delta: '-5' }),
+        body({ txid: 'num', delta: 5 }),
+        body({ txid: 'neg0', delta: '-0' })
+      ]
+    })
+    const rows = await resolveAdminHistory('x.0')
+    expect(rows.map(r => r.txid)).toEqual(['max', 'neg'])
+    expect(rows[0].delta).toBe(MAX_UINT64)
+    expect(rows[1].delta).toBe(-5n)
+    expect(describeAction({ kind: 'redeem' }, rows[1].delta)).toBe('Redeemed (burned) 5 units')
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
+  })
+
+  it('reads summary totals as exact bigints above 2^64', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ totalIssued: '36893488147419103230', totalRedeemed: '7', actionCount: 3 })
+    })
+    expect(await resolveAdminSummary('x.0')).toEqual({ totalIssued: 36893488147419103230n, totalRedeemed: 7n, actionCount: 3 })
+  })
+
+  it('refuses a summary whose totals are not decimal strings', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ totalIssued: 10, totalRedeemed: '7', actionCount: 3 }) })
+    expect(await resolveAdminSummary('x.0')).toBeNull()
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
+  })
 
   it('returns [] on non-ok HTTP response', async () => {
     mockFetch.mockResolvedValueOnce({ ok: false, status: 404 })

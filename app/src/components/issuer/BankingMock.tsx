@@ -10,7 +10,8 @@ import { useAdminSummary } from '../../hooks/useAdminHistory'
 import { useWallet } from '../../context/WalletContext'
 import { reconcile, makeTransfer, TransferDirection } from '@bsv/mandala/banking'
 import { useMockTransfers, addMockTransfer, removeMockTransfer, clearMockTransfers } from '../../lib/mandala/mockBankStore'
-import { formatAmount, parseAmount } from '@bsv/mandala/amount'
+import { displayAmount, safeParseAmount } from '../../lib/mandala/amountDisplay'
+import { decimalsOf } from '../../lib/mandala/loadHolderData'
 
 interface BankingMockProps {
   /** Controlled mode: when set, use this assetId and hide the header asset selector. */
@@ -40,14 +41,14 @@ export default function BankingMock({ assetId: controlledAssetId }: BankingMockP
   const transfers = useMockTransfers(activeAssetId)
 
   const asset = assets.find(a => a.assetId === activeAssetId) ?? null
-  const decimals = Number(asset?.metadata?.decimals) || 0
+  const decimals = decimalsOf(asset?.metadata?.decimals)
 
   // Issue/redeem totals pre-aggregated on the overlay — reconciliation never
   // downloads the full admin history.
   const summaryQuery = useAdminSummary(wallet != null ? activeAssetId : '')
   const summary = summaryQuery.data
 
-  const recon = useMemo((): { bankBalance: number, netSupply: number, drift: number } | null => {
+  const recon = useMemo((): ReturnType<typeof reconcile> | null => {
     if (summary == null) return null
     return reconcile({
       deposits: transfers.filter(t => t.direction === 'in').map(t => t.amount),
@@ -60,15 +61,17 @@ export default function BankingMock({ assetId: controlledAssetId }: BankingMockP
   // Add a demo transfer — the counterparty is always a synthetic
   // "Company {letter}" (see makeTransfer); only amount + direction are admin-supplied.
   const handleAddTransfer = useCallback(() => {
-    const amount = parseAmount(transferAmount, decimals)
-    if (!Number.isFinite(amount) || amount <= 0) {
-      toast.error('Enter a valid transfer amount')
+    // Exact bigint parse: malformed, too many fractional digits, or above
+    // MAX_UINT64 is refused (null), never rounded or wrapped.
+    const amount = safeParseAmount(transferAmount, decimals)
+    if (amount === null || amount <= 0n) {
+      toast.error('Enter a valid amount')
       return
     }
     const t = makeTransfer(amount, direction, activeAssetId)
     addMockTransfer(t)
     setTransferAmount('')
-    toast.success(`Added ${direction === 'in' ? 'incoming' : 'outgoing'} transfer: ${t.originator} · ${formatAmount(amount, decimals)}`)
+    toast.success(`Added ${direction === 'in' ? 'incoming' : 'outgoing'} transfer: ${t.originator} · ${displayAmount(amount, decimals)}`)
   }, [transferAmount, decimals, direction, activeAssetId])
 
   const handleRemoveTransfer = useCallback((id: string) => {
@@ -133,9 +136,9 @@ export default function BankingMock({ assetId: controlledAssetId }: BankingMockP
           ))}
         </div>
         <Input
-          type="number"
-          min="0"
-          step="any"
+          type="text"
+          inputMode="decimal"
+          autoComplete="off"
           value={transferAmount}
           onChange={e => setTransferAmount(e.target.value)}
           placeholder="Amount"
@@ -197,7 +200,7 @@ export default function BankingMock({ assetId: controlledAssetId }: BankingMockP
               </div>
               {/* Amount */}
               <span className={cn('text-[15px] font-semibold tabular-nums', isOut ? 'text-destructive' : 'text-success')}>
-                {isOut ? '−' : '+'}{formatAmount(t.amount, decimals)}
+                {isOut ? '−' : '+'}{displayAmount(t.amount, decimals)}
               </span>
               {/* Delete */}
               <button
@@ -215,7 +218,7 @@ export default function BankingMock({ assetId: controlledAssetId }: BankingMockP
 
       {/* RECONCILIATION */}
       {recon != null && (() => {
-        const hasDrift = recon.drift !== 0
+        const hasDrift = recon.drift !== 0n
         return (
           <>
             <p className="text-[11px] font-medium tracking-[1.2px] text-subtle-foreground uppercase mb-[10px] mt-[22px]">
@@ -225,25 +228,25 @@ export default function BankingMock({ assetId: controlledAssetId }: BankingMockP
               {/* Bank balance */}
               <div className="flex justify-between items-center border-b border-separator py-3">
                 <span className="text-[13px] text-muted-foreground">Bank balance</span>
-                <span className="text-[14px] font-semibold tabular-nums">{formatAmount(recon.bankBalance, decimals)}</span>
+                <span className="text-[14px] font-semibold tabular-nums">{displayAmount(recon.bankBalance, decimals)}</span>
               </div>
               {/* Net supply */}
               <div className="flex justify-between items-center border-b border-separator py-3">
                 <span className="text-[13px] text-muted-foreground">Net supply · issued − redeemed</span>
-                <span className="text-[14px] font-semibold tabular-nums">{formatAmount(recon.netSupply, decimals)}</span>
+                <span className="text-[14px] font-semibold tabular-nums">{displayAmount(recon.netSupply, decimals)}</span>
               </div>
               {/* Drift */}
               <div className={`flex justify-between items-center ${hasDrift ? 'py-3' : 'pt-3'} ${hasDrift ? 'text-warning' : 'text-success'}`}>
                 <span className="text-[13px] font-semibold">Drift</span>
                 <span className="text-[14px] font-semibold tabular-nums">
-                  {recon.drift > 0 ? '+' : ''}{formatAmount(recon.drift, decimals)}
+                  {recon.drift > 0n ? '+' : ''}{displayAmount(recon.drift, decimals)}
                 </span>
               </div>
               {/* Amber callout — how to close the gap */}
               {hasDrift && (
                 <div className="bg-warning/[0.08] rounded px-[13px] py-[10px] text-[11.5px] text-warning leading-[1.4]">
                   <span className="font-semibold">
-                    {recon.drift > 0
+                    {recon.drift > 0n
                       ? 'Bank reserves exceed on-chain supply — issue tokens from the Operations page to match.'
                       : 'On-chain supply exceeds bank reserves — redeem tokens from the Operations page (or add deposits) to match.'}
                   </span>

@@ -4,7 +4,8 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { useWallet } from '../../context/WalletContext'
 import { useOverlayActivity } from '../../hooks/useOverlayActivity'
 import { ActivityEntry, ActivityKind } from '@bsv/mandala/overlayActivity'
-import { formatAmount } from '@bsv/mandala/amount'
+import { displayAmount } from '../../lib/mandala/amountDisplay'
+import { decimalsOf } from '../../lib/mandala/loadHolderData'
 import { CounterpartyDisplay } from '../CounterpartyDisplay'
 import { Spinner } from '../ui/spinner'
 import { cn } from '@/lib/utils'
@@ -43,6 +44,11 @@ function KindChip ({ kind }: { kind: ActivityKind }) {
 }
 
 function AmountCell ({ e, decimals }: { e: ActivityEntry, decimals: number }) {
+  // Net units moved, exact bigint. The kind carries the sign (issue +,
+  // redeem −); a negative wire amount keeps its own sign instead of a doubled one.
+  const neg = e.amount < 0n
+  const abs = neg ? -e.amount : e.amount
+  const sign = neg || e.kind === 'redeem' ? '−' : e.kind === 'issue' ? '+' : ''
   if (e.kind === 'self') {
     return <span className="tabular text-[14px] font-semibold text-muted-foreground">0</span>
   }
@@ -53,7 +59,7 @@ function AmountCell ({ e, decimals }: { e: ActivityEntry, decimals: number }) {
       e.kind === 'redeem' && 'text-warning',
       e.kind === 'transfer' && 'text-foreground'
     )}>
-      {e.kind === 'redeem' ? '−' : e.kind === 'issue' ? '+' : ''}{formatAmount(e.amount, decimals)}
+      {sign}{displayAmount(abs, decimals)}
     </span>
   )
 }
@@ -68,7 +74,10 @@ function AmountCell ({ e, decimals }: { e: ActivityEntry, decimals: number }) {
  * pages and the list virtualizes rows (only the visible slice is in the DOM),
  * fetching the next page as the scroll approaches the end.
  */
-export default function OverlayActivity ({ assetId, decimals, standalone = false }: Props) {
+export default function OverlayActivity ({ assetId, decimals: decimalsProp, standalone = false }: Props) {
+  // Clamp to the BRC-162 range (0..18): an out-of-range dec would make the
+  // exact formatter throw and blank the page.
+  const decimals = decimalsOf(decimalsProp)
   const { wallet } = useWallet()
   const {
     entries, data, isFetching, isError, refetch,

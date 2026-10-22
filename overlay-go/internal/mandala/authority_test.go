@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"math/big"
 	"strings"
 	"testing"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 	mt "github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
 )
@@ -93,7 +95,7 @@ func (c acCase) run(t *testing.T) (*AuthorityResult, error) {
 		c.trusted = acTrusted()
 	}
 	return CheckAuthority(context.Background(), acTx, brc162.BuildLedger(acTx, c.outs, c.ins), c.outs, c.owners, c.inputOwners, c.env,
-		AuthorityDeps{Trusted: c.trusted, Store: c.store, Registry: c.registry})
+		AuthorityDeps{Trusted: c.trusted, Store: c.store, Registry: c.registry, OverlayIdentityKey: mt.Overlay.Identity})
 }
 
 // acDeploy runs layer C on a real kit deploy (real deploySig) after editing its spec.
@@ -104,8 +106,42 @@ func acDeploy(t *testing.T, b *mt.Built, owners []VerifiedOwner) error {
 		owners = acOwnedBy(outs, mt.Issuer.Identity, mt.Issuer.Identity)
 	}
 	_, err := CheckAuthority(context.Background(), b.Txid, brc162.BuildLedger(b.Txid, outs, nil), outs, owners, map[uint32]string{}, envOf(t, b.OffChain),
-		AuthorityDeps{Trusted: acTrusted(), Store: newMemStore()})
+		AuthorityDeps{Trusted: acTrusted(), Store: newMemStore(), OverlayIdentityKey: mt.Overlay.Identity})
 	return err
+}
+
+// Contract §4: a KYC registry deploy is not a color asset, so layer C asks it for no req (the shared
+// ext/icon rules still apply); a token deploy without req is refused after deploySig and trust.
+func TestCheckAuthorityDeployReqIsTokenOnly(t *testing.T) {
+	issuer := mt.Issuer
+	noReq := mt.Build(t, nil, []mt.Out{{Owner: issuer, Prover: issuer, Payload: mt.DeployPayloadWith(brc162.CborMap{"sym": "KYC", "dec": uint64(0), "label": "Members"}), HasPayload: true}}, &issuer)
+	withExt := mt.Build(t, nil, []mt.Out{{Owner: issuer, Prover: issuer, Payload: mt.DeployPayloadWith(brc162.CborMap{"sym": "KYC", "dec": uint64(0), "label": "Members", "ext": brc162.CborMap{}}), HasPayload: true}}, &issuer)
+	run := func(b *mt.Built, registry bool) error {
+		outs := brc162.ClassifyOutputs(b.Tx).Outputs
+		_, err := CheckAuthority(context.Background(), b.Txid, brc162.BuildLedger(b.Txid, outs, nil), outs, acOwnedBy(outs, issuer.Identity, issuer.Identity),
+			map[uint32]string{}, envOf(t, b.OffChain), AuthorityDeps{Trusted: acTrusted(), Store: newMemStore(), Registry: registry, OverlayIdentityKey: mt.Overlay.Identity})
+		return err
+	}
+	if err := run(noReq, true); err != nil {
+		t.Fatalf("KYC deploy without req: %v", err)
+	}
+	requireReject(t, run(withExt, true), CodeShape, "output 0: deploy payload is not a valid Mandala deploy map (ext is not allowed on a Mandala deploy)")
+	requireReject(t, run(noReq, false), CodeShape, "output 0: deploy payload is not a valid Mandala deploy map (missing key req)")
+	kycWith := func(extra brc162.CborMap, signer *mt.Party) *mt.Built {
+		m := brc162.CborMap{"sym": "KYC", "dec": uint64(0), "label": "Members"}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return mt.Build(t, nil, []mt.Out{{Owner: issuer, Prover: issuer, Payload: mt.DeployPayloadWith(m), HasPayload: true}}, signer)
+	}
+	// a KYC deploy keeps the shared shape rules: req, when present, is a map; then ext; then icon
+	requireReject(t, run(kycWith(brc162.CborMap{"req": "x", "ext": brc162.CborMap{}}, &issuer), true), CodeShape, "output 0: deploy payload is not a valid Mandala deploy map (req must be a map)")
+	requireReject(t, run(kycWith(brc162.CborMap{"icon": "x"}, &issuer), true), CodeShape, "output 0: deploy payload is not a valid Mandala deploy map (icon must be [mediaType, bytes])")
+	if err := run(kycWith(brc162.CborMap{"req": brc162.CborMap{}}, &issuer), true); err != nil {
+		t.Fatalf("KYC deploy with a map req: %v", err)
+	}
+	// and, like a token deploy, runs them only after deploySig
+	requireReject(t, run(kycWith(brc162.CborMap{"ext": brc162.CborMap{}}, nil), true), CodeAuthority, "output 0: deploy requires a valid deploySig over this txid")
 }
 
 func TestCheckAuthorityStep1Deploys(t *testing.T) {
@@ -230,31 +266,79 @@ func TestCheckAuthorityStep8DeltaRules(t *testing.T) {
 	requireReject(t, err, CodeConservation, "token "+acTokA+": pause requires delta = 0 but delta is -40")
 }
 
-func TestCheckAuthorityStep9Caps(t *testing.T) {
-	commit := func(kind string) ([]brc162.Output, *Envelope) {
-		d := acDetails(t, brc162.CborMap{"kind": kind})
-		return []brc162.Output{acAuthority(0, acTokA, d)}, acEnv(AdminEntry{Index: 0, Details: hex.EncodeToString(d)})
-	}
+func acCommit(t *testing.T, kind string) ([]brc162.Output, *Envelope) {
+	t.Helper()
+	d := acDetails(t, brc162.CborMap{"kind": kind})
+	return []brc162.Output{acAuthority(0, acTokA, d)}, acEnv(AdminEntry{Index: 0, Details: hex.EncodeToString(d)})
+}
+
+// Step 9 is the storage-range bound (contract §6, D13): no 2^53 cap on any amount, sum or supply.
+func TestCheckAuthorityStep9StorageRange(t *testing.T) {
 	authIn := acIn(0, acTokA, 0)
-	outs, env := commit("redeem")
-	_, err := acCase{outs: append(outs, acValue(1, acTokA, MaxSafeAmount)), ins: []brc162.Input{authIn, acIn(1, acTokA, MaxSafeAmount), acIn(2, acTokA, MaxSafeAmount)}, env: env}.run(t)
-	requireReject(t, err, CodeShape, "token "+acTokA+": value sum exceeds 2^53-1")
-	outs, env = commit("issue")
-	near := newMemStore()
-	near.putToken(TokenRecord{Txid: strings.Repeat("ee", 32), TokenID: acTokA, Amount: Amount(MaxSafeAmount - 50), IdentityKey: mt.Holder.Identity})
-	_, err = acCase{outs: append(outs, acValue(1, acTokA, 100)), ins: []brc162.Input{authIn}, env: env, store: near}.run(t)
-	requireReject(t, err, CodeShape, "token "+acTokA+": circulating supply would exceed 2^53-1")
-	if _, err := (acCase{outs: append(outs, acValue(1, acTokA, 50)), ins: []brc162.Input{authIn}, env: env, store: near}).run(t); err != nil {
-		t.Fatalf("an issue up to exactly 2^53-1: %v", err)
+	outs, env := acCommit(t, "redeem")
+	// value in 2*(2^64-1) and value out 2^64-1: sums past 2^64 are exact and admitted
+	res, err := acCase{outs: append(outs, acValue(1, acTokA, math.MaxUint64)), ins: []brc162.Input{authIn, acIn(1, acTokA, math.MaxUint64), acIn(2, acTokA, math.MaxUint64)}, env: env}.run(t)
+	if err != nil || res.Deltas[acTokA].String() != "-18446744073709551615" {
+		t.Fatalf("a redeem of 2^64-1 from 2*(2^64-1): %+v %v", res, err)
+	}
+	outs, env = acCommit(t, "issue")
+	past53 := newMemStore()
+	past53.putToken(TokenRecord{Txid: strings.Repeat("ee", 32), TokenID: acTokA, Amount: amount.FromUint64(math.MaxUint64), IdentityKey: mt.Holder.Identity})
+	if _, err := (acCase{outs: append(outs, acValue(1, acTokA, math.MaxUint64), acValue(2, acTokA, math.MaxUint64)), ins: []brc162.Input{authIn}, env: env, store: past53}).run(t); err != nil {
+		t.Fatalf("an issue taking the supply to 3*(2^64-1): %v", err)
 	}
 	faulty := newMemStore()
 	faulty.failNext("CirculatingSupply", errStoreDown)
-	pauseOuts, pauseEnv := commit("pause")
+	pauseOuts, pauseEnv := acCommit(t, "pause")
 	if _, err := (acCase{outs: pauseOuts, ins: []brc162.Input{authIn}, env: pauseEnv, store: faulty}).run(t); err != nil {
 		t.Fatalf("the supply is read only when the delta is positive: %v", err)
 	}
 	_, err = acCase{outs: append(outs, acValue(1, acTokA, 5)), ins: []brc162.Input{authIn}, env: env, store: faulty}.run(t)
 	requireReject(t, err, CodeUnavailable, "the circulating supply could not be read; retry")
+}
+
+// acNearMax is a store whose acTokA supply is MaxStorable() - below.
+func acNearMax(t *testing.T, below int64) *memStore {
+	t.Helper()
+	near, err := amount.FromBig(new(big.Int).Sub(amount.MaxStorable(), big.NewInt(below)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newMemStore()
+	s.putToken(TokenRecord{Txid: strings.Repeat("ee", 32), TokenID: acTokA, Amount: near, IdentityKey: mt.Holder.Identity})
+	return s
+}
+
+func TestIssueBeyondStorageRangeRefused(t *testing.T) {
+	authIn := acIn(0, acTokA, 0)
+	outs, env := acCommit(t, "issue")
+	_, err := acCase{outs: append(outs, acValue(1, acTokA, 2)), ins: []brc162.Input{authIn}, env: env, store: acNearMax(t, 1)}.run(t)
+	// ERR_SHAPE is a final verdict (HTTP 400, persisted and replayed by payload hash).
+	requireReject(t, err, CodeShape, "token "+acTokA+": amount aggregate exceeds storage range")
+	if _, err := (acCase{outs: append(outs, acValue(1, acTokA, 1)), ins: []brc162.Input{authIn}, env: env, store: acNearMax(t, 1)}).run(t); err != nil {
+		t.Fatalf("an issue up to exactly 10^34-1: %v", err)
+	}
+}
+
+func TestReissueMatchesFrozenAmountExactly(t *testing.T) {
+	target := strings.Repeat("ab", 32) + ".0"
+	reissue := acDetails(t, brc162.CborMap{"kind": "reissue", "outpoint": dtOutpoint36(0xab, 0), "recipient": dtKey(t, mt.Holder)})
+	env := acEnv(AdminEntry{Index: 0, Details: hex.EncodeToString(reissue)})
+	s := newMemStore()
+	st := DefaultAssetState(acTokA, nil)
+	st.FrozenOutpoints = []FrozenRef{{Outpoint: target, Amount: amount.FromUint64(math.MaxUint64), Owner: mt.Rogue.Identity}}
+	s.putState(st)
+	run := func(v uint64) error {
+		outs := []brc162.Output{acAuthority(0, acTokA, reissue), acValue(1, acTokA, v)}
+		owners := acOwnedBy(outs, mt.Issuer.Identity, mt.Issuer.Identity)
+		owners[1].IdentityKey = mt.Holder.Identity
+		_, err := acCase{outs: outs, owners: owners, ins: []brc162.Input{acIn(0, acTokA, 0)}, env: env, store: s}.run(t)
+		return err
+	}
+	if err := run(math.MaxUint64); err != nil {
+		t.Fatalf("a reissue of exactly 2^64-1: %v", err)
+	}
+	requireReject(t, run(math.MaxUint64-1), CodeShape, "token "+acTokA+": reissue amount does not match the frozen row")
 }
 
 func TestCheckAuthorityStep10Reissue(t *testing.T) {
@@ -279,21 +363,21 @@ func TestCheckAuthorityStep10Reissue(t *testing.T) {
 		}
 		return o
 	}
-	res, err := acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env, store: frozenStore(30)}.run(t)
+	res, err := acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env, store: frozenStore(amt(30))}.run(t)
 	if err != nil || res.Actions[0].Details.Kind != "reissue" {
 		t.Fatalf("a valid reissue (frozen outpoint matched case-insensitively): %+v %v", res, err)
 	}
 	reason := func(d string) string { return "token " + acTokA + ": reissue " + d }
 	_, err = acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env}.run(t)
 	requireReject(t, err, CodeShape, reason("target is not frozen"))
-	_, err = acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env, store: frozenStore(31)}.run(t)
+	_, err = acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env, store: frozenStore(amt(31))}.run(t)
 	requireReject(t, err, CodeShape, reason("amount does not match the frozen row"))
 	spends := []brc162.Output{acAuthority(0, acTokA, reissue), acValue(1, acTokA, 40)}
-	_, err = acCase{outs: spends, owners: toHolder(spends), ins: []brc162.Input{authIn, acIn(1, acTokA, 10)}, env: env, store: frozenStore(30)}.run(t)
+	_, err = acCase{outs: spends, owners: toHolder(spends), ins: []brc162.Input{authIn, acIn(1, acTokA, 10)}, env: env, store: frozenStore(amt(30))}.run(t)
 	requireReject(t, err, CodeShape, reason("must not spend value inputs"))
-	_, err = acCase{outs: outs, ins: []brc162.Input{authIn}, env: env, store: frozenStore(30)}.run(t) // value output owned by the issuer
+	_, err = acCase{outs: outs, ins: []brc162.Input{authIn}, env: env, store: frozenStore(amt(30))}.run(t) // value output owned by the issuer
 	requireReject(t, err, CodeShape, reason("outputs must go to the recipient"))
-	faulty := frozenStore(30)
+	faulty := frozenStore(amt(30))
 	faulty.failNext("GetAssetState", errStoreDown)
 	_, err = acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env, store: faulty}.run(t)
 	requireReject(t, err, CodeUnavailable, "the asset state could not be read; retry")

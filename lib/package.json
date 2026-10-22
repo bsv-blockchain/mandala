@@ -1,6 +1,6 @@
 {
   "name": "@bsv/mandala",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Token client for Mandala overlay assets — send, receive, and administer any asset with overlay-first commit and journaled recovery.",
   "license": "Open BSV",
   "type": "module",
@@ -29,13 +29,30 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
+  "peerDependencies": {
+    "@bsv/sdk": "^4.0.0",
+    "@bsv/templates": "^2.2.0",
     "@bsv/message-box-client": "^2.5.4",
-    "@bsv/sdk": "^2.8.11",
-    "@bsv/templates": "^2.0.0"
+    "@bsv/color-permission-module": "^0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@bsv/color-permission-module": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@bsv/color-permission-module": "file:../vendor-ts-stack/bsv-color-permission-module-0.2.0-4fa68e7.tgz",
+    "@bsv/message-box-client": "^2.5.4",
+    "@bsv/sdk": "file:../vendor-ts-stack/bsv-sdk-4.0.0-4fa68e7.tgz",
+    "@bsv/templates": "file:../vendor-ts-stack/bsv-templates-2.2.0-4fa68e7.tgz",
+    "@bsv/wallet-toolbox-client": "file:../vendor-ts-stack/bsv-wallet-toolbox-client-2.15.0-4fa68e7.tgz",
     "typescript": "~5.9.3",
     "vitest": "^4.1.9"
+  },
+  "overrides": {
+    "@bsv/color-permission-module": "$@bsv/color-permission-module",
+    "@bsv/sdk": "$@bsv/sdk",
+    "@bsv/templates": "$@bsv/templates",
+    "@bsv/wallet-toolbox-client": "$@bsv/wallet-toolbox-client"
   }
 }

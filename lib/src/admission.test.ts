@@ -16,7 +16,9 @@ const PRIV = PrivateKey.fromHex('00000000000000000000000000000000000000000000000
 const KEY = PRIV.toPublicKey().toString()
 const TXID = 'a'.repeat(64)
 const OTHER_TXID = 'b'.repeat(64)
-const T = 'tm_' + 'c'.repeat(64)
+// σI v3 is scoped to the tm_mandala registry topic (C§3); token topics are attested v1.
+const T = 'tm_mandala'
+const LEGACY_T = 'tm_' + 'c'.repeat(64)
 
 /** σ_I as both overlays mint it: ECDSA over SHA-256(message), DER hex. */
 const sign = (message: string): string => {
@@ -286,5 +288,73 @@ describe('verifyFetchedAdmission', () => {
     expect(verifyFetchedAdmission({ ...admitted, signerKey: undefined as unknown as string }, KEY)).toBe(false)
     expect(verifyFetchedAdmission({ ...admitted, signerKey: 7 as unknown as string }, KEY)).toBe(false)
     expect(verifyFetchedAdmission(admitted, undefined as unknown as string)).toBe(false)
+  })
+})
+
+// C§3 / BRC-207 C.0: a tm_color_<assetId> admission is the attested v1 statement,
+// signed by the BRC-42 child [2,'color admission attestation'] keyID '1'.
+describe('verifyFetchedAdmission per topic scheme (attested v1 vs σI v3)', () => {
+  const ID = 'c7d0f61946bc8bde6c01219c67bb99cbf2f89a39bcaea9c2ecf67c54224edb4f_0'
+  const TX = '05fabadb4a03eb7d5e54713824a483161a82ecc7061b124e99a13e9778131931'
+  const SIGNER = '02798b81951a6a8c7ef8beda09b06a23031d7efaf37b663265e0188ab378124046'
+  const LOW = '3045022100d1f48fc13a1ffd18196bcb6166aff936b8dc6cb7b0866fe9226ef1db89fb06be02203eff5870ae5215047d1d624733b29f563d5037660ce5c4ed0ce4ac52cc56758a'
+  const HIGH = '3046022100d1f48fc13a1ffd18196bcb6166aff936b8dc6cb7b0866fe9226ef1db89fb06be022100c100a78f51adeafb82e29db8cc4d60a87d5ea580a262db4eb2edb23a03dfcbb7'
+  const COLOR_T = `tm_color_${ID}`
+  const P5555 = new PrivateKey(5555)
+  const v3 = (topic: string): string => P5555.sign(Utils.toArray(`${ADMISSION_PREFIX}${topic}:${TX}:0,2`, 'utf8')).toDER('hex') as string
+  const entry = (topic: string, signature: string) =>
+    ({ kind: 'admitted' as const, txid: TX, topic, outputsToAdmit: [0, 2], signature, signerKey: SIGNER, at: 1 })
+
+  it('an admitted tm_color_<id> entry with the attested C.0 signature verifies (low- and high-S)', () => {
+    expect(verifyFetchedAdmission(entry(COLOR_T, LOW), SIGNER)).toBe(true)
+    expect(verifyFetchedAdmission(entry(COLOR_T, HIGH), SIGNER)).toBe(true)
+  })
+
+  it('the same tm_color_<id> entry carrying a σI v3 signature does not verify', () => {
+    expect(verifyFetchedAdmission(entry(COLOR_T, v3(COLOR_T)), SIGNER)).toBe(false)
+  })
+
+  it('the attested branch is exact: other signer, uppercase expected signer, unsorted set ⇒ false', () => {
+    expect(verifyFetchedAdmission(entry(COLOR_T, LOW), KEY)).toBe(false)
+    expect(verifyFetchedAdmission(entry(COLOR_T, LOW), SIGNER.toUpperCase())).toBe(false)
+    expect(verifyFetchedAdmission({ ...entry(COLOR_T, LOW), outputsToAdmit: [2, 0] }, SIGNER)).toBe(false)
+  })
+
+  it('σI v3 verifies on tm_mandala, and an attested signature there does not', () => {
+    expect(verifyFetchedAdmission(entry('tm_mandala', v3('tm_mandala')), SIGNER)).toBe(true)
+    expect(verifyFetchedAdmission(entry('tm_mandala', LOW), SIGNER)).toBe(false)
+  })
+
+  it('σI v3 is refused on any other topic (legacy tm_<txid> token topics are gone)', () => {
+    expect(verifyFetchedAdmission(entry(LEGACY_T, v3(LEGACY_T)), SIGNER)).toBe(false)
+    expect(verifyFetchedAdmission(entry('tm_mandala_kyc', v3('tm_mandala_kyc')), SIGNER)).toBe(false)
+  })
+})
+
+describe('fetchAdmission default topic (^tm_color_<64hex>_0$ | ^tm_mandala$)', () => {
+  const ID = 'c'.repeat(64) + '_0'
+  const COLOR_T = `tm_color_${ID}`
+  const body = (admissions: Record<string, unknown>) =>
+    ({ status: 200, ok: true, json: async () => ({ txid: TXID, admissions, admissionIdentityKey: KEY, at: 5 }) })
+  const one = { outputsToAdmit: [0], admissionSignature: 'de' }
+
+  beforeEach(() => {
+    mockFetch.mockReset()
+    configureMandala({ overlayUrl: 'http://test-overlay', adminApiToken: '' })
+  })
+
+  it('picks the tm_color_<id>_0 entry', async () => {
+    mockFetch.mockResolvedValueOnce(body({ tm_mandala_kyc: one, [COLOR_T]: one }))
+    expect((await fetchAdmission('http://test-overlay', TXID)) as any).toMatchObject({ kind: 'admitted', topic: COLOR_T })
+  })
+
+  it('picks tm_mandala when no color topic is present', async () => {
+    mockFetch.mockResolvedValueOnce(body({ tm_mandala_kyc: one, tm_mandala: one }))
+    expect((await fetchAdmission('http://test-overlay', TXID)) as any).toMatchObject({ kind: 'admitted', topic: 'tm_mandala' })
+  })
+
+  it('ignores a legacy tm_<64hex> topic and a non-_0 color topic', async () => {
+    mockFetch.mockResolvedValueOnce(body({ [LEGACY_T]: one, [`tm_color_${'c'.repeat(64)}_1`]: one }))
+    expect(await fetchAdmission('http://test-overlay', TXID)).toEqual({ kind: 'unavailable', code: 'ERR_UNAVAILABLE', retryable: true })
   })
 })

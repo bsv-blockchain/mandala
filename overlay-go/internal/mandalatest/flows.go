@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
+	"github.com/sirdeggen/mandala/overlay-go/internal/colorprofile"
 )
 
 func mustCbor(m brc162.CborMap) []byte {
@@ -15,10 +16,14 @@ func mustCbor(m brc162.CborMap) []byte {
 	return b
 }
 
-// DeployPayload is the strict-CBOR deploy map {sym, dec, label}.
+// DeployPayload is the strict-CBOR deploy map {sym, dec, label, req}, req naming Overlay's
+// profiles (colorprofile.MandalaReq(Overlay.Identity), contract §4).
 func DeployPayload(sym string, dec uint64, label string) []byte {
-	return mustCbor(brc162.CborMap{"sym": sym, "dec": dec, "label": label})
+	return mustCbor(brc162.CborMap{"sym": sym, "dec": dec, "label": label, "req": colorprofile.MandalaReq(Overlay.Identity)})
 }
+
+// DeployPayloadWith is the strict-CBOR encoding of an arbitrary payload map (negatives).
+func DeployPayloadWith(m brc162.CborMap) []byte { return mustCbor(m) }
 
 // Details is the strict-CBOR encoding of admin details kv.
 func Details(kv brc162.CborMap) []byte { return mustCbor(kv) }
@@ -28,12 +33,18 @@ func AdmPayload(commitment [32]byte) []byte {
 	return mustCbor(brc162.CborMap{"adm": commitment[:]})
 }
 
-// Deploy builds a signed deploy at output 0, owned and proved by issuer, payload {sym, dec:2, label:"US Dollar"}.
+// Deploy builds a signed deploy at output 0, owned and proved by issuer, payload {sym, dec:2,
+// label:"US Dollar", req: Overlay's profiles}.
 func Deploy(t testing.TB, issuer Party, sym string) *Built {
 	t.Helper()
-	return Build(t, nil, []Out{{
-		Owner: issuer, Prover: issuer, Payload: DeployPayload(sym, 2, "US Dollar"), HasPayload: true,
-	}}, &issuer)
+	return DeployWithPayload(t, issuer, DeployPayload(sym, 2, "US Dollar"))
+}
+
+// DeployWithPayload builds a deploy at output 0, owned, proved and deploySig-signed by issuer,
+// carrying payload as is.
+func DeployWithPayload(t testing.TB, issuer Party, payload []byte) *Built {
+	t.Helper()
+	return Build(t, nil, []Out{{Owner: issuer, Prover: issuer, Payload: payload, HasPayload: true}}, &issuer)
 }
 
 // Issue spends auth:authVout (the deploy or the current authority). Output 0 is the new authority
@@ -45,6 +56,21 @@ func Issue(t testing.TB, auth *Built, authVout uint32, issuer, to Party, amount 
 	return Build(t, []In{{Src: auth, Vout: authVout}}, []Out{
 		{Owner: issuer, Prover: issuer, TokenID: tokenID, Payload: AdmPayload(sha256.Sum256(details)), HasPayload: true, Details: details},
 		{Owner: to, Prover: issuer, TokenID: tokenID, Amount: amount},
+	}, nil)
+}
+
+// IssueTo is Issue with a 1Color payout (design B4): output 0 is the new authority under the Mandala
+// derivation; output 1 pays amount to `to` under ColorProtocol(tokenID, *r), keyID "color", proved by issuer.
+func IssueTo(t testing.TB, auth *Built, authVout uint32, issuer, to Party, amount uint64, r *ColorRemittance) *Built {
+	t.Helper()
+	if r == nil {
+		t.Fatal("mandalatest: IssueTo needs a remittance; use Issue for a Mandala payout")
+	}
+	tokenID := TokenIDOf(auth, authVout)
+	details := Details(brc162.CborMap{"kind": "issue"})
+	return Build(t, []In{{Src: auth, Vout: authVout}}, []Out{
+		{Owner: issuer, Prover: issuer, TokenID: tokenID, Payload: AdmPayload(sha256.Sum256(details)), HasPayload: true, Details: details},
+		{Owner: to, Prover: issuer, TokenID: tokenID, Amount: amount, Color: r},
 	}, nil)
 }
 

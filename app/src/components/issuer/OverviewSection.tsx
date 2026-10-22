@@ -6,7 +6,8 @@ import { reconcile } from '@bsv/mandala/banking'
 import { useAssetState, useInvalidateAssetState } from '../../hooks/useAssetState'
 import { useAdminSummary, useInvalidateAdminHistory } from '../../hooks/useAdminHistory'
 import { useMockTransfers } from '../../lib/mandala/mockBankStore'
-import { formatAmount } from '@bsv/mandala/amount'
+import { displayAmount, reserveRatioPct } from '../../lib/mandala/amountDisplay'
+import { decimalsOf } from '../../lib/mandala/loadHolderData'
 import { cn } from '@/lib/utils'
 import AuditLog from './AuditLog'
 
@@ -78,7 +79,7 @@ export default function OverviewSection({ assetId, asset, onReload }: Props) {
   // separate fabricated number.
   const transfers = useMockTransfers(assetId)
 
-  const decimals = Number(asset?.metadata?.decimals) || 0
+  const decimals = decimalsOf(asset?.metadata?.decimals)
 
   const stateQuery = useAssetState(assetId)
   // Whole-history issue/redeem totals come pre-aggregated from the overlay —
@@ -94,8 +95,10 @@ export default function OverviewSection({ assetId, asset, onReload }: Props) {
   const loading = assetId !== '' && (stateQuery.data === undefined || summary === undefined)
   const refetching = stateQuery.isFetching || summaryQuery.isFetching
 
-  const { inCirculation, netIssued, reserveRatioPct } = useMemo(() => {
-    if (summary == null) return { inCirculation: 0, netIssued: 0, reserveRatioPct: null as number | null }
+  // Exact bigint supply math; the only Number is the final percentage
+  // (reserveRatioPct, integer basis points on bigints, clamped 0..100).
+  const { inCirculation, netIssued, ratioPct } = useMemo((): { inCirculation: bigint, netIssued: bigint, ratioPct: number | null } => {
+    if (summary == null) return { inCirculation: 0n, netIssued: 0n, ratioPct: null }
     const circulation = summary.totalIssued - summary.totalRedeemed
 
     const recon = reconcile({
@@ -104,11 +107,7 @@ export default function OverviewSection({ assetId, asset, onReload }: Props) {
       issued: summary.totalIssued,
       redeemed: summary.totalRedeemed,
     })
-    const ratio =
-      circulation === 0
-        ? null
-        : Math.min(100, (recon.bankBalance / circulation) * 100)
-    return { inCirculation: circulation, netIssued: circulation, reserveRatioPct: ratio }
+    return { inCirculation: circulation, netIssued: circulation, ratioPct: reserveRatioPct(recon.bankBalance, circulation) }
   }, [summary, transfers])
 
   // Restrictions tile: read from assetAdminState
@@ -122,10 +121,10 @@ export default function OverviewSection({ assetId, asset, onReload }: Props) {
 
   // Reserve ratio display
   const reserveValue =
-    reserveRatioPct == null
+    ratioPct == null
       ? '—'
-      : `${reserveRatioPct.toFixed(1)}%`
-  const reserveColor = reserveRatioPct != null && reserveRatioPct < 100 ? 'text-warning' : undefined
+      : `${ratioPct.toFixed(1)}%`
+  const reserveColor = ratioPct != null && ratioPct < 100 ? 'text-warning' : undefined
 
   const ticker = String(asset?.metadata?.ticker ?? asset?.label?.slice(0, 3) ?? '').toUpperCase()
 
@@ -161,7 +160,7 @@ export default function OverviewSection({ assetId, asset, onReload }: Props) {
       <div className="flex gap-[14px]">
         <StatTile
           label="In circulation"
-          value={loading ? '…' : assetId === '' ? '—' : formatAmount(inCirculation, decimals)}
+          value={loading ? '…' : assetId === '' ? '—' : displayAmount(inCirculation, decimals)}
           sub={ticker ? ticker : 'issued − redeemed'}
         />
         <StatTile
@@ -171,10 +170,10 @@ export default function OverviewSection({ assetId, asset, onReload }: Props) {
               ? '…'
               : assetId === ''
               ? '—'
-              : (netIssued >= 0 ? '+' : '') + formatAmount(netIssued, decimals)
+              : (netIssued >= 0n ? '+' : '') + displayAmount(netIssued, decimals)
           }
           sub="all history"
-          valueColor={netIssued > 0 ? 'text-success' : undefined}
+          valueColor={netIssued > 0n ? 'text-success' : undefined}
         />
         <StatTile
           label="Reserve ratio (demo)"
@@ -197,7 +196,7 @@ export default function OverviewSection({ assetId, asset, onReload }: Props) {
             Admin history
           </div>
         </div>
-        <AuditLog assetId={assetId} />
+        <AuditLog assetId={assetId} decimals={decimals} />
       </div>
     </div>
   )

@@ -1,37 +1,43 @@
 /**
- * σ_I — the overlay's admission signature, and its verification (A12 client
- * half; offline-settlement wire contract v2 §1, FIX A).
+ * σ_I v3: the overlay's admission signature on the `tm_mandala` registry
+ * topic, and per-topic verification of a fetched admission (C§3).
+ *
+ * Scope (1Color): σI v3 is used ONLY for `tm_mandala`. A per-asset
+ * `tm_color_<assetId>` admission is the BRC-207 attested v1 statement
+ * (`attestation.ts`), signed by a BRC-42 child of the overlay identity key.
+ * `tm_mandala_kyc` is unsigned. σI v3 on any token topic is refused:
+ * `verifyFetchedAdmission` dispatches on the topic and never falls back from
+ * one scheme to the other.
  *
  * The signature binds the overlay's verdict to the *exact set of outputs it
  * admitted*, not merely to the txid. Signing over the bare txid is what let a
  * hostile, un-linked sibling output ride along on a genuine admission (the
- * phantom-coin hole); a verifier that only checked "this txid was admitted"
- * would credit it. Everything downstream (bundle.ts's COVER walk, receive.ts's
- * incoming check) therefore asks `Covered(txid, vout)`, never `Admitted(txid)`.
+ * phantom-coin hole), so callers ask `Covered(txid, vout)`, never
+ * `Admitted(txid)`.
  *
- * Wire contract (binding, both overlays and both wallets):
+ * Wire contract (binding, overlay-go and this lib):
  *
  *   digest = SHA-256("mandala-admit:v3:" + topic + ":" + txid + ":" + outputsToAdmit.sort(asc).join(","))
  *
- * (σI v3, overlay-go internal/mandala/admissions.go AdmissionDigestV3.) `topic`
- * is the STEAK topic the signature speaks for — `tm_<deployTxid>` for token
- * traffic (see brc162.ts tokenTopic), `tm_mandala` for a deploy's registry
- * entry. `txid` is 64 lowercase hex; `outputsToAdmit` is that topic's own
- * admitted output indexes as ascending decimal, comma-joined ("0", "0,2,3"),
- * never empty — no admitted outputs means no signature exists at all. The
- * signature is DER (RFC-6979 deterministic ECDSA) over those digest bytes with
- * the overlay identity key, which is byte-identical on the TS overlay
- * (`priv.sign(utf8(message))`, which hashes with SHA-256 first) and the Go
- * overlay (`priv.Sign(sha256(message))`).
+ * (σI v3, overlay-go internal/mandala/admissions.go AdmissionDigestV3.)
+ * `topic` is `tm_mandala`. `txid` is 64 lowercase hex; `outputsToAdmit` is
+ * that topic's own admitted output indexes as ascending decimal, comma-joined
+ * ("0", "0,2,3"), never empty: no admitted outputs means no signature exists.
+ * The signature is DER (RFC-6979 deterministic ECDSA) over those digest bytes
+ * with the bare overlay identity key (`priv.sign(utf8(message))`, which
+ * hashes with SHA-256 first). Verifiers never normalize S.
  *
  * Scope cap (A12): verification is against the overlay key *currently*
  * configured, not against the key that was live at the height of the Merkle
  * path. Key rotation (R34/R69) is deliberately out of scope here.
  *
- * Pure and React-Native safe: no storage, no network, no Node built-ins.
+ * Pure and React-Native safe apart from `fetchAdmission` (fetch only): no
+ * storage, no Node built-ins.
  */
 import { BigNumber, ECDSA, Hash, PublicKey, Signature, Utils } from '@bsv/sdk'
-import { adminAuthHeaders } from './constants.js'
+import { adminAuthHeaders, TOPIC } from './constants.js'
+import { verifyAttestation } from './attestation.js'
+import { isColorTopic } from './naming.js'
 
 export const ADMISSION_PREFIX = 'mandala-admit:v3:'
 
@@ -55,7 +61,7 @@ export interface AdmissionEntry {
 /** What verifyAdmission needs: an AdmissionEntry plus the txid it claims to cover. */
 export interface AdmissionCheck extends AdmissionEntry {
   txid: string
-  /** The STEAK topic the σI was taken for (`tokenTopic(assetId)` for a token coin). */
+  /** The STEAK topic the signature was taken for (`tm_mandala` for σI v3, `tm_color_<assetId>` for attested v1). */
   topic: string
 }
 
@@ -164,9 +170,11 @@ export type FetchedAdmission =
 
 export interface FetchAdmissionOptions {
   /**
-   * The topic whose σI to return (`tokenTopic(assetId)`). The route serves
+   * The topic whose admission to return (`colorTopic(assetId)` or
+   * `tm_mandala`). The route serves
    * `{admissions: {<topic>: {outputsToAdmit, admissionSignature}}}`; without
-   * this the first token topic (tm_<64 hex>) in the body is used.
+   * this the first topic matching `^tm_color_<64 hex>_0$` or `^tm_mandala$`
+   * in the body is used (Mandala assets are `_0` only).
    */
   topic?: string
   /**
@@ -194,6 +202,9 @@ export interface FetchAdmissionOptions {
  * without σ_I proves nothing, and reporting it as `admitted` would hand
  * `verifyFetchedAdmission` an entry whose `signerKey` is undefined.
  */
+/** Default topic picked from a fetched admission body (C§8.1). */
+const DEFAULT_TOPIC_RE = /^tm_color_[0-9a-f]{64}_0$|^tm_mandala$/
+
 export async function fetchAdmission (
   overlayUrl: string,
   txid: string,
@@ -225,7 +236,7 @@ export async function fetchAdmission (
     const admissions = body?.admissions != null && typeof body.admissions === 'object' ? body.admissions : undefined
     const topic = typeof opts?.topic === 'string' && opts.topic !== ''
       ? opts.topic
-      : Object.keys(admissions ?? {}).find(t => /^tm_[0-9a-f]{64}$/.test(t))
+      : Object.keys(admissions ?? {}).find(t => DEFAULT_TOPIC_RE.test(t))
     const picked = topic != null ? admissions?.[topic] : undefined
     if (res.ok && typeof body?.txid === 'string' && picked != null && Array.isArray(picked.outputsToAdmit)) {
       const signature = picked.admissionSignature
@@ -255,22 +266,41 @@ export async function fetchAdmission (
 }
 
 /**
- * Convenience wrapper: true iff `entry` is an 'admitted' verdict from exactly
- * `expectedSignerKey` whose σ_I verifies over its own txid/outputsToAdmit.
- * Every other kind (evicted/refused/unavailable/undefined) is false — never throws.
+ * True iff `entry` is an 'admitted' verdict from exactly `expectedSignerKey`
+ * whose signature verifies under its topic's scheme (C§3):
+ *
+ * - `tm_color_<assetId>`: the attested v1 statement (`verifyAttestation`):
+ *   exact lowercase signer, canonical outputs, strict-DER lowercase hex, the
+ *   BRC-42 attestation child, never the bare key.
+ * - `tm_mandala`: σI v3 by the bare overlay key.
+ * - any other topic (legacy `tm_<txid>` token topics, `tm_mandala_kyc`): false.
+ *
+ * Every other kind (evicted/refused/unavailable/undefined) is false. Never throws.
  */
 export function verifyFetchedAdmission (entry: FetchedAdmission | undefined, expectedSignerKey: string): boolean {
-  if (entry == null || entry.kind !== 'admitted') return false
-  // A hand-built entry (or an older overlay's body) can carry a non-string
-  // signerKey; `.toLowerCase()` on it would throw, and this function is
-  // contractually total.
-  if (typeof expectedSignerKey !== 'string' || typeof entry.signerKey !== 'string') return false
-  if (entry.signerKey.toLowerCase() !== expectedSignerKey.toLowerCase()) return false
-  return verifyAdmission({
-    topic: entry.topic,
-    txid: entry.txid,
-    outputsToAdmit: entry.outputsToAdmit,
-    signature: entry.signature,
-    signerKey: entry.signerKey
-  })
+  try {
+    if (entry == null || entry.kind !== 'admitted') return false
+    // A hand-built entry (or an older overlay's body) can carry a non-string
+    // signerKey; this function is contractually total.
+    if (typeof expectedSignerKey !== 'string' || typeof entry.signerKey !== 'string') return false
+    if (isColorTopic(entry.topic)) {
+      if (typeof entry.signature !== 'string') return false
+      return verifyAttestation(
+        { txid: entry.txid, outputs: entry.outputsToAdmit, signer: entry.signerKey, signature: entry.signature },
+        entry.topic.slice('tm_color_'.length),
+        expectedSignerKey
+      )
+    }
+    if (entry.topic !== TOPIC) return false
+    if (entry.signerKey.toLowerCase() !== expectedSignerKey.toLowerCase()) return false
+    return verifyAdmission({
+      topic: entry.topic,
+      txid: entry.txid,
+      outputsToAdmit: entry.outputsToAdmit,
+      signature: entry.signature,
+      signerKey: entry.signerKey
+    })
+  } catch {
+    return false
+  }
 }

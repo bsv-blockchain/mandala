@@ -210,3 +210,20 @@ func TestSpecVerdictsTruthTable(t *testing.T) {
 		}
 	}
 }
+
+// OneColor: a 36-byte legacy id classifies as an ordinary output named <txid>_<vout>, on outputs
+// and on admitted inputs alike; layer A never refuses (Mandala refuses it as policy).
+func TestClassifyLegacyTokenID(t *testing.T) {
+	legacy := strings.Repeat("aa", 32) + "_5"
+	src := txWithOutputs(mustLock(t, legacy, 7))
+	c := ClassifyOutputs(src)
+	if len(c.Invalid) != 0 || len(c.Outputs) != 1 || c.Outputs[0].TokenID != legacy || c.Outputs[0].Role != RoleValue {
+		t.Fatalf("classify = %+v", c)
+	}
+	tx := txWithOutputs(mustLock(t, legacy, 7))
+	spend(tx, src, 0)
+	in := ClassifyAdmittedInputs(tx, []uint32{0})
+	if len(in) != 1 || in[0].TokenID != legacy || in[0].Amount != 7 {
+		t.Fatalf("inputs = %+v", in)
+	}
+}

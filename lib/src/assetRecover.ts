@@ -11,8 +11,8 @@
  * registryRecover.ts for the registry spine.
  */
 import { Transaction, Utils, WalletInterface } from '@bsv/sdk'
-import { BASKET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
-import { AdminAsset, adminCustomInstructions, listAdminAssets } from './assets.js'
+import { TREASURY_BASKET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
+import { AdminAsset, actionDescription, adminCustomInstructions, listAdminAssets } from './assets.js'
 import { resolveAssetMetadata } from './metadata.js'
 import { authorityKeyIdOf } from './brc162.js'
 import { beefFromWhatsOnChain, toAtomicBeef } from './registryRecover.js'
@@ -116,12 +116,12 @@ export async function recoverAdminAuth (p: {
         outputIndex: vout,
         protocol: 'basket insertion',
         insertionRemittance: {
-          basket: BASKET,
+          basket: TREASURY_BASKET,
           customInstructions: adminCustomInstructions(p.assetId, label, authKeyID, metadata),
           tags: ['mandala-admin']
         }
       }],
-      description: `Re-attach ${label} asset authority`
+      description: actionDescription(`Re-attach ${label} asset authority`)
     })
   } catch (e) {
     if (!/already|duplicate|exists/i.test(String(e))) throw e

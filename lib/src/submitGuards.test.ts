@@ -9,19 +9,29 @@ import {
   guardIdentityKey,
   guardTokenRecipient
 } from './submitGuards.js'
+import { MAX_UINT64 } from './amount.js'
 
 describe('guardPositiveAmount', () => {
-  it('accepts positive integers', () => {
-    expect(guardPositiveAmount(1).ok).toBe(true)
-    expect(guardPositiveAmount(100).ok).toBe(true)
+  it('accepts positive integers up to MAX_UINT64', () => {
+    expect(guardPositiveAmount(1n).ok).toBe(true)
+    expect(guardPositiveAmount(100n).ok).toBe(true)
+    expect(guardPositiveAmount(MAX_UINT64).ok).toBe(true)
   })
 
-  it('rejects non-positive, non-integer, NaN', () => {
-    expect(guardPositiveAmount(0).ok).toBe(false)
-    expect(guardPositiveAmount(-1).ok).toBe(false)
-    expect(guardPositiveAmount(1.5).ok).toBe(false)
-    expect(guardPositiveAmount(NaN).ok).toBe(false)
-    expect(guardPositiveAmount(Infinity).ok).toBe(false)
+  it('rejects non-positive amounts', () => {
+    expect(guardPositiveAmount(0n).ok).toBe(false)
+    expect(guardPositiveAmount(-1n).ok).toBe(false)
+  })
+
+  it('rejects an amount above the uint64 token range', () => {
+    const r = guardPositiveAmount(MAX_UINT64 + 1n)
+    expect(r).toEqual({ ok: false, reason: 'Amount exceeds the uint64 token range' })
+  })
+
+  it('rejects a non-bigint amount from an unconverted JS caller (1.5, NaN, Infinity, 5)', () => {
+    for (const bad of [1.5, NaN, Infinity, 5, '5', null]) {
+      expect(guardPositiveAmount(bad as unknown as bigint).ok).toBe(false)
+    }
   })
 })
 
@@ -29,8 +39,8 @@ describe('guardSendSubmit', () => {
   const base = {
     assetId: 'asset.0',
     recipientKey: '02' + 'ab'.repeat(32),
-    amount: 10,
-    balance: 100,
+    amount: 10n,
+    balance: 100n,
     isPaused: false,
     walletReady: true
   }
@@ -42,8 +52,8 @@ describe('guardSendSubmit', () => {
   it('rejects empty asset, empty recipient, zero amount, over-balance', () => {
     expect(guardSendSubmit({ ...base, assetId: '' }).ok).toBe(false)
     expect(guardSendSubmit({ ...base, recipientKey: '' }).ok).toBe(false)
-    expect(guardSendSubmit({ ...base, amount: 0 }).ok).toBe(false)
-    expect(guardSendSubmit({ ...base, amount: 101 }).ok).toBe(false)
+    expect(guardSendSubmit({ ...base, amount: 0n }).ok).toBe(false)
+    expect(guardSendSubmit({ ...base, amount: 101n }).ok).toBe(false)
   })
 
   it('rejects send while paused unless pauseBypass (dev mode)', () => {
@@ -54,17 +64,23 @@ describe('guardSendSubmit', () => {
   it('rejects when wallet is not ready', () => {
     expect(guardSendSubmit({ ...base, walletReady: false }).ok).toBe(false)
   })
+
+  it('compares against a balance above 2^64 exactly', () => {
+    const balance = MAX_UINT64 * 2n
+    expect(guardSendSubmit({ ...base, amount: MAX_UINT64, balance }).ok).toBe(true)
+    expect(guardSendSubmit({ ...base, amount: MAX_UINT64 + 1n, balance }).ok).toBe(false)
+  })
 })
 
 describe('guardIssueSubmit / guardRedeemSubmit', () => {
   it('issue requires asset and positive amount', () => {
-    expect(guardIssueSubmit({ assetId: 'a.0', amount: 5, walletReady: true }).ok).toBe(true)
-    expect(guardIssueSubmit({ assetId: '', amount: 5, walletReady: true }).ok).toBe(false)
-    expect(guardIssueSubmit({ assetId: 'a.0', amount: 0, walletReady: true }).ok).toBe(false)
+    expect(guardIssueSubmit({ assetId: 'a.0', amount: 5n, walletReady: true }).ok).toBe(true)
+    expect(guardIssueSubmit({ assetId: '', amount: 5n, walletReady: true }).ok).toBe(false)
+    expect(guardIssueSubmit({ assetId: 'a.0', amount: 0n, walletReady: true }).ok).toBe(false)
   })
 
   it('issue accepts a 64-hex deposit hash as bankRef and refuses anything else when one is given (A14)', () => {
-    const base = { assetId: 'a.0', amount: 5, walletReady: true }
+    const base = { assetId: 'a.0', amount: 5n, walletReady: true }
     expect(guardIssueSubmit({ ...base, bankRef: 'ab'.repeat(32) }).ok).toBe(true)
     expect(guardIssueSubmit({ ...base, bankRef: 'AB'.repeat(32) }).ok).toBe(true)
     // Optional: absent / empty / whitespace is fine when not mandatory.
@@ -79,18 +95,25 @@ describe('guardIssueSubmit / guardRedeemSubmit', () => {
   })
 
   it('issue requires a bankRef when the deposit reference is configured as mandatory (A14)', () => {
-    const base = { assetId: 'a.0', amount: 5, walletReady: true, requireBankRef: true }
+    const base = { assetId: 'a.0', amount: 5n, walletReady: true, requireBankRef: true }
     expect(guardIssueSubmit({ ...base }).ok).toBe(false)
     expect(guardIssueSubmit({ ...base, bankRef: '' }).ok).toBe(false)
     expect(guardIssueSubmit({ ...base, bankRef: 'ab'.repeat(32) }).ok).toBe(true)
   })
 
+  it('issue and redeem refuse an amount above the uint64 token range', () => {
+    const r = guardIssueSubmit({ assetId: 'a.0', amount: MAX_UINT64 + 1n, walletReady: true })
+    expect(r.ok === false && r.reason).toBe('Amount exceeds the uint64 token range')
+    expect(guardIssueSubmit({ assetId: 'a.0', amount: MAX_UINT64, walletReady: true }).ok).toBe(true)
+    expect(guardRedeemSubmit({ assetId: 'a.0', amount: MAX_UINT64 + 1n, walletReady: true }).ok).toBe(false)
+  })
+
   it('redeem refuses amount above balance when balance is provided', () => {
     expect(
-      guardRedeemSubmit({ assetId: 'a.0', amount: 50, balance: 40, walletReady: true }).ok
+      guardRedeemSubmit({ assetId: 'a.0', amount: 50n, balance: 40n, walletReady: true }).ok
     ).toBe(false)
     expect(
-      guardRedeemSubmit({ assetId: 'a.0', amount: 40, balance: 40, walletReady: true }).ok
+      guardRedeemSubmit({ assetId: 'a.0', amount: 40n, balance: 40n, walletReady: true }).ok
     ).toBe(true)
   })
 })

@@ -5,16 +5,17 @@
  * (see submitAndBroadcast). Each resolves at the overlay-accept commit point.
  */
 import { Beef, WalletInterface } from '@bsv/sdk'
-import { BASKET, FT_PROTOCOL } from './constants.js'
-import { deployPayload, deployTopics, MandalaActionDetails } from './brc162.js'
+import { TREASURY_BASKET, ADMIN_PROTOCOL, OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, TOPIC } from './constants.js'
+import { deployPayload, MandalaActionDetails } from './brc162.js'
+import { colorTopic } from './naming.js'
 import { assertFeeRate } from './feeRate.js'
 import { AdmissionReceipt, admissionReceipt } from './overlay.js'
 import { outpoint } from './tokens.js'
-import { loadFtCandidates } from './ftCandidates.js'
-import { selectFtInputs } from './ftSelect.js'
-import { AdminAsset, adminCustomInstructions, withBankRef } from './assets.js'
+import { loadTreasuryCandidates } from './treasury/candidates.js'
+import { selectTreasuryInputs } from './treasury/select.js'
+import { AdminAsset, actionDescription, adminCustomInstructions, withBankRef } from './assets.js'
 import { withAdminAuthGate, assertSpendablePrior } from './adminAuthGate.js'
-import { guardRedeemSubmit } from './submitGuards.js'
+import { guardIssueSubmit, guardRedeemSubmit } from './submitGuards.js'
 import { withIntent } from './txJournal.js'
 import { tryWithLock } from './webLocks.js'
 import { BusyError } from './singleFlight.js'
@@ -33,8 +34,11 @@ export interface RegisterParams {
   label: string
   ticker: string
   decimals: number
+  /** Optional deploy icon `[mediaType, bytes]` (on chain only, never in the wallet metadata copy). */
+  icon?: { mediaType: string, bytes: number[] }
   /**
-   * Token-fee design §2: token base units per 1000 bytes charged for
+   * B6: the console no longer writes this by default (fuel/token fees are out
+   * of scope until fuelkeeper is ported). Token-fee design §2: token base units per 1000 bytes charged for
    * issuer-paid network fees. Omit to leave issuer-paid fees disabled; can be
    * set or changed later with setFeeRate().
    */
@@ -60,6 +64,10 @@ export interface IssuerOpResult extends AdmissionReceipt {
 }
 
 export async function registerAsset (p: RegisterParams): Promise<RegisterResult> {
+  // S5: the deploy's req names K = the overlay identity key, and the submit
+  // verifies against it. Refuse before the lock, the intent marker or any
+  // wallet call.
+  if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
   // No prior to serialise on (genesis), so the per-asset admin gate does not
   // apply — but a second register in another tab of the same wallet is still
   // a double-submit. registerFlight covers same-tab re-entry; this web lock
@@ -78,12 +86,15 @@ export async function registerAsset (p: RegisterParams): Promise<RegisterResult>
 
 /**
  * The deploy metadata. Pure so the shape is testable without a wallet. The
- * on-chain deploy payload is {sym, dec, label, feeRatePerKb?} (strict CBOR);
- * `metadata` is the wallet-side bookkeeping copy (adds issuer).
+ * on-chain deploy payload is {dec, req: mandalaReq(K), sym, icon?, label,
+ * feeRatePerKb?} (strict CBOR, C§4) with K = the configured overlay identity
+ * key (throws OVERLAY_IDENTITY_KEY_UNSET while it is unset); `metadata` is the
+ * wallet-side bookkeeping copy (adds issuer; never the icon bytes).
  */
 export function registerDetails (
-  p: Pick<RegisterParams, 'label' | 'ticker' | 'decimals' | 'identityKey' | 'feeRatePerKb'>
+  p: Pick<RegisterParams, 'label' | 'ticker' | 'decimals' | 'identityKey' | 'icon' | 'feeRatePerKb'>
 ): { metadata: Record<string, unknown>, payload: number[] } {
+  if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
   if (p.feeRatePerKb !== undefined) assertFeeRate(p.feeRatePerKb)
   const label = p.label.trim()
   const ticker = p.ticker.trim().toUpperCase()
@@ -94,7 +105,14 @@ export function registerDetails (
     issuer: p.identityKey,
     ...(p.feeRatePerKb !== undefined ? { feeRatePerKb: p.feeRatePerKb } : {})
   }
-  const payload = deployPayload({ sym: ticker, dec: p.decimals, label, feeRatePerKb: p.feeRatePerKb })
+  const payload = deployPayload({
+    sym: ticker,
+    dec: p.decimals,
+    label,
+    identityKey: OVERLAY_IDENTITY_KEY,
+    ...(p.icon != null ? { icon: p.icon } : {}),
+    ...(p.feeRatePerKb != null ? { feeRatePerKb: p.feeRatePerKb } : {})
+  })
   return { metadata, payload }
 }
 
@@ -105,10 +123,11 @@ async function registerPipeline (p: RegisterParams): Promise<RegisterResult> {
     wallet: wallet as any,
     identityKey,
     payload,
-    topics: deployTopics,
+    // Deploy submit topics are exactly [tm_mandala, tm_color_<txid>_0] (C§0).
+    topics: (txid: string) => [TOPIC, colorTopic(`${txid}_0`)],
     // The deploy CI can't name its own token id; adminAssetFromOutput resolves it.
     customInstructions: adminCustomInstructions('', String(metadata.label), 'deploy', metadata),
-    description: `Register ${String(metadata.label)}`,
+    description: actionDescription(`Register ${String(metadata.label)}`),
     labels: ['mandala', 'register']
   })
   return { assetId: res.tokenId, ...admissionReceipt(res.admitted) }
@@ -122,7 +141,8 @@ export interface IssueParams {
   wallet: WalletInterface
   identityKey: string
   asset: AdminAsset
-  amount: number
+  /** Exact base units, 1..2^64-1. */
+  amount: bigint
   /**
    * sha256 hex of the off-chain deposit record backing this issuance,
    * committed on-chain as `bankRef` (32 bytes). Omitted when empty.
@@ -132,6 +152,12 @@ export interface IssueParams {
 
 export async function issueTokens (p: IssueParams): Promise<IssuerOpResult> {
   const { wallet, identityKey, asset, amount, depositHash } = p
+  // Refuse a bad amount (non-bigint, ≤ 0, > 2^64-1) or a raw deposit
+  // reference before any gate or wallet call.
+  const gate = guardIssueSubmit({ assetId: asset.assetId, amount, bankRef: depositHash, walletReady: true })
+  if (!gate.ok) throw new Error(gate.reason)
+  // S5: fail closed before listOutputs (runAuthorityTx re-checks before createAction).
+  if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
     const keyID = 'mint-' + Date.now()
     // Self-mint: our own identity key (hex) as counterparty, not 'self' — the
@@ -139,7 +165,7 @@ export async function issueTokens (p: IssueParams): Promise<IssuerOpResult> {
     const counterparty = identityKey
     const issueDetails: MandalaActionDetails = withBankRef({ kind: 'issue' as const }, depositHash)
 
-    const listResult = await wallet.listOutputs({ basket: BASKET, include: 'entire transactions', limit: 1000 })
+    const listResult = await wallet.listOutputs({ basket: TREASURY_BASKET, include: 'entire transactions', limit: 1000 })
     if (listResult.BEEF == null) throw new Error('listOutputs returned no BEEF')
     assertSpendablePrior(asset.authOutpoint, listResult.outputs.map(o => o.outpoint))
 
@@ -156,12 +182,12 @@ export async function issueTokens (p: IssueParams): Promise<IssuerOpResult> {
         amount,
         owner: counterparty,
         keyID,
-        basket: BASKET,
-        customInstructions: JSON.stringify({ protocolID: FT_PROTOCOL, keyID, counterparty }),
+        basket: TREASURY_BASKET,
+        customInstructions: JSON.stringify({ protocolID: ADMIN_PROTOCOL, keyID, counterparty }),
         outputDescription: 'minted FT'
       }],
       inputBEEF: listResult.BEEF as number[],
-      description: `Issue ${amount} ${asset.label}`,
+      description: actionDescription(`Issue ${amount} ${asset.label}`),
       labels: ['mandala', 'issue']
     })
     return {
@@ -183,24 +209,28 @@ export interface RedeemParams {
   wallet: WalletInterface
   identityKey: string
   asset: AdminAsset
-  amount: number
+  /** Exact base units, 1..2^64-1. */
+  amount: bigint
   /**
-   * Optional known spendable balance (e.g. from holder-data cache). When set,
-   * amount-above-balance is refused before any wallet coin-selection work.
+   * Optional known spendable treasury balance (an exact sum; may exceed
+   * 2^64). When set, amount-above-balance is refused before any wallet
+   * coin-selection work.
    */
-  balance?: number
+  balance?: bigint
 }
 
 export async function redeemTokens (p: RedeemParams): Promise<IssuerOpResult> {
   const { wallet, identityKey, asset, amount, balance } = p
   const amountGate = guardRedeemSubmit({ assetId: asset.assetId, amount, balance, walletReady: true })
   if (!amountGate.ok) throw new Error(amountGate.reason)
+  // S5: fail closed before listOutputs (runAuthorityTx re-checks before createAction).
+  if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
 
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
-    const { candidates, beef: beefBytes } = await loadFtCandidates(wallet as any, asset.assetId, {
+    const { candidates, beef: beefBytes } = await loadTreasuryCandidates(wallet as any, asset.assetId, {
       requireSpendable: asset.authOutpoint
     })
-    const { selected, total: gathered } = selectFtInputs(candidates, amount) // throws if insufficient
+    const { selected, total: gathered } = selectTreasuryInputs(candidates, amount) // throws if insufficient
     const beef = new Beef()
     beef.mergeBeef(beefBytes)
     const change = gathered - amount
@@ -216,19 +246,19 @@ export async function redeemTokens (p: RedeemParams): Promise<IssuerOpResult> {
         customInstructions: k => adminCustomInstructions(asset.assetId, asset.label, k, asset.metadata)
       }],
       valueIns: selected.map(s => ({ outpoint: s.outpoint, keyID: s.keyID, counterparty: s.counterparty })),
-      valueOuts: change > 0
+      valueOuts: change > 0n
         ? [{
             tokenId: asset.assetId,
             amount: change,
             owner: identityKey,
             keyID: keyIDChange,
-            basket: BASKET,
-            customInstructions: JSON.stringify({ protocolID: FT_PROTOCOL, keyID: keyIDChange, counterparty: identityKey }),
+            basket: TREASURY_BASKET,
+            customInstructions: JSON.stringify({ protocolID: ADMIN_PROTOCOL, keyID: keyIDChange, counterparty: identityKey }),
             outputDescription: 'FT change'
           }]
         : [],
       inputBEEF: beef.toBinary(),
-      description: `Redeem ${amount} ${asset.label}`,
+      description: actionDescription(`Redeem ${amount} ${asset.label}`),
       labels: ['mandala', 'redeem']
     })
     return {

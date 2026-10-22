@@ -35,8 +35,8 @@ const vectorTxid = "3f0c9a1b2d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6
 
 // Two token topics the stub submitter hosts (a nil hasTopic hosts every name).
 var (
-	testTopicA = "tm_" + strings.Repeat("a", 64)
-	testTopicB = "tm_" + strings.Repeat("b", 64)
+	testTopicA = mandala.TokenTopicOfTxid(strings.Repeat("a", 64))
+	testTopicB = mandala.TokenTopicOfTxid(strings.Repeat("b", 64))
 )
 
 func testSigner(t *testing.T) *mandala.ECAdmissionSigner {
@@ -177,13 +177,27 @@ func requireSigma(t *testing.T, e map[string]any, identity, topic, txid string, 
 	if sig == "" || ident != identity {
 		t.Fatalf("entry %v: want a σI by %s", e, identity)
 	}
-	if ok, err := mandala.VerifyAdmission(topic, txid, outs, sig, ident); err != nil || !ok {
-		t.Fatalf("σI does not verify under %s over %v: %v", topic, outs, err)
+	if !verifyByScheme(topic, txid, outs, sig, ident) {
+		t.Fatalf("σI does not verify under %s over %v", topic, outs)
 	}
 	for _, other := range others {
-		if ok, _ := mandala.VerifyAdmission(other, txid, outs, sig, ident); ok {
-			t.Fatalf("the σI of %s also verifies under %s (digest v3 must bind the topic)", topic, other)
+		if verifyByScheme(other, txid, outs, sig, ident) {
+			t.Fatalf("the σI of %s also verifies under %s (the signed statement must bind the topic)", topic, other)
 		}
+	}
+}
+
+// verifyByScheme verifies an entry's signature the way its topic is signed (contract §3): the attested v1 statement
+// against the BRC-42 child on a color topic, σI v3 against the bare key on tm_mandala, nothing else.
+func verifyByScheme(topic, txid string, outs []uint32, sig, ident string) bool {
+	switch mandala.AdmissionSchemeOf(topic) {
+	case mandala.SchemeAttestedV1:
+		return mandala.VerifyAttestation(topic, txid, outs, sig, ident)
+	case mandala.SchemeMandalaV3:
+		ok, err := mandala.VerifyAdmission(topic, txid, outs, sig, ident)
+		return err == nil && ok
+	default:
+		return false
 	}
 }
 
@@ -208,7 +222,7 @@ func admissionKeys(rec mandala.AdmissionRecord) []string {
 
 func TestSubmit_SignsEachSigmaTopicEntryWithItsOwnDigest(t *testing.T) {
 	beef, txid := submitBeef(t, 0x11)
-	own := "tm_" + txid
+	own := mandala.TokenTopicOfTxid(txid)
 	stub := &stubSubmitter{steak: overlay.Steak{
 		mandala.MandalaTopic: {OutputsToAdmit: []uint32{0}},
 		own:                  {OutputsToAdmit: []uint32{0}},
@@ -370,7 +384,7 @@ func TestSubmit_KnownVerdictNeedsEveryNamedTopicApplied(t *testing.T) {
 // A lost record: the engine's proof covers every named topic, so the replay re-signs each σ-topic and finalizes them.
 func TestSubmit_ReplayFinalizesMissingEntriesFromTheAppliedProof(t *testing.T) {
 	beef, txid := submitBeef(t, 0x17)
-	own := "tm_" + txid
+	own := mandala.TokenTopicOfTxid(txid)
 	stub := &stubSubmitter{}
 	rec := &stubAdmissionStore{}
 	app := newServer(stub, nil, nil, nil, WithAdmissionSigner(testSigner(t)),
@@ -399,7 +413,7 @@ func TestSubmit_ReplayFinalizesMissingEntriesFromTheAppliedProof(t *testing.T) {
 // finalized. A fault on that read is 503, retryable: a retry replays from step 4.
 func TestSubmit_DupeGateRaceAnswersFromTheReReadProof(t *testing.T) {
 	beef, txid := submitBeef(t, 0x21)
-	own := "tm_" + txid
+	own := mandala.TokenTopicOfTxid(txid)
 	stub := &stubSubmitter{steak: overlay.Steak{mandala.MandalaTopic: {}, own: {}}}
 	rec := &stubAdmissionStore{}
 	calls := 0

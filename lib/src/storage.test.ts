@@ -11,6 +11,8 @@
  *     'accepted' write has RESOLVED — that write is the commit point.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { Beef, LockingScript, Transaction } from '@bsv/sdk'
+import { OVERLAY_KEY, signedSteak } from './__fixtures__/overlaySigner.js'
 import {
   MandalaStorage,
   configureStorage,
@@ -26,6 +28,11 @@ import { notifyPut, notifyList, notifyClear } from './notifyJournal.js'
 import { blindingPut, blindingGet, blindingList, blindingClear } from './blindingJournal.js'
 import { configureMandala } from './constants.js'
 import { submitAndBroadcast } from './overlay.js'
+
+const ASSET = `${'c7'.repeat(32)}_0`
+const OP_B1 = `${'b1'.repeat(32)}.0`
+const OP_OLD = `${'0d'.repeat(32)}.0`
+const OP_N1 = `${'e1'.repeat(32)}.0`
 
 /** A spying adapter over an isolated Map — stands in for the host's store. */
 function spyStorage (): { store: MandalaStorage, map: Map<string, string>, sets: string[] } {
@@ -142,16 +149,16 @@ describe('the three journals read and write through the injected adapter', () =>
     expect(map.size).toBe(0)
   })
 
-  it('blindingJournal persists r under mandala.blindingJournal.<txid> in the injected store', async () => {
+  it('blindingJournal persists r under mandala.blindingJournal.<outpoint> in the injected store', async () => {
     const { store, map } = spyStorage()
     configureStorage(store)
-    await blindingPut({ txid: 'b1', r: 'ff'.repeat(32), senderBlinded: '02ab', recipient: '03cd', keyID: 'k', at: 1 })
-    expect([...map.keys()]).toEqual(['mandala.blindingJournal.b1'])
-    expect((await blindingGet('b1'))?.r).toBe('ff'.repeat(32))
+    await blindingPut({ outpoint: OP_B1, r: 'ff'.repeat(32), senderBlinded: '02ab', recipient: '03cd', assetId: ASSET, at: 1 })
+    expect([...map.keys()]).toEqual([`mandala.blindingJournal.${OP_B1}`])
+    expect((await blindingGet(OP_B1))?.r).toBe('ff'.repeat(32))
     expect(await blindingList()).toHaveLength(1)
     await blindingClear()
     expect(map.size).toBe(0)
-    expect(await blindingGet('b1')).toBeUndefined()
+    expect(await blindingGet(OP_B1)).toBeUndefined()
   })
 
   it('a swapped adapter is authoritative immediately — nothing is cached from the old one', async () => {
@@ -159,13 +166,13 @@ describe('the three journals read and write through the injected adapter', () =>
     configureStorage(first.store)
     await journalPut({ txid: 'old', stage: 'accepted', at: 1 })
     await notifyPut({ txid: 'old', recipient: '02ab', messageBox: 'mb', body: {}, at: 1 })
-    await blindingPut({ txid: 'old', r: 'aa', senderBlinded: '02ab', recipient: '03cd', keyID: 'k', at: 1 })
+    await blindingPut({ outpoint: OP_OLD, r: 'aa', senderBlinded: '02ab', recipient: '03cd', assetId: ASSET, at: 1 })
 
     configureStorage(memoryStorage())
     expect(await journalList()).toEqual([])
     expect(await notifyList()).toEqual([])
     expect(await blindingList()).toEqual([])
-    expect(await blindingGet('old')).toBeUndefined()
+    expect(await blindingGet(OP_OLD)).toBeUndefined()
   })
 })
 
@@ -187,11 +194,11 @@ describe('no stale read after a write (the mirror is gone)', () => {
     const { store, map } = spyStorage()
     configureStorage(store)
     await notifyPut({ txid: 'n1', recipient: '02ab', messageBox: 'mb', body: {}, at: 1 })
-    await blindingPut({ txid: 'n1', r: 'aa', senderBlinded: '02', recipient: '03', keyID: 'k', at: 1 })
+    await blindingPut({ outpoint: OP_N1, r: 'aa', senderBlinded: '02', recipient: '03', assetId: ASSET, at: 1 })
     map.clear()
     expect(await notifyList()).toEqual([])
     expect(await blindingList()).toEqual([])
-    expect(await blindingGet('n1')).toBeUndefined()
+    expect(await blindingGet(OP_N1)).toBeUndefined()
   })
 
   it('a rewritten entry reads back as the new value, never the first one', async () => {
@@ -211,18 +218,26 @@ describe('no stale read after a write (the mirror is gone)', () => {
 })
 
 describe('the commit point is an awaited write (deferred adapter)', () => {
-  const signed = { tx: [1, 2, 3], txid: 'abc' }
+  // A real AtomicBEEF: with the overlay identity key configured (S5) the
+  // admitted tm_mandala entry is verified against the submitted txid.
+  const subject = new Transaction()
+  subject.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
+  const subjectBeef = new Beef(); subjectBeef.mergeTransaction(subject)
+  const TXID = subject.id('hex')
+  const signed = { tx: subjectBeef.toBinaryAtomic(TXID), txid: TXID }
+  const admitting = (): { send: any } =>
+    ({ send: vi.fn().mockImplementation(async () => await signedSteak(TXID, { tm_mandala: [0] })) })
 
   beforeEach(async () => {
     configureStorage(null)
     await journalClear()
-    configureMandala({ overlayUrl: 'http://test-overlay' })
+    configureMandala({ overlayUrl: 'http://test-overlay', overlayIdentityKey: OVERLAY_KEY })
   })
 
   it("submitAndBroadcast does not call createAction({sendWith}) until the 'accepted' write resolves", async () => {
     const deferred = deferredStorage()
     configureStorage(deferred.store)
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
+    const facilitator = admitting()
     const wallet = { createAction: vi.fn().mockResolvedValue({}), abortAction: vi.fn() }
 
     const done = submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
@@ -236,7 +251,7 @@ describe('the commit point is an awaited write (deferred adapter)', () => {
     await expect(done).resolves.toMatchObject({ outputsToAdmit: [0] })
     await vi.waitFor(() => expect(wallet.createAction).toHaveBeenCalledWith({
       description: 'broadcast overlay-accepted tx',
-      options: { sendWith: ['abc'], acceptDelayedBroadcast: false }
+      options: { sendWith: [TXID], acceptDelayedBroadcast: false }
     }))
   })
 
@@ -244,14 +259,14 @@ describe('the commit point is an awaited write (deferred adapter)', () => {
     const seenAtBroadcast: string[] = []
     const { store, map } = spyStorage()
     configureStorage(store)
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
+    const facilitator = admitting()
     const wallet = {
       createAction: vi.fn(async () => { seenAtBroadcast.push(...map.keys()); return {} }),
       abortAction: vi.fn()
     }
     await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
     await vi.waitFor(() => expect(wallet.createAction).toHaveBeenCalled())
-    expect(seenAtBroadcast).toEqual(['mandala.txJournal.abc'])
+    expect(seenAtBroadcast).toEqual([`mandala.txJournal.${TXID}`])
   })
 
   it('an intent write is awaited too, so the marker exists before the caller proceeds', async () => {
@@ -274,7 +289,7 @@ describe('the commit point is an awaited write (deferred adapter)', () => {
 
 describe('journalHas', () => {
   const stages: Array<JournalEntry['stage']> =
-    ['intent', 'accepted', 'abort', 'retryable', 'stranded', 'handed_over']
+    ['intent', 'accepted', 'abort', 'retryable', 'stranded', 'signed', 'delivered']
 
   beforeEach(async () => {
     configureStorage(null)

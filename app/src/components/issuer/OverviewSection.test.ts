@@ -10,7 +10,7 @@ vi.mock('@bsv/mandala/adminState', () => ({
   resolveAssetState: vi.fn().mockResolvedValue(null)
 }))
 vi.mock('@bsv/mandala/banking', () => ({
-  reconcile: vi.fn().mockReturnValue({ bankBalance: 0, netSupply: 0, drift: 0 }),
+  reconcile: vi.fn().mockReturnValue({ bankBalance: 0n, netSupply: 0n, drift: 0n }),
   seedDeposits: vi.fn().mockReturnValue([])
 }))
 

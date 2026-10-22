@@ -1,6 +1,6 @@
 // Package mandala is the v3 Mandala token domain on BRC-162, laid out as token
 // topics on one overlay: tm_mandala (the token registry), tm_mandala_kyc (the
-// identity registry) and one tm_<deploy txid> per token.
+// identity registry) and one tm_color_<assetId> per token.
 //
 // Design: docs/superpowers/specs/2026-10-01-mandala-brc162-design.md (layers
 // A-D, the §4.2a owner journal, typed verdicts, §6.6 storage) and

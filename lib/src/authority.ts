@@ -1,8 +1,8 @@
 /**
  * BRC-162 authority-chain transactions (overlay-go internal/mandala/authority.go).
  *
- * An authority coin is a 1-sat Bsv21Binary output of amount 0, locked to the
- * issuer's own wallet-derived key under FT_PROTOCOL and proven by
+ * An authority coin is a 1-sat 1Color output of amount 0, locked to the
+ * issuer's own wallet-derived key under ADMIN_PROTOCOL and proven by
  * specificKeyLinkage like any token output. A deploy (output 0, no token id)
  * is the chain's first link; every admin action spends the token's live
  * authority and re-emits one committing `{adm: sha256(details)}`, with the
@@ -14,15 +14,17 @@
  * lost track of.
  */
 import { Transaction, WalletInterface } from '@bsv/sdk'
-import { BASKET, FT_PROTOCOL } from './constants.js'
+import { OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, TREASURY_BASKET } from './constants.js'
 import {
-  commitmentHex, commitmentPayload, DEPLOY_KEY_ID, encodeAdminDetails, lockToken,
-  MandalaActionDetails, signDeploy, tokenIdOfDeploy, tokenTopic
+  commitmentHex, commitmentPayload, DEPLOY_KEY_ID, encodeAdminDetails, lockIssuerToken,
+  MandalaActionDetails, signDeploy, tokenIdOfDeploy
 } from './brc162.js'
-import { encodeLinkagePayload, MandalaLinkagePayload } from './encoding.js'
+import { colorTopic } from './naming.js'
+import { encodeEnvelope, SpecificLinkage } from './encoding.js'
 import { OverlayAdmitResult, submitAndBroadcast } from './overlay.js'
-import { revealLinkage } from './tokens.js'
-import { walletMandalaUnlock } from './unlock.js'
+import { journalPut } from './txJournal.js'
+import { revealIssuerLinkage } from './treasury/linkage.js'
+import { issuerUnlock } from './treasury/unlock.js'
 
 /** A live authority coin this wallet can spend. */
 export interface AuthorityRef {
@@ -45,7 +47,8 @@ export interface ValueIn { outpoint: string, keyID: string, counterparty: string
 
 export interface ValueOut {
   tokenId: string
-  amount: number
+  /** Exact uint64 token amount. */
+  amount: bigint
   /** Owner identity key (66 hex). */
   owner: string
   keyID: string
@@ -55,9 +58,21 @@ export interface ValueOut {
   outputDescription?: string
 }
 
+/**
+ * An output this tx creates for someone else's key (a reissue's recipient
+ * `p color` output): the caller locks it and supplies its overlay linkage.
+ */
+export interface ForeignOut {
+  lockingScript: string
+  linkage: SpecificLinkage
+  outputDescription: string
+}
+
 export interface AuthorityTxResult {
   txid: string
   tx: number[]
+  /** Output index of each foreign output (same order as foreignOuts; always 0..). */
+  foreignIndices: number[]
   /** Output index of each leg's new authority (same order as legs). */
   authIndices: number[]
   /** Output index of each value output (same order as valueOuts). */
@@ -67,12 +82,47 @@ export interface AuthorityTxResult {
   authKeyIDs: string[]
   /** Hex strict-CBOR details per leg. */
   detailsHex: string[]
+  /** The submitted Mandala envelope bytes (the tx's submission data, for receipts). */
+  offChainValues: number[]
+}
+
+/**
+ * Sign the planned spends of a signable action with the issuer's
+ * ADMIN_PROTOCOL keys and return the `signAction` spends map. Each planned
+ * outpoint is located among the signable tx's inputs; a wallet that hands
+ * back inputs without resolvable sources keeps the planned (positional)
+ * order.
+ */
+export async function signTreasurySpends (
+  wallet: WalletInterface,
+  signableTx: number[],
+  spendPlan: ValueIn[]
+): Promise<Record<string, { unlockingScript: string }>> {
+  const tx = Transaction.fromBEEF(signableTx)
+  const indexOf = (op: string): number => {
+    const dot = op.lastIndexOf('.')
+    const txid = op.slice(0, dot)
+    const vout = Number(op.slice(dot + 1))
+    return tx.inputs.findIndex(i => (i.sourceTXID ?? i.sourceTransaction?.id('hex')) === txid && i.sourceOutputIndex === vout)
+  }
+  const located = spendPlan.map(s => indexOf(s.outpoint))
+  const positional = located.some(i => i < 0) && tx.inputs.length >= spendPlan.length
+  const indices = spendPlan.map((s, k) => {
+    const i = positional ? k : located[k]
+    if (i < 0) throw new Error(`createAction did not spend ${s.outpoint}`)
+    tx.inputs[i].unlockingScriptTemplate = issuerUnlock(wallet, s.keyID, s.counterparty)
+    return i
+  })
+  await tx.sign()
+  const spends: Record<string, { unlockingScript: string }> = {}
+  for (const i of indices) spends[String(i)] = { unlockingScript: tx.inputs[i].unlockingScript!.toHex() }
+  return spends
 }
 
 /**
  * Build, sign, submit (overlay-first) and broadcast one authority tx.
- * Inputs: every leg's prior authority, then value inputs. Outputs: value
- * outputs first, then one authority per leg. Topics: tm_<id> of every token
+ * Inputs: every leg's prior authority, then value inputs. Outputs: foreign
+ * outputs first, then value outputs, then one authority per leg. Topics: tm_<id> of every token
  * touched. Callers hold the admin-auth gate and the intent marker.
  */
 export async function runAuthorityTx (p: {
@@ -81,23 +131,40 @@ export async function runAuthorityTx (p: {
   legs: AuthorityLeg[]
   valueIns?: ValueIn[]
   valueOuts?: ValueOut[]
+  /** Outputs to other keys, placed first (index 0..), before value outputs and authorities. */
+  foreignOuts?: ForeignOut[]
   inputBEEF: number[]
   description: string
   labels: string[]
   /** X-Topics override (the KYC registry names tm_mandala_kyc); default tm_<id> of every token touched. */
   topics?: string[]
+  /**
+   * Awaited after signing and before the submit, with what a receipt needs
+   * (a reissue journals its receipt intent here, plan 04 R6). A throw aborts
+   * the held action (a failed abort is journaled) and is rethrown: nothing is
+   * submitted.
+   */
+  beforeSubmit?: (s: { txid: string, tx: number[], offChainValues: number[], topics: string[], foreignIndices: number[] }) => Promise<void>
 }): Promise<AuthorityTxResult> {
   const { wallet, identityKey, legs } = p
   const valueIns = p.valueIns ?? []
   const valueOuts = p.valueOuts ?? []
+  const foreignOuts = p.foreignOuts ?? []
   if (legs.length === 0) throw new Error('authority tx needs at least one leg')
+  // S5: the envelope linkages and the submit need the overlay key; refuse
+  // before createAction so no wallet action is left behind.
+  if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
 
   const detailsBytes = legs.map(l => encodeAdminDetails(l.details))
   const authKeyIDs = detailsBytes.map(commitmentHex)
 
-  const outputs: any[] = []
+  const outputs: any[] = foreignOuts.map(f => ({
+    satoshis: 1,
+    lockingScript: f.lockingScript,
+    outputDescription: f.outputDescription
+  }))
   for (const v of valueOuts) {
-    const script = await lockToken(wallet, v.tokenId, v.amount, FT_PROTOCOL, v.keyID, v.owner)
+    const script = await lockIssuerToken(wallet, v.tokenId, v.amount, v.keyID, v.owner)
     outputs.push({
       satoshis: 1,
       lockingScript: script.toHex(),
@@ -107,12 +174,12 @@ export async function runAuthorityTx (p: {
     })
   }
   for (let i = 0; i < legs.length; i++) {
-    const script = await lockToken(wallet, legs[i].prior.tokenId, 0, FT_PROTOCOL, authKeyIDs[i], identityKey, commitmentPayload(detailsBytes[i]))
+    const script = await lockIssuerToken(wallet, legs[i].prior.tokenId, 0n, authKeyIDs[i], identityKey, commitmentPayload(detailsBytes[i]))
     outputs.push({
       satoshis: 1,
       lockingScript: script.toHex(),
       outputDescription: `${legs[i].details.kind} authority`,
-      basket: BASKET,
+      basket: TREASURY_BASKET,
       customInstructions: legs[i].customInstructions(authKeyIDs[i]),
       ...(legs[i].tags != null ? { tags: legs[i].tags } : {})
     })
@@ -132,26 +199,7 @@ export async function runAuthorityTx (p: {
   })
   if (created.signableTransaction == null) throw new Error(`${p.description}: no signableTransaction`)
 
-  const tx = Transaction.fromBEEF(created.signableTransaction.tx as number[])
-  const spends: Record<string, { unlockingScript: string }> = {}
-  const indexOf = (op: string): number => {
-    const dot = op.lastIndexOf('.')
-    const txid = op.slice(0, dot)
-    const vout = Number(op.slice(dot + 1))
-    return tx.inputs.findIndex(i => (i.sourceTXID ?? i.sourceTransaction?.id('hex')) === txid && i.sourceOutputIndex === vout)
-  }
-  // Match each planned spend by outpoint; a wallet that hands back inputs
-  // without resolvable sources keeps the planned (positional) order.
-  const located = spendPlan.map(s => indexOf(s.outpoint))
-  const positional = located.some(i => i < 0) && tx.inputs.length >= spendPlan.length
-  const indices = spendPlan.map((s, k) => {
-    const i = positional ? k : located[k]
-    if (i < 0) throw new Error(`createAction did not spend ${s.outpoint}`)
-    tx.inputs[i].unlockingScriptTemplate = walletMandalaUnlock(wallet, s.keyID, s.counterparty)
-    return i
-  })
-  await tx.sign()
-  for (const i of indices) spends[String(i)] = { unlockingScript: tx.inputs[i].unlockingScript!.toHex() }
+  const spends = await signTreasurySpends(wallet, created.signableTransaction.tx as number[], spendPlan)
 
   const signed = await wallet.signAction({
     reference: created.signableTransaction.reference,
@@ -160,38 +208,57 @@ export async function runAuthorityTx (p: {
   })
   if (signed.tx == null || signed.txid == null) throw new Error(`${p.description}: signAction returned no tx`)
 
-  const valueIndices = valueOuts.map((_, i) => i)
-  const authIndices = legs.map((_, i) => valueOuts.length + i)
-  const outLinks: MandalaLinkagePayload['outputs'] = []
+  const foreignIndices = foreignOuts.map((_, i) => i)
+  const valueIndices = valueOuts.map((_, i) => foreignOuts.length + i)
+  const authIndices = legs.map((_, i) => foreignOuts.length + valueOuts.length + i)
+  const outLinks: Array<{ index: number, linkage: SpecificLinkage }> = foreignOuts.map((f, i) => ({ index: foreignIndices[i], linkage: f.linkage }))
   for (let i = 0; i < valueOuts.length; i++) {
-    outLinks.push({ index: valueIndices[i], linkage: await revealLinkage(wallet, valueOuts[i].keyID, valueOuts[i].owner) })
+    outLinks.push({ index: valueIndices[i], linkage: await revealIssuerLinkage(wallet, valueOuts[i].keyID, valueOuts[i].owner) })
   }
   for (let i = 0; i < legs.length; i++) {
-    outLinks.push({ index: authIndices[i], linkage: await revealLinkage(wallet, authKeyIDs[i], identityKey) })
+    outLinks.push({ index: authIndices[i], linkage: await revealIssuerLinkage(wallet, authKeyIDs[i], identityKey) })
   }
   const detailsHex = detailsBytes.map(b => b.map(x => x.toString(16).padStart(2, '0')).join(''))
-  const env = encodeLinkagePayload({
-    inputs: [],
+  // Issuer/admin envelope: outputs + admin; `inputs` is omitted (optional for the overlay).
+  const env = encodeEnvelope({
     outputs: outLinks,
     admin: legs.map((_, i) => ({ index: authIndices[i], details: detailsHex[i] }))
   })
-  const topics = p.topics ?? [...new Set([...legs.map(l => l.prior.tokenId), ...valueOuts.map(v => v.tokenId)].map(tokenTopic))]
+  const topics = p.topics ?? [...new Set([...legs.map(l => l.prior.tokenId), ...valueOuts.map(v => v.tokenId)].map(colorTopic))]
+  if (p.beforeSubmit != null) {
+    const reference = created.signableTransaction.reference
+    try {
+      await p.beforeSubmit({ txid: signed.txid, tx: signed.tx as number[], offChainValues: env, topics, foreignIndices })
+    } catch (e) {
+      try {
+        await wallet.abortAction({ reference })
+      } catch {
+        await journalPut({ txid: `abort:${reference}`, stage: 'abort', reference, at: Date.now() })
+      }
+      throw e
+    }
+  }
   const admitted = await submitAndBroadcast(
     wallet,
     { tx: signed.tx as number[], txid: signed.txid },
     env,
     created.signableTransaction.reference,
     undefined,
-    topics
+    topics,
+    // A foreign (recipient) output carries a receipt: never hold it on a
+    // retryable refusal that proves nothing was applied (see
+    // submitAndBroadcast; an unknown outcome is always held, and the caller
+    // keeps its receipt intent). Plain authority txs keep the hold.
+    { holdRetryable: foreignOuts.length === 0 }
   )
-  return { txid: signed.txid, tx: signed.tx as number[], authIndices, valueIndices, admitted, authKeyIDs, detailsHex }
+  return { txid: signed.txid, tx: signed.tx as number[], foreignIndices, authIndices, valueIndices, admitted, authKeyIDs, detailsHex, offChainValues: env }
 }
 
 /**
  * Deploy a new token (or the KYC registry): output 0 is the deploy, locked to
  * our own key under DEPLOY_KEY_ID with `payload`; the envelope carries its
  * linkage and the deploy signature over the txid. `topics(txid)` names the
- * X-Topics (deployTopics for a token, [REGISTRY_TOPIC] for the registry).
+ * X-Topics (`[TOPIC, colorTopic(`${txid}_0`)]` for a token, [REGISTRY_TOPIC] for the registry).
  */
 export async function runDeployTx (p: {
   wallet: WalletInterface
@@ -204,7 +271,9 @@ export async function runDeployTx (p: {
   labels: string[]
 }): Promise<{ txid: string, tokenId: string, admitted: OverlayAdmitResult }> {
   const { wallet, identityKey } = p
-  const script = await lockToken(wallet, null, 0, FT_PROTOCOL, DEPLOY_KEY_ID, identityKey, p.payload)
+  // S5: refuse before createAction (see runAuthorityTx).
+  if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
+  const script = await lockIssuerToken(wallet, null, 0n, DEPLOY_KEY_ID, identityKey, p.payload)
   const created = await wallet.createAction({
     description: p.description,
     labels: p.labels,
@@ -212,7 +281,7 @@ export async function runDeployTx (p: {
       satoshis: 1,
       lockingScript: script.toHex(),
       outputDescription: 'token deploy + first authority',
-      basket: BASKET,
+      basket: TREASURY_BASKET,
       customInstructions: p.customInstructions,
       ...(p.tags != null ? { tags: p.tags } : {})
     }],
@@ -220,10 +289,8 @@ export async function runDeployTx (p: {
   })
   if (created.tx == null || created.txid == null) throw new Error('deploy: no tx returned')
   const txid = created.txid
-  const env = encodeLinkagePayload({
-    inputs: [],
-    outputs: [{ index: 0, linkage: await revealLinkage(wallet, DEPLOY_KEY_ID, identityKey) }],
-    admin: [],
+  const env = encodeEnvelope({
+    outputs: [{ index: 0, linkage: await revealIssuerLinkage(wallet, DEPLOY_KEY_ID, identityKey) }],
     deploySig: await signDeploy(wallet, txid)
   })
   const admitted = await submitAndBroadcast(

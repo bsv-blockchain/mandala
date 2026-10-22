@@ -241,3 +241,16 @@ func TestEngineKYCMembershipGatesATokenTransfer(t *testing.T) {
 	f.mustSubmit(admitReceiver, KYCTopic)
 	flowEntry(t, f.mustSubmit(tr, topic), topic, []uint32{0, 1}, []uint32{0})
 }
+
+func TestKYCManagerRefusesALegacyTokenID(t *testing.T) {
+	d := mandalatest.Build(t, nil, []mandalatest.Out{
+		{Owner: mandalatest.Issuer, Prover: mandalatest.Issuer, Payload: mandalatest.DeployPayload("KYC", 0, "Mandala registry"), HasPayload: true},
+		{Owner: mandalatest.Issuer, Prover: mandalatest.Issuer, TokenID: strings.Repeat("ab", 32) + "_3", Amount: 1},
+	}, &mandalatest.Issuer)
+	st := newMemStore()
+	_, err := kycRun(t, d, st, nil)
+	mgrRefusal(t, err, CodeShape, "output 1: legacy 36-byte token id "+strings.Repeat("ab", 32)+"_3 is refused by Mandala policy (32-byte ids only)", KYCTopic)
+	if len(st.owners) != 0 {
+		t.Fatalf("journal = %+v", st.owners)
+	}
+}

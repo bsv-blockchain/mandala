@@ -7,8 +7,9 @@ import (
 )
 
 // The §6.6 records (D §6.6, F/ts-storage §1.2). On every record the bson tag, the json tag and the
-// TS field name are the same string, so a document the TS P2 overlay wrote decodes here and the
-// reverse.
+// TS field name are the same string. Every amount field is an Amount: a Decimal128 in Mongo and a
+// decimal string in JSON (contract §6, D13), so a store written before 1Color (BSON double/int
+// amounts) does not decode: a fresh NODE_NAME is required.
 
 // Outpoint is the {txid, outputIndex} projection shape.
 type Outpoint struct {

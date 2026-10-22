@@ -1,7 +1,7 @@
 // app/src/lib/mandala/banking.ts
 export type TransferDirection = 'in' | 'out'
 
-export interface MockTransfer { id: string, assetId: string, amount: number, direction: TransferDirection, originator: string, timestamp: number }
+export interface MockTransfer { id: string, assetId: string, amount: bigint, direction: TransferDirection, originator: string, timestamp: number }
 
 const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
@@ -17,7 +17,7 @@ export function randomLetter(random: () => number = Math.random): string {
  * real originator data, so it must not look like one.
  */
 export function makeTransfer(
-  amount: number,
+  amount: bigint,
   direction: TransferDirection,
   assetId: string,
   opts: { now?: () => number, random?: () => number } = {}
@@ -35,10 +35,13 @@ export function makeTransfer(
   }
 }
 
-export const bankBalance = (deposits: number[], withdrawals: number[]): number =>
-  deposits.reduce((a, b) => a + b, 0) - withdrawals.reduce((a, b) => a + b, 0)
+const sum = (xs: bigint[]): bigint => xs.reduce((a, b) => a + b, 0n)
 
-export function reconcile (p: { deposits: number[], withdrawals: number[], issued: number, redeemed: number }): { bankBalance: number, netSupply: number, drift: number } {
+/** Exact bigint bank balance (deposits − withdrawals), unbounded. */
+export const bankBalance = (deposits: bigint[], withdrawals: bigint[]): bigint =>
+  sum(deposits) - sum(withdrawals)
+
+export function reconcile (p: { deposits: bigint[], withdrawals: bigint[], issued: bigint, redeemed: bigint }): { bankBalance: bigint, netSupply: bigint, drift: bigint } {
   const bal = bankBalance(p.deposits, p.withdrawals)
   const netSupply = p.issued - p.redeemed
   return { bankBalance: bal, netSupply, drift: bal - netSupply }

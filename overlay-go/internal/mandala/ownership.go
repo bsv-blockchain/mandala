@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 )
 
@@ -34,15 +35,16 @@ type InputOwnerDeps struct {
 	Store    StateStore
 	Engine   EngineOutputReader
 	Verifier LinkageVerifier
-	Topic    string                               // the journal/engine topic of the coins (tm_<id> or tm_mandala_kyc)
+	Topic    string                               // the journal/engine topic of the coins (tm_color_<id> or tm_mandala_kyc)
 	Txid     string                               // the transaction under validation: its own spend mark on Topic reads admitted (V-16)
 	OnRepair func(outpoint string, inserted bool) // never nil here; managers default it to LogOwnerRepair(<topic>); nil falls back to that too
 }
 
-// sameAmount: a stored amount equals amount only when it is a safe non-negative integer (TS
-// Number.isSafeInteger(stored) && BigInt(stored) === amount).
-func sameAmount(stored Amount, amount uint64) bool {
-	return stored >= 0 && uint64(stored) <= MaxSafeAmount && uint64(stored) == amount
+// sameAmount: a stored amount equals a script amount only when it is a uint64 equal to it
+// (exact; a negative or larger stored value never matches).
+func sameAmount(stored Amount, want uint64) bool {
+	u, ok := stored.Uint64()
+	return ok && u == want
 }
 
 // ownFirstFailing returns the index of the first output (index order) that fails.
@@ -55,8 +57,24 @@ func ownFirstFailing(outputs []brc162.Output, fails func(brc162.Output) bool) (u
 	return 0, false
 }
 
+// RequireNoLegacyTokenIDs refuses the first output (index order) that carried a 36-byte legacy
+// wire id. It runs on every Mandala token topic right after layer A and before ScopeToToken, so a
+// legacy output is refused, never scoped out as a foreign asset (contract §4 step 0). A deploy
+// carries no wire id: its own <txid>_<index> name is not a legacy id (a deploy off vout 0 stays
+// rDeployNotAtZero / out of scope). Inputs need no check: previousCoins are the topic's admitted
+// coins, and no output with a legacy id is ever admitted.
+func RequireNoLegacyTokenIDs(outputs []brc162.Output) error {
+	for _, o := range outputs {
+		if o.Role != brc162.RoleDeploy && brc162.IsLegacyTokenID(o.TokenID) {
+			return rLegacyTokenID(o.Index, o.TokenID)
+		}
+	}
+	return nil
+}
+
 // RequireValidTokenOutputs is the shape policy, rule-major (each rule scans every output before
-// the next rule runs): codec refusals, deploy at vout 0, P2PKH remainder, 1 satoshi, amount cap.
+// the next rule runs): codec refusals, deploy at vout 0, P2PKH remainder, 1 satoshi, no req/ext off
+// a deploy. Any uint64 amount is valid (no 2^53 cap: design §2 goal 2, 0162:140-143).
 func RequireValidTokenOutputs(invalid []brc162.InvalidOutput, outputs []brc162.Output) error {
 	if len(invalid) > 0 {
 		return rInvalidTokenOutput(invalid[0].Index, invalid[0].Detail)
@@ -70,10 +88,27 @@ func RequireValidTokenOutputs(invalid []brc162.InvalidOutput, outputs []brc162.O
 	if i, bad := ownFirstFailing(outputs, func(o brc162.Output) bool { return o.Satoshis != 1 }); bad {
 		return rOneSat(i)
 	}
-	if i, bad := ownFirstFailing(outputs, func(o brc162.Output) bool { return o.Amount > MaxSafeAmount }); bad {
-		return rAmountCap(i)
+	if i, bad := ownFirstFailing(outputs, carriesProfileKeys); bad {
+		return rProfileKeysOnNonDeploy(i)
 	}
 	return nil
+}
+
+// carriesProfileKeys: a non-deploy output whose payload reads as a strict map under the deploy
+// limits (65536 bytes, depth 64) and has a req or ext key (contract §4 step 5). The push's
+// canonicality is not consulted: the rule is about the bytes. A payload that is not such a map, or
+// an authority {adm} payload, is not this rule's business.
+func carriesProfileKeys(o brc162.Output) bool {
+	if o.Role == brc162.RoleDeploy || !o.HasPayload {
+		return false
+	}
+	m, err := decodeMandalaCbor(o.Payload, MaxDeployPayloadBytes)
+	if err != nil {
+		return false
+	}
+	_, req := m["req"]
+	_, ext := m["ext"]
+	return req || ext
 }
 
 // ownLinkedIdentity is TS linkedIdentity: ok=false for no entry, no remainder pkh, a linkage of any
@@ -116,7 +151,7 @@ func VerifyOutputOwners(ctx context.Context, outputs []brc162.Output, env *Envel
 }
 
 // journalAgrees: the journal row names this token, the source script's own role (a spent genesis
-// deploy journals as "deploy"), this amount as a safe integer, and a compressed identity key.
+// deploy journals as "deploy"), exactly this amount, and a compressed identity key.
 func journalAgrees(j *OwnerRecord, tokenID string, role brc162.Role, amount uint64) bool {
 	return j != nil && j.TokenID == tokenID && j.Role == role && sameAmount(j.Amount, amount) && IsIdentity(j.IdentityKey)
 }
@@ -287,7 +322,7 @@ func TakeBackRepair(ctx context.Context, s RepairUndoStore, txid string, vout ui
 	if err != nil || row == nil {
 		return err
 	}
-	return s.AdjustBalance(ctx, row.IdentityKey, -int64(row.Amount))
+	return s.AdjustBalance(ctx, row.IdentityKey, row.Amount.Neg())
 }
 
 // JournalOwners writes one journal row per verified owner (D §4.2a rule 1) with one shared
@@ -298,7 +333,7 @@ func JournalOwners(ctx context.Context, s StateStore, topic, txid string, owners
 	for _, o := range owners {
 		rows = append(rows, OwnerRecord{
 			Txid: txid, OutputIndex: o.Index, Topic: topic, TokenID: o.TokenID, Role: o.Role,
-			Amount:      Amount(o.Amount), // layer B caps every amount at 2^53-1, so this is exact
+			Amount:      amount.FromUint64(o.Amount),
 			IdentityKey: o.IdentityKey, CreatedAt: at,
 		})
 	}

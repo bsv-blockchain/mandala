@@ -1,42 +1,56 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { useWallet } from '../context/WalletContext'
-import { transferTokens, TransferResult } from '@bsv/mandala/transfer'
-import { reconcileWallet } from '@bsv/mandala/reconcile'
-import { reconcileBans } from '@bsv/mandala/reconcileBans'
-import { reconcileNotifications } from '@bsv/mandala/notifyJournal'
+import { deliverHandover, markHandoverDelivered, sendHandover, settleHandover } from '@bsv/mandala'
 import { sendFlight, BusyError } from '@bsv/mandala/singleFlight'
 import { guardPositiveAmount } from '@bsv/mandala/submitGuards'
 import { holderDataKey, HolderData } from './useHolderData'
 import { contactsKey } from './useContactsData'
+import {
+  describeSettle,
+  explainSendError,
+  sendAndDeliver,
+  type SendOutcome,
+  type SendVars
+} from '../lib/mandala/sendPipeline'
 
-export interface SendVars {
-  assetId: string
-  amount: number
-  recipientKey: string
-  /** The sender's own note — becomes the recipient's action description in
-   * place of the fixed "Receive N of assetId" wording (see transfer.ts). */
-  note?: string
-}
+export type { SendOutcome, SendVars } from '../lib/mandala/sendPipeline'
+
+interface SendContext { prev?: HolderData, acquired?: boolean }
 
 /**
- * Optimistic send. On mutate the balance drops and a pending history row
- * appears instantly; the pipeline (build → sign → overlay submit) runs behind
- * it. The overlay is the commit point — a rejection aborts the wallet action
- * (inputs released, see submitAndBroadcast) and rolls the cache back. The
- * network broadcast continues in the background under journal protection.
+ * Optimistic holder send over BRC-207 (B5): sign → deliver → post-ACK settle
+ * (`sendAndDeliver`). On mutate the balance drops and a pending history row
+ * appears; the lib journal holds the signed hand-over before `sendHandover`
+ * resolves, so after that point the mutation always succeeds and reports the
+ * outcome (delivery or settle failures are finished by `drainNow`).
  *
- * Single-flight: sendFlight rejects a second mutate before React re-renders
- * isPending, so double-click cannot start two createAction pipelines.
+ * Stability:
+ * - Double-click: `sendFlight` is acquired synchronously in onMutate, before
+ *   any await; the lib's `mandala.send` web lock covers other tabs.
+ * - BusyError has two sources: this tab's latch (thrown by onMutate, nothing
+ *   written, `ctx` undefined) and the lib's cross-tab lock (thrown by
+ *   mutationFn after the optimistic write). Rollback and invalidation key on
+ *   `ctx.acquired`, not on the error class.
+ * - Stale cache: holder data and contacts are invalidated when the send
+ *   settles and again when the post-send drain resolves (a refusal restores
+ *   coins the optimistic cache removed).
+ * - Recovery: the drain owns redelivery and settle recovery; the wallet
+ *   module owns spendability. Nothing here reconciles directly.
  */
 export function useSendMutation() {
-  const { wallet, messageBoxClient, identityKey } = useWallet()
+  const { wallet, messageBoxClient, identityKey, overlayIdentityKey, drainNow } = useWallet()
   const qc = useQueryClient()
   const key = holderDataKey(identityKey)
 
-  return useMutation<TransferResult, Error, SendVars, { prev?: HolderData; acquired?: boolean }>({
+  const refresh = (): void => {
+    void qc.invalidateQueries({ queryKey: key })
+    void qc.invalidateQueries({ queryKey: contactsKey(identityKey) })
+  }
+
+  return useMutation<SendOutcome, Error, SendVars, SendContext>({
     mutationFn: async vars => {
-      if (wallet == null || messageBoxClient == null || identityKey == null) {
+      if (wallet == null || messageBoxClient == null || identityKey == null || overlayIdentityKey == null) {
         throw new Error('Wallet not ready')
       }
       const amountGate = guardPositiveAmount(vars.amount)
@@ -44,21 +58,22 @@ export function useSendMutation() {
       if (vars.assetId.trim() === '' || vars.recipientKey.trim() === '') {
         throw new Error('Asset and recipient are required')
       }
-      // Latch is acquired in onMutate (before optimistic write). Hold through
-      // the full pipeline; release in onSettled.
-      return transferTokens({
+      // Latch is acquired in onMutate (before the optimistic write). Held
+      // through sign, deliver and settle; released in onSettled.
+      return await sendAndDeliver({
         wallet: wallet as any,
-        messageBoxClient,
         identityKey,
-        assetId: vars.assetId,
-        amount: vars.amount,
-        recipientKey: vars.recipientKey,
-        note: vars.note
-      })
+        overlayIdentityKey,
+        messageBoxClient,
+        send: sendHandover,
+        deliver: deliverHandover,
+        markDelivered: markHandoverDelivered,
+        settle: settleHandover
+      }, vars)
     },
 
     onMutate: async vars => {
-      // Sync latch before any await — second click in the same tick no-ops.
+      // Sync latch before any await — a second click in the same tick no-ops.
       if (!sendFlight.tryAcquire()) {
         throw new BusyError('Send already in progress')
       }
@@ -69,7 +84,7 @@ export function useSendMutation() {
           qc.setQueryData<HolderData>(key, {
             ...prev,
             assets: prev.assets.map(a =>
-              a.assetId === vars.assetId ? { ...a, balance: a.balance - vars.amount } : a
+              a.assetId === vars.assetId && a.balance != null ? { ...a, balance: a.balance - vars.amount } : a
             ),
             history: [
               ...prev.history,
@@ -93,35 +108,30 @@ export function useSendMutation() {
     },
 
     onError: (e, _vars, ctx) => {
-      // Busy re-entry never wrote optimistically (onMutate threw before setQueryData
-      // only when acquire failed — in that case ctx is undefined).
-      if (e instanceof BusyError) return
-      // Overlay rejected (or build failed) — the wallet action was aborted and
-      // inputs released; restore the pre-send snapshot.
-      if (ctx?.prev != null) qc.setQueryData(key, ctx.prev)
+      // This tab's losing double-click never wrote optimistically (ctx is
+      // undefined); the Send screen shows its BusyError inline.
+      if (ctx?.acquired !== true) return
+      // Signing failed or was refused (including another tab's send holding
+      // the lib lock): nothing is journaled; restore the pre-send snapshot.
+      if (ctx.prev != null) qc.setQueryData(key, ctx.prev)
+      toast.error(explainSendError(e))
     },
 
-    onSuccess: res => {
-      if (!res.notified) {
-        toast.warning('Sent, but the recipient could not be notified — they may need to refresh.')
-      }
+    onSuccess: outcome => {
+      const d = describeSettle(outcome)
+      toast[d.kind](d.text)
+      // Finish whatever the immediate leg left (redelivery, settle retry) and
+      // refetch once that pass resolves.
+      void drainNow({ force: true }).finally(refresh)
     },
 
-    onSettled: (_d, e, vars, ctx) => {
-      if (ctx?.acquired) sendFlight.release()
-      // A losing BusyError mutate did no wallet work. Invalidating or
-      // reconciling here would race the winner's in-flight pipeline: a refetch
-      // clobbers its optimistic row, and the reconcile sweep can abort its
-      // live noSend action before the journal 'accepted' entry lands.
-      if (e instanceof BusyError) return
-      void qc.invalidateQueries({ queryKey: key })
-      void qc.invalidateQueries({ queryKey: contactsKey(identityKey) })
-      // Self-heal any half-finished state (stuck aborts, pending broadcasts,
-      // undelivered recipient notifications) without waiting for the next
-      // page load.
-      if (wallet != null) void reconcileWallet(wallet as any).catch(() => {})
-      if (wallet != null) void reconcileBans(wallet as any, [vars.assetId]).catch(() => {})
-      if (messageBoxClient != null) void reconcileNotifications(messageBoxClient).catch(() => {})
+    onSettled: (_d, _e, _vars, ctx) => {
+      // A losing same-tab mutate did no wallet work. Invalidating here would
+      // race the winner's in-flight pipeline (a refetch clobbers its
+      // optimistic row).
+      if (ctx?.acquired !== true) return
+      sendFlight.release()
+      refresh()
     }
   })
 }

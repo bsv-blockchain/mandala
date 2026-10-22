@@ -1,11 +1,15 @@
 package mandala
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +58,8 @@ func newEngineFlow(t *testing.T, dbName string) *engineFlow {
 		Engine:           es,
 		Screening:        NoSanctions{},
 		OnOwnerRepair:    func(op string, _ bool) { f.repairs = append(f.repairs, op) },
+		// contract §4: the K every deploy's req names
+		OverlayIdentityKey: v.IdentityKey(),
 	}
 	reg, err := NewTokenRegistryTopicManager(f.deps)
 	if err != nil {
@@ -192,7 +198,7 @@ func TestEngineConflictingSpendRefused(t *testing.T) {
 // hostWithLookup registers ls_<tokenID> and then tm_<tokenID> (the order TokenTopics.Ensure uses).
 func (f *engineFlow) hostWithLookup(tokenID string) string {
 	f.t.Helper()
-	ls, err := NewTokenLookupService(tokenID, f.deps.Verifier, f.store)
+	ls, err := NewTokenLookupService(tokenID, f.deps.Verifier, f.store, f.es)
 	if err != nil {
 		f.t.Fatalf("token lookup %s: %v", tokenID, err)
 	}
@@ -258,7 +264,7 @@ func TestEngineFullFlowDeployIssueTransferTwoToken(t *testing.T) {
 	flowEntry(t, steak, topicB, []uint32{1}, []uint32{1})
 
 	for key, want := range map[string]int64{holder.Identity: 0, receiver.Identity: 150, issuer.Identity: 0} {
-		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal != want {
+		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal.Cmp(amt(want)) != 0 {
 			t.Fatalf("balance of %s = %d, %v; want %d", key, bal, err, want)
 		}
 	}
@@ -349,7 +355,7 @@ func TestRegistryRecordSurvivesAnIssueThatNamesTmMandala(t *testing.T) {
 	if r, err := f.store.FindRegistryRecord(f.ctx, id); err != nil || r == nil {
 		t.Fatalf("registry record = %+v, %v; want it kept (T7)", r, err)
 	}
-	if bal, _ := f.store.GetBalance(f.ctx, mandalatest.Holder.Identity); bal != 100 {
+	if bal, _ := f.store.GetBalance(f.ctx, mandalatest.Holder.Identity); bal.Cmp(amt(100)) != 0 {
 		t.Fatalf("holder balance = %d, want 100 (credited once)", bal)
 	}
 	if got := flowTokenOutpoints(t, f, id); !slices.Equal(got, []string{iss.Txid + ".1"}) {
@@ -376,7 +382,7 @@ func TestEngineOwnerIndexRepairOnTheRealEngine(t *testing.T) {
 	if took, err := takeRow(f.ctx, f.store, iss.Txid, 1); err != nil || !took {
 		t.Fatalf("take iss:1 = %v, %v", took, err)
 	}
-	if bal, _ := f.store.GetBalance(f.ctx, holder.Identity); bal != 0 {
+	if bal, _ := f.store.GetBalance(f.ctx, holder.Identity); bal.Cmp(amt(0)) != 0 {
 		t.Fatalf("holder balance after the lost write = %d, want 0", bal)
 	}
 	tr := mandalatest.Transfer(t, iss, 1, receiver, 40)
@@ -385,7 +391,7 @@ func TestEngineOwnerIndexRepairOnTheRealEngine(t *testing.T) {
 		t.Fatalf("repairs = %v, want %v (one inline repair)", f.repairs, want)
 	}
 	for key, want := range map[string]int64{holder.Identity: 60, receiver.Identity: 40} {
-		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal != want {
+		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal.Cmp(amt(want)) != 0 {
 			t.Fatalf("balance of %s = %d, %v; want %d (credited once)", key, bal, err, want)
 		}
 	}
@@ -418,7 +424,7 @@ func TestEngineOwnerIndexRepairOnTheRealEngine(t *testing.T) {
 	if row, _ := f.store.GetTokenRow(f.ctx, iss2.Txid, 1); row != nil || len(f.repairs) != 1 {
 		t.Fatalf("an unrepairable coin was repaired: row %+v, repairs %v", row, f.repairs)
 	}
-	if bal, _ := f.store.GetBalance(f.ctx, holder.Identity); bal != 60 {
+	if bal, _ := f.store.GetBalance(f.ctx, holder.Identity); bal.Cmp(amt(60)) != 0 {
 		t.Fatalf("holder balance = %d, want 60 (nothing credited for the refused spend)", bal)
 	}
 }
@@ -441,7 +447,7 @@ func TestEngineAdminActionsGateTheNextSubmit(t *testing.T) {
 		[]mandalatest.Out{mgrActionOut(t, id, AdminDetails{Kind: "freezeOutput", Outpoint: frozenOp})}, nil)
 	flowEntry(t, f.mustSubmit(freeze, topic), topic, []uint32{0}, []uint32{0})
 	state, err := f.store.GetAssetState(f.ctx, id)
-	if err != nil || !slices.Equal(state.FrozenOutpoints, []FrozenRef{{Outpoint: frozenOp, Amount: 100, Owner: holder.Identity}}) {
+	if err != nil || !sameJSON(state.FrozenOutpoints, []FrozenRef{{Outpoint: frozenOp, Amount: amt(100), Owner: holder.Identity}}) {
 		t.Fatalf("folded freeze = %+v, %v", state.FrozenOutpoints, err)
 	}
 	_, err = f.submit(mandalatest.Transfer(t, iss, 1, receiver, 40), topic)
@@ -455,7 +461,7 @@ func TestEngineAdminActionsGateTheNextSubmit(t *testing.T) {
 	if state, err = f.store.GetAssetState(f.ctx, id); err != nil || len(state.FrozenOutpoints) != 0 || !slices.Contains(state.EvictedOutpoints, frozenOp) {
 		t.Fatalf("folded reissue: frozen %+v, evicted %v, %v", state.FrozenOutpoints, state.EvictedOutpoints, err)
 	}
-	if bal, _ := f.store.GetBalance(f.ctx, receiver.Identity); bal != 100 {
+	if bal, _ := f.store.GetBalance(f.ctx, receiver.Identity); bal.Cmp(amt(100)) != 0 {
 		t.Fatalf("receiver balance after the reissue = %d, want 100", bal)
 	}
 
@@ -471,7 +477,7 @@ func TestEngineAdminActionsGateTheNextSubmit(t *testing.T) {
 	redeem := mandalatest.Build(t, []mandalatest.In{{Src: pause, Vout: 0}, {Src: reissue, Vout: 1}},
 		[]mandalatest.Out{mgrActionOut(t, id, AdminDetails{Kind: "redeem"})}, nil)
 	flowEntry(t, f.mustSubmit(redeem, topic), topic, []uint32{0}, []uint32{0, 1})
-	if bal, _ := f.store.GetBalance(f.ctx, receiver.Identity); bal != 0 {
+	if bal, _ := f.store.GetBalance(f.ctx, receiver.Identity); bal.Cmp(amt(0)) != 0 {
 		t.Fatalf("receiver balance after the redeem = %d, want 0", bal)
 	}
 	history, err := f.store.FindAdminHistory(f.ctx, id, 0, 0)
@@ -485,4 +491,114 @@ func TestEngineAdminActionsGateTheNextSubmit(t *testing.T) {
 	if want := []string{"issue", "freezeOutput", "reissue", "pause", "redeem"}; !slices.Equal(kinds, want) {
 		t.Fatalf("history kinds = %v, want %v", kinds, want)
 	}
+}
+
+// Review Focus 1: uint64 end to end (design §2 goal 2; 0162:140-143). An issue of two 2^64-1
+// outputs is admitted; the supply, the balances and the history Δ are exact past 2^64.
+func TestIssueTwoMaxOutputsAdmittedAndExact(t *testing.T) {
+	f := newEngineFlow(t, "mandala3_test_flow_uint64")
+	issuer, holder, receiver := mandalatest.Issuer, mandalatest.Holder, mandalatest.Receiver
+	d := mandalatest.Deploy(t, issuer, "MAX")
+	id := mandalatest.TokenIDOf(d, 0)
+	topic := f.hostWithLookup(id) // ls_ then tm_, registered once
+	f.mustSubmit(d, MandalaTopic, topic)
+	issueDetails := mandalatest.Details(brc162.CborMap{"kind": "issue"})
+	is := mandalatest.Build(t, []mandalatest.In{{Src: d, Vout: 0}}, []mandalatest.Out{
+		{Owner: issuer, Prover: issuer, TokenID: id, Payload: mandalatest.AdmPayload(sha256.Sum256(issueDetails)), HasPayload: true, Details: issueDetails},
+		{Owner: holder, Prover: issuer, TokenID: id, Amount: math.MaxUint64},
+		{Owner: holder, Prover: issuer, TokenID: id, Amount: math.MaxUint64},
+	}, nil)
+	steak := f.mustSubmit(is, topic)
+	if !slices.Equal(steak[topic].OutputsToAdmit, []uint32{0, 1, 2}) {
+		t.Fatalf("issue steak = %+v", steak[topic])
+	}
+	const twoMax = "36893488147419103230"
+	if sup, err := f.store.CirculatingSupply(f.ctx, id); err != nil || sup.String() != twoMax {
+		t.Fatalf("supply = %v, %v", sup, err)
+	}
+	if bal, err := f.store.GetBalance(f.ctx, holder.Identity); err != nil || bal.String() != twoMax {
+		t.Fatalf("holder balance = %v, %v", bal, err)
+	}
+	hist, err := f.store.FindAdminHistory(f.ctx, id, 0, 0)
+	if err != nil || len(hist) != 1 || hist[0].Delta.String() != twoMax {
+		t.Fatalf("history = %+v, %v; want one issue with delta %s", hist, err, twoMax)
+	}
+	if row, err := f.store.GetTokenRow(f.ctx, is.Txid, 2); err != nil || row == nil || row.Amount.String() != "18446744073709551615" {
+		t.Fatalf("row 2 = %+v, %v", row, err)
+	}
+
+	tr := mandalatest.Transfer(t, is, 1, receiver, math.MaxUint64) // the whole max coin moves holder -> receiver
+	if steak := f.mustSubmit(tr, topic); !slices.Equal(steak[topic].OutputsToAdmit, []uint32{0}) {
+		t.Fatalf("transfer steak = %+v", steak[topic])
+	}
+	for key, want := range map[string]string{holder.Identity: "18446744073709551615", receiver.Identity: "18446744073709551615"} {
+		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal.String() != want {
+			t.Fatalf("balance of %s = %v, %v; want %s", key, bal, err, want)
+		}
+	}
+	if sup, err := f.store.CirculatingSupply(f.ctx, id); err != nil || sup.String() != twoMax {
+		t.Fatalf("supply after the transfer = %v, %v", sup, err)
+	}
+}
+
+// colorHolderTransfer deploys, issues 1000 to Holder under a p color derivation (B4: issuer-proved payout) and
+// builds a holder transfer of that coin with an outputs-only envelope (contract §5.1, D3): output 0 pays 600 to
+// Receiver at the maximum remittance lengths (48 UTF-8 bytes each, contract §0), output 1 returns 400 to Holder.
+// noChangeLinkage drops output 1's envelope entry.
+func colorHolderTransfer(t *testing.T, f *engineFlow, noChangeLinkage bool) (string, string, *mandalatest.Built) {
+	t.Helper()
+	d := mandalatest.Deploy(t, mandalatest.Issuer, "TUSD")
+	id := mandalatest.TokenIDOf(d, 0)
+	topic := f.hostWithLookup(id)
+	f.mustSubmit(d, MandalaTopic, topic)
+	r1 := &mandalatest.ColorRemittance{Prefix: "AAAAAAAAAAAAAAAAAAAAAA==", Suffix: "BBBBBBBBBBBBBBBBBBBBBB=="}
+	is := mandalatest.IssueTo(t, d, 0, mandalatest.Issuer, mandalatest.Holder, 1000, r1)
+	flowEntry(t, f.mustSubmit(is, topic), topic, []uint32{0, 1}, []uint32{0})
+	r2 := &mandalatest.ColorRemittance{Prefix: strings.Repeat("p", 48), Suffix: strings.Repeat("s", 48)}
+	r3 := &mandalatest.ColorRemittance{Prefix: "CCCCCCCCCCCCCCCCCCCCCC==", Suffix: "DDDDDDDDDDDDDDDDDDDDDD=="}
+	tr := mandalatest.BuildWith(t, []mandalatest.In{{Src: is, Vout: 1}}, []mandalatest.Out{
+		{Owner: mandalatest.Receiver, Prover: mandalatest.Holder, TokenID: id, Amount: 600, Color: r2},
+		{Owner: mandalatest.Holder, Prover: mandalatest.Holder, TokenID: id, Amount: 400, Color: r3, NoLinkage: noChangeLinkage},
+	}, nil, mandalatest.BuildOptions{OutputsOnlyEnvelope: true})
+	if string(tr.OffChain[:12]) != `{"outputs":[` || bytes.Contains(tr.OffChain, []byte(`"inputs"`)) || bytes.Contains(tr.OffChain, []byte(`"admin"`)) {
+		t.Fatalf("not an outputs-only envelope: %s", tr.OffChain)
+	}
+	return id, topic, tr
+}
+
+// Task 10 (contract §5.1, design B4): holder outputs derived under [2,"p color <assetTag> <hex> <hex>"], keyID
+// "color", carried in an outputs-only envelope, are admitted with unchanged envelope semantics.
+func TestHolderColorTransferOutputsOnlyEnvelope(t *testing.T) {
+	f := newEngineFlow(t, "mandala3_test_flow_color")
+	id, topic, tr := colorHolderTransfer(t, f, false)
+	if !bytes.Contains(tr.OffChain, []byte(`"keyID":"color"`)) || !bytes.Contains(tr.OffChain, []byte(`"p color `+mandalatest.AssetTag(id)+` `)) {
+		t.Fatalf("envelope does not carry the p color tuple: %s", tr.OffChain)
+	}
+	flowEntry(t, f.mustSubmit(tr, topic), topic, []uint32{0, 1}, []uint32{0})
+	for vout, want := range map[uint32]struct {
+		owner  mandalatest.Party
+		amount int64
+	}{0: {mandalatest.Receiver, 600}, 1: {mandalatest.Holder, 400}} {
+		row, err := f.store.GetTokenRow(f.ctx, tr.Txid, vout)
+		if err != nil || row == nil || row.IdentityKey != want.owner.Identity || row.Amount.Cmp(amt(want.amount)) != 0 || row.TokenID != id {
+			t.Fatalf("row %d = %+v, %v; want %s owning %d", vout, row, err, want.owner.Name, want.amount)
+		}
+	}
+	for key, want := range map[string]int64{mandalatest.Receiver.Identity: 600, mandalatest.Holder.Identity: 400} {
+		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal.Cmp(amt(want)) != 0 {
+			t.Fatalf("balance of %s = %v, %v; want %d", key, bal, err, want)
+		}
+	}
+	// a double-submit is accepted and moves nothing
+	f.mustSubmit(tr, topic)
+	if bal, _ := f.store.GetBalance(f.ctx, mandalatest.Receiver.Identity); bal.Cmp(amt(600)) != 0 {
+		t.Fatalf("receiver balance after the replay = %v, want 600", bal)
+	}
+}
+
+func TestHolderColorTransferMissingOutputLinkage(t *testing.T) {
+	f := newEngineFlow(t, "mandala3_test_flow_color")
+	_, topic, tr := colorHolderTransfer(t, f, true)
+	_, err := f.submit(tr, topic)
+	mgrRefusal(t, err, CodeLinkage, "output 1: token output with no verified linkage", topic)
 }

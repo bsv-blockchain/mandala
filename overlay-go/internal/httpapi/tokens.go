@@ -6,7 +6,9 @@ package httpapi
 // (404 token not hosted). All of them are public with wildcard CORS (none is an adminGatedPath).
 
 import (
+	"fmt"
 	"math"
+	"math/big"
 	"net/url"
 	"sort"
 	"strconv"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
 
@@ -125,7 +128,7 @@ func boundedIntParam(raw string, def, min, max int64) (int64, bool) {
 
 // authoritiesBeefHandler serves the stored BEEF of an authority output so an issuer whose wallet lost the coin's
 // bookkeeping can re-attach it. The route has no token id, so the output is found across topics and served only
-// from a tm_<id> copy: a tm_mandala (registry) or tm_mandala_kyc copy is never an authority of a token.
+// from a tm_color_<id> copy: a tm_mandala (registry) or tm_mandala_kyc copy is never an authority of a token.
 func authoritiesBeefHandler(where OutputBeefWhereFunc) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		if where == nil {
@@ -291,32 +294,43 @@ func jsClampedInt(raw string, def, min, max int64) int64 {
 	return int64(t)
 }
 
+// adminSummary: the totals are token amounts, so they are exact decimal strings in JSON; actionCount is a
+// count and stays a number (contract §0, §6).
 type adminSummary struct {
-	TotalIssued   int64 `json:"totalIssued"`
-	TotalRedeemed int64 `json:"totalRedeemed"`
-	ActionCount   int64 `json:"actionCount"`
+	TotalIssued   amount.Amount `json:"totalIssued"`
+	TotalRedeemed amount.Amount `json:"totalRedeemed"`
+	ActionCount   int64         `json:"actionCount"`
 }
 
 // summarizeAdminHistory is TS summarizeHistory: one row per (txid, outputIndex) (re-admits append duplicates),
-// Σ positive delta issued, Σ |negative delta| redeemed, distinct actions counted.
-func summarizeAdminHistory(rows []mandala.AdminHistoryEntry) adminSummary {
+// Σ positive delta issued, Σ |negative delta| redeemed, distinct actions counted. The sums are exact; a total
+// past the storage range (only reachable through repeated issue/redeem cycles near 10^34-1) is an error, never
+// a clamp.
+func summarizeAdminHistory(rows []mandala.AdminHistoryEntry) (adminSummary, error) {
 	seen := make(map[string]bool, len(rows))
-	var s adminSummary
+	issued, redeemed := new(big.Int), new(big.Int)
 	for _, r := range rows {
 		key := r.Txid + ":" + strconv.FormatUint(uint64(r.OutputIndex), 10)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		switch d := int64(r.Delta); {
-		case d > 0:
-			s.TotalIssued += d
-		case d < 0:
-			s.TotalRedeemed += -d
+		switch d := r.Delta.Big(); d.Sign() {
+		case 1:
+			issued.Add(issued, d)
+		case -1:
+			redeemed.Sub(redeemed, d)
 		}
 	}
-	s.ActionCount = int64(len(seen))
-	return s
+	totalIssued, err := amount.FromBig(issued)
+	if err != nil {
+		return adminSummary{}, fmt.Errorf("admin summary: total issued: %w", err)
+	}
+	totalRedeemed, err := amount.FromBig(redeemed)
+	if err != nil {
+		return adminSummary{}, fmt.Errorf("admin summary: total redeemed: %w", err)
+	}
+	return adminSummary{TotalIssued: totalIssued, TotalRedeemed: totalRedeemed, ActionCount: int64(len(seen))}, nil
 }
 
 func tokenAdminSummaryHandler(c *fiber.Ctx, store AdminStore, tokenID string) error {
@@ -324,5 +338,9 @@ func tokenAdminSummaryHandler(c *fiber.Ctx, store AdminStore, tokenID string) er
 	if err != nil {
 		return tokenRouteFailure(c, err)
 	}
-	return c.Status(fiber.StatusOK).JSON(summarizeAdminHistory(rows))
+	summary, err := summarizeAdminHistory(rows)
+	if err != nil {
+		return tokenRouteFailure(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(summary)
 }

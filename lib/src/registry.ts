@@ -4,14 +4,15 @@
  * The overlay database is a cache of this chain.
  */
 import { WalletInterface } from '@bsv/sdk'
-import { adminAuthHeaders, BASKET, OVERLAY_URL, OVERLAY_URL_UNSET, REGISTRY_TOPIC } from './constants.js'
-import { deployPayload } from './brc162.js'
+import { adminAuthHeaders, TREASURY_BASKET, OVERLAY_URL, OVERLAY_URL_UNSET, REGISTRY_TOPIC } from './constants.js'
+import { encodeStrictCbor } from '@bsv/templates'
 import { AdmissionReceipt, admissionReceipt } from './overlay.js'
 import { registryFlight } from './singleFlight.js'
 import { guardIdentityKey } from './submitGuards.js'
 import { outpoint } from './tokens.js'
 import { withIntent } from './txJournal.js'
 import { runAuthorityTx, runDeployTx } from './authority.js'
+import { actionDescription } from './assets.js'
 
 export interface RegistryActionDetails {
   kind: 'admitIdentity' | 'revokeIdentity'
@@ -57,7 +58,7 @@ const tokenIdOf = (ci: RegistryCI, op: string): string =>
   ci.tokenId !== '' ? ci.tokenId : `${op.slice(0, op.lastIndexOf('.'))}_0`
 
 export async function listRegistryAuth (wallet: WalletInterface): Promise<RegistryAuth | null> {
-  const res = await wallet.listOutputs({ basket: BASKET, includeCustomInstructions: true, limit: 1000 })
+  const res = await wallet.listOutputs({ basket: TREASURY_BASKET, includeCustomInstructions: true, limit: 1000 })
   const found: RegistryAuth[] = []
   for (const o of res.outputs) {
     const ci = parseRegistryCI(o.customInstructions)
@@ -82,8 +83,11 @@ export interface RegistryActionResult extends AdmissionReceipt {
   tokenId: string
 }
 
-/** The KYC registry deploy payload (the overlay ignores it on tm_mandala_kyc, but a deploy must be well-formed). */
-export const REGISTRY_DEPLOY_PAYLOAD = (): number[] => deployPayload({ sym: 'KYC', dec: 0, label: 'Mandala identity registry' })
+/**
+ * The KYC registry deploy payload (the overlay ignores it on tm_mandala_kyc, but a deploy must be well-formed).
+ * No `req`: C§4 does not police tm_mandala_kyc deploys.
+ */
+export const REGISTRY_DEPLOY_PAYLOAD = (): number[] => encodeStrictCbor({ sym: 'KYC', dec: 0n, label: 'Mandala identity registry' })
 
 /**
  * Deploy the KYC registry chain on tm_mandala_kyc (the first trusted deploy
@@ -98,7 +102,7 @@ export async function registerIdentities (p: { wallet: WalletInterface, identity
       topics: () => [REGISTRY_TOPIC],
       customInstructions: registryCustomInstructions('', 'deploy'),
       tags: ['mandala-registry'],
-      description: 'Register identity chain',
+      description: actionDescription('Register identity chain'),
       labels: ['mandala', 'registry', 'register']
     })
     return { authOutpoint: outpoint(res.txid, 0), authKeyID: 'deploy', tokenId: res.tokenId, ...admissionReceipt(res.admitted) }
@@ -139,7 +143,7 @@ export async function admitOrRevokeIdentity (p: {
           tags: ['mandala-registry']
         }],
         inputBEEF,
-        description: `${p.kind} ${p.targetKey.slice(0, 16)}`,
+        description: actionDescription(`${p.kind} ${p.targetKey.slice(0, 16)}`),
         labels: ['mandala', 'registry', p.kind],
         topics: [REGISTRY_TOPIC]
       })

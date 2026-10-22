@@ -9,7 +9,7 @@ import (
 )
 
 func foldInt64(v int64) *int64    { return &v }
-func foldAmount(v int64) *Amount  { a := Amount(v); return &a }
+func foldAmount(v int64) *Amount  { a := amt(v); return &a }
 func foldString(v string) *string { return &v }
 
 func TestFoldActionTable(t *testing.T) {
@@ -25,7 +25,7 @@ func TestFoldActionTable(t *testing.T) {
 	}
 	frozen := func(amount int64, owner string) func(*AssetAdminState) {
 		return func(s *AssetAdminState) {
-			s.FrozenOutpoints = []FrozenRef{{Outpoint: op, Amount: Amount(amount), Owner: owner}}
+			s.FrozenOutpoints = []FrozenRef{{Outpoint: op, Amount: amt(amount), Owner: owner}}
 		}
 	}
 	cases := []struct {
@@ -91,7 +91,7 @@ func TestFoldActionNeverMutatesItsInput(t *testing.T) {
 	prev := DefaultAssetState(strings.Repeat("ab", 32)+"_0", foldInt64(5))
 	prev.BlockedIdentities = append(make([]string, 0, 8), key)
 	prev.AllowedIdentities = append(make([]string, 0, 8), key)
-	prev.FrozenOutpoints = append(make([]FrozenRef, 0, 8), FrozenRef{Outpoint: op, Amount: 1, Owner: key})
+	prev.FrozenOutpoints = append(make([]FrozenRef, 0, 8), FrozenRef{Outpoint: op, Amount: amt(1), Owner: key})
 	prev.EvictedOutpoints = make([]string, 0, 8)
 	for _, d := range []AdminDetails{
 		{Kind: "blockIdentity", IdentityKey: other}, {Kind: "unblockIdentity", IdentityKey: key},
@@ -102,7 +102,7 @@ func TestFoldActionNeverMutatesItsInput(t *testing.T) {
 		FoldAction(prev, d, FoldContext{})
 		if len(prev.BlockedIdentities) != 1 || prev.BlockedIdentities[0] != key || prev.BlockedIdentities[:2][1] != "" ||
 			len(prev.AllowedIdentities) != 1 || prev.AllowedIdentities[:2][1] != "" ||
-			len(prev.FrozenOutpoints) != 1 || prev.FrozenOutpoints[0].Outpoint != op || prev.FrozenOutpoints[:2][1] != (FrozenRef{}) ||
+			len(prev.FrozenOutpoints) != 1 || prev.FrozenOutpoints[0].Outpoint != op || !sameJSON(prev.FrozenOutpoints[:2][1], FrozenRef{}) ||
 			len(prev.EvictedOutpoints) != 0 || prev.EvictedOutpoints[:1][0] != "" || *prev.FeeRatePerKb != 5 {
 			t.Fatalf("%s mutated its input: %+v", d.Kind, prev)
 		}

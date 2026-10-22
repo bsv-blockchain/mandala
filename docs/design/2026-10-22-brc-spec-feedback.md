@@ -1,0 +1,81 @@
+# BRC-162 / BRC-207 spec feedback (draft)
+
+> **DRAFT for the user. No BRC PR is opened from this run (design §3).**
+>
+> Sources: audit `docs/design/2026-10-21-brc162-brc207-conformance-audit.md` (F1-F7 at :61-66, §8.1 at :155), design `docs/superpowers/specs/2026-10-21-1color-brc207-conformance-design.md` (§3, §8 B1/B2), interface contract `docs/superpowers/plans/2026-10-22-1color-00-interfaces.md` (Revision 2, §0). Line cites are to the pinned copies in this repo: **0162** = `docs/design/brc-0162-1color.pinned.md`, **0207** = `docs/design/brc-0207-1color-wallet-module.pinned.md`, **0161** = `docs/design/brc-0161-bsv21-json.pinned.md`. The audit cited an earlier, unpinned fetch of 0162, so its 0162 line numbers are shifted by about 4. The numbers here are the pinned ones.
+>
+> Each item gives the cite, the problem, proposed wording, and the Mandala impact. F1-F7 relate to the BRC-207 attested profile (`https://brc.dev/207/attested` v1). The last two items are about BRC-162.
+
+---
+
+## F1: Attestation topic is fixed to `tm_color_<assetId>`
+
+- **Cite:** 0207:247 ("`topic` is independently derived as `tm_color_<assetId>`") and 0207:700-705 (deterministic `tm_color_<assetId>` / `ls_color_<assetId>`). Audit :61.
+- **Problem:** the attested statement `1color-admit:v1:<topic>:<txid>:<outputs>` can only name `tm_color_<assetId>`. An overlay that admits an asset under another BRC-22 topic name cannot produce a qualifying attestation for that admission. Examples are an issuer platform that predates the naming rule, or one that groups several assets under one topic. The only way out is a full `evidenceProfile` replacement (0207:435-450), which is heavy for what is only a topic name.
+- **Proposed wording** (after 0207:247): "A companion profile named by `evidenceProfile` MAY instead fix a different BRC-22 topic name for the statement. It does so without replacing any other part of the default construction. In that case the statement's `topic` is that name, and every other rule in this section is unchanged." Alternatively, state plainly that a non-`tm_color_` topic always needs a full `evidenceProfile` replacement.
+- **Mandala impact: low.** Mandala adopted the per-asset `tm_color_<assetId>` / `ls_color_<assetId>` names (contract §0, design C1). The Mandala-specific registry and KYC topics (`tm_mandala`, `tm_mandala_kyc`) are outside BRC-207 and keep their own signature format. Raise this for other issuers, not as a blocker for Mandala.
+
+## F2: `identity` mode has one fixed key and no rotation
+
+- **Cite:** 0207:219 (`identity` row: "The deploy's exact `identityKey` signs every anchor") and 0207:224-226 ("The fixed key cannot silently rotate; a future declared profile may specify authenticated rotation semantics"). Also 0207:178-180 (`identityKey` is "required exactly in `identity` mode", a single key). Audit :62.
+- **Problem:** `req` is immutable after deploy (0162 required-profile section; 0207 vector C04). An asset in `identity` mode is tied to one overlay signing key for its whole life. If that key is lost or compromised, or the operator rotates it, no new admission can ever qualify, and the only remedy is a new asset. The spec defers rotation to "a future declared profile", but it gives no outline of one, so every issuer that needs rotation must write a full replacement.
+- **Proposed wording:** add an optional `identityKeys` parameter: a non-empty, sorted, unique array of keys, any of which satisfies `identity` coverage, and mutually exclusive with `identityKey`. Or define a minimal authenticated-rotation companion in the spec itself: a rotation statement signed by the current key, and a rule for which key covers an anchor, given that attestations carry no timestamp (0207 C56). Either way, state what happens to anchors signed by a retired key.
+- **Mandala impact: medium.** Every new Mandala deploy declares the attested profile in `identity` mode with the overlay identity key K (contract §4, design §4.2). Rotating K means redeploying every asset. Mandala accepts this for now (no back-compat), but any production issuer would hit it.
+
+## F3 (offline regression): issuer rules beyond BRC-162 cannot be checked locally
+
+- **Cite:** 0207:335-354 (frontier steps 2-4, step 4 at :348-354: "Authenticate and enforce all other required profiles at every relevant state boundary"), 0207:316-321 (`submissions`: "Companion profiles may require nonempty caller-supplied data; absence then fails acceptance") and 0207:435-450 (`evidenceProfile` replaces the whole default construction). Audit :63.
+- **Problem:** Mandala's issuer rules cannot be decided by a wallet that is offline. They are owner linkage encrypted to the overlay key, freeze/pause, the KYC allow/deny/sanctions layers, and holder I==O. Only the issuer's overlay can decide them, at submit time. The spec offers two existing options, and neither fits:
+  - **The companion profile route (0207:316-321, frontier step 4).** A companion may *require* data. But step 4 says the wallet must "authenticate and enforce" every required profile at each state boundary before acceptance. A rule that only the overlay can evaluate is therefore either unenforceable offline, so offline acceptance must fail, or silently skipped, which step 4 forbids.
+  - **The `evidenceProfile` route (0207:435-450).** This replaces signature selection, trust selection and graph validation as well, which is far more than needed. It also drops the default profile's well-specified local checks.
+- **Proposed wording** (a middle ground; add after 0207:354): "A required companion profile MAY designate some of its rules as *settlement-time checks*. Such a rule is not evaluated in local step 4. It gates only the removal of `color_offline` (it must succeed at actual admission before the output counts as settled), and a refusal is handled as a final refusal (C55). The companion MUST still define every rule it can check locally. A wallet that accepts value under settlement-time checks MUST disclose to the user that the issuer may refuse it, and MUST apply the user's offline risk policy. Signature, trust and graph validation are not affected."
+- **Mandala impact: high.** This is the offline-settlement regression the audit flagged. Mandala relies on it: design §2 goal 4 (offline credit as `color_offline`) and design B1 (the owner-linkage envelope carried as companion submission data in `submissions[].offChainValues`). Without a rule like this, a strict reading of step 4 forces a conforming wallet to refuse offline Mandala receipts.
+
+## F4: behaviour when BRC-177 lifecycles are absent
+
+- **Cite:** 0207:323-326 (`lifecycles` are given "for every unresolved protected root"; "Unknown non-protected upstream disposition is a disclosed risk"), 0207:409 ("missing lifecycle evidence cannot be described as `never`"), 0207:426-431 ("Normal BRC-177 finite or `never` batch lifecycles … still apply") and vector C44 (0207 Appendix C.2: a missing lifecycle for a known protected root fails protected delivery). Audit :64. Design B2.
+- **Problem:** on the recipient side, 0207:325-326 already treats an unknown non-protected upstream as a disclosed risk. The spec does not say whether the **sender** may hand over with no protected root at all. In such a hand-over the sender signs a plain `noSend` transaction, without a BRC-177 label, prefunded anchor, broadcast or pre-split, and the recipient submits it. 0207:426 ("Normal BRC-177 … lifecycles … still apply") can be read as requiring BRC-177 for every offline batch the sender releases. C44 covers only a *known* protected root that is missing its lifecycle. It does not cover a graph where no root is protected at all.
+- **Proposed wording** (after 0207:431): "A sender MAY hand over a graph that contains no protected root. `lifecycles` is then absent or empty. The recipient MUST treat the sender's disposition of every unconfirmed ancestor as unknown: it may be double-spent or reclaimed at any time until admission. The recipient MUST disclose this as offline-conflict risk under 0207:409, and MUST NOT present it as `never`." Add a C.2 vector for this case. Optionally, let a required profile declare that its assets use plain `noSend` hand-over.
+- **Mandala impact: high.** Mandala hand-overs are plain `noSend` actions that work fully offline (design B2), and the T2 handler declares this per asset. Without this clarification, Mandala's hand-over mode rests on a reading of 0207:426 that the spec does not confirm.
+
+## F5: give a worked `evidenceProfile` example
+
+- **Cite:** 0207:435-450 (explicit future replacement), 0207:180 (`evidenceProfile` parameter) and vectors C38/C39 (0207 Appendix C.1). Audit :64.
+- **Problem:** the replacement contract asks the replacing profile to "name each replaced procedure and define every affected fact and failure outcome", but gives no example. Implementers cannot tell how detailed such a declaration must be. They also cannot tell whether a `req` that names both profiles is well-formed (C38/C39 are prose only).
+- **Proposed wording:** an informative appendix with one full example: a deploy `req` with the attested profile `{version:1, params:{evidenceProfile:"<uri>"}}` and the companion `<uri>`, the companion's replaced-procedure list, its `profileData` leaf, and one accept vector and one reject vector. A natural example is a freshness- or epoch-bearing attestation, which is the gap shown by C56.
+- **Mandala impact: low now, medium later.** The audit (:65) notes that freeze/pause/KYC would fit best as an `evidenceProfile` replacement with an admin-state epoch. A worked example would make that a smaller future change.
+
+## F6: define "known conflict" as wallet-local state
+
+- **Cite:** 0207:350-354 (frontier step 4: "A known incompatible spend outside the validated graph, established contradictory claim … defeats acceptance", "known contradictory facts cannot be ignored") and vectors C28/C55. Audit :64.
+- **Problem:** "known" is not defined. One reader may take it to mean any conflict that exists anywhere, which needs an online check and contradicts "No universal online check is required" (0207:353-354). Another may take it to mean conflicts this wallet has already recorded. Two conforming wallets holding the same evidence could then decide differently.
+- **Proposed wording:** "'Known' means recorded in this wallet's own durable state before the decision: a verified conflicting transaction, a refusal or a revocation that the wallet has received and authenticated. Acceptance does not require a lookup. A wallet that does look up and learns of a conflict MUST record it and apply it." Note in C28 that the evidence is wallet-local.
+- **Mandala impact: medium.** The Mandala wallets keep settlement stores (pending, held, refused). This wording would let those stores be the authority for the check, without an online call on the offline path.
+
+## F7: add a vector with a fabricated authority parent inside the bundle
+
+- **Cite:** 0207:335-347 (frontier steps 2-3: "recursively validate **all** same-asset token inputs, including authority inputs. Apply the full token transition rules to the transaction") and the nearest existing vectors C25 (0207:10298, quantity bypass) and C26 (0207:10299, authority branch). Audit :64 (security finding S1).
+- **Problem:** C25 and C26 are prose decisions over abstract outpoints. No vector supplies an unattested **parent inside the bundle** that creates value or authority from nothing, and checks that the wallet rejects it. Examples of such a parent are a mint transaction whose authority input is not a valid authority output, or a value output with no token inputs at all. That is the exact gap Mandala's own pre-1Color COVER walk had (audit S1): the walk checked only that every path reached an anchor, never the transitions along the way. A byte-level vector would catch this class of bug in any implementation.
+- **Proposed wording:** add vector C.1 "C25a fabricated parent". It gives a deploy (`req` = attested, `identity` mode, test key 5555 from C.0), an attestation covering the deploy authority output, and an **unattested** in-bundle parent that spends a non-token input and writes a 1Color `mint` value output. A child spends that output to the recipient. **Required result:** reject, because the parent's transition has no valid authority input. Supply exact raw transactions so implementations can run the vector as a test.
+- **Mandala impact: high (security).** The design closes S1 by adopting the attested frontier validator (design goal 6). This vector is the regression test both Mandala and upstream need, and Mandala will carry a local copy until the spec has one.
+
+---
+
+## Editorial: the token id form in 0162:111 contradicts 0162:120 and 0162:292
+
+- **Cite:** 0162:111 ("a binary-native token id is always `<deploy txid>.0` (outpoint string per BRC-36)"). Compare 0162:120 ("the string form is `<txid>_<vout>` … **underscore** separator … not the general dual-form outpoint convention") and 0162:292 ("Token id := this output's outpoint (`<txid>_0`)"). 0161:53 also says the token id "does not take the BRC-36 dot form". The audit (:28, :66, §8.1 at :155) cites these as 0162:107 vs 0162:116 under the earlier unpinned fetch. The numbers above are the pinned ones.
+- **Problem:** one paragraph gives the token id in BRC-36 dot form, while two others (and BRC-161) fix it in underscore form. An implementer who follows 0162:111 produces ids that do not match any `tm_color_<assetId>` topic or BRC-207 asset id.
+- **Proposed wording:** change 0162:111 to "…so a binary-native token id is always `<deploy txid>_0`". Or say that 0162:111 names the deploy **outpoint** in BRC-36 dot form, which is a different thing from the token id: "the deploy outpoint is always `<deploy txid>.0` (BRC-36), and the token id is its underscore form `<deploy txid>_0`".
+- **Mandala impact: none (already conforms to 0162:120).** Mandala keeps the two forms apart. Token and asset ids are always `<64hex>_0`, and outpoints are always `<txid>.<vout>` (contract §0).
+
+## PUSHDATA ambiguity: is a non-minimal payload push valid?
+
+- **Cite:** 0162:101 ("A push operation is any push opcode: `OP_0`, `OP_1NEGATE`, `OP_1`–`OP_16`, or a data push") and 0162:105 (encoders write `OP_0 OP_DROP` when the remainder begins with `<push> OP_DROP`).
+- **Problem:** 0162:101 counts every push form as the payload push, including non-minimal `OP_PUSHDATA1/2/4` and a one-byte data push that duplicates `OP_1`..`OP_16`. It does not say whether such a payload is valid, valid but non-canonical, or invalid. The id and amount fields are tighter (the amount is a "minimally encoded script number", 0162:91), so the payload field is the only one with no rule. In practice:
+  - `@bsv/templates` `OneColor.decode` accepts a non-minimal payload push and reports `payloadCanonical: false`. A non-minimal amount push is rejected.
+  - Mandala's overlay records whether the payload push is canonical and rejects a non-canonical push on deploy (audit 2.2, `details.go`).
+  - `needsEmptyPayloadMarker` (`@bsv/templates` 2.2.0) treats every push form as a push, so `lockRemainder` writes the marker in all of these cases (plan 01 Task 6, RF4). That choice is safe under either reading.
+
+  Two indexers can therefore agree on balances but disagree on whether a deploy's `req` was declared, if one accepts a non-minimal deploy payload and the other does not. Required profiles live in that payload.
+- **Proposed wording** (append to 0162:101): "The payload push SHOULD be minimal. Readers MUST accept a non-minimal payload push and read its bytes as the payload. Validity and attributes never depend on push minimality." Or, if the authors prefer strictness: "A non-minimal payload push makes the output carry no defined attributes." Either way, add a vector: a deploy whose `req` map is pushed with `OP_PUSHDATA1` at a length below 76.
+- **Mandala impact: low.** Mandala only writes canonical pushes, and its overlay enforces this on deploy. The rule matters for interoperability with other 1Color indexers, which read Mandala deploys. The matching BRC-161 envelope question (`OP_1` vs a one-byte push as a field tag) is item 6 of `docs/design/2026-10-22-bsv21token-issue-draft.md`.

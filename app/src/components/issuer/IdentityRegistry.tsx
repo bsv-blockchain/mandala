@@ -9,6 +9,7 @@ import { useWallet } from '../../context/WalletContext'
 import { guardIdentityKey } from '@bsv/mandala/submitGuards'
 import { registryFlight, BusyError } from '@bsv/mandala/singleFlight'
 import { registryIsLive } from '@bsv/mandala/registry'
+import { REGISTRY_TOPIC } from '@bsv/mandala'
 import { useOverlayRegistry, useRegistryAuth } from '../../hooks/useRegistry'
 import { useRegistryMutations } from '../../hooks/useRegistryMutations'
 import { cn } from '@/lib/utils'
@@ -133,7 +134,7 @@ export default function IdentityRegistry () {
             <p className="text-[12.5px] text-subtle-foreground mt-1 leading-[1.55]">
               {live
                 ? 'The overlay already admitted your opening transaction (it is on chain), but this wallet is not listing the 1-sat authorization with its bookkeeping. Re-attach puts that existing UTXO back in the basket — it does not open a second genesis.'
-                : 'Asset genesis is a different spine. Opening the chain is a 1-sat issuer transaction on tm_mandala_registry and admits you as issuer.'}
+                : `Asset genesis is a different spine. Opening the chain is a 1-sat issuer transaction on ${REGISTRY_TOPIC} and admits you as issuer.`}
             </p>
           </div>
           <Button

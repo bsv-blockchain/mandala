@@ -8,11 +8,14 @@
  * assertSpendablePrior are the backstop there.
  *
  * Lock names in use (one per cross-tab-exclusive pipeline):
- *   'mandala.send'             — holder transfer (transfer.ts)
+ *   'mandala.send'             — holder hand-over (handover.ts sendHandover)
+ *   'mandala.payout'           — issuer payout to a holder (payout.ts payoutTokens)
  *   'mandala.register'         — asset genesis (issuerOps.ts registerAsset);
  *                                registerFlight covers same-tab re-entry only
  *   'mandala.admin.<assetId>'  — per-asset admin-auth spend (adminAuthGate.ts)
  *   'mandala.reconcile'        — the recovery pass (reconcile.ts)
+ *   'mandala.notify'           — the notification retry/redelivery pass
+ *                                (notifyJournal.ts reconcileNotifications)
  */
 
 export interface TryLockResult<T> {

@@ -51,7 +51,7 @@ func admitAsHost(t *testing.T, app *App, b *mandalatest.Built, topics ...string)
 	admissions := map[string]mandala.TopicAdmission{}
 	ident := ""
 	for topic, ai := range steak {
-		if ai == nil || !mandala.IsSigmaTopic(topic) || len(ai.OutputsToAdmit) == 0 {
+		if ai == nil || mandala.AdmissionSchemeOf(topic) == mandala.SchemeNone || len(ai.OutputsToAdmit) == 0 {
 			continue
 		}
 		outs := mandala.CanonicalOutputs(ai.OutputsToAdmit)
@@ -88,7 +88,10 @@ func balanceOf(t *testing.T, app *App, p mandalatest.Party) int64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return b
+	if !b.Big().IsInt64() {
+		t.Fatalf("balance %s is not an int64", b)
+	}
+	return b.Big().Int64()
 }
 
 func tokenRowOf(t *testing.T, app *App, txid string, vout uint32) *mandala.TokenRecord {
@@ -166,7 +169,7 @@ func TestEvictTwoTokenTransferRestoresEachInputUnderItsOwnTopic(t *testing.T) {
 			t.Fatalf("%s.1 is not live again on %s (%v)", c.txid, c.topic, err)
 		}
 		row := tokenRowOf(t, app, c.txid, 1)
-		if row == nil || row.TokenID != c.tokenID || int64(row.Amount) != c.amount || row.IdentityKey != mandalatest.Holder.Identity {
+		if row == nil || row.TokenID != c.tokenID || row.Amount.Cmp(amt(c.amount)) != 0 || row.IdentityKey != mandalatest.Holder.Identity {
 			t.Fatalf("restored row %+v, want %s %d owned by the holder", row, c.tokenID, c.amount)
 		}
 		rows, err := app.Store.OwnerJournalByOutpoint(ctx, c.txid, 1)
@@ -377,7 +380,7 @@ func TestEvictStampsNothingWhenTheRestoreFails(t *testing.T) {
 	admitAsHost(t, app, t1, topic)
 
 	// An undecodable journal row (fractional amount) under the spent outpoint breaks the journal read.
-	junkTopic := "tm_" + strings.Repeat("e", 64)
+	junkTopic := mandala.TokenTopicOfTxid(strings.Repeat("e", 64))
 	owners := app.Mongo.Collection(mandala.OwnersCollection)
 	if _, err := owners.InsertOne(ctx, bson.D{
 		{Key: "txid", Value: iss.Txid}, {Key: "outputIndex", Value: int64(1)}, {Key: "topic", Value: junkTopic},

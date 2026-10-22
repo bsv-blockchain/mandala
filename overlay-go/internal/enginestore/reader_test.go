@@ -22,8 +22,8 @@ import (
 var _ mandala.EngineOutputReader = (*Store)(nil)
 
 var (
-	tokenTopicA = "tm_" + strings.Repeat("aa", 32)
-	tokenTopicB = "tm_" + strings.Repeat("bb", 32)
+	tokenTopicA = mandala.TokenTopicOfTxid(strings.Repeat("aa", 32))
+	tokenTopicB = mandala.TokenTopicOfTxid(strings.Repeat("bb", 32))
 )
 
 func readerStore(t *testing.T) *Store {

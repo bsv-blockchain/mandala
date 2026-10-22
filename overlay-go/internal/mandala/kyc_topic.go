@@ -78,6 +78,10 @@ func (m *KYCTopicManager) identify(ctx context.Context, beef *transaction.Beef, 
 
 	// layer A (unscoped: the registry is one chain)
 	cls := brc162.ClassifyOutputs(tx)
+	// Mandala policy: a legacy 36-byte id refuses the whole tx (contract §4 step 0)
+	if err := RequireNoLegacyTokenIDs(cls.Outputs); err != nil {
+		return none, err
+	}
 	inputs := brc162.ClassifyAdmittedInputs(tx, previousCoins)
 	ledger := brc162.BuildLedger(txidHex, cls.Outputs, inputs)
 

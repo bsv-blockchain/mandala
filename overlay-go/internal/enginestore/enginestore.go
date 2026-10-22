@@ -1028,7 +1028,7 @@ func storedOutputScript(beefBytes []byte, txid string, vout uint32, topic string
 	if tx == nil {
 		return nil, 0, fmt.Errorf("enginestore: stored BEEF for %s.%d on %s does not carry the transaction", txid, vout, topic)
 	}
-	if int(vout) >= len(tx.Outputs) || tx.Outputs[vout].LockingScript == nil {
+	if uint64(vout) >= uint64(len(tx.Outputs)) || tx.Outputs[vout].LockingScript == nil {
 		return nil, 0, fmt.Errorf("enginestore: stored transaction %s has no output %d", txid, vout)
 	}
 	out := tx.Outputs[vout]

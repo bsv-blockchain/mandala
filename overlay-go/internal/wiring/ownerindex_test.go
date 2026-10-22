@@ -431,7 +431,7 @@ func TestOwnerIndexTopicsAreTheRegisteredTokensPlusKYC(t *testing.T) {
 		}
 	}
 	got := ownerIndexTopics(tokens)()
-	if want := []string{"tm_" + a, "tm_" + b, mandala.KYCTopic}; !reflect.DeepEqual(got, want) {
+	if want := []string{mandala.TokenTopicOfTxid(a), mandala.TokenTopicOfTxid(b), mandala.KYCTopic}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("topics = %v, want %v", got, want)
 	}
 	if slices.Contains(got, mandala.MandalaTopic) {
@@ -452,7 +452,7 @@ func TestAppStartReconcilesTheBootUnionThenArmsTheInterval(t *testing.T) {
 	}
 	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
 	iss := mandalatest.Issue(t, dep, 0, mandalatest.Issuer, mandalatest.Holder, 100)
-	tokenID, topic := dep.Txid+"_0", "tm_"+dep.Txid
+	tokenID, topic := dep.Txid+"_0", mandala.TokenTopicOfTxid(dep.Txid)
 	if _, err := app.Store.StoreRegistryRecord(ctx, mandala.TokenRegistryRecord{
 		TokenID: tokenID, DeployTxid: dep.Txid, Sym: "USD", Dec: 2, Label: "US Dollar", Issuer: mandalatest.Issuer.Identity, CreatedAt: time.Now(),
 	}); err != nil {
@@ -468,7 +468,7 @@ func TestAppStartReconcilesTheBootUnionThenArmsTheInterval(t *testing.T) {
 	now := time.Now()
 	if err := app.Store.RecordOwners(ctx, []mandala.OwnerRecord{
 		{Txid: iss.Txid, OutputIndex: 0, Topic: topic, TokenID: tokenID, Role: brc162.RoleAuthority, IdentityKey: mandalatest.Issuer.Identity, CreatedAt: now},
-		{Txid: iss.Txid, OutputIndex: 1, Topic: topic, TokenID: tokenID, Role: brc162.RoleValue, Amount: 100, IdentityKey: mandalatest.Holder.Identity, CreatedAt: now},
+		{Txid: iss.Txid, OutputIndex: 1, Topic: topic, TokenID: tokenID, Role: brc162.RoleValue, Amount: amt(100), IdentityKey: mandalatest.Holder.Identity, CreatedAt: now},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -476,7 +476,7 @@ func TestAppStartReconcilesTheBootUnionThenArmsTheInterval(t *testing.T) {
 	if err := app.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if row, _ := app.Store.GetTokenRow(ctx, iss.Txid, 1); row == nil || row.Amount != 100 || row.IdentityKey != mandalatest.Holder.Identity {
+	if row, _ := app.Store.GetTokenRow(ctx, iss.Txid, 1); row == nil || row.Amount.Cmp(amt(100)) != 0 || row.IdentityKey != mandalatest.Holder.Identity {
 		t.Fatalf("value row = %+v: the boot reconcile did not cover the topic the boot union registered", row)
 	}
 	if auth, _ := app.Store.GetAuthorityRow(ctx, iss.Txid, 0); auth == nil || auth.IdentityKey != mandalatest.Issuer.Identity {
@@ -684,7 +684,7 @@ func TestAppStartSweepsPhantomRowsAndRebuildsBalances(t *testing.T) {
 	holder := mandalatest.Holder.Identity
 	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
 	iss := mandalatest.Issue(t, dep, 0, mandalatest.Issuer, mandalatest.Holder, 100)
-	tokenID, topic := dep.Txid+"_0", "tm_"+dep.Txid
+	tokenID, topic := dep.Txid+"_0", mandala.TokenTopicOfTxid(dep.Txid)
 	phantom, unhosted := strings.Repeat("9", 64), strings.Repeat("8", 64)
 	if _, err := app.Store.StoreRegistryRecord(ctx, mandala.TokenRegistryRecord{
 		TokenID: tokenID, DeployTxid: dep.Txid, Sym: "USD", Dec: 2, Label: "US Dollar", Issuer: mandalatest.Issuer.Identity, CreatedAt: time.Now(),
@@ -701,19 +701,19 @@ func TestAppStartSweepsPhantomRowsAndRebuildsBalances(t *testing.T) {
 	now := time.Now()
 	if err := app.Store.RecordOwners(ctx, []mandala.OwnerRecord{
 		{Txid: iss.Txid, OutputIndex: 0, Topic: topic, TokenID: tokenID, Role: brc162.RoleAuthority, IdentityKey: mandalatest.Issuer.Identity, CreatedAt: now},
-		{Txid: iss.Txid, OutputIndex: 1, Topic: topic, TokenID: tokenID, Role: brc162.RoleValue, Amount: 100, IdentityKey: holder, CreatedAt: now},
+		{Txid: iss.Txid, OutputIndex: 1, Topic: topic, TokenID: tokenID, Role: brc162.RoleValue, Amount: amt(100), IdentityKey: holder, CreatedAt: now},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	for _, r := range []mandala.TokenRecord{
-		{Txid: phantom, OutputIndex: 0, TokenID: tokenID, Amount: 11, IdentityKey: holder, CreatedAt: now},
-		{Txid: unhosted, OutputIndex: 0, TokenID: unhosted + "_0", Amount: 13, IdentityKey: holder, CreatedAt: now},
+		{Txid: phantom, OutputIndex: 0, TokenID: tokenID, Amount: amt(11), IdentityKey: holder, CreatedAt: now},
+		{Txid: unhosted, OutputIndex: 0, TokenID: unhosted + "_0", Amount: amt(13), IdentityKey: holder, CreatedAt: now},
 	} {
 		if _, err := app.Store.StoreTokenIfAbsent(ctx, r); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := app.Store.AdjustBalance(ctx, holder, 999); err != nil {
+	if err := app.Store.AdjustBalance(ctx, holder, amt(999)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -726,10 +726,10 @@ func TestAppStartSweepsPhantomRowsAndRebuildsBalances(t *testing.T) {
 	if row, err := app.Store.GetTokenRow(ctx, unhosted, 0); err != nil || row == nil {
 		t.Fatalf("unregistered token's row = %+v (%v), want it untouched", row, err)
 	}
-	if row, err := app.Store.GetTokenRow(ctx, iss.Txid, 1); err != nil || row == nil || row.Amount != 100 {
+	if row, err := app.Store.GetTokenRow(ctx, iss.Txid, 1); err != nil || row == nil || row.Amount.Cmp(amt(100)) != 0 {
 		t.Fatalf("reconciled row = %+v (%v)", row, err)
 	}
-	if bal, err := app.Store.GetBalance(ctx, holder); err != nil || bal != 13+100 {
+	if bal, err := app.Store.GetBalance(ctx, holder); err != nil || bal.Cmp(amt(13+100)) != 0 {
 		t.Fatalf("holder balance = %d (%v), want 113 (rebuilt from the rows, then credited by the repair)", bal, err)
 	}
 	if s, msg := app.OwnerIndex.Readiness(); s != "ok" || msg != "" {

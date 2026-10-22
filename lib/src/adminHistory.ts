@@ -1,5 +1,6 @@
 import { OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 import { decodeAdminDetails, MandalaActionDetails } from './brc162.js'
+import { parseDecimalAmount } from './amount.js'
 
 /** One admin-history row (`GET /admin/admin-history/:tokenId`). */
 export interface AdminHistoryRow {
@@ -13,14 +14,17 @@ export interface AdminHistoryRow {
   detailsHex: string
   /** sha256(details) hex — also the authority keyID of this link. */
   commitment: string
-  /** Supply change of the action (issue > 0, redeem < 0, reissue = frozen amount). */
-  delta: number
+  /** Supply change of the action (issue > 0, redeem < 0, reissue = frozen amount). Exact. */
+  delta: bigint
   admitSeq?: number
   createdAt?: string
 }
 
-function toRow (e: any): AdminHistoryRow | null {
+/** A row, null when it is not a row, or 'bad-amount' when its delta is not a C§0 signed decimal string. */
+function toRow (e: any): AdminHistoryRow | null | 'bad-amount' {
   if (e == null || typeof e.txid !== 'string') return null
+  const delta = parseDecimalAmount(e.delta, true)
+  if (delta == null) return 'bad-amount'
   const detailsHex = typeof e.detailsHex === 'string' ? e.detailsHex : ''
   const actionDetails = decodeAdminDetails(detailsHex) ?? { kind: e.kind }
   return {
@@ -32,14 +36,25 @@ function toRow (e: any): AdminHistoryRow | null {
     actionDetails,
     detailsHex,
     commitment: typeof e.commitment === 'string' ? e.commitment : '',
-    delta: Number(e.delta) || 0,
+    delta,
     ...(typeof e.admitSeq === 'number' ? { admitSeq: e.admitSeq } : {}),
     ...(typeof e.createdAt === 'string' ? { createdAt: e.createdAt } : {})
   }
 }
 
-const toRows = (body: unknown): AdminHistoryRow[] =>
-  Array.isArray(body) ? body.map(toRow).filter((r): r is AdminHistoryRow => r != null) : []
+// A row whose delta is not a canonical decimal string is dropped, never coerced (C§0).
+function toRows (body: unknown): AdminHistoryRow[] {
+  if (!Array.isArray(body)) return []
+  const rows: AdminHistoryRow[] = []
+  let dropped = 0
+  for (const e of body) {
+    const r = toRow(e)
+    if (r === 'bad-amount') dropped++
+    else if (r != null) rows.push(r)
+  }
+  if (dropped > 0) console.warn(`[mandala] admin history: dropped ${dropped} row(s) whose delta is not a decimal string`)
+  return rows
+}
 
 export async function resolveAdminHistory (assetId: string): Promise<AdminHistoryRow[]> {
   if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
@@ -71,8 +86,9 @@ export async function resolveAdminHistoryPage (
 }
 
 export interface AdminSummary {
-  totalIssued: number
-  totalRedeemed: number
+  /** Exact, unbounded (sums may exceed 2^64). */
+  totalIssued: bigint
+  totalRedeemed: bigint
   actionCount: number
 }
 
@@ -87,11 +103,14 @@ export async function resolveAdminSummary (assetId: string): Promise<AdminSummar
     const res = await fetch(`${OVERLAY_URL}/admin/admin-summary/${encodeURIComponent(assetId)}`)
     if (!res.ok) return null
     const s = await res.json()
-    return {
-      totalIssued: Number(s.totalIssued) || 0,
-      totalRedeemed: Number(s.totalRedeemed) || 0,
-      actionCount: Number(s.actionCount) || 0
+    const totalIssued = parseDecimalAmount(s?.totalIssued)
+    const totalRedeemed = parseDecimalAmount(s?.totalRedeemed)
+    if (totalIssued == null || totalRedeemed == null) {
+      // Never coerced (C§0): a summary we cannot read exactly is no summary.
+      console.warn(`[mandala] admin summary for ${assetId}: totals are not decimal strings`)
+      return null
     }
+    return { totalIssued, totalRedeemed, actionCount: Number(s.actionCount) || 0 }
   } catch {
     return null
   }
@@ -106,8 +125,8 @@ const feeRateOf = (d: Record<string, unknown>): number | undefined => {
 }
 
 /** `delta` is the supply change the overlay recorded for the row (issue/redeem/reissue amounts). */
-export function describeAction (d: MandalaActionDetails, delta?: number): string {
-  const amt = delta != null ? `${Math.abs(delta)} units` : 'units'
+export function describeAction (d: MandalaActionDetails, delta?: bigint): string {
+  const amt = delta != null ? `${(delta < 0n ? -delta : delta).toString()} units` : 'units'
   switch (d.kind) {
     // bankRef is the sha256 of the off-chain deposit record (R12) — shown in
     // full so an auditor can match it against the bank's own record hash.
@@ -143,7 +162,7 @@ export function exportAdminHistoryCsv (rows: AdminHistoryRow[]): string {
       esc(String(r.actionDetails.bankRef ?? '')),
       esc(r.detailsHex),
       esc(r.commitment),
-      String(r.delta),
+      r.delta.toString(),
       String(r.height),
       String(r.offset),
       esc(describeAction(r.actionDetails, r.delta))

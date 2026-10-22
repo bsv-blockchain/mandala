@@ -22,11 +22,20 @@
  *      'accepted' and is broadcast exactly as the live path would. A final
  *      verdict on the retry, or RETRY_CAP fruitless passes, aborts the
  *      reference and drops the entry so the inputs are not held forever.
- *   2b. Journal 'handed_over' entries — an OFFLINE hand-over the payee owns
- *      the submission of (§0.1 rule 3). When this device is online it may
- *      submit too (rule 6, so its change becomes spendable promptly); the
- *      overlay's idempotent /submit makes the order between the two
- *      irrelevant. Treated exactly like 'retryable'.
+ *   2b. Journal 'delivered' entries — an acknowledged holder hand-over
+ *      (handover.ts). The sender submits the exact journaled bytes on
+ *      `[colorTopic(assetId)]`, verified against OVERLAY_IDENTITY_KEY, via
+ *      `resubmitDelivered` (the recipient may already have: /submit is
+ *      idempotent). Admitted ⇒ 'accepted' + broadcast (step 1's commit
+ *      point). Retryable or transport ⇒ attempts + 1, then 'stranded' at
+ *      RETRY_CAP — NEVER aborted, unlike a plain 'retryable' entry: the
+ *      recipient holds these bytes, so releasing the inputs would un-pay
+ *      them. Final ⇒ abort the reference + drop. Without an overlay
+ *      identity key (S5), or with a malformed one, every 'delivered' entry is
+ *      left untouched (no pass counted), with one warning per pass.
+ *      'signed' entries (not yet acknowledged) are never submitted, aborted
+ *      or swept; they are counted in
+ *      `handoversAwaitingDelivery` and redelivered by reconcileNotifications.
  *   3. Journal 'abort' entries — overlay rejected, abort pending: retry the
  *      abortAction that releases the held inputs. Kept (attempts++) on failure
  *      so a transient error never orphans the only durable record; handed to
@@ -44,6 +53,9 @@
  *
  * Whole pass runs under a cross-tab web lock: concurrent reconciles (two tabs,
  * init + settle overlap) skip instead of double-broadcasting / double-aborting.
+ * The hand-over branch is covered by the same lock; a live `settleHandover`
+ * of the same txid in this tab shares one in-flight submit (handover.ts), and
+ * one in another tab can at worst re-POST the same bytes (idempotent).
  *
  * Aborting a stuck action releases the old auth output → the asset reappears.
  */
@@ -51,8 +63,12 @@ import { Utils, WalletInterface } from '@bsv/sdk'
 import {
   admissionReceipt, broadcastAcceptedTx, isAlreadyBroadcast, OverlayRefusedError, submitToOverlay
 } from './overlay.js'
-import { JournalEntry, journalList, journalPut, journalRemove, INTENT_TTL_MS } from './txJournal.js'
+import {
+  isHandoverEntry, JournalEntry, journalGet, journalList, journalPut, journalRemove, INTENT_TTL_MS
+} from './txJournal.js'
 import { tryWithLock } from './webLocks.js'
+import { OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
+import { resubmitDelivered } from './handover.js'
 
 /**
  * wallet-toolbox listActions spec-op: intercepts this "label" to list actions
@@ -69,6 +85,9 @@ export const SPEC_OP_NOSEND_ACTIONS = 'ac6b20a3bb320adafecd637b25c84b792ad828d3a
  * swept. See `sweepStuckNoSendActions`.
  */
 const ACTION_TIME_FROM_ANY = 'action time from 0'
+
+/** The overlay identity key shape `settleHandover` accepts (handover.ts checkKey). */
+const COMPRESSED_KEY = /^0[23][0-9a-f]{64}$/
 
 /** After this many failed abort retries the bulk sweep owns the cleanup. */
 export const ABORT_RETRY_CAP = 5
@@ -137,10 +156,21 @@ export interface ReconcileResult {
   aborted: string[]
   /** Retryable refusals the overlay has now accepted (§9.11). */
   resubmitted: string[]
-  /** Accepted txids parked as 'stranded' this pass — kept, never auto-retried. */
+  /**
+   * Txids parked as 'stranded' this pass — kept, never auto-retried: accepted
+   * entries past BROADCAST_RETRY_CAP, and delivered hand-overs past RETRY_CAP.
+   * Only the first kind (admissionSignature set) may ever be broadcast; see
+   * `journalListStranded`.
+   */
   stranded: string[]
   /** Stuck nosend mandala actions released by the bulk sweep. */
   swept: number
+  /**
+   * 'signed' hand-overs the recipient has not acknowledged yet. Never
+   * submitted, aborted or swept; reconcileNotifications redelivers them.
+   * While any exists the bulk sweep does not run.
+   */
+  handoversAwaitingDelivery: number
   /** True when another reconcile (this tab or another) held the lock. */
   skipped?: boolean
 }
@@ -153,7 +183,7 @@ export async function reconcileWallet (
     await reconcilePass(wallet, opts.sweep !== false, opts.broadcast !== false)
   )
   if (!acquired || result == null) {
-    return { rebroadcast: [], aborted: [], resubmitted: [], stranded: [], swept: 0, skipped: true }
+    return { rebroadcast: [], aborted: [], resubmitted: [], stranded: [], swept: 0, handoversAwaitingDelivery: 0, skipped: true }
   }
   return result
 }
@@ -171,6 +201,8 @@ async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast
   const aborted: string[] = []
   const resubmitted: string[] = []
   const stranded: string[] = []
+  let handoversAwaitingDelivery = 0
+  let warnedUnconfigured = false
   const now = Date.now()
   /**
    * Every txid/reference this pass has seen an entry for, INCLUDING entries it
@@ -252,13 +284,33 @@ async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast
       // never blocking anything — the host decides what happens next.
       continue
     }
-    if (entry.stage === 'retryable' || entry.stage === 'handed_over') {
-      // A 'handed_over' entry is the payer's OPTIONAL later submit (offline
-      // settlement §0.1 rule 6): the payee may already have submitted, which
-      // is fine — /submit is idempotent and re-admission returns the same σ_I.
-      // Mechanically identical to a retryable refusal: re-POST the stored
-      // bytes, commit + broadcast on acceptance, abort at a final verdict or
-      // at RETRY_CAP.
+    if (entry.stage === 'signed') {
+      // A hand-over the recipient has not acknowledged yet: its bytes may
+      // already be in the recipient's hands, so it is never submitted (B5),
+      // never aborted and never swept. Redelivery is reconcileNotifications'.
+      handoversAwaitingDelivery++
+      continue
+    }
+    if (entry.stage === 'delivered') {
+      if (!COMPRESSED_KEY.test(OVERLAY_IDENTITY_KEY) || OVERLAY_URL === '') {
+        // S5 (or a malformed key): nothing can be submitted or verified. A
+        // configuration fault is not a verdict on the bytes, so no pass is
+        // counted toward stranding; the entry waits for configureMandala.
+        if (!warnedUnconfigured) {
+          warnedUnconfigured = true
+          const why = OVERLAY_IDENTITY_KEY === ''
+            ? OVERLAY_IDENTITY_KEY_UNSET
+            : OVERLAY_URL === '' ? OVERLAY_URL_UNSET : 'The overlay identity key is not a 66-hex compressed lowercase public key.'
+          console.warn(`[mandala] ${why} Delivered hand-overs are not submitted until it is configured.`)
+        }
+        continue
+      }
+      await settleDelivered(wallet, entry, { resubmitted, aborted, stranded }, broadcastAccepted)
+      continue
+    }
+    if (entry.stage === 'retryable') {
+      // Re-POST the stored bytes, commit + broadcast on acceptance, abort at
+      // a final verdict or at RETRY_CAP.
       await retryRefused(wallet, entry, resubmitted, broadcastAccepted)
       continue
     }
@@ -296,16 +348,92 @@ async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast
   const blocked = entries.some(e =>
     e.stage === 'accepted' ||
     e.stage === 'retryable' ||
-    // A handed-over tx's inputs are held ON PURPOSE — the payee holds evidence
-    // over these exact bytes, so sweeping the action would un-pay them.
-    e.stage === 'handed_over' ||
+    // A hand-over's inputs are held ON PURPOSE — the recipient holds (or is
+    // about to hold) these exact bytes, so sweeping the action would un-pay them.
+    e.stage === 'signed' ||
+    e.stage === 'delivered' ||
     (e.stage === 'intent' && Date.now() - e.at < INTENT_TTL_MS)
   )
   if (sweep && !blocked) {
     swept = await sweepStuckNoSendActions(wallet, seenTxids, seenRefs)
   }
 
-  return { rebroadcast, aborted, resubmitted, stranded, swept }
+  return { rebroadcast, aborted, resubmitted, stranded, swept, handoversAwaitingDelivery }
+}
+
+/**
+ * One pass over a 'delivered' hand-over (Task 15). The recipient acknowledged
+ * it, so the sender submits the exact journaled bytes through
+ * `resubmitDelivered` (no background broadcast: this pass broadcasts the
+ * 'accepted' entry itself, honouring `broadcast: false` and the attempt caps).
+ *
+ * Never aborted except on a FINAL verdict (which `resubmitDelivered` handles:
+ * abort + drop, or an 'abort' entry when the abort fails). Everything else —
+ * a retryable verdict, a transport failure, an entry this pass cannot submit
+ * (malformed, or bytes that no longer hash to the txid) — counts a pass, and
+ * at RETRY_CAP parks the entry as 'stranded': still protecting its action
+ * from the sweep by txid, surfaced by `journalListStranded`, never retried.
+ */
+async function settleDelivered (
+  wallet: WalletInterface,
+  entry: JournalEntry,
+  out: { resubmitted: string[], aborted: string[], stranded: string[] },
+  broadcastAccepted: (e: JournalEntry) => Promise<void>
+): Promise<void> {
+  const countPass = async (code?: string): Promise<void> => {
+    // resubmitDelivered already counted a retry on the stored entry; read it
+    // back rather than double-counting. Anything else counts here.
+    const current = await journalGet(entry.txid)
+    // Gone or moved on (a concurrent settle resolved it): nothing to count.
+    if (current?.stage !== 'delivered') return
+    const base = current
+    const attempts = code === undefined ? (base.attempts ?? 0) : (base.attempts ?? 0) + 1
+    const next: JournalEntry = { ...base, attempts, ...(code !== undefined ? { code } : {}) }
+    if (attempts >= RETRY_CAP) {
+      await journalPut({ ...next, stage: 'stranded' })
+      out.stranded.push(entry.txid)
+      console.warn(
+        `[mandala] delivered hand-over ${entry.txid} was not admitted after ${attempts} passes ` +
+        `(${next.code ?? 'unknown'}); parked as stranded (journalListStranded). It is never aborted: the recipient holds it.`
+      )
+    } else if (code !== undefined) {
+      await journalPut(next)
+    }
+  }
+
+  if (!isHandoverEntry(entry)) {
+    console.warn(`[mandala] delivered hand-over ${entry.txid} has an incomplete journal entry; it cannot be submitted from here`)
+    await countPass('ERR_JOURNAL')
+    return
+  }
+
+  let result
+  try {
+    result = await resubmitDelivered(wallet, entry, OVERLAY_IDENTITY_KEY, { broadcast: false })
+  } catch (e) {
+    const msg = (e as { message?: unknown })?.message
+    // S5 raced a reconfiguration: not a verdict, not a pass.
+    if (msg === OVERLAY_IDENTITY_KEY_UNSET || msg === OVERLAY_URL_UNSET) return
+    console.warn(`[mandala] delivered hand-over ${entry.txid} cannot be submitted from its journal entry:`, e)
+    await countPass('ERR_JOURNAL')
+    return
+  }
+
+  if (result.status === 'admitted') {
+    out.resubmitted.push(entry.txid)
+    // The commit point already wrote 'accepted' (with σ). Broadcast it here,
+    // unless a concurrent settle in this tab already broadcast and cleared it.
+    const accepted = await journalGet(entry.txid)
+    if (accepted?.stage === 'accepted') await broadcastAccepted(accepted)
+    return
+  }
+  if (result.status === 'refused') {
+    // Released and dropped; a failed abort left an 'abort' entry instead,
+    // which the next pass retries like any other.
+    if (await journalGet(entry.txid) == null) out.aborted.push(entry.txid)
+    return
+  }
+  await countPass()
 }
 
 /** One listed noSend action, reduced to what the sweep decides on. */
@@ -503,6 +631,11 @@ async function retryRefused (
     resubmitted.push(entry.txid)
     await broadcastAccepted(accepted)
   } catch (e) {
+    // S5: an unconfigured overlay (URL or identity key) never sent the bytes
+    // and judged nothing. It must not count toward RETRY_CAP, whose abort is
+    // a wallet mutation; the entry waits untouched for configureMandala.
+    const msg = (e as { message?: unknown })?.message
+    if (!(e instanceof OverlayRefusedError) && (msg === OVERLAY_IDENTITY_KEY_UNSET || msg === OVERLAY_URL_UNSET)) return
     // A refusal the contract calls final means these bytes will never be
     // admitted — retrying is pointless, so release the inputs now.
     const final = e instanceof OverlayRefusedError && !e.retryable

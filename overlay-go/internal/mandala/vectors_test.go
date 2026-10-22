@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -17,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/overlay"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
 )
 
@@ -62,7 +65,7 @@ type vectorToken struct {
 	Txid        string `json:"txid"`
 	OutputIndex uint32 `json:"outputIndex"`
 	TokenID     string `json:"tokenId"`
-	Amount      int64  `json:"amount"`
+	Amount      uint64 `json:"amount"`
 	IdentityKey string `json:"identityKey"`
 }
 
@@ -96,7 +99,7 @@ func (s vectorState) memStore() *memStore {
 	st := newMemStore()
 	epoch := time.Unix(0, 0).UTC()
 	for _, r := range s.Tokens {
-		st.putToken(TokenRecord{Txid: r.Txid, OutputIndex: r.OutputIndex, TokenID: r.TokenID, Amount: Amount(r.Amount), IdentityKey: r.IdentityKey, CreatedAt: epoch})
+		st.putToken(TokenRecord{Txid: r.Txid, OutputIndex: r.OutputIndex, TokenID: r.TokenID, Amount: amount.FromUint64(r.Amount), IdentityKey: r.IdentityKey, CreatedAt: epoch})
 	}
 	for _, r := range s.Authorities {
 		st.putAuthority(AuthorityRecord{Txid: r.Txid, OutputIndex: r.OutputIndex, Topic: r.Topic, TokenID: r.TokenID, IdentityKey: r.IdentityKey, CreatedAt: epoch})
@@ -182,6 +185,8 @@ func managerFor(t *testing.T, f rejectVectors, c rejectCase, st *memStore, repai
 		Screening:      screeningOver(c.State.Sanctioned),
 		Membership:     membershipOver(c.State.Members),
 		OnOwnerRepair:  onRepair,
+		// contract §4: the K every deploy's req names is the file's verifier
+		OverlayIdentityKey: v.IdentityKey(),
 	}
 	var m engine.TopicManager
 	switch {
@@ -224,6 +229,99 @@ func caseNamed(t *testing.T, v rejectVectors, id string) rejectCase {
 	return rejectCase{}
 }
 
+// The 1Color replay seam (design C9). mandala-rejects.json stays byte-for-byte pinned to the TS
+// parity reference, which 1Color deliberately makes stale in places. Every divergence is spelled
+// out here instead of in the file: vectorTopic maps the file's topic names to this overlay's, and
+// vectorOverrides replaces a case's expectation, each entry with a one-line reason.
+
+// vectorTopic maps a topic named in the vector file to the topic this overlay uses. It applies to
+// case.Topic and to every Topic in state.authorities and state.owners. The file names a token topic
+// tm_<deploy txid>; this overlay names it tm_color_<deploy txid>_0 (contract §0, design C1). Every
+// other name (tm_mandala, tm_mandala_kyc, malformed names) passes through unchanged. No file reason
+// embeds a token topic name, so the rename needs no override.
+func vectorTopic(topic string) string {
+	if m := legacyVectorTopic.FindStringSubmatch(topic); m != nil {
+		return TokenTopicOfTxid(m[1])
+	}
+	return topic
+}
+
+var legacyVectorTopic = regexp.MustCompile(`^tm_([0-9a-f]{64})$`)
+
+// vectorOverride is a reviewed replacement for one case's file expectation.
+type vectorOverride struct {
+	Expected rejectExpected
+	Why      string
+}
+
+// vectorOverrides is keyed by case id. TestVectorOverridesAreLive keeps every entry pointed at a
+// real case, reasoned, and different from the file.
+var vectorOverrides = map[string]vectorOverride{
+	// Task 2: the codec reads full strict DAG-CBOR (templates cbdccfe5b), so a float16 or a tag
+	// reaches its own check instead of the old blanket "not allowed" refusal.
+	"deploy-payload-float": {Why: fullDagCborWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: deploy payload is not a valid Mandala deploy map (float must be 64-bit)"}}, // sym: f93c00
+	"deploy-payload-tag": {Why: fullDagCborWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: deploy payload is not a valid Mandala deploy map (invalid CID)"}}, // sym: d82a + text "USD"
+	"details-tag": {Why: fullDagCborWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: admin details violate the schema (invalid CID)"}}, // kind: d82a + text "issue"
+	"details-float": {Why: fullDagCborWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: admin details violate the schema (float must be 64-bit)"}}, // feeRatePerKb: f93c00
+
+	// Task 3: the codec is OneColor (templates cbdccfe5b), so its token-id message names 32- or
+	// 36-byte pushes, and a canonical 36-byte id parses and is then refused as Mandala policy.
+	"token-id-pushdata1": {Why: oneColorIDWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 1: token-shaped output is not a valid BRC-162 token output (token id must be a direct 32- or 36-byte push)"}},
+	"token-id-31-bytes": {Why: oneColorIDWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 1: token-shaped output is not a valid BRC-162 token output (token id must be a direct 32- or 36-byte push)"}},
+	"token-shaped-garbage": {Why: oneColorIDWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 1: token-shaped output is not a valid BRC-162 token output (token id must be a direct 32- or 36-byte push)"}}, // 02dead: a 2-byte id push
+	"token-id-36-bytes": {Why: oneColorIDWhy, Expected: rejectExpected{Code: "ERR_SHAPE", // id ab..ab ‖ 01020304 = vout 0x04030201
+		Reason: "output 1: legacy 36-byte token id " + strings.Repeat("ab", 32) + "_67305985 is refused by Mandala policy (32-byte ids only)"}},
+
+	// Task 6: no 2^53 cap on an amount, a sum or the supply; only the storage-range bound remains.
+	// The lone 2^53 output carries no linkage, so the next layer-B rule refuses it. The issue of
+	// 2^53-1 + 1 (value sum 2^53) and the issue of 1 onto a supply of 2^53-1 are admitted exactly.
+	"amount-above-2^53-1": {Why: uint64Why, Expected: rejectExpected{Code: "ERR_LINKAGE",
+		Reason: "output 0: token output with no verified linkage"}},
+	"value-sum-above-2^53-1":          {Why: uint64Why, Expected: rejectExpected{OutputsToAdmit: &[]uint32{0, 1, 2}, CoinsToRetain: &[]uint32{0}}},
+	"circulating-supply-above-2^53-1": {Why: uint64Why, Expected: rejectExpected{OutputsToAdmit: &[]uint32{0, 1}, CoinsToRetain: &[]uint32{0}}},
+
+	// Task 9: TS deploys carry no req. The req check runs after sym/dec/label/feeRatePerKb, deploySig
+	// and the trusted-issuer rules (contract §4 step 2), so only the two deploys that pass all of
+	// those flip; every other deploy case keeps its file reason.
+	"admit-signed-deploy": {Why: mandalaReqWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: deploy payload is not a valid Mandala deploy map (missing key req)"}},
+	"registry-admits-a-signed-deploy": {Why: mandalaReqWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: deploy payload is not a valid Mandala deploy map (missing key req)"}},
+}
+
+const mandalaReqWhy = "Mandala deploys must declare req = attested(identity K) + issuer-v1(K) (contract §4, design C3)"
+
+const uint64Why = "uint64 end to end (design §2 goal 2, 0162:140-143); caps removed"
+
+const fullDagCborWhy = "full strict DAG-CBOR (0162:148); Mandala payload policy 65536 B / depth 64 (contract §4.1)"
+
+const oneColorIDWhy = "OneColor 36-byte ids parse in the codec; Mandala refuses them as policy (0162:113-115, design §4.2)"
+
+// replayCase is c as this overlay replays it: topics through vectorTopic and the expectation
+// through vectorOverrides. The state slices are cloned, so the loaded file is never mutated.
+func replayCase(c rejectCase) rejectCase {
+	c.Topic = vectorTopic(c.Topic)
+	c.State.Authorities = slices.Clone(c.State.Authorities)
+	for i := range c.State.Authorities {
+		c.State.Authorities[i].Topic = vectorTopic(c.State.Authorities[i].Topic)
+	}
+	c.State.Owners = slices.Clone(c.State.Owners)
+	for i := range c.State.Owners {
+		c.State.Owners[i].Topic = vectorTopic(c.State.Owners[i].Topic)
+	}
+	if o, ok := vectorOverrides[c.ID]; ok {
+		c.Expected = o.Expected
+	}
+	return c
+}
+
 func TestRejectVectorsHaveTheShapeGoReads(t *testing.T) {
 	v := loadRejectVectors(t)
 	if v.ID != "mandala.rejects" || v.Version != 2 {
@@ -244,15 +342,15 @@ func TestRejectVectorsHaveTheShapeGoReads(t *testing.T) {
 			t.Fatalf("duplicate case id %s", c.ID)
 		}
 		ids[c.ID] = true
-		switch {
-		case IsTokenTopic(c.Topic):
-			tokenTopics[c.Topic] = true
-		case c.Topic == MandalaTopic:
+		switch topic := vectorTopic(c.Topic); {
+		case IsTokenTopic(topic):
+			tokenTopics[topic] = true
+		case topic == MandalaTopic:
 			registry++
-		case c.Topic == KYCTopic:
+		case topic == KYCTopic:
 			kyc++
 		default:
-			t.Fatalf("%s: topic %q is neither a token topic, tm_mandala nor tm_mandala_kyc", c.ID, c.Topic)
+			t.Fatalf("%s: topic %q (file %q) is neither a token topic, tm_mandala nor tm_mandala_kyc", c.ID, topic, c.Topic)
 		}
 		e := c.Expected
 		admits := e.OutputsToAdmit != nil || e.CoinsToRetain != nil
@@ -285,7 +383,8 @@ func TestRejectVectorsHaveTheShapeGoReads(t *testing.T) {
 
 func TestRejectVectorsReplay(t *testing.T) {
 	v := loadRejectVectors(t)
-	for _, c := range v.Cases {
+	for _, fc := range v.Cases {
+		c := replayCase(fc)
 		t.Run(c.ID, func(t *testing.T) {
 			var repairs []string
 			got, err := runVector(t, v, c, c.State.memStore(), &repairs)
@@ -312,7 +411,8 @@ func TestRejectVectorsReplay(t *testing.T) {
 
 func TestRejectVectorsJournalEveryAdmittedOutput(t *testing.T) {
 	v := loadRejectVectors(t)
-	for _, c := range v.Cases {
+	for _, fc := range v.Cases {
+		c := replayCase(fc)
 		if c.Expected.OutputsToAdmit == nil {
 			continue
 		}
@@ -342,7 +442,7 @@ func TestRejectVectorsJournalEveryAdmittedOutput(t *testing.T) {
 
 func TestRejectVectorsRepairTheMissingOwnerRowInline(t *testing.T) {
 	v := loadRejectVectors(t)
-	c := caseNamed(t, v, "admit-transfer-repairing-the-owner-row")
+	c := replayCase(caseNamed(t, v, "admit-transfer-repairing-the-owner-row"))
 	var lost *OwnerRecord
 	for i := range c.State.Owners {
 		if c.State.Owners[i].Role == "value" {
@@ -365,7 +465,30 @@ func TestRejectVectorsRepairTheMissingOwnerRowInline(t *testing.T) {
 		t.Fatalf("token rows = %+v, want exactly the repaired row", st.tokens)
 	}
 	r := st.tokens[0]
-	if r.Txid != lost.Txid || r.OutputIndex != lost.OutputIndex || r.TokenID != lost.TokenID || r.Amount != lost.Amount || r.IdentityKey != lost.IdentityKey {
+	if r.Txid != lost.Txid || r.OutputIndex != lost.OutputIndex || r.TokenID != lost.TokenID || r.Amount.Cmp(lost.Amount) != 0 || r.IdentityKey != lost.IdentityKey {
 		t.Fatalf("repaired row = %+v, want the journal row %+v", r, *lost)
+	}
+}
+
+func TestVectorOverridesAreLive(t *testing.T) {
+	v := loadRejectVectors(t)
+	byID := map[string]rejectCase{}
+	for _, c := range v.Cases {
+		byID[c.ID] = c
+	}
+	for id, o := range vectorOverrides {
+		c, ok := byID[id]
+		if !ok {
+			t.Fatalf("override %q names no case", id)
+		}
+		if strings.TrimSpace(o.Why) == "" {
+			t.Fatalf("override %q has no reason", id)
+		}
+		if reflect.DeepEqual(c.Expected, o.Expected) {
+			t.Fatalf("override %q equals the file's expectation", id)
+		}
+	}
+	if vectorTopic("tm_mandala") != "tm_mandala" {
+		t.Fatal("registry topic must not be remapped")
 	}
 }
