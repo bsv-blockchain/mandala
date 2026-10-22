@@ -1,5 +1,5 @@
 <!--
-Pinned verbatim copy of tokens/0162.md from https://github.com/bitcoin-sv/BRCs/blob//tokens/0162.md, fetched 2026-10-21 (final/published). Do not edit.
+Pinned verbatim copy of tokens/0162.md from https://github.com/bitcoin-sv/BRCs/blob/5119a9b5148e9ec90eb4865b16f9f732a29703df/tokens/0162.md, fetched 2026-10-21 (final/published). Do not edit.
 -->
 
 # BRC-162: 1Color

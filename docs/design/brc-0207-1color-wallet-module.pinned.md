@@ -1,5 +1,5 @@
 <!--
-Pinned verbatim copy of wallet/0207.md from https://github.com/bitcoin-sv/BRCs/blob//wallet/0207.md, fetched 2026-10-21 (final/published). Do not edit.
+Pinned verbatim copy of wallet/0207.md from https://github.com/bitcoin-sv/BRCs/blob/5119a9b5148e9ec90eb4865b16f9f732a29703df/wallet/0207.md, fetched 2026-10-21 (final/published). Do not edit.
 -->
 
 # BRC-207: 1Color Wallet Module
