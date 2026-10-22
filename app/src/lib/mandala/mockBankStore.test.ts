@@ -71,6 +71,17 @@ describe('mockBankStore (bigint feed, decimal-string persistence)', () => {
     expect(deserializeTransfers(ls.getItem(MOCK_BANK_KEY)).map(r => r.id)).toEqual(['z', 'y', 'x'])
   })
 
+  it('quota (setItem throws, getItem works): earlier in-memory rows are not dropped', async () => {
+    const ls = memStorage()
+    ls.setItem = () => { throw new Error('QuotaExceededError') }
+    vi.stubGlobal('localStorage', ls)
+    vi.resetModules()
+    const store = await import('./mockBankStore')
+    store.addMockTransfer(t)
+    store.addMockTransfer({ ...t, id: 'y' })
+    expect(store.currentMockTransfers().map(r => r.id)).toEqual(['y', 'x'])
+  })
+
   it('storage unavailable: mutations still apply in memory', async () => {
     vi.stubGlobal('localStorage', {
       getItem: () => { throw new Error('denied') },

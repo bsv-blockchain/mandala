@@ -96,13 +96,22 @@ function notify (): void {
   listeners.forEach(l => l())
 }
 
+// Set while the last write failed (quota): storage is then older than memory,
+// so it must not be the base of the next mutation.
+let writeFailed = false
+
 /** Read-modify-write against the freshest copy (another tab may have written since). */
 function update (fn: (current: MockTransfer[]) => MockTransfer[]): void {
-  const next = fn(readStored() ?? transfers)
+  const next = fn(writeFailed ? transfers : (readStored() ?? transfers))
   transfers = next
   try {
-    if (typeof localStorage !== 'undefined') localStorage.setItem(MOCK_BANK_KEY, serializeTransfers(next))
-  } catch { /* quota/unavailable — in-memory copy still holds */ }
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(MOCK_BANK_KEY, serializeTransfers(next))
+      writeFailed = false
+    }
+  } catch {
+    writeFailed = true // quota/unavailable — in-memory copy still holds
+  }
   notify()
 }
 
