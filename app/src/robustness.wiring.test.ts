@@ -8,17 +8,12 @@ import { readFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-// This file lives at app/src/; app modules resolve against it, the extracted
-// @bsv/mandala package sources live at <repo>/lib/src.
+// This file lives at app/src/; app modules resolve against it. Lib-source
+// invariants are owned by @bsv/mandala's own suite (contract §8.1), not scanned here.
 const appSrc = dirname(fileURLToPath(import.meta.url))
-const libSrc = resolve(appSrc, '../../lib/src')
 
 function src(rel: string): string {
   return readFileSync(resolve(appSrc, rel), 'utf8')
-}
-
-function lib(rel: string): string {
-  return readFileSync(resolve(libSrc, rel), 'utf8')
 }
 
 describe('robustness wiring (shipped source)', () => {
@@ -39,28 +34,6 @@ describe('robustness wiring (shipped source)', () => {
     expect(s).toContain('BusyError')
     expect(s).toContain('guardPositiveAmount')
     expect(s).toContain('sendFlight.release')
-  })
-
-  it('issuerOps + submitAdminAction share withAdminAuthGate; redeem asserts prior before FT load', () => {
-    const issue = lib('issuerOps.ts')
-    const assets = lib('assets.ts')
-    const ftc = lib('ftCandidates.ts')
-    expect(issue).toContain('withAdminAuthGate')
-    expect(issue).toContain('assertSpendablePrior')
-    expect(assets).toContain('withAdminAuthGate')
-    expect(assets).toContain('assertSpendablePrior')
-    // redeemTokens fails fast on a stale prior via loadFtCandidates'
-    // requireSpendable, which asserts against the first basket listing —
-    // before the heavier BEEF/listActions work (skeptic gap).
-    const redeemFn = issue.slice(issue.indexOf('export async function redeemTokens'))
-    expect(redeemFn).toContain('requireSpendable')
-    expect(redeemFn).toContain('guardRedeemSubmit')
-    expect(ftc).toContain('assertSpendablePrior')
-    const assertIdx = ftc.indexOf('assertSpendablePrior(')
-    const beefIdx = ftc.indexOf("include: 'entire transactions'")
-    expect(assertIdx).toBeGreaterThan(-1)
-    expect(beefIdx).toBeGreaterThan(-1)
-    expect(assertIdx).toBeLessThan(beefIdx)
   })
 
   it('IssuerPanel and RegisterAssetStrip use sync re-entry refs + guards', () => {
@@ -88,19 +61,14 @@ describe('robustness wiring (shipped source)', () => {
   it('IdentityRegistry mock-KYC uses registryFlight and compressed-key guard', () => {
     const ui = src('components/issuer/IdentityRegistry.tsx')
     const mut = src('hooks/useRegistryMutations.ts')
-    const libReg = lib('registry.ts')
     expect(ui).toContain('registryFlight')
     expect(ui).toContain('guardIdentityKey')
     expect(ui).toContain('startedRef')
     expect(ui).toContain('Re-attach identity chain')
     expect(ui).toContain('handleOpen')
     expect(mut).toContain('mockKycOpen')
-    expect(libReg).toContain('recoverRegistryAuth')
     expect(mut).toContain('mockKycAdmit')
     expect(mut).toContain('mockKycRevoke')
-    expect(libReg).toContain('registryFlight.run')
-    expect(libReg).toContain('nextRegistryPlan')
-    expect(libReg).toContain('runAuthorityTx')
   })
 
   it('useIssuerMutations wraps register in registerFlight and pre-gates amounts', () => {
@@ -133,133 +101,10 @@ describe('robustness wiring (shipped source)', () => {
     expect(guardIdx).toBeLessThan(adjustIdx)
   })
 
-  it('reconcile prioritizes accepted rebroadcast; sweep blocked by accepted + fresh intents', () => {
-    const s = lib('reconcile.ts')
-    expect(s).toContain("entry.stage === 'accepted'")
-    expect(s).toContain('broadcastAcceptedTx')
-    // Sweep must stay away while an overlay-accepted tx awaits broadcast OR a
-    // live pipeline's intent marker is fresh.
-    expect(s).toMatch(/e\.stage === 'accepted' \|\|[\s\S]*e\.stage === 'intent'/)
-    expect(s).toContain('INTENT_TTL_MS')
-    // Cross-tab: the whole pass runs under a web lock.
-    expect(s).toContain("tryWithLock('mandala.reconcile'")
-    // Failed aborts are retained (attempts++), not dropped on first failure.
-    expect(s).toContain('ABORT_RETRY_CAP')
-    // §9.11: a retryable refusal is re-submitted then released; an accepted tx
-    // whose broadcast keeps failing is parked, not retried forever.
-    expect(s).toContain('RETRY_CAP')
-    expect(s).toContain('BROADCAST_RETRY_CAP')
-    expect(s).toContain("stage: 'stranded'")
-    expect(s).toMatch(/e\.stage === 'retryable'/)
-  })
-
-  it('txJournal stages cover the four recovery states plus intent, with per-entry atomic keys', () => {
-    const s = lib('txJournal.ts')
-    // 'retryable' and 'stranded' are amendment v2.1 §9.11: a liftable refusal
-    // leaves a live action that needs a durable record, and an accepted tx whose
-    // broadcast never lands must stop wedging reconcile.
-    expect(s).toContain("stage: 'intent' | 'accepted' | 'abort' | 'retryable' | 'stranded'")
-    expect(s).toContain('journalListStranded')
-    expect(s).toContain("'mandala.txJournal.'") // per-entry key prefix
-    expect(s).not.toMatch(/stage:.*pending/)
-  })
-
-  it('pipelines run under intent markers and cross-tab locks', () => {
-    const transfer = lib('transfer.ts')
-    const issuer = lib('issuerOps.ts')
-    const assets = lib('assets.ts')
-    expect(transfer).toContain('journalIntentBegin')
-    expect(transfer).toContain("tryWithLock('mandala.send'")
-    expect(issuer.match(/withIntent\(/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
-    expect(assets).toContain('withIntent(')
-    expect(lib('adminAuthGate.ts')).toContain('tryWithLock(`mandala.admin.')
-  })
-
-  it('receive verifies the transaction against the message body before internalizing', () => {
-    const s = lib('receive.ts')
-    expect(s).toContain('verifyIncoming(msg)')
-    expect(s).toContain('InvalidTransferError')
-    expect(s).toContain('isAlreadyInternalized')
-  })
-
-  it('transfer journals the recipient notification before sending it', () => {
-    const transfer = lib('transfer.ts')
-    expect(transfer).toContain('notifyPut(')
-    expect(transfer).toContain('notifyRemove(')
-    const putIdx = transfer.indexOf('notifyPut(')
-    const sendIdx = transfer.indexOf('messageBoxClient.sendMessage', putIdx)
-    expect(putIdx).toBeGreaterThan(-1)
-    expect(sendIdx).toBeGreaterThan(putIdx)
-  })
-
-  it('A08: submitAdminAction journals the reissue notification before sending; the console surfaces a pending notify', () => {
-    const assets = lib('assets.ts')
-    const putIdx = assets.indexOf('notifyPut(')
-    const sendIdx = assets.indexOf('messageBoxClient.sendMessage', putIdx)
-    expect(putIdx).toBeGreaterThan(-1)
-    expect(sendIdx).toBeGreaterThan(putIdx)
-    expect(assets).toContain('notifyRemove(')
-    expect(assets).toContain("senderMode: 'unblinded'")
-    expect(assets).toContain('outputIndex: res.valueIndices[0]')
+  it('A08: the console surfaces a pending reissue notify', () => {
     const rc = src('components/issuer/RegulatoryControls.tsx')
     expect(rc).toContain('notified')
     expect(rc).toMatch(/recipient notification pending/i)
-  })
-
-  it('A15: registerAsset runs under intent + the mandala.register lock; global admin action under the composed gate', () => {
-    const issuer = lib('issuerOps.ts')
-    const assets = lib('assets.ts')
-    expect(issuer).toContain("tryWithLock('mandala.register'")
-    expect(issuer.match(/withIntent\(/g)?.length ?? 0).toBeGreaterThanOrEqual(3)
-    const globalFn = assets.slice(assets.indexOf('export async function submitGlobalAdminAction'))
-    expect(globalFn).toContain('withAdminAuthGates(')
-    expect(globalFn).toContain('withIntent(')
-    expect(globalFn).toContain('spendableBeef(')
-  })
-
-  it('D3c: the three journals persist only through the injected storage adapter', () => {
-    for (const file of ['txJournal.ts', 'notifyJournal.ts', 'blindingJournal.ts']) {
-      const s = lib(file)
-      // The adapter owns the platform guard; a journal reaching for
-      // localStorage directly is exactly the RN-unsafe path D3c removed.
-      expect(s).not.toContain('localStorage !==')
-      expect(s).toContain("from './storage.js'")
-      expect(s).toContain('getStorage()')
-      // No memory mirror in front of the store — a second reader must never
-      // be served an entry the store no longer has.
-      expect(s).not.toMatch(/new Map<string, (JournalEntry|PendingNotification|BlindingRecord)>\(memory\)/)
-    }
-    const storage = lib('storage.ts')
-    expect(storage).toContain('export interface MandalaStorage')
-    expect(storage).toContain('export function configureStorage')
-    expect(storage).toContain('export function getStorage')
-    expect(storage).toContain('typeof localStorage !==')
-    // configureMandala stays the single entry point (D3a) and now carries it.
-    expect(lib('constants.ts')).toContain('configureStorage(endpoints.storage)')
-  })
-
-  it("D3c: the 'accepted' commit-point write is awaited before the background broadcast", () => {
-    const s = lib('overlay.ts')
-    const put = s.indexOf("await journalPut({\n    txid: signed.txid,\n    stage: 'accepted'")
-    const broadcast = s.indexOf('broadcastAcceptedTx(wallet, signed.txid)')
-    expect(put).toBeGreaterThan(-1)
-    expect(broadcast).toBeGreaterThan(put)
-    // Every journal call site awaits: an un-awaited one reopens the crash window.
-    const calls = ['journalPut(', 'journalRemove(', 'journalIntentBegin(', 'journalIntentEnd(', 'notifyPut(', 'notifyRemove(', 'blindingPut(']
-    const unawaited: string[] = []
-    let sites = 0
-    for (const file of ['overlay.ts', 'transfer.ts', 'assets.ts', 'reconcile.ts', 'notifyJournal.ts']) {
-      for (const line of lib(file).split('\n')) {
-        const trimmed = line.trim()
-        // Imports name the symbols without calling them; so does the export.
-        if (trimmed.startsWith('import') || trimmed.startsWith('export ') || trimmed.startsWith('*') || trimmed.startsWith('//')) continue
-        if (!calls.some(c => trimmed.includes(c))) continue
-        sites++
-        if (!trimmed.includes('await ')) unawaited.push(`${file}: ${trimmed}`)
-      }
-    }
-    expect(sites).toBeGreaterThanOrEqual(18) // the enumerated D3c call sites
-    expect(unawaited).toEqual([])
   })
 
   it('A18: the post-mutation asset-state refresh bypasses the lib memo', () => {
@@ -270,14 +115,12 @@ describe('robustness wiring (shipped source)', () => {
   it('the note SendTokens captures reaches transferTokens, not just the Review screen', () => {
     const ui = src('components/SendTokens.tsx')
     const mut = src('hooks/useSendMutation.ts')
-    const transfer = lib('transfer.ts')
     // The field exists and is shown back on Review (already true) — the gap is
     // whether it is actually sent anywhere beyond that.
     expect(ui).toContain('const [note, setNote] = useState')
     expect(ui).toMatch(/sendMutation\.mutate\(\s*\{[\s\S]*?note[\s\S]*?\}/)
     expect(mut).toMatch(/interface SendVars\s*\{[\s\S]*?note\??:\s*string/)
     expect(mut).toMatch(/transferTokens\(\{[\s\S]*?note[\s\S]*?\}/)
-    expect(transfer).toContain('note?: string')
   })
 
   it('A14: IssuerPanel hashes the deposit ref client-side and the issue mutation passes depositHash through the guard + issueTokens', () => {

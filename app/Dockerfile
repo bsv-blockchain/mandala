@@ -3,6 +3,9 @@
 FROM node:22-alpine AS build
 WORKDIR /src
 
+# Vendored unpublished @bsv tarballs (contract §9): both lib and app install from them.
+COPY vendor-ts-stack vendor-ts-stack
+
 # Install lib deps without running its `prepare` build (sources not copied yet).
 COPY lib/package.json lib/package-lock.json lib/
 RUN cd lib && npm ci --ignore-scripts
