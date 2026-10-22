@@ -5,6 +5,8 @@
  * { ok: false, reason } with a human-readable reason.
  */
 
+import { MAX_UINT64 } from './amount.js'
+
 export type GuardResult = { ok: true } | { ok: false; reason: string }
 
 function fail(reason: string): GuardResult {
@@ -13,16 +15,20 @@ function fail(reason: string): GuardResult {
 
 const ok: GuardResult = { ok: true }
 
-/** Positive integer base units (on-chain amount). */
-export function guardPositiveAmount(amount: number): GuardResult {
-  if (!Number.isFinite(amount) || Number.isNaN(amount)) {
-    return fail('Amount is not a valid number')
-  }
-  if (!Number.isInteger(amount)) {
+/**
+ * Positive integer base units within the per-output uint64 token range
+ * (0 < amount ≤ MAX_UINT64). A non-bigint (an unconverted JS number) is refused:
+ * `1.5 > 0n` is true in JS, so a type check is the only safe gate.
+ */
+export function guardPositiveAmount(amount: bigint): GuardResult {
+  if (typeof amount !== 'bigint') {
     return fail('Amount must be a whole number of base units')
   }
-  if (amount <= 0) {
+  if (amount <= 0n) {
     return fail('Amount must be greater than zero')
+  }
+  if (amount > MAX_UINT64) {
+    return fail('Amount exceeds the uint64 token range')
   }
   return ok
 }
@@ -30,8 +36,9 @@ export function guardPositiveAmount(amount: number): GuardResult {
 export interface SendSubmitInput {
   assetId: string
   recipientKey: string
-  amount: number
-  balance: number
+  amount: bigint
+  /** Spendable balance: an unbounded exact sum (may exceed 2^64). */
+  balance: bigint
   /** When true and not bypassed, reject before any wallet work. */
   isPaused: boolean
   /** Dev mode intentionally reaches the overlay on a paused asset. */
@@ -55,9 +62,9 @@ export function guardSendSubmit(input: SendSubmitInput): GuardResult {
 
 export interface IssueRedeemSubmitInput {
   assetId: string
-  amount: number
+  amount: bigint
   /** Redeem only — must not burn more than held. Issue has no upper bound here. */
-  balance?: number
+  balance?: bigint
   walletReady: boolean
   /**
    * Issue only — sha256 hex of the off-chain deposit record, committed on-chain

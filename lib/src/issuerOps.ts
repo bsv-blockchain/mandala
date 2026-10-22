@@ -193,7 +193,16 @@ export interface RedeemParams {
 
 export async function redeemTokens (p: RedeemParams): Promise<IssuerOpResult> {
   const { wallet, identityKey, asset, amount, balance } = p
-  const amountGate = guardRedeemSubmit({ assetId: asset.assetId, amount, balance, walletReady: true })
+  // Transitional (Task 9 makes RedeemParams bigint): convert at this boundary.
+  // A non-integer number is passed through unconverted so the guard refuses it
+  // with its own reason instead of BigInt() throwing a RangeError.
+  const units = (n: number): bigint => (Number.isInteger(n) ? BigInt(n) : (n as unknown as bigint))
+  const amountGate = guardRedeemSubmit({
+    assetId: asset.assetId,
+    amount: units(amount),
+    balance: balance == null ? undefined : units(balance),
+    walletReady: true
+  })
   if (!amountGate.ok) throw new Error(amountGate.reason)
 
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
