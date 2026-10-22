@@ -20,7 +20,7 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { LockingScript, PrivateKey, ProtoWallet, PublicKey, Transaction, Utils } from '@bsv/sdk'
+import { Beef, LockingScript, PrivateKey, ProtoWallet, PublicKey, Transaction, Utils } from '@bsv/sdk'
 import { OneColor } from '@bsv/templates'
 import { decodeEnvelope, type SpecificLinkage } from './encoding.js'
 import { decodeToken, readDeploy } from './brc162.js'
@@ -101,6 +101,11 @@ describe('envelope fixture is self-consistent', () => {
       expect(p.id('hex')).toBe(t.txid)
       expect(p.toHex()).toBe(t.rawTxHex)
       expect(Utils.toHex(p.toAtomicBEEF())).toBe(t.atomicBeefHex)
+      // Structurally complete (no dangling source): overlay-go's BEEF check
+      // runs first. Funding is synthetic and unproven (no BUMPs, plan 04 R1).
+      const beef = Beef.fromBinary(Utils.toArray(t.atomicBeefHex, 'hex'))
+      expect(beef.atomicTxid).toBe(t.txid)
+      expect(beef.isValid(false)).toBe(true)
     }
   })
 

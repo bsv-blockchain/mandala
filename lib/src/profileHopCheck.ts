@@ -6,7 +6,11 @@
  * `admitReceipt` answers `unavailable` and the color module may credit the
  * receipt offline (`color_offline`) on attested evidence. The module's
  * frontier validator proves every unanchored hop descends from attested
- * outputs (S1), but it knows nothing of Mandala policy. Without these checks
+ * outputs (S1), but it knows nothing of Mandala policy. (In module 0.2.0 the
+ * frontier validator runs before `admitReceipt` and already refuses a hop
+ * whose value outputs exceed its inputs, so rule 1 is defense in depth there;
+ * rules 2-5 are reachable only here. Pinned by Task 22's integration test.)
+ * Without these checks
  * the wallet would credit value the overlay later refuses for good
  * (ERR_CONSERVATION, ERR_SATOSHIS, ERR_SHAPE, ERR_LINKAGE). So every
  * unanchored hop is checked here, against the same rules the overlay applies:
