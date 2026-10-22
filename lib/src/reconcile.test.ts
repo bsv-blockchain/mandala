@@ -758,6 +758,21 @@ describe('reconcileWallet — hand-over entries (signed / delivered, Task 15)', 
     }
   })
 
+  it('a malformed overlay identity key is a configuration fault: delivered entries are skipped, never counted toward stranding', async () => {
+    configureMandala({ overlayIdentityKey: OVERLAY_KEY.toUpperCase() })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await journalPut(handover({ attempts: RETRY_CAP - 1 }))
+      const r = await reconcileWallet(mkWallet() as any)
+      expect(mockFetch).not.toHaveBeenCalled()
+      expect(r.stranded).toEqual([])
+      expect(await journalList()).toMatchObject([{ txid: SUBJECT_TXID, stage: 'delivered', attempts: RETRY_CAP - 1 }])
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
   it('a delivered entry whose journaled bytes do not hash to its txid is never submitted or aborted, and the pass goes on', async () => {
     await journalPut(handover({ txid: 'f'.repeat(64), at: 1 }))
     await journalPut({ txid: 'bb', stage: 'abort', reference: 'ref-b', at: 2 })

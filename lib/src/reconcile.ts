@@ -31,9 +31,10 @@
  *      RETRY_CAP — NEVER aborted, unlike a plain 'retryable' entry: the
  *      recipient holds these bytes, so releasing the inputs would un-pay
  *      them. Final ⇒ abort the reference + drop. Without an overlay
- *      identity key (S5) every 'delivered' entry is left untouched, with one
- *      warning per pass. 'signed' entries (not yet acknowledged) are never
- *      submitted, aborted or swept; they are counted in
+ *      identity key (S5), or with a malformed one, every 'delivered' entry is
+ *      left untouched (no pass counted), with one warning per pass.
+ *      'signed' entries (not yet acknowledged) are never submitted, aborted
+ *      or swept; they are counted in
  *      `handoversAwaitingDelivery` and redelivered by reconcileNotifications.
  *   3. Journal 'abort' entries — overlay rejected, abort pending: retry the
  *      abortAction that releases the held inputs. Kept (attempts++) on failure
@@ -84,6 +85,9 @@ export const SPEC_OP_NOSEND_ACTIONS = 'ac6b20a3bb320adafecd637b25c84b792ad828d3a
  * swept. See `sweepStuckNoSendActions`.
  */
 const ACTION_TIME_FROM_ANY = 'action time from 0'
+
+/** The overlay identity key shape `settleHandover` accepts (handover.ts checkKey). */
+const COMPRESSED_KEY = /^0[23][0-9a-f]{64}$/
 
 /** After this many failed abort retries the bulk sweep owns the cleanup. */
 export const ABORT_RETRY_CAP = 5
@@ -286,15 +290,16 @@ async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast
       continue
     }
     if (entry.stage === 'delivered') {
-      if (OVERLAY_IDENTITY_KEY === '' || OVERLAY_URL === '') {
-        // S5: nothing can be submitted or verified. Not a verdict on the
-        // bytes, so no pass is counted; the entry waits for configureMandala.
+      if (!COMPRESSED_KEY.test(OVERLAY_IDENTITY_KEY) || OVERLAY_URL === '') {
+        // S5 (or a malformed key): nothing can be submitted or verified. A
+        // configuration fault is not a verdict on the bytes, so no pass is
+        // counted toward stranding; the entry waits for configureMandala.
         if (!warnedUnconfigured) {
           warnedUnconfigured = true
-          console.warn(
-            `[mandala] ${OVERLAY_IDENTITY_KEY === '' ? OVERLAY_IDENTITY_KEY_UNSET : OVERLAY_URL_UNSET} ` +
-            'Delivered hand-overs are not submitted until it is configured.'
-          )
+          const why = OVERLAY_IDENTITY_KEY === ''
+            ? OVERLAY_IDENTITY_KEY_UNSET
+            : OVERLAY_URL === '' ? OVERLAY_URL_UNSET : 'The overlay identity key is not a 66-hex compressed lowercase public key.'
+          console.warn(`[mandala] ${why} Delivered hand-overs are not submitted until it is configured.`)
         }
         continue
       }
