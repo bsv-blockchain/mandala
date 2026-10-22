@@ -1362,3 +1362,35 @@ git commit -m "docs(color): 1Color/BRC-207 wallet module notes and publish prere
 - **CG-DESK-ERR:** sdk `HTTPWalletJSON` discards a 400 body without `isError` (`HTTPWalletJSON.ts:421-425`), so the name the bridge forwards does not reach an HTTP client. Needs an sdk client change; candidate owner plan 02. Task 13 pins it with a `test.fails` marker until it lands.
 - **CG-DESK-CLS:** lib `decodeToken` ignores 1Color outputs with a non-P2PKH remainder (0162:102-104). The guard uses a templates prefix-only decoder too if 2.2.0 exports one.
 - **CG-DESK-SETTLED:** if the vendored 0.2.0 never marks a profile-free (default-provider) send as settled, the guard holds such sends forever. Task 14 reports it; the fix belongs to plan 02.
+
+## Execution record: whole-plan review fixes (2026-10-22, bsv-desktop `feat/1color` 3a45154, 457fe6f, 80d32ad)
+
+**CG-DESK-SETTLED: confirmed, for plan 02 (Task 14 item 6).** Vendored `@bsv/color-permission-module` 0.2.0 does **not** mark a profile-free send settled unless its SHIP host returns an attested STEAK. `attestationFromSteak` (`node_modules/@bsv/color-permission-module/dist/index.mjs:1041-1053`) returns `undefined` when `admissionSignature` or `admissionIdentityKey` is absent. The settle submit path then returns `retry` with `ERR_NO_ATTESTATION` ("the overlay gave no admission" at `:1680`, "the admission is not attested" at `:1687`) and never reaches `store.markSettled` (`:1698`). A profile-free 1Color tx whose SHIP host returns an unattested STEAK, together with its parked BSV children, therefore stays in `~/.bsv-desktop/color-guard/<identityKey>-<chain>/` indefinitely. Nothing in the UI shows it and there is no way to release it. Per this plan the desktop does not work around it. It is recorded in bsv-desktop `CHANGELOG.md` (Known gaps) and `docs/desktop-wallet-ux.md` (Known limitations). Fix candidates for plan 02: SHIP hosts sign admissions for `tm_color_*`, or the module settles profile-free assets from an unattested admission it can verify some other way.
+
+**Toolbox re-checks (Task 14 items 2-3), vendored `@bsv/wallet-toolbox` 2.15.0 (`out/src`), cross-checked against ts-stack worktree `4fa68e783` source. No change, nothing BLOCKED:**
+- `attemptToPostReqsToNetwork.ts:79-82` (compiled `attemptToPostReqsToNetwork.js:59-66`): `attempts++` then `attempts > 6 ⇒ invalid` only inside the `validateReqError` catch (or `The txid parameter must be known to storage`).
+- `attemptToPostReqsToNetwork.ts:213-215` (compiled `:188-190`): `applyAggregateStatus` `serviceError` only does `attempts++` and returns `sending`/`sending`.
+- `StorageKnex.ts:2359-2360` `allocateChangeInput` (compiled `StorageKnex.js:1978-1981`): `['completed', 'unproven']`, plus `'sending'` unless `excludeSending`. The same list is at `:2032`, `:2072`, `:2112` and `:2333`. A `nosend` hand-over's change is never auto-selected, so the guard's own-storage `nosend` rule stays a fail-closed backstop.
+
+**CG-DESK-REMOTE (new; contract note for §8.2, owner: interface contract).** §8.2's broadcast hold holds only where the host owns the storage that posts. On desktop the guard is installed on the main-process `StorageKnex` and its services. With remote active storage (`StorageClient`), the storage server runs `internalizeAction`/`createAction`/`sendWith` and posts with its own services, so nothing can be held. The desktop now fails closed:
+- remote selected at build: a refusing module, `ColorLocalStorageRequiredError` / `ERR_COLOR_LOCAL_STORAGE_REQUIRED`, with no capability, no settle and no linkage grant;
+- local selected: a live per-request and per-settle check (`isLocalStorageActive()`, which makes an unused manager available first);
+- every backup sync first runs the re-park sweep.
+
+Residuals the contract should state:
+- (a) a remote storage provider gets no BRC-207 hold, so a host MUST refuse `p color` there;
+- (b) only labelled `p color` requests are refused, so an app's unlabelled BRC-162 output through remote storage is not held;
+- (c) a withhold that lands during a backup sync can reach a backup server at `sending`;
+- (d) a request already past the live check when the user switches the primary runs on the storage it started on.
+
+**Classifier shape (review finding, recorded, not changed).** `isOneColorShaped` holds any `<push> <push> OP_2DROP …` output even when `OneColor.decode` rejects it, for example a 2-field PushDrop with `lockPosition: 'after'`. Such a tx and its children are released only by `isSettled`, so this wallet never broadcasts them. This is documented as a known limitation. Neither a UI for held txids nor an `isSettled`-independent release for outputs that fail decode was added: the latter needs the design owner's agreement, and the project is close to a demo.
+
+**Linkage keys (review finding).** The linkage policy now reads the overlay keys the color module accepted (`colorLinkageOverlayKeys(module)`), not raw `settings.mandalaOverlays`. An off-curve key the Mandala profile dropped gets no grant, and no key gets one while the module refuses requests or after it is disposed.
+
+**Task 1 Step 4 baseline / network-switch.** The baseline numbers were not available to this run. The two `networkSwitch.integration` failures under Electron's Node (`window.addEventListener is not a function` at `directPaySettings.ts:249`) are pre-existing by code identity: `DirectPayManager.ts`, `directPaySettings.ts` and the test file are unchanged since `361778c`, and `_buildWallet` already called `_startDirectPay()` there (`WalletService.ts:885` at `361778c`). The stub is now an `EventTarget`, both services register the color module, and Electron-node gives `4 passed (4)` files / `14 passed` tests (storageIdentity ×2, networkSwitch, colorBroadcastGuard.integration).
+
+**Gate after the fixes:**
+- `npm test`: `Test Files 66 passed | 4 skipped (70)` and `Tests 885 passed | 1 expected fail | 25 skipped (911)`. The file count is +1 against Task 15's 65 because of the new `colorBackupSync`;
+- webrtc: `107 passed`;
+- both `tsc` configs exit 0;
+- `npm run build` passes.
