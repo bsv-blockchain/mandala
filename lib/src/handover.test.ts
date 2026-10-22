@@ -143,7 +143,7 @@ describe('sendHandover', () => {
   it('builds a noSend 1-sat output with a transfer plan, blinds by default and journals signed before resolving', async () => {
     const h = await sendHandover(S())
     const ca = wallet.createAction.mock.calls[0][0]
-    expect(ca.options).toEqual({ noSend: true, randomizeOutputs: false })
+    expect(ca.options).toEqual({ noSend: true, randomizeOutputs: false, signAndProcess: false })
     expect(ca.outputs).toHaveLength(1)
     expect(ca.outputs[0].satoshis).toBe(1)
     expect(ca.outputs[0].outputDescription).toBe('Mandala token payment')

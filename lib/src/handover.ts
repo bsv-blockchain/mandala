@@ -268,7 +268,12 @@ async function sendPipeline (c: CheckedSend): Promise<HandoverResult> {
       satoshis: 1,
       outputDescription: 'Mandala token payment'
     }],
-    options: { noSend: true, randomizeOutputs: false }
+    // signAndProcess false: a WalletPermissionsManager otherwise signs a
+    // caller-input-free action inside createAction (BRC-100 isSignAction is
+    // false) and returns no reference, so the held action could not be
+    // released on a later failure. Two-phase keeps the reference in hand and
+    // the module's colorHandoff on the signAction result.
+    options: { noSend: true, randomizeOutputs: false, signAndProcess: false }
   })
   const reference = created.signableTransaction?.reference
   if (reference == null || reference === '') throw new Error('sendHandover: createAction returned no signableTransaction')
