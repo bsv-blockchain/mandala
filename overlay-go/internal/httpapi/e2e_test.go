@@ -14,6 +14,8 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
+	"github.com/sirdeggen/mandala/overlay-go/internal/colorprofile"
 	"github.com/sirdeggen/mandala/overlay-go/internal/httpapi"
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
@@ -499,5 +501,65 @@ func TestE2EReplayReturnsIdenticalAttestation(t *testing.T) {
 	if adm.Txid != iss.Txid || len(adm.Admissions) != 1 || adm.AdmissionIdentityKey != mandalatest.Overlay.Identity ||
 		!slices.Equal(adm.Admissions[tm].OutputsToAdmit, first.OutputsToAdmit) || adm.Admissions[tm].AdmissionSignature != first.AdmissionSignature {
 		t.Fatalf("admission map = %+v", adm)
+	}
+}
+
+// Review Focus 4: a deploy whose req names another overlay's key is a final ERR_SHAPE. The refusal is persisted and
+// replayed by payload hash, nothing is applied and no registry row exists; the same deploy with this overlay's req is
+// a different transaction and is admitted on both topics.
+func TestE2EDeployWrongReqIsFinalAndPersisted(t *testing.T) {
+	e2eDB(t, e2eNode)
+	o := e2eBoot(t, e2eNode, nil, false)
+	I := mandalatest.Issuer
+	const want = "output 0: deploy payload is not a valid Mandala deploy map (req does not match this overlay's Mandala profiles)"
+	wrong := mandalatest.DeployWithPayload(t, I, mandalatest.DeployPayloadWith(brc162.CborMap{
+		"sym": "USD", "dec": uint64(2), "label": "US Dollar", "req": colorprofile.MandalaReq(mandalatest.Rogue.Identity)}))
+	tm := mandala.TokenTopicOfTxid(wrong.Txid)
+
+	type refusal struct {
+		Code        string `json:"code"`
+		Retryable   *bool  `json:"retryable"`
+		Description string `json:"description"`
+	}
+	requireRefusal := func(what string, code int, body []byte) {
+		t.Helper()
+		var r refusal
+		if err := json.Unmarshal(body, &r); code != 400 || err != nil || r.Code != "ERR_SHAPE" || r.Retryable == nil || *r.Retryable || r.Description != want {
+			t.Fatalf("%s: %d %s, want 400 final ERR_SHAPE %q", what, code, body, want)
+		}
+	}
+	code, first := e2eSubmit(t, o, wrong, mandala.MandalaTopic, tm)
+	requireRefusal("first submit", code, first)
+	code, second := e2eSubmit(t, o, wrong, mandala.MandalaTopic, tm)
+	requireRefusal("resubmit", code, second)
+	if !bytes.Equal(first, second) {
+		t.Fatalf("resubmit body %s differs from %s", second, first)
+	}
+	rec, err := o.app.Store.GetAdmission(context.Background(), wrong.Txid)
+	if err != nil || rec == nil || rec.RefusedCode != "ERR_SHAPE" || rec.RefusedDescription != want || rec.RefusedPayloadHash != mandala.PayloadHashHex(wrong.OffChain) || rec.Admitted() {
+		t.Fatalf("persisted refusal = %+v, err %v", rec, err)
+	}
+	code, body := e2eGet(t, o, "/admin/admission/"+wrong.Txid+"?payloadHash="+mandala.PayloadHashHex(wrong.OffChain))
+	requireRefusal("GET /admin/admission?payloadHash", code, body)
+	// without the payload hash the refusal is not served, and no applied engine record stands behind it
+	if code, body := e2eGet(t, o, "/admin/admission/"+wrong.Txid); code != 404 {
+		t.Fatalf("GET /admin/admission without payloadHash: %d %s, want 404 (nothing applied)", code, body)
+	}
+	if _, ok := e2eTokens(t, o)[wrong.Txid+"_0"]; ok {
+		t.Fatal("a refused deploy has a registry row")
+	}
+
+	right := mandalatest.DeployWithPayload(t, I, mandalatest.DeployPayloadWith(brc162.CborMap{
+		"sym": "USD", "dec": uint64(2), "label": "US Dollar", "req": colorprofile.MandalaReq(mandalatest.Overlay.Identity)}))
+	if right.Txid == wrong.Txid {
+		t.Fatal("the corrected deploy reuses the refused txid")
+	}
+	tmRight := mandala.TokenTopicOfTxid(right.Txid)
+	steak := e2eAdmit(t, o, right, mandala.MandalaTopic, tmRight)
+	if !slices.Equal(steak[mandala.MandalaTopic].OutputsToAdmit, []uint32{0}) || !slices.Equal(steak[tmRight].OutputsToAdmit, []uint32{0}) {
+		t.Fatalf("corrected deploy STEAK = %+v", steak)
+	}
+	if _, ok := e2eTokens(t, o)[right.Txid+"_0"]; !ok {
+		t.Fatal("the admitted deploy has no registry row")
 	}
 }

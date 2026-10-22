@@ -194,6 +194,8 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 		Screening:        mandala.NoSanctions{},
 		Membership:       mandala.KYCMembership{Store: store},
 		Spends:           spends,
+		// the K every deploy's req must name (contract §4): this overlay's SERVER_PRIVATE_KEY pub
+		OverlayIdentityKey: overlayPriv.PubKey().ToDERHex(),
 	}
 	registry, err := mandala.NewTokenRegistryTopicManager(deps)
 	if err != nil {

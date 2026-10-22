@@ -25,6 +25,18 @@ type TokenTopicDeps struct {
 	Membership       MembershipProvider                   // nil = no membership gate
 	Spends           SpendChecker                         // nil = no conflicting-spend guard
 	OnOwnerRepair    func(outpoint string, inserted bool) // nil = LogOwnerRepair(<topic>)
+	// OverlayIdentityKey is this overlay's identity key (SERVER_PRIVATE_KEY pub), compressed
+	// lowercase: every deploy's req must name it (contract §4). Required; the managers refuse
+	// construction without it (fail closed, S5).
+	OverlayIdentityKey string
+}
+
+// requireOverlayIdentityKey is the constructors' check on TokenTopicDeps.OverlayIdentityKey.
+func requireOverlayIdentityKey(k, owner string) error {
+	if !IsCanonicalKey(k) {
+		return fmt.Errorf("%s: OverlayIdentityKey must be a compressed lowercase identity key", owner)
+	}
+	return nil
 }
 
 // TokenTopicManager is tm_color_<assetId>: one Mandala token (Q2/mandala/MandalaTopicManager.ts).
@@ -38,11 +50,14 @@ type TokenTopicManager struct {
 
 var _ engine.TopicManager = (*TokenTopicManager)(nil)
 
-// NewTokenTopicManager fails on a non-canonical token id or a bad trusted/exempt list
-// (configuration faults, never per-transaction refusals).
+// NewTokenTopicManager fails on a non-canonical token id, a bad trusted/exempt list or a missing
+// overlay identity key (configuration faults, never per-transaction refusals).
 func NewTokenTopicManager(tokenID string, d TokenTopicDeps) (*TokenTopicManager, error) {
 	topic, err := TokenTopic(tokenID)
 	if err != nil {
+		return nil, err
+	}
+	if err := requireOverlayIdentityKey(d.OverlayIdentityKey, "TokenTopicManager"); err != nil {
 		return nil, err
 	}
 	trusted, err := TrustedSet(d.TrustedIssuers, "TokenTopicManager")
@@ -124,7 +139,7 @@ func (m *TokenTopicManager) identify(ctx context.Context, beef *transaction.Beef
 
 	// layers C and D
 	auth, err := CheckAuthority(ctx, txidHex, ledger, v.Outputs, owners, inputOwners, v.Env,
-		AuthorityDeps{Trusted: m.trusted, Store: m.deps.Store, Registry: false})
+		AuthorityDeps{Trusted: m.trusted, Store: m.deps.Store, Registry: false, OverlayIdentityKey: m.deps.OverlayIdentityKey})
 	if err != nil {
 		return fail(err)
 	}

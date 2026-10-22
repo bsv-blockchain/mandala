@@ -19,9 +19,10 @@ import (
 
 // AuthorityDeps are layer C's dependencies.
 type AuthorityDeps struct {
-	Trusted  map[string]bool // lowercase compressed keys
-	Store    StateStore
-	Registry bool // KYC: RegistryKinds and value outputs forbidden
+	Trusted            map[string]bool // lowercase compressed keys
+	Store              StateStore
+	Registry           bool   // KYC: RegistryKinds and value outputs forbidden; deploys need no req
+	OverlayIdentityKey string // compressed lowercase: the K every token deploy's req must name (contract §4)
 }
 
 // CommittedAction is one verified admin action: the details its authority output commits to.
@@ -70,24 +71,43 @@ func authOwnerAt(owners []VerifiedOwner, index uint32) (VerifiedOwner, error) {
 
 func authDelta(l *brc162.TokenLedger) *big.Int { return new(big.Int).Sub(l.ValueOut, l.ValueIn) }
 
-// 1. deploys (layer B already put any deploy at output 0).
-func authRequireDeploys(ctx context.Context, txid string, outputs []brc162.Output, owners []VerifiedOwner, env *Envelope) error {
+// 1. deploys (layer B already put any deploy at output 0). Returns each deploy's parsed metadata
+// for the req check, which runs after the trusted-issuer rules (step 2b).
+func authRequireDeploys(ctx context.Context, txid string, outputs []brc162.Output, owners []VerifiedOwner, env *Envelope) ([]DeployMetadata, error) {
+	var deploys []DeployMetadata
 	for _, o := range outputs {
 		if o.Role != brc162.RoleDeploy {
 			continue
 		}
 		if o.Amount > 0 {
-			return rFixedSupply()
+			return nil, rFixedSupply()
 		}
-		if _, err := ParseDeployMetadata(o.Payload, o.HasPayload, o.PayloadCanonical); err != nil {
-			return err
+		md, err := ParseDeployMetadata(o.Payload, o.HasPayload, o.PayloadCanonical)
+		if err != nil {
+			return nil, err
 		}
 		owner, err := authOwnerAt(owners, o.Index)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if !VerifyDeploySig(ctx, txid, env.DeploySig, env.HasDeploySig, owner.IdentityKey) {
-			return rDeploySig()
+			return nil, rDeploySig()
+		}
+		deploys = append(deploys, md)
+	}
+	return deploys, nil
+}
+
+// 2b. the Mandala deploy req (contract §4 step 2): after the existing sym/dec/label/feeRatePerKb,
+// deploySig and trusted-issuer rules, every token deploy's req names exactly this overlay's
+// profiles. A KYC registry deploy is not a color asset and carries no req.
+func authRequireDeployReq(deploys []DeployMetadata, d AuthorityDeps) error {
+	if d.Registry {
+		return nil
+	}
+	for _, md := range deploys {
+		if err := RequireMandalaReq(md, d.OverlayIdentityKey); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -310,16 +330,20 @@ func authLowered(keys map[string]bool) map[string]bool {
 }
 
 // CheckAuthority is layer C for one transaction, steps 1-11 of F/ts-layers §3 in order: deploys,
-// trusted outputs, trusted authority inputs, authority inputs, continuity, commitments, registry
+// trusted outputs, the Mandala deploy req (1Color, contract §4 step 2), trusted authority inputs, authority inputs, continuity, commitments, registry
 // value outputs, delta rule, storage range, reissues, result.
 func CheckAuthority(ctx context.Context, txid string, l *brc162.Ledger, outputs []brc162.Output, owners []VerifiedOwner,
 	inputOwners map[uint32]string, env *Envelope, d AuthorityDeps) (*AuthorityResult, error) {
 	ledgers := l.Tokens()
 	trusted := authLowered(d.Trusted)
-	if err := authRequireDeploys(ctx, txid, outputs, owners, env); err != nil {
+	deploys, err := authRequireDeploys(ctx, txid, outputs, owners, env)
+	if err != nil {
 		return nil, err
 	}
 	if err := authRequireTrustedOutputs(owners, trusted); err != nil {
+		return nil, err
+	}
+	if err := authRequireDeployReq(deploys, d); err != nil {
 		return nil, err
 	}
 	if err := authRequireTrustedInputs(ledgers, inputOwners, trusted); err != nil {

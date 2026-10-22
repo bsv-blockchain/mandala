@@ -24,6 +24,9 @@ type TokenRegistryTopicManager struct {
 var _ engine.TopicManager = (*TokenRegistryTopicManager)(nil)
 
 func NewTokenRegistryTopicManager(d TokenTopicDeps) (*TokenRegistryTopicManager, error) {
+	if err := requireOverlayIdentityKey(d.OverlayIdentityKey, "TokenRegistryTopicManager"); err != nil {
+		return nil, err
+	}
 	trusted, err := TrustedSet(d.TrustedIssuers, "TokenRegistryTopicManager")
 	if err != nil {
 		return nil, err

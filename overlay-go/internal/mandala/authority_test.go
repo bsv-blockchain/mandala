@@ -95,7 +95,7 @@ func (c acCase) run(t *testing.T) (*AuthorityResult, error) {
 		c.trusted = acTrusted()
 	}
 	return CheckAuthority(context.Background(), acTx, brc162.BuildLedger(acTx, c.outs, c.ins), c.outs, c.owners, c.inputOwners, c.env,
-		AuthorityDeps{Trusted: c.trusted, Store: c.store, Registry: c.registry})
+		AuthorityDeps{Trusted: c.trusted, Store: c.store, Registry: c.registry, OverlayIdentityKey: mt.Overlay.Identity})
 }
 
 // acDeploy runs layer C on a real kit deploy (real deploySig) after editing its spec.
@@ -106,8 +106,27 @@ func acDeploy(t *testing.T, b *mt.Built, owners []VerifiedOwner) error {
 		owners = acOwnedBy(outs, mt.Issuer.Identity, mt.Issuer.Identity)
 	}
 	_, err := CheckAuthority(context.Background(), b.Txid, brc162.BuildLedger(b.Txid, outs, nil), outs, owners, map[uint32]string{}, envOf(t, b.OffChain),
-		AuthorityDeps{Trusted: acTrusted(), Store: newMemStore()})
+		AuthorityDeps{Trusted: acTrusted(), Store: newMemStore(), OverlayIdentityKey: mt.Overlay.Identity})
 	return err
+}
+
+// Contract §4: a KYC registry deploy is not a color asset, so layer C asks it for no req (the shared
+// ext/icon rules still apply); a token deploy without req is refused after deploySig and trust.
+func TestCheckAuthorityDeployReqIsTokenOnly(t *testing.T) {
+	issuer := mt.Issuer
+	noReq := mt.Build(t, nil, []mt.Out{{Owner: issuer, Prover: issuer, Payload: mt.DeployPayloadWith(brc162.CborMap{"sym": "KYC", "dec": uint64(0), "label": "Members"}), HasPayload: true}}, &issuer)
+	withExt := mt.Build(t, nil, []mt.Out{{Owner: issuer, Prover: issuer, Payload: mt.DeployPayloadWith(brc162.CborMap{"sym": "KYC", "dec": uint64(0), "label": "Members", "ext": brc162.CborMap{}}), HasPayload: true}}, &issuer)
+	run := func(b *mt.Built, registry bool) error {
+		outs := brc162.ClassifyOutputs(b.Tx).Outputs
+		_, err := CheckAuthority(context.Background(), b.Txid, brc162.BuildLedger(b.Txid, outs, nil), outs, acOwnedBy(outs, issuer.Identity, issuer.Identity),
+			map[uint32]string{}, envOf(t, b.OffChain), AuthorityDeps{Trusted: acTrusted(), Store: newMemStore(), Registry: registry, OverlayIdentityKey: mt.Overlay.Identity})
+		return err
+	}
+	if err := run(noReq, true); err != nil {
+		t.Fatalf("KYC deploy without req: %v", err)
+	}
+	requireReject(t, run(withExt, true), CodeShape, "output 0: deploy payload is not a valid Mandala deploy map (ext is not allowed on a Mandala deploy)")
+	requireReject(t, run(noReq, false), CodeShape, "output 0: deploy payload is not a valid Mandala deploy map (missing key req)")
 }
 
 func TestCheckAuthorityStep1Deploys(t *testing.T) {

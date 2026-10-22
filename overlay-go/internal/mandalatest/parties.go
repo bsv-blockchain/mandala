@@ -1,7 +1,8 @@
 // Package mandalatest builds real-signature Mandala fixtures for Go tests: fixed parties, BRC-42
 // derived token locks, BRC-72 linkage revealed to the overlay, SPV-valid spends, atomic BEEF and
-// the off-chain envelope. It imports only internal/brc162 and go-sdk, never internal/mandala, so
-// package mandala's own tests, wiring and httpapi can all use it (plan D-3).
+// the off-chain envelope. It imports only internal/brc162, internal/colorprofile (itself only
+// brc162) and go-sdk, never internal/mandala, so package mandala's own tests, wiring and httpapi
+// can all use it (plan D-3).
 package mandalatest
 
 import (

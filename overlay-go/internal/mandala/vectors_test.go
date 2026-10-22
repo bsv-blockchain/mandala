@@ -185,6 +185,8 @@ func managerFor(t *testing.T, f rejectVectors, c rejectCase, st *memStore, repai
 		Screening:      screeningOver(c.State.Sanctioned),
 		Membership:     membershipOver(c.State.Members),
 		OnOwnerRepair:  onRepair,
+		// contract §4: the K every deploy's req names is the file's verifier
+		OverlayIdentityKey: v.IdentityKey(),
 	}
 	var m engine.TopicManager
 	switch {
@@ -284,7 +286,17 @@ var vectorOverrides = map[string]vectorOverride{
 		Reason: "output 0: token output with no verified linkage"}},
 	"value-sum-above-2^53-1":          {Why: uint64Why, Expected: rejectExpected{OutputsToAdmit: &[]uint32{0, 1, 2}, CoinsToRetain: &[]uint32{0}}},
 	"circulating-supply-above-2^53-1": {Why: uint64Why, Expected: rejectExpected{OutputsToAdmit: &[]uint32{0, 1}, CoinsToRetain: &[]uint32{0}}},
+
+	// Task 9: TS deploys carry no req. The req check runs after sym/dec/label/feeRatePerKb, deploySig
+	// and the trusted-issuer rules (contract §4 step 2), so only the two deploys that pass all of
+	// those flip; every other deploy case keeps its file reason.
+	"admit-signed-deploy": {Why: mandalaReqWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: deploy payload is not a valid Mandala deploy map (missing key req)"}},
+	"registry-admits-a-signed-deploy": {Why: mandalaReqWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: deploy payload is not a valid Mandala deploy map (missing key req)"}},
 }
+
+const mandalaReqWhy = "Mandala deploys must declare req = attested(identity K) + issuer-v1(K) (contract §4, design C3)"
 
 const uint64Why = "uint64 end to end (design §2 goal 2, 0162:140-143); caps removed"
 

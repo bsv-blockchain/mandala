@@ -74,6 +74,12 @@ func rLegacyTokenID(i uint32, tokenID string) *RejectError {
 	return newReject(CodeShape, "output %d: legacy 36-byte token id %s is refused by Mandala policy (32-byte ids only)", i, tokenID)
 }
 
+// rProfileKeysOnNonDeploy is Mandala policy (contract §4 step 5, D14): req and ext belong on a
+// deploy only, so a non-deploy output whose payload is a strict map naming either is refused.
+func rProfileKeysOnNonDeploy(i uint32) *RejectError {
+	return newReject(CodeShape, "output %d: req and ext are deploy-only under Mandala policy", i)
+}
+
 func rNonP2pkhRemainder(i uint32) *RejectError {
 	return newReject(CodeShape, "output %d: token output remainder must be a P2PKH lock", i)
 }

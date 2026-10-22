@@ -56,6 +56,8 @@ func newEngineFlow(t *testing.T, dbName string) *engineFlow {
 		Engine:           es,
 		Screening:        NoSanctions{},
 		OnOwnerRepair:    func(op string, _ bool) { f.repairs = append(f.repairs, op) },
+		// contract §4: the K every deploy's req names
+		OverlayIdentityKey: v.IdentityKey(),
 	}
 	reg, err := NewTokenRegistryTopicManager(f.deps)
 	if err != nil {

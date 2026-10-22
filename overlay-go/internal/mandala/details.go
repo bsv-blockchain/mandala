@@ -20,6 +20,7 @@ import (
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
+	"github.com/sirdeggen/mandala/overlay-go/internal/colorprofile"
 )
 
 // AdminKinds are the token admin kinds (TS ADMIN_KINDS, order kept).
@@ -297,12 +298,21 @@ func EncodeAdminDetails(d AdminDetails) ([]byte, error) {
 	return brc162.EncodeStrictCbor(m)
 }
 
-// DeployMetadata is a decoded deploy payload.
+// DeployIcon is a deploy's optional icon [mediaType, bytes] (contract §4).
+type DeployIcon struct {
+	MediaType string
+	Bytes     []byte
+}
+
+// DeployMetadata is a decoded deploy payload. ReqBytes is the strict re-encoding of the req value
+// (nil when req is absent); RequireMandalaReq compares it with this overlay's expected req.
 type DeployMetadata struct {
 	Sym          string
 	Dec          int64
 	Label        string
 	FeeRatePerKb *int64
+	Icon         *DeployIcon
+	ReqBytes     []byte
 }
 
 func detLabel(v any, max int) (string, bool) {
@@ -314,9 +324,12 @@ func detLabel(v any, max int) (string, bool) {
 	return s, n >= 1 && n <= max
 }
 
-// ParseDeployMetadata reads the deploy payload {sym, dec, label, feeRatePerKb?} (unknown keys
-// ignored) in TS order: missing payload, non-canonical push, strict CBOR under the Mandala policy
-// (65536 bytes, depth 64), sym, dec, label, fee rate. Every refusal is rDeployPayload(detail).
+// ParseDeployMetadata reads the deploy payload {sym, dec, label, feeRatePerKb?, icon?, req?} (other
+// keys ignored, except ext) in TS order: missing payload, non-canonical push, strict CBOR under the
+// Mandala policy (65536 bytes, depth 64), sym, dec, label, fee rate; then the 1Color rules (contract
+// §4 steps 3-4), placed after the existing ones so no existing reason changes: icon is exactly
+// [text, bytes], ext is absent, req (when present) is a map. Whether req is present and names this
+// overlay is RequireMandalaReq's job: a KYC deploy carries no req. Every refusal is rDeployPayload(detail).
 func ParseDeployMetadata(payload []byte, hasPayload, canonical bool) (DeployMetadata, error) {
 	if !hasPayload {
 		return DeployMetadata{}, rDeployPayload("missing payload")
@@ -357,7 +370,64 @@ func ParseDeployMetadata(payload []byte, hasPayload, canonical bool) (DeployMeta
 		return DeployMetadata{}, rDeployPayload(detFeeRateRule)
 	}
 	md.FeeRatePerKb = fee
+	if v, present := m["icon"]; present {
+		icon, ok := deployIcon(v)
+		if !ok {
+			return DeployMetadata{}, rDeployPayload("icon must be [mediaType, bytes]")
+		}
+		md.Icon = icon
+	}
+	if _, present := m["ext"]; present {
+		return DeployMetadata{}, rDeployPayload("ext is not allowed on a Mandala deploy")
+	}
+	if v, present := m["req"]; present {
+		req, ok := v.(brc162.CborMap)
+		if !ok {
+			return DeployMetadata{}, rDeployPayload("req must be a map")
+		}
+		b, err := brc162.EncodeStrictCborValue(req)
+		if err != nil { // a decoded strict map always re-encodes; anything else is a codec fault
+			return DeployMetadata{}, fmt.Errorf("deploy req re-encode: %w", err)
+		}
+		md.ReqBytes = b
+	}
 	return md, nil
+}
+
+// deployIcon reads icon = [text, bytes], exactly two elements.
+func deployIcon(v any) (*DeployIcon, bool) {
+	arr, ok := v.([]any)
+	if !ok || len(arr) != 2 {
+		return nil, false
+	}
+	mediaType, ok := arr[0].(string)
+	if !ok {
+		return nil, false
+	}
+	b, ok := arr[1].([]byte)
+	if !ok {
+		return nil, false
+	}
+	return &DeployIcon{MediaType: mediaType, Bytes: slices.Clone(b)}, true
+}
+
+// RequireMandalaReq is the Mandala deploy req policy (contract §4 step 2): req is present and its
+// strict re-encoding is byte-identical to colorprofile.MandalaReqBytes(overlayIdentityKey), i.e.
+// exactly attested v1 {identityKey: K, trustMode: "identity"} and issuer-v1 v1 {identityKey: K}
+// with K this overlay's key. The input is never normalized: a non-canonical req already failed the
+// strict decode.
+func RequireMandalaReq(md DeployMetadata, overlayIdentityKey string) error {
+	if md.ReqBytes == nil {
+		return rDeployPayload("missing key req")
+	}
+	want, err := colorprofile.MandalaReqBytes(overlayIdentityKey)
+	if err != nil {
+		return fmt.Errorf("expected req encode: %w", err)
+	}
+	if !bytes.Equal(md.ReqBytes, want) {
+		return rDeployPayload("req does not match this overlay's Mandala profiles")
+	}
+	return nil
 }
 
 // CommitmentOf reads the authority payload {adm: bytes(32)} (other keys ignored). A missing,

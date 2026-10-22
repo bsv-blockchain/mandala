@@ -19,6 +19,7 @@ import (
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
+	"github.com/sirdeggen/mandala/overlay-go/internal/colorprofile"
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
 )
 
@@ -93,6 +94,8 @@ func mgrDeps(t *testing.T, st *memStore, eng EngineOutputReader) TokenTopicDeps 
 		Engine:         eng,
 		Screening:      NoSanctions{},
 		OnOwnerRepair:  func(string, bool) {},
+		// contract §4: the K every deploy's req names
+		OverlayIdentityKey: mandalatest.Overlay.Identity,
 	}
 }
 
@@ -522,5 +525,161 @@ func TestTokenTopicConstructorsAndMetaData(t *testing.T) {
 	}
 	if m.GetDocumentation() == "" {
 		t.Fatal("empty documentation")
+	}
+}
+
+// identifyDeploy runs a deploy as the HTTP deploy path does: the token registry's dry run, then the
+// deploy's own token topic tm_color_<txid>_0, each over a fresh store. It returns the token topic's
+// admittance, or the first refusal.
+func identifyDeploy(t *testing.T, b *mandalatest.Built) (overlay.AdmittanceInstructions, error) {
+	t.Helper()
+	if _, err := mgrRunRegistry(t, b, newMemStore(), nil, nil); err != nil {
+		return overlay.AdmittanceInstructions{}, err
+	}
+	return mgrRunToken(t, brc162.DeployTokenID(b.Txid, 0), b, newMemStore(), nil, nil)
+}
+
+// swapFirstTwoKeys re-serializes the strict-CBOR map payload with its first two entries (canonical
+// order) swapped: every key and value is the codec's own encoding, only the order is wrong.
+func swapFirstTwoKeys(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	m, err := brc162.DecodeStrictCbor(payload)
+	if err != nil || len(m) < 2 || len(m) > 23 {
+		t.Fatalf("swapFirstTwoKeys: %d keys, %v", len(m), err)
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, detKeyLess)
+	keys[0], keys[1] = keys[1], keys[0]
+	out := []byte{0xa0 | byte(len(keys))}
+	for _, k := range keys {
+		kb, err := brc162.EncodeStrictCborValue(k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vb, err := brc162.EncodeStrictCborValue(m[k])
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(append(out, kb...), vb...)
+	}
+	return out
+}
+
+// Review Focus 4: the deploy req is exactly attested(identity K) + issuer-v1(K) for this overlay's
+// K; ext is absent; icon is [text, bytes]. Every refusal is the final ERR_SHAPE deploy-payload one.
+func TestDeployReqPolicy(t *testing.T) {
+	K := mandalatest.Overlay.Identity
+	good := colorprofile.MandalaReq(K)
+	extra := colorprofile.MandalaReq(K)
+	extra["https://example.com/p"] = brc162.CborMap{"version": uint64(1), "params": nil}
+	anyMode := colorprofile.MandalaReq(K)
+	anyMode[colorprofile.AttestedProfileID].(brc162.CborMap)["params"].(brc162.CborMap)["trustMode"] = "any"
+	noAttested := colorprofile.MandalaReq(K)
+	delete(noAttested, colorprofile.AttestedProfileID)
+	v2 := colorprofile.MandalaReq(K)
+	v2[colorprofile.MandalaProfileID].(brc162.CborMap)["version"] = uint64(2)
+	upperK := colorprofile.MandalaReq(strings.ToUpper(K))
+	base := func(extraKV brc162.CborMap) brc162.CborMap {
+		m := brc162.CborMap{"sym": "TUSD", "dec": uint64(2), "label": "Test Dollar"}
+		for k, v := range extraKV {
+			m[k] = v
+		}
+		return m
+	}
+	cases := []struct {
+		name   string
+		m      brc162.CborMap
+		reason string
+	}{
+		{"no req", base(nil), "missing key req"},
+		{"other key", base(brc162.CborMap{"req": colorprofile.MandalaReq(mandalatest.Rogue.Identity)}), "req does not match this overlay's Mandala profiles"},
+		{"uppercase key", base(brc162.CborMap{"req": upperK}), "req does not match this overlay's Mandala profiles"},
+		{"extra profile", base(brc162.CborMap{"req": extra}), "req does not match this overlay's Mandala profiles"},
+		{"missing attested", base(brc162.CborMap{"req": noAttested}), "req does not match this overlay's Mandala profiles"},
+		{"issuer version 2", base(brc162.CborMap{"req": v2}), "req does not match this overlay's Mandala profiles"},
+		{"trustMode any", base(brc162.CborMap{"req": anyMode}), "req does not match this overlay's Mandala profiles"},
+		{"empty req", base(brc162.CborMap{"req": brc162.CborMap{}}), "req does not match this overlay's Mandala profiles"},
+		{"req text", base(brc162.CborMap{"req": "x"}), "req must be a map"},
+		{"req null", base(brc162.CborMap{"req": nil}), "req must be a map"},
+		{"ext", base(brc162.CborMap{"req": good, "ext": brc162.CborMap{}}), "ext is not allowed on a Mandala deploy"},
+		{"ext without req", base(brc162.CborMap{"ext": brc162.CborMap{}}), "ext is not allowed on a Mandala deploy"},
+		{"bad icon", base(brc162.CborMap{"req": good, "icon": []any{"image/png"}}), "icon must be [mediaType, bytes]"},
+		{"icon swapped", base(brc162.CborMap{"req": good, "icon": []any{[]byte{0x89}, "image/png"}}), "icon must be [mediaType, bytes]"},
+		{"icon text", base(brc162.CborMap{"req": good, "icon": "image/png"}), "icon must be [mediaType, bytes]"},
+		{"icon three", base(brc162.CborMap{"req": good, "icon": []any{"image/png", []byte{0x89}, "x"}}), "icon must be [mediaType, bytes]"},
+		// existing rules keep their reasons and run before the new ones
+		{"sym before req", brc162.CborMap{"dec": uint64(2), "label": "Test Dollar", "ext": brc162.CborMap{}}, "missing key sym"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := identifyDeploy(t, mandalatest.DeployWithPayload(t, mandalatest.Issuer, mandalatest.DeployPayloadWith(c.m)))
+			requireReject(t, err, "ERR_SHAPE", "output 0: deploy payload is not a valid Mandala deploy map ("+c.reason+")")
+		})
+	}
+	for _, ok := range []brc162.CborMap{base(brc162.CborMap{"req": good}), base(brc162.CborMap{"req": good, "icon": []any{"image/png", []byte{0x89, 0x50}}})} {
+		adm, err := identifyDeploy(t, mandalatest.DeployWithPayload(t, mandalatest.Issuer, mandalatest.DeployPayloadWith(ok)))
+		if err != nil || !slices.Equal(adm.OutputsToAdmit, []uint32{0}) {
+			t.Fatal(adm, err)
+		}
+	}
+	unsorted := mandalatest.DeployPayloadWith(base(brc162.CborMap{"req": good}))
+	_, err := identifyDeploy(t, mandalatest.DeployWithPayload(t, mandalatest.Issuer, swapFirstTwoKeys(t, unsorted)))
+	requireReject(t, err, "ERR_SHAPE", "output 0: deploy payload is not a valid Mandala deploy map (map keys unsorted or duplicated)")
+}
+
+// Contract §4 step 2: deploySig and the trusted-issuer rules run before the req check, so a deploy
+// with no req is refused for those first.
+func TestDeployReqCheckedAfterDeploySigAndTrust(t *testing.T) {
+	noReq := mandalatest.DeployPayloadWith(brc162.CborMap{"sym": "TUSD", "dec": uint64(2), "label": "Test Dollar"})
+	unsigned := mandalatest.Build(t, nil, []mandalatest.Out{{Owner: mandalatest.Issuer, Prover: mandalatest.Issuer, Payload: noReq, HasPayload: true}}, nil)
+	_, err := identifyDeploy(t, unsigned)
+	requireReject(t, err, "ERR_AUTHORITY", "output 0: deploy requires a valid deploySig over this txid")
+	rogue := mandalatest.DeployWithPayload(t, mandalatest.Rogue, noReq)
+	_, err = identifyDeploy(t, rogue)
+	requireReject(t, err, "ERR_UNTRUSTED", "output 0: owner "+mandalatest.Rogue.Identity+" is not a trusted issuer")
+}
+
+// Contract §4 step 5: req and ext are deploy-only; an authority {adm} payload is unchanged.
+func TestNonDeployOutputWithReqRefused(t *testing.T) {
+	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
+	id := mandalatest.TokenIDOf(dep, 0)
+	details := mandalatest.Details(brc162.CborMap{"kind": "issue"})
+	issueWith := func(payload []byte) *mandalatest.Built {
+		return mandalatest.Build(t, []mandalatest.In{{Src: dep, Vout: 0}}, []mandalatest.Out{
+			{Owner: mandalatest.Issuer, Prover: mandalatest.Issuer, TokenID: id, Payload: mandalatest.AdmPayload(sha256.Sum256(details)), HasPayload: true, Details: details},
+			{Owner: mandalatest.Holder, Prover: mandalatest.Issuer, TokenID: id, Amount: 100, Payload: payload, HasPayload: true},
+		}, nil)
+	}
+	for _, m := range []brc162.CborMap{{"req": brc162.CborMap{}}, {"ext": nil}, {"note": "x", "req": colorprofile.MandalaReq(mandalatest.Overlay.Identity)}} {
+		st := newMemStore()
+		mgrSeed(t, st, dep, "")
+		_, err := mgrRunToken(t, id, issueWith(mandalatest.DeployPayloadWith(m)), st, []uint32{0}, nil)
+		requireReject(t, err, "ERR_SHAPE", "output 1: req and ext are deploy-only under Mandala policy")
+	}
+	// any other value payload (a map without req/ext, or bytes that are not a strict map) is not this rule's business
+	for _, payload := range [][]byte{mandalatest.DeployPayloadWith(brc162.CborMap{"note": "x"}), {0x01, 0x02}} {
+		st := newMemStore()
+		mgrSeed(t, st, dep, "")
+		adm, err := mgrRunToken(t, id, issueWith(payload), st, []uint32{0}, nil)
+		if err != nil || !slices.Equal(adm.OutputsToAdmit, []uint32{0, 1}) {
+			t.Fatal(adm, err)
+		}
+	}
+}
+
+func TestNewTokenTopicManagerNeedsOverlayKey(t *testing.T) {
+	const want = "TokenTopicManager: OverlayIdentityKey must be a compressed lowercase identity key"
+	for _, k := range []string{"", strings.ToUpper(mandalatest.Overlay.Identity), mandalatest.Overlay.Identity[:64], "04" + mandalatest.Overlay.Identity[2:]} {
+		d := mgrDeps(t, newMemStore(), nil)
+		d.OverlayIdentityKey = k
+		if _, err := NewTokenTopicManager(mgrUntouched, d); err == nil || err.Error() != want {
+			t.Fatalf("%q: %v", k, err)
+		}
+		if _, err := NewTokenRegistryTopicManager(d); err == nil || err.Error() != "TokenRegistryTopicManager: OverlayIdentityKey must be a compressed lowercase identity key" {
+			t.Fatalf("registry %q: %v", k, err)
+		}
 	}
 }

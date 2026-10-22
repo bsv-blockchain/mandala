@@ -73,8 +73,8 @@ func RequireNoLegacyTokenIDs(outputs []brc162.Output) error {
 }
 
 // RequireValidTokenOutputs is the shape policy, rule-major (each rule scans every output before
-// the next rule runs): codec refusals, deploy at vout 0, P2PKH remainder, 1 satoshi. Any uint64
-// amount is valid (no 2^53 cap: design §2 goal 2, 0162:140-143).
+// the next rule runs): codec refusals, deploy at vout 0, P2PKH remainder, 1 satoshi, no req/ext off
+// a deploy. Any uint64 amount is valid (no 2^53 cap: design §2 goal 2, 0162:140-143).
 func RequireValidTokenOutputs(invalid []brc162.InvalidOutput, outputs []brc162.Output) error {
 	if len(invalid) > 0 {
 		return rInvalidTokenOutput(invalid[0].Index, invalid[0].Detail)
@@ -88,7 +88,27 @@ func RequireValidTokenOutputs(invalid []brc162.InvalidOutput, outputs []brc162.O
 	if i, bad := ownFirstFailing(outputs, func(o brc162.Output) bool { return o.Satoshis != 1 }); bad {
 		return rOneSat(i)
 	}
+	if i, bad := ownFirstFailing(outputs, carriesProfileKeys); bad {
+		return rProfileKeysOnNonDeploy(i)
+	}
 	return nil
+}
+
+// carriesProfileKeys: a non-deploy output whose payload reads as a strict map under the deploy
+// limits (65536 bytes, depth 64) and has a req or ext key (contract §4 step 5). The push's
+// canonicality is not consulted: the rule is about the bytes. A payload that is not such a map, or
+// an authority {adm} payload, is not this rule's business.
+func carriesProfileKeys(o brc162.Output) bool {
+	if o.Role == brc162.RoleDeploy || !o.HasPayload {
+		return false
+	}
+	m, err := decodeMandalaCbor(o.Payload, MaxDeployPayloadBytes)
+	if err != nil {
+		return false
+	}
+	_, req := m["req"]
+	_, ext := m["ext"]
+	return req || ext
 }
 
 // ownLinkedIdentity is TS linkedIdentity: ok=false for no entry, no remainder pkh, a linkage of any

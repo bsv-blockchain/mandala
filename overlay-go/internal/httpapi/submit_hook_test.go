@@ -697,6 +697,8 @@ func TestDoubleClickedDeployOverHTTP(t *testing.T) {
 		Engine:           app.EngineStore,
 		Screening:        mandala.NoSanctions{},
 		Membership:       mandala.KYCMembership{Store: app.Store},
+		// contract §4: the K every deploy's req names
+		OverlayIdentityKey: mandalatest.Overlay.Identity,
 		// Spends is nil: a deploy spends no token coin, so the conflicting-spend guard is not exercised here.
 	}
 	app.Tokens = wiring.NewTokenTopics(app.Engine, nil, false, func(id string) (engine.TopicManager, engine.LookupService, error) {
