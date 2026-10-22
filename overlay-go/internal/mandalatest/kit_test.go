@@ -168,7 +168,7 @@ func probe(t *testing.T, b *Built) envelopeProbe {
 
 func TestEnvelopeShapeAndKeyOrder(t *testing.T) {
 	d := Deploy(t, Issuer, "USD")
-	if !bytes.HasPrefix(d.OffChain, []byte(`{"inputs":[],"outputs":[{"index":0,"linkage":{"prover":"`+Issuer.Identity+`","verifier":"`+Overlay.Identity+`","counterparty":"`+Issuer.Identity+`","protocolID":[2,"p mandala token"],"keyID":"out-0","encryptedLinkage":[`)) {
+	if !bytes.HasPrefix(d.OffChain, []byte(`{"inputs":[],"outputs":[{"index":0,"linkage":{"prover":"`+Issuer.Identity+`","verifier":"`+Overlay.Identity+`","counterparty":"`+Issuer.Identity+`","protocolID":[2,"mandala admin"],"keyID":"out-0","encryptedLinkage":[`)) {
 		t.Fatalf("deploy envelope prefix: %s", d.OffChain)
 	}
 	if !bytes.Contains(d.OffChain, []byte(`],"admin":[],"deploySig":"`)) {
@@ -283,7 +283,7 @@ func TestColorDerivationAndOutputsOnlyEnvelope(t *testing.T) {
 	if len(p.Outputs) != 2 || json.Unmarshal(p.Outputs[0].Linkage, &auth) != nil || json.Unmarshal(p.Outputs[1].Linkage, &pay) != nil {
 		t.Fatalf("IssueTo envelope: %s", is.OffChain)
 	}
-	if auth.KeyID != "out-0" || auth.ProtocolID[1] != FTProtocol.Protocol {
+	if auth.KeyID != "out-0" || auth.ProtocolID[1] != AdminProtocol.Protocol {
 		t.Fatalf("authority output left the Mandala derivation: %+v", auth)
 	}
 	if pay.KeyID != ColorKeyID || pay.ProtocolID[1] != ColorProtocol(id, r).Protocol || pay.Prover != Issuer.Identity || pay.Counterparty != Holder.Identity {

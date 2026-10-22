@@ -39,8 +39,10 @@ var (
 	Rogue    = NewParty("rogue", 0x33)
 )
 
-// FTProtocol is the one protocol every Mandala token output derives under (D §5.1a).
-var FTProtocol = wallet.Protocol{SecurityLevel: wallet.SecurityLevelEveryAppAndCounterparty, Protocol: "p mandala token"}
+// AdminProtocol is the protocol every non-color (Mandala-key) output derives under: deploy, treasury, authority,
+// registry and change. It mirrors lib ADMIN_PROTOCOL [2,'mandala admin'] (contract §8.1), so the suites exercise a
+// lib-shaped issuer/admin envelope; p color outputs (Out.Color) use ColorProtocol instead.
+var AdminProtocol = wallet.Protocol{SecurityLevel: wallet.SecurityLevelEveryAppAndCounterparty, Protocol: "mandala admin"}
 
 // deployProtocol is D §5.3's deploy-signature protocol.
 var deployProtocol = wallet.Protocol{SecurityLevel: wallet.SecurityLevelEveryAppAndCounterparty, Protocol: "mandala deploy"}

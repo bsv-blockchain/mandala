@@ -33,7 +33,7 @@ type Out struct {
 	NoLinkage  bool   // omit this output's env.outputs entry
 	Satoshis   uint64 // 0 means 1
 	// Color set: the lock derives under ColorProtocol(TokenID, *Color) with keyID "color" (contract §5.1)
-	// and the linkage is revealed with that tuple; nil keeps the Mandala derivation (FTProtocol, "out-<n>").
+	// and the linkage is revealed with that tuple; nil keeps the Mandala derivation (AdminProtocol, "out-<n>").
 	Color *ColorRemittance
 }
 
@@ -133,12 +133,12 @@ type outputsOnlyJSON struct {
 func keyIDOf(vout uint32) string { return "out-" + strconv.FormatUint(uint64(vout), 10) }
 
 // derivationOf is the (protocol, keyID) output vout of spec o locks under: the p color tuple when o.Color
-// is set, else the Mandala tuple (FTProtocol, "out-<vout>"). Spending and revealing use the same tuple.
+// is set, else the Mandala tuple (AdminProtocol, "out-<vout>"). Spending and revealing use the same tuple.
 func derivationOf(o Out, vout uint32) (wallet.Protocol, string) {
 	if o.Color != nil {
 		return ColorProtocol(o.TokenID, *o.Color), ColorKeyID
 	}
-	return FTProtocol, keyIDOf(vout)
+	return AdminProtocol, keyIDOf(vout)
 }
 
 // lockPubKey is the BRC-42 child of owner that prover derives for (proto, keyID): the key the output locks to.
@@ -228,7 +228,7 @@ func deploySig(t testing.TB, signer Party, txid string) string {
 
 // Build signs one transaction: token inputs first (in ins order), then one fresh proven funding
 // input; one output per outs entry, locked to the Owner's BRC-42 child derived by the Prover for
-// derivationOf(out, n) ((FTProtocol, "out-<n>"), or the p color tuple when Out.Color is set) and
+// derivationOf(out, n) ((AdminProtocol, "out-<n>"), or the p color tuple when Out.Color is set) and
 // revealed to Overlay. deploySigBy != nil adds a deploySig over the txid.
 func Build(t testing.TB, ins []In, outs []Out, deploySigBy *Party) *Built {
 	t.Helper()

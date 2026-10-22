@@ -1258,6 +1258,7 @@ These are planner calls on points the contract leaves open. Each is also listed 
 13. Lookup store faults answer 503 `ERR_UNAVAILABLE` (retryable) instead of 400. Classification is by type (review fix): only a `*mandala.LookupQueryError` (invalid or unsupported query, wrong service) or `engine.ErrUnknownTopic` answers 400; every other lookup error, including `ls_mandala` store faults and the engine's unwrapped hydration faults (`FindOutput`, `LoadAncillaryBeef`), answers 503.
 14. The `color-*` query validation strings are pinned by this plan (Task 11).
 15. A 36-byte id is refused as ERR_SHAPE `rLegacyTokenID` before token scoping.
+16. **Pre-merge follow-up, blocked on P-LIB (contract §10 ENVELOPE seam, must-pass):** when P-LIB checks in `lib/src/__fixtures__/1color-envelope.json`, copy it byte for byte to `overlay-go/internal/mandala/testdata/1color-envelope.json` and add an engine-flow test that admits it. `TestEnvelopeFixtureMatchesLib` logs and passes while the lib file is absent and fails once it exists until the Go copy matches by sha256. The test kit's non-color outputs already derive under `mandalatest.AdminProtocol` = `[2,"mandala admin"]` (lib `ADMIN_PROTOCOL`, contract §8.1; renamed from `FTProtocol` `[2,"p mandala token"]` in the review fix).
 
 ## Self-review notes (planner)
 
