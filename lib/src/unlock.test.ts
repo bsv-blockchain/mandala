@@ -13,7 +13,7 @@ describe('walletMandalaUnlock', () => {
     const counterparty = 'self'
     const assetId = `${'a'.repeat(64)}_0`
 
-    const lockingScript = await new MandalaToken(wallet as any).lockBRC29(assetId, 100, ADMIN_PROTOCOL, keyID, counterparty)
+    const lockingScript = await new MandalaToken(wallet as any).lockBRC29(assetId, 100n, ADMIN_PROTOCOL, keyID, counterparty)
 
     const sourceTx = new Transaction()
     sourceTx.addOutput({ lockingScript, satoshis: 1 })
@@ -50,7 +50,7 @@ describe('walletMandalaUnlock', () => {
     const assetId = `${'b'.repeat(64)}_0`
 
     // Sender locks the FT to the recipient (counterparty = recipient identity).
-    const lockingScript = await new MandalaToken(sender as any).lockBRC29(assetId, 100, ADMIN_PROTOCOL, keyID, recipientId)
+    const lockingScript = await new MandalaToken(sender as any).lockBRC29(assetId, 100n, ADMIN_PROTOCOL, keyID, recipientId)
 
     const sourceTx = new Transaction()
     sourceTx.addOutput({ lockingScript, satoshis: 1 })

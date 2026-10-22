@@ -1,7 +1,7 @@
 /**
  * BRC-162 authority-chain transactions (overlay-go internal/mandala/authority.go).
  *
- * An authority coin is a 1-sat Bsv21Binary output of amount 0, locked to the
+ * An authority coin is a 1-sat 1Color output of amount 0, locked to the
  * issuer's own wallet-derived key under ADMIN_PROTOCOL and proven by
  * specificKeyLinkage like any token output. A deploy (output 0, no token id)
  * is the chain's first link; every admin action spends the token's live
@@ -14,9 +14,9 @@
  * lost track of.
  */
 import { Transaction, WalletInterface } from '@bsv/sdk'
-import { TREASURY_BASKET, ADMIN_PROTOCOL } from './constants.js'
+import { TREASURY_BASKET } from './constants.js'
 import {
-  commitmentHex, commitmentPayload, DEPLOY_KEY_ID, encodeAdminDetails, lockToken,
+  commitmentHex, commitmentPayload, DEPLOY_KEY_ID, encodeAdminDetails, lockIssuerToken,
   MandalaActionDetails, signDeploy, tokenIdOfDeploy, tokenTopic
 } from './brc162.js'
 import { encodeLinkagePayload, MandalaLinkagePayload } from './encoding.js'
@@ -45,7 +45,8 @@ export interface ValueIn { outpoint: string, keyID: string, counterparty: string
 
 export interface ValueOut {
   tokenId: string
-  amount: number
+  /** Exact uint64 token amount. */
+  amount: bigint
   /** Owner identity key (66 hex). */
   owner: string
   keyID: string
@@ -97,7 +98,7 @@ export async function runAuthorityTx (p: {
 
   const outputs: any[] = []
   for (const v of valueOuts) {
-    const script = await lockToken(wallet, v.tokenId, v.amount, ADMIN_PROTOCOL, v.keyID, v.owner)
+    const script = await lockIssuerToken(wallet, v.tokenId, v.amount, v.keyID, v.owner)
     outputs.push({
       satoshis: 1,
       lockingScript: script.toHex(),
@@ -107,7 +108,7 @@ export async function runAuthorityTx (p: {
     })
   }
   for (let i = 0; i < legs.length; i++) {
-    const script = await lockToken(wallet, legs[i].prior.tokenId, 0, ADMIN_PROTOCOL, authKeyIDs[i], identityKey, commitmentPayload(detailsBytes[i]))
+    const script = await lockIssuerToken(wallet, legs[i].prior.tokenId, 0n, authKeyIDs[i], identityKey, commitmentPayload(detailsBytes[i]))
     outputs.push({
       satoshis: 1,
       lockingScript: script.toHex(),
@@ -204,7 +205,7 @@ export async function runDeployTx (p: {
   labels: string[]
 }): Promise<{ txid: string, tokenId: string, admitted: OverlayAdmitResult }> {
   const { wallet, identityKey } = p
-  const script = await lockToken(wallet, null, 0, ADMIN_PROTOCOL, DEPLOY_KEY_ID, identityKey, p.payload)
+  const script = await lockIssuerToken(wallet, null, 0n, DEPLOY_KEY_ID, identityKey, p.payload)
   const created = await wallet.createAction({
     description: p.description,
     labels: p.labels,

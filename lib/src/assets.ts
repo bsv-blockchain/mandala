@@ -138,6 +138,8 @@ export async function submitAdminAction (
   p: SubmitAdminActionParams
 ): Promise<SubmitAdminActionResult> {
   const { wallet, asset, details, ftOutput, messageBoxClient, identityKey } = p
+  // Transitional (Task 9 makes ftOutput.amount bigint): convert before any gate or wallet call.
+  const ftUnits = ftOutput != null ? BigInt(ftOutput.amount) : 0n
 
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
     const inputBEEF = await spendableBeef(wallet, [asset.authOutpoint])
@@ -151,7 +153,7 @@ export async function submitAdminAction (
         customInstructions: keyID => adminCustomInstructions(asset.assetId, asset.label, keyID, asset.metadata)
       }],
       valueOuts: ftOutput != null
-        ? [{ tokenId: asset.assetId, amount: ftOutput.amount, owner: ftOutput.recipient, keyID: ftKeyID, outputDescription: 'reissued FT' }]
+        ? [{ tokenId: asset.assetId, amount: ftUnits, owner: ftOutput.recipient, keyID: ftKeyID, outputDescription: 'reissued FT' }]
         : [],
       inputBEEF,
       description: `${details.kind} ${asset.label}`,

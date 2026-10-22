@@ -249,7 +249,7 @@ export async function recoverRegistryAuth (p: {
   const authKeyID = script != null ? authorityKeyIdOf(script) : null
   const decoded = script != null ? decodeToken(script) : null
   if (authKeyID == null || decoded == null) throw new Error(`${op} is not a registry authority output`)
-  const tokenId = decoded.tokenId ?? `${row.txid}_0`
+  const tokenId = decoded.assetId ?? `${row.txid}_0`
   try {
     await p.wallet.internalizeAction({
       tx: atomic,

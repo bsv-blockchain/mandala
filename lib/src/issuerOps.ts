@@ -5,7 +5,7 @@
  * (see submitAndBroadcast). Each resolves at the overlay-accept commit point.
  */
 import { Beef, WalletInterface } from '@bsv/sdk'
-import { TREASURY_BASKET, ADMIN_PROTOCOL } from './constants.js'
+import { TREASURY_BASKET, ADMIN_PROTOCOL, OVERLAY_IDENTITY_KEY } from './constants.js'
 import { deployPayload, deployTopics, MandalaActionDetails } from './brc162.js'
 import { assertFeeRate } from './feeRate.js'
 import { AdmissionReceipt, admissionReceipt } from './overlay.js'
@@ -78,8 +78,10 @@ export async function registerAsset (p: RegisterParams): Promise<RegisterResult>
 
 /**
  * The deploy metadata. Pure so the shape is testable without a wallet. The
- * on-chain deploy payload is {sym, dec, label, feeRatePerKb?} (strict CBOR);
- * `metadata` is the wallet-side bookkeeping copy (adds issuer).
+ * on-chain deploy payload is {dec, req: mandalaReq(K), sym, label,
+ * feeRatePerKb?} (strict CBOR, C§4) with K = the configured overlay identity
+ * key (deployPayload throws TypeError while it is unset, before any wallet
+ * call); `metadata` is the wallet-side bookkeeping copy (adds issuer).
  */
 export function registerDetails (
   p: Pick<RegisterParams, 'label' | 'ticker' | 'decimals' | 'identityKey' | 'feeRatePerKb'>
@@ -94,7 +96,7 @@ export function registerDetails (
     issuer: p.identityKey,
     ...(p.feeRatePerKb !== undefined ? { feeRatePerKb: p.feeRatePerKb } : {})
   }
-  const payload = deployPayload({ sym: ticker, dec: p.decimals, label, feeRatePerKb: p.feeRatePerKb })
+  const payload = deployPayload({ sym: ticker, dec: p.decimals, label, identityKey: OVERLAY_IDENTITY_KEY, ...(p.feeRatePerKb != null ? { feeRatePerKb: p.feeRatePerKb } : {}) })
   return { metadata, payload }
 }
 
@@ -132,6 +134,9 @@ export interface IssueParams {
 
 export async function issueTokens (p: IssueParams): Promise<IssuerOpResult> {
   const { wallet, identityKey, asset, amount, depositHash } = p
+  // Transitional (Task 9 makes IssueParams bigint): convert at this boundary,
+  // before any gate or wallet call (BigInt throws RangeError on a non-integer).
+  const units = BigInt(amount)
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
     const keyID = 'mint-' + Date.now()
     // Self-mint: our own identity key (hex) as counterparty, not 'self' — the
@@ -153,7 +158,7 @@ export async function issueTokens (p: IssueParams): Promise<IssuerOpResult> {
       }],
       valueOuts: [{
         tokenId: asset.assetId,
-        amount,
+        amount: units,
         owner: counterparty,
         keyID,
         basket: TREASURY_BASKET,
@@ -228,7 +233,7 @@ export async function redeemTokens (p: RedeemParams): Promise<IssuerOpResult> {
       valueOuts: change > 0
         ? [{
             tokenId: asset.assetId,
-            amount: change,
+            amount: BigInt(change),
             owner: identityKey,
             keyID: keyIDChange,
             basket: TREASURY_BASKET,

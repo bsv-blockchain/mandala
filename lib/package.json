@@ -43,7 +43,7 @@
   "devDependencies": {
     "@bsv/message-box-client": "^2.5.4",
     "@bsv/sdk": "file:../vendor-ts-stack/bsv-sdk-4.0.0-cbdccfe.tgz",
-    "@bsv/templates": "file:../vendor-ts-stack/bsv-templates-2.1.0-cbdccfe.tgz",
+    "@bsv/templates": "file:../vendor-ts-stack/bsv-templates-2.2.0-f241034.tgz",
     "typescript": "~5.9.3",
     "vitest": "^4.1.9"
   },

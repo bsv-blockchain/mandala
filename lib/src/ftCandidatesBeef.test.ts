@@ -17,7 +17,7 @@ describe('loadFtCandidates without lockingScript on the listing', () => {
     src.addOutput({ satoshis: 2, lockingScript: new P2PKH().lock(pkh) })
     const tx = new Transaction()
     tx.addInput({ sourceTransaction: src, sourceOutputIndex: 0, unlockingScript: new (await import('@bsv/sdk')).UnlockingScript([]), sequence: 0xffffffff })
-    tx.addOutput({ satoshis: 1, lockingScript: new MandalaToken().lock(assetId, 25, pkh) })
+    tx.addOutput({ satoshis: 1, lockingScript: new MandalaToken().lock(assetId, 25n, pkh) })
     const outpoint = `${tx.id('hex')}.0`
     const beef = tx.toBEEF()
     const wallet = {

@@ -32,7 +32,7 @@ import type { AdminAsset } from './assets.js'
 import { registerAsset } from './issuerOps.js'
 import { clearAdminAuthGates } from './adminAuthGate.js'
 import { BusyError } from './singleFlight.js'
-import { MESSAGEBOX } from './constants.js'
+import { MESSAGEBOX, configureMandala } from './constants.js'
 
 // Label lookup only; an unconfigured overlay URL now throws (see overlayUrlGuard.test.ts),
 // and these tests are about journal/receive ordering, not metadata.
@@ -309,8 +309,21 @@ describe('A15 registerAsset runs under an intent marker and the mandala.register
   beforeEach(() => {
     stubTemplates()
     vi.mocked(submitAndBroadcast).mockReset()
+    // The deploy payload's req names K = the overlay identity key (C§4).
+    configureMandala({ overlayIdentityKey: STUB_KEY.toPublicKey().toString() })
   })
-  afterEach(() => vi.restoreAllMocks())
+  afterEach(() => {
+    configureMandala({ overlayIdentityKey: '' })
+    vi.restoreAllMocks()
+  })
+
+  it('refuses before createAction while the overlay identity key is unset (no req K)', async () => {
+    configureMandala({ overlayIdentityKey: '' })
+    const wallet = mkRegWallet()
+    await expect(registerAsset(params(wallet))).rejects.toThrow(TypeError)
+    expect(wallet.createAction).not.toHaveBeenCalled()
+    expect(await hasFreshIntent()).toBe(false)
+  })
 
   it('a crash after createAction leaves a fresh intent that the reconcile sweep respects until TTL', async () => {
     // "Crash" = the overlay round-trip never returns; the pipeline is stuck

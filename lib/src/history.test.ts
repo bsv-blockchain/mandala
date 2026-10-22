@@ -7,7 +7,7 @@ import { parseActionsToHistory, exportTransactionsCsv } from './history.js'
 const ASSET = `${'ab'.repeat(32)}_0`
 const PKH = Array.from({ length: 20 }, (_, i) => i + 1)
 const ftScript = (assetId: string, amount: number): string =>
-  new MandalaToken().lock(assetId, amount, PKH).toHex()
+  new MandalaToken().lock(assetId, BigInt(amount), PKH).toHex()
 
 const actions = [
   {

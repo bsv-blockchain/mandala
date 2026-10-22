@@ -1,16 +1,18 @@
 /**
- * BRC-162 wire helpers: the Bsv21Binary token codec boundary, the strict
- * DAG-CBOR admin details / authority commitment / deploy payload, the deploy
+ * BRC-162 wire helpers: the 1Color (OneColor) token codec boundary, the strict
+ * DAG-CBOR admin details / authority commitment / deploy payload and Mandala
+ * `req` (C§4), the deploy
  * signature digest and the per-token topic names. Mirrors overlay-go
  * internal/mandala/{details,deploysig,topics}.go.
  *
  * Pure and React-Native safe (@bsv/templates 2.x imports only @bsv/sdk).
  */
 import { Hash, LockingScript, Utils, WalletInterface, WalletProtocol } from '@bsv/sdk'
-import { Bsv21Binary, decodeStrictCbor, encodeStrictCbor, tokenIdToString } from '@bsv/templates'
+import { OneColor, decodeStrictCbor, encodeStrictCbor, readOneColorAttributes } from '@bsv/templates'
+import { MAX_UINT64 } from './amount.js'
+import { ADMIN_PROTOCOL, ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID } from './constants.js'
 
 export const MANDALA_TOPIC = 'tm_mandala'
-export const MAX_SAFE_AMOUNT = Number.MAX_SAFE_INTEGER
 
 const TOKEN_ID_RE = /^([0-9a-f]{64})_0$/
 const TOKEN_TOPIC_RE = /^tm_[0-9a-f]{64}$/
@@ -38,30 +40,36 @@ export const isSigmaTopic = (t: string): boolean => t === MANDALA_TOPIC || TOKEN
 export const deployTopics = (deployTxid: string): string[] => [MANDALA_TOPIC, `tm_${deployTxid}`]
 
 // ---------------------------------------------------------------------------
-// Codec boundary
+// Codec boundary (BRC-162 1Color, @bsv/templates OneColor)
 // ---------------------------------------------------------------------------
-
-export const codec = new Bsv21Binary()
 
 export interface DecodedToken {
   role: 'deploy' | 'authority' | 'value'
-  /** Absent for a deploy (its id is `<this txid>_0`). */
-  tokenId?: string
-  amount: number
+  /** The output's asset id; for a deploy only when its txid was given (`<txid>_<vout>`). */
+  assetId?: string
+  /** Exact uint64 amount; no 2^53 logic. */
+  amount: bigint
   payload?: number[]
 }
 
-/** Decode a BRC-162 token output, or null when the script is not one (or its amount is unsafe). */
-export function decodeToken (script: LockingScript | string): DecodedToken | null {
+/**
+ * Decode a BRC-162 1Color output locked to a plain P2PKH remainder. Null for a
+ * non-token, a malformed token or any other remainder. No amount cap and no
+ * Mandala id policy: a 36-byte id decodes to `<txid>_<vout>` and the overlay
+ * refuses it.
+ */
+export function decodeToken (script: LockingScript | string, txid?: string, vout?: number): DecodedToken | null {
   try {
     const ls = typeof script === 'string' ? LockingScript.fromHex(script) : script
-    const d = Bsv21Binary.decode(ls)
+    const d = OneColor.decode(ls)
     if (d.restPubKeyHash == null) return null
-    if (d.amount > BigInt(MAX_SAFE_AMOUNT)) return null
+    let assetId: string | undefined
+    if (d.tokenId != null) assetId = OneColor.tokenIdToString(d.tokenId)
+    else if (txid != null) assetId = `${txid}_${vout ?? 0}`
     return {
       role: d.role,
-      ...(d.tokenId != null ? { tokenId: tokenIdToString(d.tokenId) } : {}),
-      amount: Number(d.amount),
+      ...(assetId != null ? { assetId } : {}),
+      amount: d.amount,
       ...(d.payload != null ? { payload: d.payload } : {})
     }
   } catch {
@@ -69,26 +77,38 @@ export function decodeToken (script: LockingScript | string): DecodedToken | nul
   }
 }
 
-/** A value coin of `tokenId` (amount > 0), else null. */
+/**
+ * A value coin of `tokenId` (amount > 0), else null; null above 2^53.
+ * @deprecated Transitional (Task 5): the last 2^53 logic in the lib. Task 16
+ * deletes it; use decodeToken (bigint) instead.
+ */
 export function decodeValue (script: LockingScript | string, tokenId?: string): { tokenId: string, amount: number } | null {
   const d = decodeToken(script)
-  if (d == null || d.role !== 'value' || d.tokenId == null) return null
-  if (tokenId != null && d.tokenId !== tokenId) return null
-  return { tokenId: d.tokenId, amount: d.amount }
+  if (d == null || d.role !== 'value' || d.assetId == null) return null
+  if (!/^[0-9a-f]{64}_0$/.test(d.assetId)) return null // only 32-byte ids, as before 1Color
+  if (tokenId != null && d.assetId !== tokenId) return null
+  if (d.amount > BigInt(Number.MAX_SAFE_INTEGER)) return null
+  return { tokenId: d.assetId, amount: Number(d.amount) }
 }
 
-/** Lock to hash160 of the wallet-derived key (BRC-29 style), like the old MandalaToken.lockBRC29. */
-export async function lockToken (
+/**
+ * Lock a Mandala-key (issuer, treasury, authority, deploy, registry) 1Color
+ * output: OneColor lockBRC29 to hash160 of the key derived under
+ * ADMIN_PROTOCOL. `assetId` null is a deploy. Throws RangeError for an amount
+ * outside 0..2^64-1 before any key derivation.
+ */
+export async function lockIssuerToken (
   wallet: WalletInterface,
-  tokenId: string | null,
-  amount: number,
-  protocolID: WalletProtocol,
+  assetId: string | null,
+  amount: bigint,
   keyID: string,
   counterparty: string,
   payload?: number[]
 ): Promise<LockingScript> {
-  if (!Number.isSafeInteger(amount) || amount < 0) throw new Error(`amount must be a safe non-negative integer, got ${amount}`)
-  return await new Bsv21Binary(wallet).lockBRC29(tokenId, BigInt(amount), protocolID, keyID, counterparty, payload)
+  if (typeof amount !== 'bigint' || amount < 0n || amount > MAX_UINT64) {
+    throw new RangeError(`@bsv/mandala: token amount must be a bigint in 0..2^64-1, got ${String(amount)}`)
+  }
+  return await new OneColor(wallet).lockBRC29(assetId, amount, ADMIN_PROTOCOL, keyID, counterparty, payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -200,39 +220,143 @@ export function commitmentOf (payload?: number[]): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Deploy
+// Deploy payload and the Mandala `req` (C§4)
 // ---------------------------------------------------------------------------
 
-export interface DeployMetadata {
-  /** 1-32 characters. */
-  sym: string
-  /** 0-18. */
-  dec: number
-  /** 1-64 characters. */
-  label: string
-  feeRatePerKb?: number | null
+const SECP256K1_P = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fn
+
+function modPow (b: bigint, e: bigint, m: bigint): bigint {
+  let r = 1n
+  b %= m
+  while (e > 0n) {
+    if ((e & 1n) === 1n) r = (r * b) % m
+    b = (b * b) % m
+    e >>= 1n
+  }
+  return r
 }
 
-export function deployPayload (m: DeployMetadata): number[] {
-  const map: Record<string, any> = { sym: m.sym, dec: BigInt(m.dec), label: m.label }
-  if (m.feeRatePerKb != null) map.feeRatePerKb = BigInt(m.feeRatePerKb)
+/** 66-hex lowercase compressed secp256k1 key whose x is a field element on the curve (C§0). */
+function isIdentityKey (k: unknown): k is string {
+  if (typeof k !== 'string' || !/^0[23][0-9a-f]{64}$/.test(k)) return false
+  const x = BigInt('0x' + k.slice(2))
+  if (x >= SECP256K1_P) return false
+  const y2 = (modPow(x, 3n, SECP256K1_P) + 7n) % SECP256K1_P
+  const y = modPow(y2, (SECP256K1_P + 1n) / 4n, SECP256K1_P)
+  return (y * y) % SECP256K1_P === y2
+}
+
+const codePoints = (s: unknown): number => typeof s === 'string' ? [...s].length : -1
+
+/**
+ * The exact `req` every Mandala deploy writes (C§4): attested v1 in identity
+ * mode and Mandala issuer-v1, both for K = the overlay's identity key.
+ */
+export function mandalaReq (identityKey: string): Record<string, { version: 1, params: Record<string, string> }> {
+  return {
+    [ATTESTED_PROFILE_ID]: { version: 1, params: { trustMode: 'identity', identityKey } },
+    [MANDALA_PROFILE_ID]: { version: 1, params: { identityKey } }
+  }
+}
+
+export interface DeployPayloadParams {
+  /** 1..32 Unicode code points. */
+  sym: string
+  /** Integer 0..18. */
+  dec: number
+  /** 1..64 Unicode code points. */
+  label: string
+  /** K, the Mandala overlay identity key the deploy's `req` names (66-hex lowercase, on curve). */
+  identityKey: string
+  icon?: { mediaType: string, bytes: number[] }
+  /** Optional; the console no longer writes it by default (B6). */
+  feeRatePerKb?: number
+}
+
+/**
+ * Strict DAG-CBOR Mandala deploy payload `{dec, req: mandalaReq(K), sym, label, icon?, feeRatePerKb?}`
+ * (C§4). `ext` is never written. TypeError on any out-of-range field.
+ */
+export function deployPayload (m: DeployPayloadParams): number[] {
+  const n = codePoints(m.sym)
+  if (n < 1 || n > 32) throw new TypeError('@bsv/mandala: sym must be 1..32 characters')
+  const l = codePoints(m.label)
+  if (l < 1 || l > 64) throw new TypeError('@bsv/mandala: label must be 1..64 characters')
+  if (!Number.isInteger(m.dec) || m.dec < 0 || m.dec > 18) throw new TypeError('@bsv/mandala: dec must be an integer 0..18')
+  if (!isIdentityKey(m.identityKey)) throw new TypeError('@bsv/mandala: identityKey must be a 66-hex lowercase compressed public key on secp256k1')
+  const map: Record<string, any> = { dec: BigInt(m.dec), req: mandalaReq(m.identityKey), sym: m.sym, label: m.label }
+  if (m.icon != null) {
+    if (typeof m.icon.mediaType !== 'string' || m.icon.mediaType === '') throw new TypeError('@bsv/mandala: icon mediaType must be non-empty')
+    if (!Array.isArray(m.icon.bytes) || m.icon.bytes.some(b => !Number.isInteger(b) || b < 0 || b > 255)) {
+      throw new TypeError('@bsv/mandala: icon bytes must be an array of bytes')
+    }
+    map.icon = [m.icon.mediaType, Uint8Array.from(m.icon.bytes)]
+  }
+  if (m.feeRatePerKb != null) {
+    if (!Number.isSafeInteger(m.feeRatePerKb) || m.feeRatePerKb < 0) throw new TypeError('@bsv/mandala: feeRatePerKb must be a non-negative safe integer')
+    map.feeRatePerKb = BigInt(m.feeRatePerKb)
+  }
   return encodeStrictCbor(map)
 }
 
-export function parseDeployPayload (payload?: number[]): DeployMetadata | null {
+export interface ParsedDeployPayload {
+  sym: string
+  dec: number
+  label: string
+  feeRatePerKb?: number | null
+  icon?: { mediaType: string, bytes: number[] }
+}
+
+/** The display fields of a strict deploy payload, or null when it lacks a valid sym/dec/label. */
+export function parseDeployPayload (payload?: number[]): ParsedDeployPayload | null {
   if (payload == null) return null
-  try {
-    const m = decodeStrictCbor(payload) as Record<string, unknown>
-    if (typeof m.sym !== 'string' || typeof m.label !== 'string' || m.dec == null) return null
-    return {
-      sym: m.sym,
-      dec: Number(m.dec),
-      label: m.label,
-      ...('feeRatePerKb' in m ? { feeRatePerKb: m.feeRatePerKb == null ? null : Number(m.feeRatePerKb) } : {})
-    }
-  } catch {
-    return null
+  const a = readOneColorAttributes(payload)
+  if (a.payload !== 'map' || a.map == null) return null
+  const label = a.map.label
+  if (a.sym.status !== 'valid' || a.dec.status !== 'valid' || typeof label !== 'string') return null
+  const out: ParsedDeployPayload = { sym: a.sym.value, dec: a.dec.value, label }
+  if ('feeRatePerKb' in a.map) {
+    const f = a.map.feeRatePerKb
+    out.feeRatePerKb = f == null ? null : Number(f)
   }
+  if (a.icon.status === 'valid') out.icon = { mediaType: a.icon.value.mediaType, bytes: Array.from(a.icon.value.bytes) }
+  return out
+}
+
+/**
+ * Read a deploy output (output `vout` 0 of `txid`): its asset id, display
+ * fields and, iff its `req` wire bytes are exactly `mandalaReq(K)`, the
+ * Mandala key K. Null unless the script is a 1Color deploy to P2PKH. Never
+ * throws. An opaque or absent payload gives `dec: 0` and no display fields; a
+ * malformed `dec` gives `dec: 0` (display fields are independent, 0162:221).
+ * The `req` check compares the exact wire span, never a re-encoding (a float
+ * 1.0 version must not pass as 1; plan 01 RF2).
+ */
+export function readDeploy (
+  lockingScript: LockingScript | string,
+  txid: string
+): { assetId: string, sym?: string, dec: number, label?: string, mandalaKey?: string } | null {
+  const d = decodeToken(lockingScript, txid, 0)
+  if (d == null || d.role !== 'deploy' || d.assetId == null) return null
+  const a = readOneColorAttributes(d.payload)
+  const out: { assetId: string, sym?: string, dec: number, label?: string, mandalaKey?: string } = {
+    assetId: d.assetId,
+    dec: a.dec.status === 'valid' ? a.dec.value : 0
+  }
+  if (a.payload !== 'map' || a.map == null) return out
+  if (a.sym.status === 'valid') out.sym = a.sym.value
+  if (typeof a.map.label === 'string') out.label = a.map.label
+  if (a.req.status === 'valid' && a.reqBytes != null) {
+    const params = a.req.value.get(MANDALA_PROFILE_ID)?.params
+    const k = params != null && typeof params === 'object' && !Array.isArray(params) && !(params instanceof Uint8Array)
+      ? (params as Record<string, unknown>).identityKey
+      : undefined
+    if (typeof k === 'string' && isIdentityKey(k) &&
+      Utils.toHex(Array.from(a.reqBytes)) === Utils.toHex(encodeStrictCbor(mandalaReq(k)))) {
+      out.mandalaKey = k
+    }
+  }
+  return out
 }
 
 export const DEPLOY_PROTOCOL: WalletProtocol = [2, 'mandala deploy']
@@ -255,7 +379,7 @@ export const DEPLOY_KEY_ID = 'deploy'
 /** keyID of an authority output: its commitment hex, or DEPLOY_KEY_ID for a deploy. Recomputable from chain data alone. */
 export function authorityKeyIdOf (script: LockingScript | string): string | null {
   const d = decodeToken(script)
-  if (d == null || d.amount !== 0) return null
+  if (d == null || d.amount !== 0n) return null
   if (d.role === 'deploy') return DEPLOY_KEY_ID
   return commitmentOf(d.payload)
 }

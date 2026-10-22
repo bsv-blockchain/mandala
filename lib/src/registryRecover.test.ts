@@ -9,7 +9,8 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { LockingScript, Transaction, Utils } from '@bsv/sdk'
-import { codec, commitmentPayload } from './brc162.js'
+import { OneColor } from '@bsv/templates'
+import { commitmentPayload } from './brc162.js'
 import {
   abortStuckRegistryActions,
   beefContainsTxid,
@@ -294,7 +295,7 @@ describe('fetchRegistryBeef / loadRegistryInputBeef', () => {
 describe('recoverRegistryAuth hands the wallet AtomicBEEF', () => {
   const mockFetch = vi.fn()
   const tx = new Transaction()
-  tx.addOutput({ satoshis: 1, lockingScript: codec.lock('ee'.repeat(32) + '_0', 0n, new Array(20).fill(7), commitmentPayload([1])) })
+  tx.addOutput({ satoshis: 1, lockingScript: new OneColor().lock('ee'.repeat(32) + '_0', 0n, new Array(20).fill(7), commitmentPayload([1])) })
   const TXID = tx.id('hex')
   const ISSUER = '02' + 'ab'.repeat(32)
   const row: OverlayRegistryRow = {
