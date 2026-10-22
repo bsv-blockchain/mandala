@@ -23,8 +23,6 @@
  * (D22, G12); `ProfileParamsError` is the module's own class and adds that
  * prefix itself.
  */
-import { PublicKey } from '@bsv/sdk'
-import { StrictCborLink, type StrictCborValue } from '@bsv/templates'
 import {
   ProfileParamsError,
   type ColorOverlayProvider,
@@ -33,6 +31,8 @@ import {
 } from '@bsv/color-permission-module'
 import { ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID } from './constants.js'
 import { createMandalaOverlayProvider, type MandalaOverlayProvider } from './profileProvider.js'
+import { hasExactly, invalidProfile as invalid, isCborMap, issuerKey } from './profileDescriptor.js'
+import { checkPlanData, submissionData } from './profilePlanData.js'
 
 export { MANDALA_PROFILE_ID }
 export { createMandalaOverlayProvider }
@@ -48,45 +48,6 @@ export interface MandalaProfileOptions {
 
 /** Receipt customInstructions limit for Mandala assets (attested receipts, 16 MiB). */
 const MAX_RECEIPT_BYTES = 16_777_216
-const KEY_RE = /^0[23][0-9a-f]{64}$/
-
-type CborMap = { readonly [key: string]: StrictCborValue }
-
-/** A CBOR map as the strict decoder returns it: an object that is no array, bytes or link. */
-function isCborMap (v: unknown): v is CborMap {
-  return typeof v === 'object' && v !== null && !Array.isArray(v) &&
-    !(v instanceof Uint8Array) && !(v instanceof StrictCborLink)
-}
-
-/** True iff `map` has exactly the own members `members` (order-free). */
-function hasExactly (map: CborMap, members: readonly string[]): boolean {
-  const keys = Object.keys(map)
-  return keys.length === members.length && members.every(m => Object.prototype.hasOwnProperty.call(map, m))
-}
-
-/** 66 lowercase hex, compressed, on the curve, canonical. */
-function isIdentityKey (k: unknown): k is string {
-  if (typeof k !== 'string' || !KEY_RE.test(k)) return false
-  try {
-    return PublicKey.fromString(k).toString() === k
-  } catch {
-    return false
-  }
-}
-
-const invalid = (reason: string): ProfileParamsError =>
-  new ProfileParamsError(`BRC-207: invalid Mandala issuer-v1 profile: ${reason}`)
-
-/** issuer-v1 params: exactly `{identityKey: K}` (C§4). Returns K, else throws ProfileParamsError. */
-function issuerKey (descriptor: ProfileDescriptor): string {
-  if (descriptor == null || typeof descriptor !== 'object') throw invalid('descriptor must be {version, params}')
-  if (descriptor.version !== 1) throw invalid('version must be 1')
-  const params = descriptor.params
-  if (!isCborMap(params) || !hasExactly(params, ['identityKey'])) throw invalid('params must be exactly {identityKey}')
-  const k = params.identityKey
-  if (!isIdentityKey(k)) throw invalid('identityKey must be a lowercase compressed public key (66 hex) on the curve')
-  return k
-}
 
 /** C§4: issuer params exactly {identityKey: K}; req exactly {attested v1 identity K, issuer-v1}. */
 function checkDescriptor (descriptor: ProfileDescriptor, req: ReadonlyMap<string, ProfileDescriptor>): void {
@@ -145,7 +106,11 @@ export function createMandalaProfile (o: MandalaProfileOptions): RequiredProfile
       if (provider === undefined) throw new ProfileParamsError(`no Mandala overlay configured for ${k}`)
       return provider
     },
-    deployProviders: (): ColorOverlayProvider[] => [...providers.values()]
+    deployProviders: (): ColorOverlayProvider[] => [...providers.values()],
+    // B1 (C§5.2): the plan leaf and the tx layout are checked at createAction
+    // and again at signAction; submissionData gives the envelope bytes.
+    checkPlanData,
+    submissionData
   }
   return Object.freeze(handler)
 }
