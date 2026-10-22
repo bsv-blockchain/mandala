@@ -707,7 +707,7 @@ func TestDoubleClickedDeployOverHTTP(t *testing.T) {
 		if err != nil {
 			return nil, nil, err
 		}
-		ls, err := mandala.NewTokenLookupService(id, app.Verifier, app.Store)
+		ls, err := mandala.NewTokenLookupService(id, app.Verifier, app.Store, app.EngineStore)
 		if err != nil {
 			return nil, nil, err
 		}

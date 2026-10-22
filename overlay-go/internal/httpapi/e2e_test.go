@@ -9,9 +9,12 @@ import (
 	"net/http/httptest"
 	"slices"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
@@ -26,6 +29,7 @@ import (
 const (
 	e2eNode      = "mandala3_test_e2e"
 	e2eAllowNode = "mandala3_test_e2e_allow"
+	e2eColorNode = "mandala3_test_e2e_color"
 )
 
 type e2eOverlay struct {
@@ -607,4 +611,161 @@ func TestE2EColorHolderFlow(t *testing.T) {
 	if h, r := e2eBalance(t, o, H), e2eBalance(t, o, R); h != 400 || r != 600 {
 		t.Fatalf("balances after the replay holder %d receiver %d, want 400 and 600", h, r)
 	}
+}
+
+type e2eLookupItem struct {
+	Beef        []byte
+	OutputIndex uint32
+	Txid        string
+}
+
+// e2eLookup POSTs /lookup {service, query} and returns the status, and on 200 the output-list items.
+func e2eLookup(t *testing.T, o e2eOverlay, service, query string) (int, []e2eLookupItem, []byte) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/lookup", strings.NewReader(`{"service":"`+service+`","query":`+query+`}`))
+	req.Header.Set("Content-Type", "application/json")
+	code, body := e2eDo(t, o, req)
+	if code != 200 {
+		return code, nil, body
+	}
+	var ans struct {
+		Type    string `json:"type"`
+		Outputs []struct {
+			Beef        []int   `json:"beef"`
+			OutputIndex uint32  `json:"outputIndex"`
+			Txid        *string `json:"txid"`
+		} `json:"outputs"`
+	}
+	if err := json.Unmarshal(body, &ans); err != nil || ans.Type != "output-list" {
+		t.Fatalf("lookup answer %s: %v", body, err)
+	}
+	items := make([]e2eLookupItem, 0, len(ans.Outputs))
+	for _, out := range ans.Outputs {
+		if out.Txid == nil {
+			t.Fatalf("lookup item without txid: %s", body)
+		}
+		beef := make([]byte, len(out.Beef))
+		for i, v := range out.Beef {
+			beef[i] = byte(v)
+		}
+		items = append(items, e2eLookupItem{Beef: beef, OutputIndex: out.OutputIndex, Txid: *out.Txid})
+	}
+	return code, items, body
+}
+
+// e2eColorQuery is a color-* query object on asset id for the outpoints.
+func e2eColorQuery(typ, id string, ops ...string) string {
+	q, _ := json.Marshal(map[string]any{"type": typ, "version": 1, "assetId": id, "topic": "tm_color_" + id, "outpoints": ops})
+	return string(q)
+}
+
+// e2eRequireItems: the answer is exactly want (built tx, vout) in order, each item's txid is its AtomicBEEF subject,
+// and the BEEF parses to that txid with the built locking script at outputIndex.
+func e2eRequireItems(t *testing.T, label string, items []e2eLookupItem, want ...e2eOut) {
+	t.Helper()
+	if len(items) != len(want) {
+		t.Fatalf("%s: %d items, want %d", label, len(items), len(want))
+	}
+	for i, w := range want {
+		it := items[i]
+		if it.Txid != w.b.Txid || it.OutputIndex != w.vout {
+			t.Fatalf("%s[%d] = %s.%d, want %s.%d", label, i, it.Txid, it.OutputIndex, w.b.Txid, w.vout)
+		}
+		beef, tx, txid, err := transaction.ParseBeef(it.Beef)
+		if err != nil || txid == nil || txid.String() != w.b.Txid {
+			t.Fatalf("%s[%d]: ParseBeef txid %v, %v", label, i, txid, err)
+		}
+		if tx == nil {
+			tx = beef.FindTransactionForSigningByHash(txid)
+		}
+		if tx == nil || int(w.vout) >= len(tx.Outputs) ||
+			!bytes.Equal(tx.Outputs[w.vout].LockingScript.Bytes(), w.b.Tx.Outputs[w.vout].LockingScript.Bytes()) {
+			t.Fatalf("%s[%d]: the BEEF's output %d is not the built script", label, i, w.vout)
+		}
+	}
+}
+
+type e2eOut struct {
+	b    *mandalatest.Built
+	vout uint32
+}
+
+func (e e2eOut) String() string { return e.b.Txid + "." + strconv.FormatUint(uint64(e.vout), 10) }
+
+// Review Focus 3: color-admission answers admitted outputs spent or not (the deploy <txid>.0 after an issue), with
+// BEEF and txid; color-spendability omits the spent ones. The legacy query keeps answering, with txid on every item.
+func TestE2EColorLookupsSpentAndUnspent(t *testing.T) {
+	e2eDB(t, e2eColorNode)
+	o := e2eBoot(t, e2eColorNode, nil, false)
+	I, H, R := mandalatest.Issuer, mandalatest.Holder, mandalatest.Receiver
+
+	d := mandalatest.Deploy(t, I, "USD")
+	id := mandalatest.TokenIDOf(d, 0)
+	tm := mandala.TokenTopicOfTxid(d.Txid)
+	ls := "ls_color_" + id
+	e2eAdmit(t, o, d, mandala.MandalaTopic, tm)
+	d0 := e2eOut{d, 0}
+	_, items, _ := e2eLookup(t, o, ls, e2eColorQuery("color-spendability", id, d0.String()))
+	e2eRequireItems(t, "spendability before the issue", items, d0)
+
+	is := mandalatest.Issue(t, d, 0, I, H, 1000)
+	e2eAdmit(t, o, is, tm)
+	is0, is1 := e2eOut{is, 0}, e2eOut{is, 1}
+
+	code, items, body := e2eLookup(t, o, ls, e2eColorQuery("color-admission", id, d0.String(), is0.String(), is1.String()))
+	if code != 200 {
+		t.Fatalf("color-admission: %d %s", code, body)
+	}
+	e2eRequireItems(t, "admission [d.0, is.0, is.1]", items, d0, is0, is1)
+	_, items, _ = e2eLookup(t, o, ls, e2eColorQuery("color-spendability", id, d0.String(), is0.String(), is1.String()))
+	e2eRequireItems(t, "spendability [d.0, is.0, is.1]", items, is0, is1)
+
+	tr := mandalatest.Transfer(t, is, 1, R, 400)
+	e2eAdmit(t, o, tr, tm)
+	_, items, _ = e2eLookup(t, o, ls, e2eColorQuery("color-spendability", id, is1.String()))
+	e2eRequireItems(t, "spendability [is.1] after the transfer", items)
+	_, items, _ = e2eLookup(t, o, ls, e2eColorQuery("color-admission", id, is1.String()))
+	e2eRequireItems(t, "admission [is.1] after the transfer", items, is1)
+	_, items, _ = e2eLookup(t, o, ls, e2eColorQuery("color-spendability", id, e2eOut{tr, 1}.String(), e2eOut{tr, 0}.String()))
+	e2eRequireItems(t, "spendability of the transfer outputs", items, e2eOut{tr, 1}, e2eOut{tr, 0})
+
+	// an outpoint never admitted, and one of another asset's deploy, answer nothing
+	other := mandalatest.Deploy(t, I, "EUR")
+	e2eAdmit(t, o, other, mandala.MandalaTopic, mandala.TokenTopicOfTxid(other.Txid))
+	_, items, _ = e2eLookup(t, o, ls, e2eColorQuery("color-admission", id, e2eOut{other, 0}.String(), strings.Repeat("00", 32)+".0"))
+	e2eRequireItems(t, "admission of foreign outpoints", items)
+
+	// the legacy query still answers, and every item carries its txid
+	code, items, body = e2eLookup(t, o, ls, `{"tokenId":"`+id+`"}`)
+	if code != 200 || len(items) == 0 {
+		t.Fatalf("legacy tokenId lookup: %d %s", code, body)
+	}
+	for _, it := range items {
+		if beefTxid := e2eAtomicSubject(t, it.Beef); it.Txid != beefTxid {
+			t.Fatalf("legacy item txid %s, AtomicBEEF subject %s", it.Txid, beefTxid)
+		}
+	}
+
+	// query refusals are 400; an unhosted service is 400
+	for _, q := range []string{
+		e2eColorQuery("color-admission", id, strings.ToUpper(d.Txid)+".0"),
+		e2eColorQuery("color-admission", id, d0.String(), d0.String()),
+		`{"type":"color-admission","tokenId":"` + id + `"}`,
+	} {
+		if code, _, body := e2eLookup(t, o, ls, q); code != 400 {
+			t.Fatalf("%s: %d %s, want 400", q, code, body)
+		}
+	}
+	if code, _, body := e2eLookup(t, o, ls+"_1", e2eColorQuery("color-admission", id, d0.String())); code != 400 {
+		t.Fatalf("unhosted service: %d %s, want 400", code, body)
+	}
+}
+
+func e2eAtomicSubject(t *testing.T, beef []byte) string {
+	t.Helper()
+	_, _, txid, err := transaction.ParseBeef(beef)
+	if err != nil || txid == nil || len(beef) < 36 || !bytes.Equal(beef[:4], []byte{1, 1, 1, 1}) {
+		t.Fatalf("not AtomicBEEF: %v", err)
+	}
+	return txid.String()
 }

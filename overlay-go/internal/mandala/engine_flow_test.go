@@ -198,7 +198,7 @@ func TestEngineConflictingSpendRefused(t *testing.T) {
 // hostWithLookup registers ls_<tokenID> and then tm_<tokenID> (the order TokenTopics.Ensure uses).
 func (f *engineFlow) hostWithLookup(tokenID string) string {
 	f.t.Helper()
-	ls, err := NewTokenLookupService(tokenID, f.deps.Verifier, f.store)
+	ls, err := NewTokenLookupService(tokenID, f.deps.Verifier, f.store, f.es)
 	if err != nil {
 		f.t.Fatalf("token lookup %s: %v", tokenID, err)
 	}

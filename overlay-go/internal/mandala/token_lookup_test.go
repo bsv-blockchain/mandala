@@ -3,6 +3,7 @@ package mandala
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -35,7 +36,7 @@ func lkStore(t *testing.T) (*Store, *mongo.Database, context.Context) {
 
 func lkToken(t *testing.T, store *Store, tokenID string) *TokenLookupService {
 	t.Helper()
-	ls, err := NewTokenLookupService(tokenID, overlayVerifier(t), store)
+	ls, err := NewTokenLookupService(tokenID, overlayVerifier(t), store, &memEngine{})
 	if err != nil {
 		t.Fatalf("token lookup: %v", err)
 	}
@@ -381,7 +382,41 @@ func TestTokenLookupNamesAndMetaData(t *testing.T) {
 	if ls.GetDocumentation() == "" {
 		t.Fatal("empty documentation")
 	}
-	if _, err := NewTokenLookupService("nope", overlayVerifier(t), st); err == nil || err.Error() != "not a canonical Mandala token id: nope" {
+	if _, err := NewTokenLookupService("nope", overlayVerifier(t), st, &memEngine{}); err == nil || err.Error() != "not a canonical Mandala token id: nope" {
 		t.Fatalf("bad id = %v", err)
+	}
+	id := strings.Repeat("ab", 32) + "_0"
+	for name, eng := range map[string]EngineOutputReader{"no engine reader": nil, "no store": &memEngine{}} {
+		store := st
+		if eng != nil {
+			store = nil
+		}
+		if _, err := NewTokenLookupService(id, overlayVerifier(t), store, eng); err == nil ||
+			err.Error() != "ls_color_"+id+": a store and an engine output reader are required" {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+// A store read fault on a Mandala-key query is ErrLookupUnavailable (503), not a query error (400).
+func TestTokenLookupLegacyStoreFaultIsUnavailable(t *testing.T) {
+	store, _, _ := lkStore(t)
+	id := strings.Repeat("ab", 32) + "_0"
+	ls := lkToken(t, store, id)
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, q := range []string{
+		`{"metadataTokenId":"` + id + `"}`,
+		`{"authoritiesTokenId":"` + id + `"}`,
+		`{"tokenId":"` + id + `"}`,
+		`{"txid":"` + strings.Repeat("cd", 32) + `","outputIndex":0}`,
+	} {
+		_, err := ls.Lookup(dead, &lookup.LookupQuestion{Service: ls.Name(), Query: json.RawMessage(q)})
+		if !errors.Is(err, ErrLookupUnavailable) {
+			t.Fatalf("%s on a dead context: %v, want ErrLookupUnavailable", q, err)
+		}
+	}
+	if _, err := ls.Lookup(dead, &lookup.LookupQuestion{Service: ls.Name(), Query: json.RawMessage(`{"tokenId":"nope"}`)}); err == nil || errors.Is(err, ErrLookupUnavailable) {
+		t.Fatalf("a query error must stay a query error: %v", err)
 	}
 }

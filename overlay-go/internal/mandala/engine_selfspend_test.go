@@ -54,7 +54,7 @@ func (l *lookupFault) OutputAdmittedByTopic(ctx context.Context, p *engine.Outpu
 // hostWithFaultyLookup registers ls_<tokenID> behind a lookupFault, then tm_<tokenID>.
 func (f *engineFlow) hostWithFaultyLookup(tokenID string) (string, *lookupFault) {
 	f.t.Helper()
-	ls, err := NewTokenLookupService(tokenID, f.deps.Verifier, f.store)
+	ls, err := NewTokenLookupService(tokenID, f.deps.Verifier, f.store, f.es)
 	if err != nil {
 		f.t.Fatalf("token lookup %s: %v", tokenID, err)
 	}

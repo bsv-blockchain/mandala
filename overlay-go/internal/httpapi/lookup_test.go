@@ -3,14 +3,19 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/bsv-blockchain/go-sdk/overlay/lookup"
+
+	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
 
 // stubLookuper is a Lookuper test double: it records what it was called
@@ -73,7 +78,7 @@ func TestLookup_OutputListAnswer(t *testing.T) {
 		answer: &lookup.LookupAnswer{
 			Type: lookup.AnswerTypeOutputList,
 			Outputs: []*lookup.OutputListItem{
-				{Beef: []byte{1, 2, 3}, OutputIndex: 7},
+				{Beef: atomicFixture, OutputIndex: 7},
 			},
 		},
 	}
@@ -85,8 +90,8 @@ func TestLookup_OutputListAnswer(t *testing.T) {
 	}
 
 	raw := readRawBody(t, resp)
-	if !strings.Contains(string(raw), `"beef":[1,2,3]`) {
-		t.Fatalf("body = %s, want to contain \"beef\":[1,2,3]", raw)
+	if !strings.Contains(string(raw), atomicFixtureJSON) {
+		t.Fatalf("body = %s, want to contain the AtomicBEEF bytes", raw)
 	}
 	if !strings.Contains(string(raw), `"type":"output-list"`) {
 		t.Fatalf("body = %s, want to contain \"type\":\"output-list\"", raw)
@@ -115,7 +120,7 @@ func TestLookup_AggregationHeaderIgnored(t *testing.T) {
 		answer: &lookup.LookupAnswer{
 			Type: lookup.AnswerTypeOutputList,
 			Outputs: []*lookup.OutputListItem{
-				{Beef: []byte{1, 2, 3}, OutputIndex: 7},
+				{Beef: atomicFixture, OutputIndex: 7},
 			},
 		},
 	}
@@ -134,8 +139,8 @@ func TestLookup_AggregationHeaderIgnored(t *testing.T) {
 	}
 
 	raw := readRawBody(t, resp)
-	if !strings.Contains(string(raw), `"beef":[1,2,3]`) {
-		t.Fatalf("body = %s, want to contain \"beef\":[1,2,3] even with X-Aggregation set", raw)
+	if !strings.Contains(string(raw), atomicFixtureJSON) {
+		t.Fatalf("body = %s, want to contain the AtomicBEEF bytes even with X-Aggregation set", raw)
 	}
 }
 
@@ -194,5 +199,86 @@ func TestLookup_EmptyOutputsIsEmptyArrayNotNull(t *testing.T) {
 	raw := readRawBody(t, resp)
 	if !strings.Contains(string(raw), `"outputs":[]`) {
 		t.Fatalf("body = %s, want \"outputs\":[] (never null)", raw)
+	}
+}
+
+// atomicFixture is an AtomicBEEF header (01010101 ‖ subject txid in internal byte order) plus one trailing byte;
+// atomicFixtureTxid is that subject in display hex (reversed).
+var (
+	atomicFixture, atomicFixtureTxid, atomicFixtureJSON = func() ([]byte, string, string) {
+		b := []byte{1, 1, 1, 1}
+		for i := 0; i < 32; i++ {
+			b = append(b, byte(i))
+		}
+		b = append(b, 0xef)
+		disp := make([]byte, 32)
+		for i := range disp {
+			disp[i] = byte(31 - i)
+		}
+		parts := make([]string, len(b))
+		for i, v := range b {
+			parts[i] = strconv.Itoa(int(v))
+		}
+		return b, hex.EncodeToString(disp), `"beef":[` + strings.Join(parts, ",") + `]`
+	}()
+)
+
+func TestLookupItemCarriesAtomicBeefTxid(t *testing.T) {
+	stub := &stubLookuper{answer: &lookup.LookupAnswer{Type: lookup.AnswerTypeOutputList,
+		Outputs: []*lookup.OutputListItem{{Beef: atomicFixture, OutputIndex: 7}, {Beef: atomicFixture, OutputIndex: 0}}}}
+	app := newServer(&stubSubmitter{}, stub, nil, nil)
+	resp := doRequest(t, app, lookupRequest(`{"service":"ls_mandala","query":{}}`))
+	raw := readRawBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (%s)", resp.StatusCode, raw)
+	}
+	var got struct {
+		Outputs []struct {
+			OutputIndex uint32 `json:"outputIndex"`
+			Txid        string `json:"txid"`
+		} `json:"outputs"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil || len(got.Outputs) != 2 ||
+		got.Outputs[0].Txid != atomicFixtureTxid || got.Outputs[0].OutputIndex != 7 || got.Outputs[1].Txid != atomicFixtureTxid {
+		t.Fatalf("outputs = %+v (%v) from %s", got.Outputs, err, raw)
+	}
+}
+
+// A non-atomic BEEF item cannot name its subject: the answer fails closed with 500, never an item without txid.
+func TestLookupNonAtomicBeefIs500(t *testing.T) {
+	for name, beef := range map[string][]byte{
+		"plain BEEF":       {0x02, 0x00, 0xbe, 0xef, 0x00},
+		"short header":     atomicFixture[:35],
+		"empty":            {},
+		"bad atomic magic": append([]byte{1, 1, 1, 2}, atomicFixture[4:]...),
+	} {
+		stub := &stubLookuper{answer: &lookup.LookupAnswer{Type: lookup.AnswerTypeOutputList,
+			Outputs: []*lookup.OutputListItem{{Beef: atomicFixture, OutputIndex: 1}, {Beef: beef, OutputIndex: 0}}}}
+		resp := doRequest(t, newServer(&stubSubmitter{}, stub, nil, nil), lookupRequest(`{"service":"ls_mandala","query":{}}`))
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("%s: status = %d, want 500", name, resp.StatusCode)
+		}
+		body := decodeJSON(t, resp)
+		if body["status"] != "error" || body["message"] != "lookup answer: output is not AtomicBEEF" {
+			t.Fatalf("%s: body = %v", name, body)
+		}
+	}
+}
+
+// A lookup store or engine read fault is retryable: 503 ERR_UNAVAILABLE (contract §6); any other error stays 400.
+func TestLookupStoreFaultIs503(t *testing.T) {
+	stub := &stubLookuper{err: fmt.Errorf("%w: x", mandala.ErrLookupUnavailable)}
+	resp := doRequest(t, newServer(&stubSubmitter{}, stub, nil, nil), lookupRequest(`{"service":"ls_mandala","query":{}}`))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	body := decodeJSON(t, resp)
+	if body["status"] != "error" || body["code"] != "ERR_UNAVAILABLE" || body["retryable"] != true ||
+		body["description"] != "lookup unavailable: x" || body["message"] != "lookup unavailable: x" {
+		t.Fatalf("body = %v", body)
+	}
+	stub.err = errors.New("Invalid lookup query: x")
+	if resp := doRequest(t, newServer(&stubSubmitter{}, stub, nil, nil), lookupRequest(`{"service":"ls_mandala","query":{}}`)); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a query error status = %d, want 400", resp.StatusCode)
 	}
 }

@@ -234,7 +234,7 @@ func Build(ctx context.Context, cfg Config, opts ...Option) (*App, error) {
 
 	gate := maintenance.NewGate(maintenance.DefaultDrainTimeout)
 	reconcileLock := maintenance.NewGate(maintenance.DefaultDrainTimeout)
-	tokens := NewTokenTopics(eng, cfg.TokenAllowlist, cfg.TokenAllowlistSet, tokenTopicFactory(deps, verifier, store))
+	tokens := NewTokenTopics(eng, cfg.TokenAllowlist, cfg.TokenAllowlistSet, tokenTopicFactory(deps, verifier, store, es))
 	ownerIndex := NewOwnerIndexMaintenance(OwnerIndexDeps{
 		Gate:                gate,
 		ReconcileLock:       reconcileLock,
@@ -304,14 +304,15 @@ func (a *App) Close() {
 }
 
 // tokenTopicFactory builds one token's manager and lookup on the shared store with the shared deps (one spend checker,
-// one trusted set, one membership provider for every token topic).
-func tokenTopicFactory(deps mandala.TokenTopicDeps, v *mandala.Verifier, store *mandala.Store) TokenTopicFactory {
+// one trusted set, one membership provider for every token topic); the lookup reads the engine's outputs for the
+// color-* queries.
+func tokenTopicFactory(deps mandala.TokenTopicDeps, v *mandala.Verifier, store *mandala.Store, es *enginestore.Store) TokenTopicFactory {
 	return func(tokenID string) (engine.TopicManager, engine.LookupService, error) {
 		tm, err := mandala.NewTokenTopicManager(tokenID, deps)
 		if err != nil {
 			return nil, nil, err
 		}
-		ls, err := mandala.NewTokenLookupService(tokenID, v, store)
+		ls, err := mandala.NewTokenLookupService(tokenID, v, store, es)
 		if err != nil {
 			return nil, nil, err
 		}

@@ -119,16 +119,22 @@ var (
 )
 
 // TokenLookupService is ls_color_<assetId> (Q2/mandala/MandalaLookupService.ts), answering formulas
-// only (D-9).
+// only (D-9). Besides the Mandala keys it answers the color-spendability / color-admission shapes
+// (contract §6) from the engine's outputs, the admission records and the asset state.
 type TokenLookupService struct {
 	tokenID, topic, name string
 	verifier             LinkageVerifier
 	store                *Store
+	eng                  EngineOutputReader // the color-* reads (the engine's documents on topic)
+	admissions           AdmissionReader    // = store
+	states               assetStateReader   // = store
 }
 
 var _ engine.LookupService = (*TokenLookupService)(nil)
 
-func NewTokenLookupService(tokenID string, v LinkageVerifier, store *Store) (*TokenLookupService, error) {
+// NewTokenLookupService builds ls_color_<tokenID> on the shared store and the engine's output reader;
+// a missing store or engine reader is refused (the color-* answers cannot fail open).
+func NewTokenLookupService(tokenID string, v LinkageVerifier, store *Store, eng EngineOutputReader) (*TokenLookupService, error) {
 	topic, err := TokenTopic(tokenID)
 	if err != nil {
 		return nil, err
@@ -137,7 +143,11 @@ func NewTokenLookupService(tokenID string, v LinkageVerifier, store *Store) (*To
 	if err != nil {
 		return nil, err
 	}
-	return &TokenLookupService{tokenID: tokenID, topic: topic, name: name, verifier: v, store: store}, nil
+	if store == nil || eng == nil {
+		return nil, errors.New(name + ": a store and an engine output reader are required")
+	}
+	return &TokenLookupService{tokenID: tokenID, topic: topic, name: name, verifier: v, store: store,
+		eng: eng, admissions: store, states: store}, nil
 }
 
 func (l *TokenLookupService) Name() string  { return l.name }
@@ -322,10 +332,38 @@ func (l *TokenLookupService) OutputBlockHeightUpdated(context.Context, *chainhas
 	return nil
 }
 
-// Lookup validates every key before answering any (TS order: the token keys, txid, outputIndex,
+// Lookup takes the color branch when the query object has a top-level "type" member (contract §6
+// discriminator; any Mandala key mixed in is then an unexpected field), else the Mandala keys as
+// before. Every store or engine read fault wraps ErrLookupUnavailable (HTTP 503).
+func (l *TokenLookupService) Lookup(ctx context.Context, q *lookup.LookupQuestion) (*lookup.LookupAnswer, error) {
+	if q != nil {
+		if _, query, err := lookupObject(q.Query); err == nil {
+			if _, color := query["type"]; color {
+				return l.lookupColor(ctx, q)
+			}
+		}
+	}
+	return l.lookupMandala(ctx, q)
+}
+
+// lookupColor answers a color-* query with formulas in query order (the engine hydrates them, spent
+// outputs included: Mandala retains every token input).
+func (l *TokenLookupService) lookupColor(ctx context.Context, q *lookup.LookupQuestion) (*lookup.LookupAnswer, error) {
+	cq, err := ParseColorQuery(q, l.name, l.tokenID)
+	if err != nil {
+		return nil, err
+	}
+	ops, err := colorAnswer(ctx, cq, l.topic, l.tokenID, l.eng, l.admissions, l.states)
+	if err != nil {
+		return nil, err
+	}
+	return lookupFormulas(ops...)
+}
+
+// lookupMandala validates every key before answering any (TS order: the token keys, txid, outputIndex,
 // limit, skip), refuses any token key naming another token (Q2 ac8d82732), then answers the first
 // token key present, else txid + outputIndex.
-func (l *TokenLookupService) Lookup(ctx context.Context, q *lookup.LookupQuestion) (*lookup.LookupAnswer, error) {
+func (l *TokenLookupService) lookupMandala(ctx context.Context, q *lookup.LookupQuestion) (*lookup.LookupAnswer, error) {
 	query, err := RequireLookupQuery(q, l.name, tokenLookupQueryKeys)
 	if err != nil {
 		return nil, err
@@ -375,7 +413,7 @@ func (l *TokenLookupService) Lookup(ctx context.Context, q *lookup.LookupQuestio
 	case "metadataTokenId":
 		md, err := l.store.FindMetadata(ctx, l.tokenID)
 		if err != nil {
-			return nil, err
+			return nil, lookupUnavailable(l.name, err)
 		}
 		if md == nil {
 			return lookupFormulas()
@@ -384,7 +422,7 @@ func (l *TokenLookupService) Lookup(ctx context.Context, q *lookup.LookupQuestio
 	case "authoritiesTokenId":
 		rows, err := l.store.ListAuthorities(ctx, l.topic, l.tokenID)
 		if err != nil {
-			return nil, err
+			return nil, lookupUnavailable(l.name, err)
 		}
 		start := min(int(skip), len(rows))
 		end := min(start+int(limit), len(rows))
@@ -396,7 +434,7 @@ func (l *TokenLookupService) Lookup(ctx context.Context, q *lookup.LookupQuestio
 	case "tokenId":
 		rows, err := l.store.FindTokensByTokenID(ctx, l.tokenID, limit, skip)
 		if err != nil {
-			return nil, err
+			return nil, lookupUnavailable(l.name, err)
 		}
 		ops := make([]Outpoint, 0, len(rows))
 		for _, r := range rows {
@@ -414,7 +452,7 @@ func (l *TokenLookupService) Lookup(ctx context.Context, q *lookup.LookupQuestio
 	idx := uint32(vout)
 	row, err := l.store.GetTokenRow(ctx, txid, idx)
 	if err != nil {
-		return nil, err
+		return nil, lookupUnavailable(l.name, err)
 	}
 	if row != nil {
 		if row.TokenID != l.tokenID {
@@ -424,7 +462,7 @@ func (l *TokenLookupService) Lookup(ctx context.Context, q *lookup.LookupQuestio
 	}
 	a, err := l.store.GetAuthorityRow(ctx, txid, idx)
 	if err != nil {
-		return nil, err
+		return nil, lookupUnavailable(l.name, err)
 	}
 	if a != nil && a.TokenID == l.tokenID {
 		return lookupFormulas(Outpoint{Txid: a.Txid, OutputIndex: a.OutputIndex})

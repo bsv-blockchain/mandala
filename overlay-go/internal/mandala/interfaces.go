@@ -44,6 +44,12 @@ type EngineOutputReader interface {
 	ListUnspentAdmittedOutputs(ctx context.Context, topic string, after *transaction.Outpoint, limit int) ([]transaction.Outpoint, error)
 }
 
+// AdmissionReader reads a txid's admission record (nil when it has none); *Store implements it. The color-*
+// lookups read it to tell an admitted output from one whose transaction was evicted.
+type AdmissionReader interface {
+	GetAdmission(ctx context.Context, txid string) (*AdmissionRecord, error)
+}
+
 // ScreeningProvider answers the sanctions screen (layer D).
 type ScreeningProvider interface {
 	IsSanctioned(ctx context.Context, identityKey string) (bool, error)
