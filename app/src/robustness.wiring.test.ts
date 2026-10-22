@@ -201,4 +201,14 @@ describe('robustness wiring (shipped source)', () => {
     expect(h).not.toMatch(/balance\s*\+\s*(row\.|a\.|asset\.)?(incoming|unsettled)|(incoming|unsettled)\s*\+\s*(row\.|a\.|asset\.)?balance/)
     expect(h).not.toMatch(/\.pending\b/)
   })
+
+  it('admin views carry no Number() on amounts; reissue takes the frozen row amount', () => {
+    const rc = src('components/issuer/RegulatoryControls.tsx'); expect(rc).not.toMatch(/Number\(reissueAmount\)/)
+    expect(rc).toMatch(/ftOutput:\s*\{\s*recipient,\s*amount:\s*row\.amount\s*\}/); expect(rc).toContain('notified')
+    expect(src('components/issuer/OverviewSection.tsx')).toContain('reserveRatioPct(')
+    for (const f of ['OverviewSection', 'BankingMock', 'OverlayActivity', 'AuditLog', 'RegulatoryControls'])
+      expect(src(`components/issuer/${f}.tsx`)).not.toContain("'@bsv/mandala/amount'")
+    const bank = src('components/issuer/BankingMock.tsx')
+    expect(bank).toContain('safeParseAmount('); expect(bank).not.toMatch(/type="number"/)
+  })
 })

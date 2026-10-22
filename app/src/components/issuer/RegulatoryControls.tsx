@@ -10,7 +10,6 @@ import { useWallet } from '../../context/WalletContext'
 import { AdminAsset, submitAdminAction, SubmitAdminActionParams, withReason } from '@bsv/mandala/assets'
 import { setFeeRate } from '@bsv/mandala/feeRate'
 import { AssetAdminStateView } from '@bsv/mandala/adminState'
-import { formatAmount } from '@bsv/mandala/amount'
 import { guardAdminFields, guardPositiveAmount } from '@bsv/mandala/submitGuards'
 import { BusyError } from '@bsv/mandala/singleFlight'
 import { isAdminAuthInFlight } from '@bsv/mandala/adminAuthGate'
@@ -18,6 +17,8 @@ import { useAssetState, useInvalidateAssetState } from '../../hooks/useAssetStat
 import { useInvalidateAdminHistory } from '../../hooks/useAdminHistory'
 import { useAdvanceAdminAuth } from '../../hooks/useAdminAssets'
 import { parseFeeRateInput } from '../../lib/mandala/feeRateInput'
+import { displayAmount } from '../../lib/mandala/amountDisplay'
+import { decimalsOf } from '../../lib/mandala/loadHolderData'
 
 interface Props {
   assets: AdminAsset[]
@@ -64,7 +65,6 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
 
   // Reissue
   const [reissueOutpoint, setReissueOutpoint] = useState('')
-  const [reissueAmount, setReissueAmount] = useState('')
   const [reissueRecipient, setReissueRecipient] = useState('')
   const [reissueRecipientPublicKey, setReissueRecipientPublicKey] = useState('')
   const [reissuePublicKeyInput, setReissuePublicKeyInput] = useState('')
@@ -73,7 +73,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
   const activeAssetId = controlledAssetId ?? selectedAssetId
 
   const asset = assets.find(a => a.assetId === activeAssetId) ?? null
-  const decimals = Number(asset?.metadata?.decimals) || 0
+  const decimals = decimalsOf(asset?.metadata?.decimals)
 
   // Shared overlay admin-state query — cached across sections, refetched in
   // the background so controls stay usable while it refreshes.
@@ -91,14 +91,13 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
     }
   }, [stateQuery.data])
 
-  // Pre-fill reissue amount when a frozen outpoint is selected
-  useEffect(() => {
-    if (reissueOutpoint === '' || state == null) { return }
-    const ref = state.frozenOutpoints.find(r => r.outpoint === reissueOutpoint)
-    if (ref != null) {
-      setReissueAmount(String(ref.amount))
-    }
-  }, [reissueOutpoint, state])
+  // The reissue amount is never typed: it is the selected frozen output's exact
+  // bigint amount (the overlay rejects any other value). An outpoint is
+  // immutable, so a stale cached row still carries the right amount; a row
+  // that left the frozen list (unfrozen or reissued elsewhere) disables submit.
+  const reissueRow = reissueOutpoint === '' || state == null
+    ? null
+    : state.frozenOutpoints.find(r => r.outpoint === reissueOutpoint) ?? null
 
   const identitySearch = useIdentitySearch({
     originator: 'mandala',
@@ -273,8 +272,10 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
       requireRecipient: true
     })
     if (!fields.ok) { toast.error(fields.reason); return }
-    const amount = Number(reissueAmount)
-    const amountGate = guardPositiveAmount(amount)
+    // Resolve the frozen row at submit time from the current admin state.
+    const row = state?.frozenOutpoints.find(r => r.outpoint === op) ?? null
+    if (row == null) { toast.error('That output is no longer frozen — pick another frozen output'); return }
+    const amountGate = guardPositiveAmount(row.amount)
     if (!amountGate.ok) { toast.error(amountGate.reason); return }
     const res = await submitAction({
       asset: asset!,
@@ -283,9 +284,9 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
         outpoint: op,
         recipient
       }, reason),
-      ftOutput: { recipient, amount }
+      ftOutput: { recipient, amount: row.amount }
     })
-    const summary = `Reissued ${formatAmount(amount, decimals)} ${asset!.label} to ${recipient.slice(0, 12)}…`
+    const summary = `Reissued ${displayAmount(row.amount, decimals)} ${asset!.label} to ${recipient.slice(0, 12)}…`
     if (res.notified === false) {
       // The reissue is committed (overlay accepted + broadcast); only the
       // recipient's MessageBox remittance is outstanding. It is journaled and
@@ -296,7 +297,6 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
       toast.success(summary)
     }
     setReissueOutpoint('')
-    setReissueAmount('')
     setReissueRecipient('')
     setReissueRecipientPublicKey('')
     setReissuePublicKeyInput('')
@@ -330,7 +330,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
       case 'unallowIdentity':
         return identityKeyEmpty
       case 'reissue':
-        return reissueOutpoint === '' || reissueAmount === '' || (reissueRecipient === '' && reissuePublicKeyInput.trim() === '')
+        return reissueRow == null || (reissueRecipient === '' && reissuePublicKeyInput.trim() === '')
       default:
         return false
     }
@@ -577,7 +577,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
                   <option value="">Select frozen output…</option>
                   {state!.frozenOutpoints.map(r => (
                     <option key={r.outpoint} value={r.outpoint}>
-                      {r.outpoint.slice(0, 20)}… — {formatAmount(r.amount, decimals)} — {r.owner.slice(0, 10)}…
+                      {r.outpoint.slice(0, 20)}… — {displayAmount(r.amount, decimals)} — {r.owner.slice(0, 10)}…
                     </option>
                   ))}
                 </Select>
@@ -663,7 +663,7 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
                   <option value="">Select frozen output…</option>
                   {state!.frozenOutpoints.map(r => (
                     <option key={r.outpoint} value={r.outpoint}>
-                      {r.outpoint.slice(0, 20)}… — {formatAmount(r.amount, decimals)} — {r.owner.slice(0, 10)}…
+                      {r.outpoint.slice(0, 20)}… — {displayAmount(r.amount, decimals)} — {r.owner.slice(0, 10)}…
                     </option>
                   ))}
                 </Select>
@@ -671,15 +671,13 @@ export default function RegulatoryControls({ assets, onActionComplete, assetId: 
                 {/* Amount — locked to the selected frozen output's value. The
                     overlay's reissue guard rejects any mismatch, so circulation is
                     conserved; keep the field read-only so it can't be understated. */}
-                <input
-                  type="number"
-                  value={reissueAmount}
-                  readOnly
+                <div
                   aria-readonly="true"
-                  tabIndex={-1}
-                  placeholder="Select a frozen output"
-                  className="bg-muted border border-border rounded px-[13px] py-[11px] font-mono text-[12px] text-foreground w-full mt-2 outline-none cursor-not-allowed"
-                />
+                  aria-label="Reissue amount"
+                  className={`bg-muted border border-border rounded px-[13px] py-[11px] font-mono text-[12px] w-full mt-2 break-all ${reissueRow == null ? 'text-subtle-foreground' : 'text-foreground'}`}
+                >
+                  {reissueRow == null ? 'Select a frozen output' : displayAmount(reissueRow.amount, decimals)}
+                </div>
                 <p className="text-[11px] text-subtle-foreground mt-1">
                   Locked to the frozen output's amount — reissuing a different value is rejected by the overlay, so circulation stays constant.
                 </p>

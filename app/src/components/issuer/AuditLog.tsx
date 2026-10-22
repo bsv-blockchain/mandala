@@ -6,22 +6,33 @@ import { Spinner } from '../ui/spinner'
 import { AdminAsset } from '@bsv/mandala/assets'
 import { describeAction, exportAdminHistoryCsv, resolveAdminHistory, AdminHistoryRow } from '@bsv/mandala/adminHistory'
 import { useAdminHistoryPages } from '../../hooks/useAdminHistory'
+import { displayAmount } from '../../lib/mandala/amountDisplay'
+import { decimalsOf } from '../../lib/mandala/loadHolderData'
 
 interface Props {
   assets?: AdminAsset[]
   /** Controlled mode: when set, use this assetId and suppress the internal asset selector. */
   assetId?: string
+  /** Asset `dec` for the supply-change column; standalone mode reads it from `assets`. */
+  decimals?: number
+}
+
+/** Signed display of a row's exact supply change; `null` for actions that move no supply. */
+function deltaText (delta: bigint, decimals: number): string | null {
+  if (delta === 0n) return null
+  return `${delta < 0n ? '−' : '+'}${displayAmount(delta < 0n ? -delta : delta, decimals)}`
 }
 
 /** Fixed row height for virtualization — rows clamp their text to one line. */
 const ROW_HEIGHT = 48
 
-export default function AuditLog({ assets = [], assetId: controlledAssetId }: Props) {
+export default function AuditLog({ assets = [], assetId: controlledAssetId, decimals: decimalsProp }: Props) {
   const [selectedAssetId, setSelectedAssetId] = useState('')
   const [exporting, setExporting] = useState(false)
 
   // In controlled mode the active asset is the prop; otherwise use internal state
   const activeAssetId = controlledAssetId ?? selectedAssetId
+  const decimals = decimalsOf(decimalsProp ?? assets.find(a => a.assetId === activeAssetId)?.metadata?.decimals)
 
   // Paged newest-first history — thousands of actions stream in pages instead
   // of one unbounded response; rows render through a virtualized list.
@@ -128,6 +139,7 @@ export default function AuditLog({ assets = [], assetId: controlledAssetId }: Pr
             <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
               {items.map(vi => {
                 const row = rows[vi.index]
+                const delta = deltaText(row.delta, decimals)
                 return (
                   <div
                     key={`${row.txid}-${row.outputIndex}-${vi.index}`}
@@ -140,8 +152,14 @@ export default function AuditLog({ assets = [], assetId: controlledAssetId }: Pr
                     </span>
                     {/* Description */}
                     <span className="flex-1 min-w-0 truncate text-[13px] text-foreground">
-                      {describeAction(row.actionDetails)}
+                      {describeAction(row.actionDetails, row.delta)}
                     </span>
+                    {/* Supply change (exact, in display units) */}
+                    {delta != null && (
+                      <span className={`text-[12.5px] font-semibold tabular-nums shrink-0 ${row.delta < 0n ? 'text-warning' : 'text-success'}`}>
+                        {delta}
+                      </span>
+                    )}
                     {/* Block height */}
                     <span className="text-[12px] text-subtle-foreground tabular-nums shrink-0">
                       {row.height > 0 ? row.height : '—'}
