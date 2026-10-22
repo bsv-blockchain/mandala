@@ -22,7 +22,8 @@ import { colorProtocolID, colorTopic } from './naming.js'
 import { PLAN_LABEL_PREFIX } from './plan.js'
 import { configureStorage, getStorage, memoryStorage } from './storage.js'
 import { hasFreshIntent, journalClear, journalGet, journalList, journalListHandovers, journalPut } from './txJournal.js'
-import { notifyClear, notifyList } from './notifyJournal.js'
+import { notifyClear, notifyList, reconcileNotifications } from './notifyJournal.js'
+import { reconcileWallet } from './reconcile.js'
 import { blindingClear, blindingGet } from './blindingJournal.js'
 import { attestationFromSteak, type Attestation } from './attestation.js'
 import { OVERLAY_KEY, signedSteak } from './__fixtures__/overlaySigner.js'
@@ -221,6 +222,25 @@ describe('sendHandover', () => {
     expect(ca.outputs[0].lockingScript).toBe(new OneColor().lock(ID, 5n, selfPkh).toHex())
     expect(h.receipt.senderIdentityKey).toBe(A)
     expect(wallet.encrypt).not.toHaveBeenCalled()
+  })
+
+  it('self-send: journaled delivered (no delivery is owed), so reconcileWallet re-submits it and nothing is redelivered', async () => {
+    const h = await sendHandover(S({ recipientKey: A }))
+    expect((await journalGet(h.txid))?.stage).toBe('delivered')
+    // Even once aged past the redelivery window, the sender is never sent its own receipt.
+    const e = await journalGet(h.txid)
+    await journalPut({ ...e!, at: Date.now() - 61_000 })
+    const mb = mkMb()
+    expect(await reconcileNotifications(mb)).toEqual([])
+    expect(mb.sendMessage).not.toHaveBeenCalled()
+
+    vi.mocked(submitToOverlay).mockResolvedValue(await admittedFor(h.txid) as any)
+    const r = await reconcileWallet(wallet as any, { sweep: false })
+    expect(submitToOverlay).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(submitToOverlay).mock.calls[0][0]).toEqual(h.tx)
+    expect(vi.mocked(submitToOverlay).mock.calls[0][3]).toEqual([colorTopic(ID)])
+    expect(r.resubmitted).toEqual([h.txid])
+    expect(wallet.abortAction).not.toHaveBeenCalled()
   })
 
   it('no colorHandoff ⇒ rejects, aborts the action, journals nothing', async () => {

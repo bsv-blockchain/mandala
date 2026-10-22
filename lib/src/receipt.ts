@@ -9,7 +9,7 @@
  */
 import { Random, Utils, WalletInterface } from '@bsv/sdk'
 import { OneColor } from '@bsv/templates'
-import { ATTESTED_PROFILE_ID, MESSAGEBOX, OVERLAY_IDENTITY_KEY } from './constants.js'
+import { MESSAGEBOX, OVERLAY_IDENTITY_KEY } from './constants.js'
 import type { Attestation } from './attestation.js'
 import { notifyPut, notifyRemove } from './notifyJournal.js'
 import { recipientLinkage } from './linkage.js'
@@ -36,48 +36,11 @@ export function newRemittance (): string {
 }
 
 /**
- * The attested-profile leaf of an issuer receipt (payout or reissue): the tip
- * is attested and has no unattested ancestors, so `transactions` is empty and
- * `submissions` holds exactly the tip (C§8.1 PayoutResult note).
+ * The issuer receipt builders. Defined in issuerIntent.ts, which rebuilds a
+ * receipt after a crash (plan 04 R6) and must not import this module back.
  */
-export function issuerAttestedLeaf (p: {
-  /** Raw deploy tx: `(await fetchDeployTx(assetId)).toBinary()`. */
-  declarationTx: number[]
-  attestation: Attestation
-  /** The tip's submission data (the Mandala envelope bytes). */
-  offChainValues: number[]
-}): Record<string, unknown> {
-  return {
-    declarationTx: Utils.toHex(p.declarationTx),
-    transactions: [],
-    attestations: [p.attestation],
-    submissions: [{ txid: p.attestation.txid, offChainValues: Utils.toHex(p.offChainValues) }]
-  }
-}
-
-/** The receipt for an issuer-built `p color` output, members in C§7.1 order. */
-export function issuerReceipt (p: {
-  assetId: string
-  derivationPrefix: string
-  derivationSuffix: string
-  senderIdentityKey: string
-  declarationTx: number[]
-  attestation: Attestation
-  offChainValues: number[]
-}): ReceiptInstruction {
-  return {
-    version: 1,
-    assetId: p.assetId,
-    derivationPrefix: p.derivationPrefix,
-    derivationSuffix: p.derivationSuffix,
-    senderIdentityKey: p.senderIdentityKey,
-    profileData: {
-      [ATTESTED_PROFILE_ID]: {
-        [p.assetId]: issuerAttestedLeaf({ declarationTx: p.declarationTx, attestation: p.attestation, offChainValues: p.offChainValues })
-      }
-    }
-  }
-}
+export { issuerAttestedLeaf, issuerReceipt } from './issuerIntent.js'
+export type { IssuerReceiptIntent } from './issuerIntent.js'
 
 /**
  * The MessageBox hand-over body (C§7.2). Defined in notifyJournal.ts, which
@@ -88,8 +51,9 @@ export { handoverBody } from './notifyJournal.js'
 /**
  * Deliver `body` for committed tx `txid` on MESSAGEBOX. The notification is
  * journaled BEFORE the send (a crash or a failed send is retried by
- * reconcileNotifications) and cleared after it. Never throws: the tx is
- * already committed, so a failed send only reports `false`.
+ * reconcileNotifications) and cleared after it; that write replaces the
+ * pending receipt intent the payout journaled before its submit (R6). Never
+ * throws: the tx is already committed, so a failed send only reports `false`.
  */
 export async function deliverIssuerReceipt (p: {
   messageBoxClient: MessageBoxSender

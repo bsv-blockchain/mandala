@@ -5,6 +5,7 @@ import { outpoint } from './tokens.js'
 import { AdmissionReceipt, admissionReceipt } from './overlay.js'
 import { withAdminAuthGate, withAdminAuthGates, assertSpendablePrior } from './adminAuthGate.js'
 import { withIntent } from './txJournal.js'
+import { notifyPutIntent, notifyRemove } from './notifyJournal.js'
 import { runAuthorityTx } from './authority.js'
 import { fetchDeployTx } from './overlayLookup.js'
 import { guardPositiveAmount } from './submitGuards.js'
@@ -200,7 +201,8 @@ function checkReissue (p: SubmitAdminActionParams): void {
  * index 0 (unblinded linkage, counterparty = details.recipient) and spends
  * no value inputs (overlay reissue rule). Its deploy is fetched before any
  * coin is held; after admission the attested BRC-207 receipt is journaled
- * and delivered on MESSAGEBOX exactly like a payout. `notified` is false when
+ * and delivered on MESSAGEBOX exactly like a payout (its receipt intent is
+ * journaled before the submit, R6). `notified` is false when
  * the send failed (reconcileNotifications retries); the action itself is
  * committed and must never be retried. A retryable overlay refusal on a
  * reissue is not held (holdRetryable false): the action is aborted, nothing
@@ -223,21 +225,48 @@ export async function submitAdminAction (
     const foreign = ftOutput != null
       ? await issuerRecipientOutput(wallet, { identityKey, recipientKey: ftOutput.recipient, assetId: asset.assetId, amount: ftOutput.amount })
       : undefined
-    const res = await runAuthorityTx({
-      wallet,
-      identityKey,
-      legs: [{
-        prior: { tokenId: asset.assetId, outpoint: asset.authOutpoint, keyID: asset.authKeyID },
-        details,
-        customInstructions: keyID => adminCustomInstructions(asset.assetId, asset.label, keyID, asset.metadata)
-      }],
-      ...(foreign != null
-        ? { foreignOuts: [{ lockingScript: foreign.lockingScript, linkage: foreign.linkage, outputDescription: 'reissued token' }] }
-        : {}),
-      inputBEEF,
-      description: actionDescription(`${details.kind} ${asset.label}`),
-      labels: ['mandala', details.kind]
-    })
+    // R6: a reissue journals its receipt intent before the submit; any
+    // failure from there to admission removes it (the action was released).
+    let intentTxid: string | undefined
+    const journalIntent = ftOutput != null && foreign != null && declarationTx != null
+      ? async (s: { txid: string, tx: number[], offChainValues: number[], topics: string[], foreignIndices: number[] }) => {
+        intentTxid = s.txid
+        await notifyPutIntent(s.txid, {
+          assetId: asset.assetId,
+          recipientKey: ftOutput.recipient,
+          outputIndex: s.foreignIndices[0],
+          derivationPrefix: foreign.derivationPrefix,
+          derivationSuffix: foreign.derivationSuffix,
+          senderIdentityKey: foreign.senderIdentityKey,
+          declarationTxHex: Utils.toHex(declarationTx),
+          txHex: Utils.toHex(s.tx),
+          offChainHex: Utils.toHex(s.offChainValues),
+          topics: s.topics
+        })
+      }
+      : undefined
+    let res
+    try {
+      res = await runAuthorityTx({
+        wallet,
+        identityKey,
+        legs: [{
+          prior: { tokenId: asset.assetId, outpoint: asset.authOutpoint, keyID: asset.authKeyID },
+          details,
+          customInstructions: keyID => adminCustomInstructions(asset.assetId, asset.label, keyID, asset.metadata)
+        }],
+        ...(foreign != null
+          ? { foreignOuts: [{ lockingScript: foreign.lockingScript, linkage: foreign.linkage, outputDescription: 'reissued token' }] }
+          : {}),
+        inputBEEF,
+        description: actionDescription(`${details.kind} ${asset.label}`),
+        labels: ['mandala', details.kind],
+        ...(journalIntent != null ? { beforeSubmit: journalIntent } : {})
+      })
+    } catch (e) {
+      if (intentTxid != null) await notifyRemove(intentTxid)
+      throw e
+    }
 
     let notified = true
     if (ftOutput != null && foreign != null && declarationTx != null) {

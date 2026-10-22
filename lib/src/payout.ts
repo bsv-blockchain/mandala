@@ -13,18 +13,20 @@
  *   held, so a bad lookup never leaves a held action behind.
  * - Crash: r is reserved before createAction (a failed write stops the
  *   payout before any side effect) and committed to the recipient outpoint
- *   after signing; the 'accepted' journal entry is written before the
- *   broadcast (submitAndBroadcast) and the notification before the send.
- *   A failure between createAction and the submit aborts the action so its
- *   inputs are released.
+ *   after signing, before the submit. The receipt inputs are journaled as a
+ *   pending intent (notifyPutIntent, throwing) before the submit, so a crash
+ *   after admission leaves reconcileNotifications enough to complete and
+ *   deliver the receipt (plan 04 risk R6, issuerIntent.ts). The 'accepted'
+ *   journal entry is written before the broadcast (submitAndBroadcast) and
+ *   the final body replaces the intent before the send. A failure between
+ *   createAction and the submit aborts the action so its inputs are
+ *   released; a failed submit also removes the intent.
  * - Retry: a retryable overlay refusal (pause, freeze) is NOT held for
  *   reconcile (holdRetryable false): the action is aborted, nothing is
  *   committed, and re-running the payout is the retry. A blinded payout's r
- *   reservation is then orphaned and pruned (blindingPruneReserved).
- * - Known gap (plan 04 risk R6, Task 15): a crash after admission and before
- *   the notification is journaled loses the in-memory receipt inputs.
+ *   record then names an outpoint that never exists (sender-local, harmless).
  */
-import { WalletInterface } from '@bsv/sdk'
+import { Utils, WalletInterface } from '@bsv/sdk'
 import { OneColor } from '@bsv/templates'
 import { ADMIN_PROTOCOL, OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, TREASURY_BASKET } from './constants.js'
 import { lockIssuerToken } from './brc162.js'
@@ -40,6 +42,7 @@ import { recipientLinkage } from './linkage.js'
 import { blindingCommit, blindingReserve } from './blindingJournal.js'
 import { guardPositiveAmount } from './submitGuards.js'
 import { journalPut, withIntent } from './txJournal.js'
+import { notifyPutIntent, notifyRemove } from './notifyJournal.js'
 import { tryWithLock } from './webLocks.js'
 import { BusyError } from './singleFlight.js'
 import type { AdminAsset } from './assets.js'
@@ -160,25 +163,58 @@ async function payoutPipeline (p: PayoutParams): Promise<PayoutResult> {
     throw e
   }
 
-  // (8) Overlay-first submit, then the background broadcast (journaled commit point).
-  //     holdRetryable false: a retryable refusal (pause, freeze) aborts like a
-  //     final one. Holding it would let reconcile broadcast this tx later with
-  //     no receipt ever sent (the receipt inputs above live only in memory),
-  //     stranding the output, while the operator re-runs the payout and pays
-  //     twice. Released and uncommitted, re-running the payout IS the retry.
-  const admitted = await submitAndBroadcast(wallet, signed, env, reference, undefined, [colorTopic(assetId)], { holdRetryable: false })
-
-  // (9) r now belongs to the recipient outpoint.
+  // (8) r now belongs to the recipient outpoint (before the submit: a crash
+  //     after admission must not lose it).
   if (recipient.r != null) await blindingCommit(derivationSuffix, `${signed.txid}.0`)
 
-  // (10) The receipt (attested leaf: the tip's attestation and submission).
+  // (9) R6: the receipt inputs are durable before the submit. A failed write
+  //     fails the payout here, inputs released, nothing submitted.
+  const topics = [colorTopic(assetId)]
+  try {
+    await notifyPutIntent(signed.txid, {
+      assetId,
+      recipientKey,
+      outputIndex: 0,
+      derivationPrefix,
+      derivationSuffix,
+      senderIdentityKey: recipient.senderIdentityKey,
+      ...(p.note != null ? { note: p.note } : {}),
+      declarationTxHex: Utils.toHex(declarationTx),
+      txHex: Utils.toHex(signed.tx),
+      offChainHex: Utils.toHex(env),
+      topics
+    })
+  } catch (e) {
+    await notifyRemove(signed.txid)
+    await releaseAction(wallet, reference)
+    throw e
+  }
+
+  // (10) Overlay-first submit, then the background broadcast (journaled commit point).
+  //     holdRetryable false: a retryable refusal (pause, freeze) aborts like a
+  //     final one. Holding it would let reconcile broadcast this tx later
+  //     while the operator, told "retry later", re-runs the payout and pays
+  //     twice. Released and uncommitted, re-running the payout IS the retry.
+  //     Every submit failure released the action (or journaled its abort), so
+  //     the intent goes too: these bytes are never re-POSTed.
+  let admitted
+  try {
+    admitted = await submitAndBroadcast(wallet, signed, env, reference, undefined, topics, { holdRetryable: false })
+  } catch (e) {
+    await notifyRemove(signed.txid)
+    throw e
+  }
+
+  // (11) The receipt (attested leaf: the tip's attestation and submission).
   const attestation = requireAttestedOutput(admitted, 0, signed.txid)
   const receipt = issuerReceipt({
     assetId, derivationPrefix, derivationSuffix, senderIdentityKey: recipient.senderIdentityKey,
     declarationTx, attestation, offChainValues: env
   })
 
-  // (11) Journal, send, clear.
+  // (12) Journal (replacing the intent), send, clear. A ReceiptUnavailableError
+  //      above keeps the intent: the output is committed, and a later pass can
+  //      complete its receipt once the overlay attests it.
   const notified = await deliverIssuerReceipt({
     messageBoxClient: p.messageBoxClient,
     recipientKey,

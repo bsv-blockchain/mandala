@@ -5,6 +5,7 @@
  *
  *   sendHandover    build + sign noSend (the module adds inputs, token change
  *                   and the envelope), read `colorHandoff`, journal 'signed'
+ *                   ('delivered' for a self-send: no delivery is owed)
  *   deliverHandover journal the notification, send the v3 body on MESSAGEBOX,
  *                   mark 'delivered'
  *   settleHandover  post-ACK: submit the exact bytes on `tm_color_<assetId>`,
@@ -24,6 +25,8 @@
  *   abort it, which is safe because nobody has the bytes yet.
  * - Crash after the 'signed' journalPut: the entry is never submitted,
  *   aborted or swept, and is redelivered by reconcileNotifications (Task 15).
+ *   A self-send owes no delivery: it is journaled 'delivered' directly, so
+ *   reconcile re-submits it and nothing is ever redelivered to the sender.
  *   The journal write and the blinding commit are both awaited before
  *   `sendHandover` resolves, so a caller never holds bytes the journal lacks.
  * - Stale cache: `settleHandover` checks that the bytes it submits hash to the
@@ -308,9 +311,13 @@ async function sendPipeline (c: CheckedSend): Promise<HandoverResult> {
   return { txid, tx, reference, outputIndex: 0, receipt, offChainValues }
 
   async function writeSigned (): Promise<void> {
+    // A self-send owes no delivery (and never goes through deliverHandover):
+    // it is journaled 'delivered' at once, so reconcile re-submits it like any
+    // acknowledged hand-over instead of holding its inputs as 'signed'.
+    const stage = c.self ? 'delivered' : 'signed'
     await journalPut({
       txid,
-      stage: 'signed',
+      stage,
       reference,
       at: Date.now(),
       assetId,
@@ -321,8 +328,8 @@ async function sendPipeline (c: CheckedSend): Promise<HandoverResult> {
       submit: { txHex: Utils.toHex(tx), offChainHex: Utils.toHex(offChainValues), topics: [colorTopic(assetId)] }
     })
     // Read back from the store: the entry must be durable before we resolve.
-    if ((await journalGet(txid))?.stage !== 'signed') {
-      throw new Error(`sendHandover: the 'signed' journal entry for ${txid} was not stored; the hand-over was released`)
+    if ((await journalGet(txid))?.stage !== stage) {
+      throw new Error(`sendHandover: the '${stage}' journal entry for ${txid} was not stored; the hand-over was released`)
     }
   }
 }

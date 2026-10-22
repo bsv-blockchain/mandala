@@ -12,7 +12,7 @@ import {
 import { OneColor } from '@bsv/templates'
 import { payoutTokens, type PayoutResult } from './payout.js'
 import { submitAdminAction, type AdminAsset } from './assets.js'
-import { submitAndBroadcast } from './overlay.js'
+import { submitAndBroadcast, submitToOverlay } from './overlay.js'
 import { fetchDeployTx } from './overlayLookup.js'
 import { configureMandala, ADMIN_PROTOCOL, ATTESTED_PROFILE_ID, MESSAGEBOX, TREASURY_BASKET } from './constants.js'
 import { decodeToken } from './brc162.js'
@@ -21,15 +21,17 @@ import { colorProtocolID, colorTopic } from './naming.js'
 import { MAX_UINT64 } from './amount.js'
 import { notifyClear, notifyList, reconcileNotifications } from './notifyJournal.js'
 import { blindingClear, blindingGet, blindingListReserved } from './blindingJournal.js'
-import { hasFreshIntent, journalClear, journalList } from './txJournal.js'
+import { hasFreshIntent, INTENT_TTL_MS, journalClear, journalGet, journalList, journalPut } from './txJournal.js'
+import { configureStorage, getStorage, memoryStorage } from './storage.js'
 import { adminAuthInFlightPrior, clearAdminAuthGates, StaleAdminAuthError } from './adminAuthGate.js'
 import { attestationFromSteak, verifyAttestation, type Attestation } from './attestation.js'
-import { handoverBody, issuerAttestedLeaf, newRemittance, ReceiptUnavailableError } from './receipt.js'
+import { handoverBody, issuerAttestedLeaf, issuerReceipt, newRemittance, ReceiptUnavailableError } from './receipt.js'
 import { OVERLAY_KEY, signedSteak } from './__fixtures__/overlaySigner.js'
 
 vi.mock('./overlay.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./overlay.js')>()),
-  submitAndBroadcast: vi.fn()
+  submitAndBroadcast: vi.fn(),
+  submitToOverlay: vi.fn()
 }))
 vi.mock('./overlayLookup.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./overlayLookup.js')>()),
@@ -140,6 +142,7 @@ beforeEach(async () => {
   vi.mocked(submitAndBroadcast).mockReset().mockImplementation(async () =>
     ({ topic: colorTopic(ID), outputsToAdmit: ATT.outputs, admissionSignature: ATT.signature, admissionIdentityKey: ATT.signer, attestation: ATT }) as any)
   vi.mocked(fetchDeployTx).mockReset().mockImplementation(async () => Transaction.fromHex(DEPLOY_HEX))
+  vi.mocked(submitToOverlay).mockReset()
   wallet = mkWallet()
   mb = mkMb()
 })
@@ -392,7 +395,10 @@ describe('payoutTokens (B4)', () => {
     expect(err).toMatchObject({ name: 'ReceiptUnavailableError', committed: true, txid: TXID })
     await expect(Promise.reject(err)).rejects.toThrow(/attestation covering output 0.*do not retry/)
     expect(mb.sendMessage).not.toHaveBeenCalled()
-    expect(await notifyList()).toEqual([])
+    // R6: the committed output's receipt inputs stay journaled (pending, never
+    // sent as is) so a later pass can complete the receipt once the overlay
+    // attests the output.
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true, intent: { outputIndex: 0 } }])
   })
 
   it('a failure after createAction and before the submit releases the held inputs', async () => {
@@ -480,7 +486,7 @@ describe('reissue through the payout path (submitAdminAction ftOutput)', () => {
     expect(err).toMatchObject({ committed: true, txid: TXID, message: expect.stringMatching(/do not retry/) })
     expect(adminAuthInFlightPrior(ID)).toBeUndefined()
     expect(mb.sendMessage).not.toHaveBeenCalled()
-    expect(await notifyList()).toEqual([])
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true, intent: { outputIndex: 0 } }])
     // A caller that retries anyway with its stale asset fails closed: the
     // wallet no longer lists the spent authority.
     wallet.listOutputs.mockImplementation(async () => ({ outputs: [], BEEF: [1] }) as any)
@@ -516,5 +522,309 @@ describe('reissue through the payout path (submitAdminAction ftOutput)', () => {
     vi.mocked(fetchDeployTx).mockRejectedValue(new Error('lookup down'))
     await expect(reissue()).rejects.toThrow(/lookup down/)
     expect(wallet.createAction).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Plan 04 risk R6: the receipt inputs of an issuer payout or reissue are
+// journaled (pending, throwing write) BEFORE the submit, removed on any submit
+// failure, overwritten by the final v3 body after admission, and completed by
+// reconcileNotifications after a crash: from the 'accepted' entry's σ while it
+// exists, else (after INTENT_TTL_MS) only once a color-admission lookup shows
+// the output admitted. Never re-POSTed blindly; never sent while pending.
+// ---------------------------------------------------------------------------
+
+describe('R6: issuer receipt intents', () => {
+  const NOTIFY_KEY = `mandala.notifyJournal.${TXID}`
+
+  /** Run a payout whose process "crashes" right after admission: the intent stays, nothing is sent. */
+  async function crashAfterAdmission (run: () => Promise<unknown>, accepted: boolean): Promise<string> {
+    let snapshot: string | null = null
+    vi.mocked(submitAndBroadcast).mockImplementationOnce(async () => {
+      snapshot = await getStorage().getItem(NOTIFY_KEY)
+      if (accepted) {
+        await journalPut({
+          txid: TXID, stage: 'accepted', at: Date.now(), reference: 'ref-1', topic: colorTopic(ID),
+          admissionSignature: ATT.signature, admissionIdentityKey: ATT.signer, outputsToAdmit: ATT.outputs
+        } as any)
+      }
+      throw new Error('crash')
+    })
+    await expect(run()).rejects.toThrow('crash')
+    expect(snapshot).not.toBeNull()
+    return snapshot as unknown as string
+  }
+
+  /** Put the crashed intent back, aged `ageMs`. */
+  async function restoreAged (raw: string, ageMs: number): Promise<any> {
+    const entry = JSON.parse(raw)
+    entry.at = Date.now() - ageMs
+    await getStorage().setItem(NOTIFY_KEY, JSON.stringify(entry))
+    return entry
+  }
+
+  function lookupAnswers (rows: Array<{ txid: string, outputIndex: number }> | 'down'): ReturnType<typeof vi.fn> {
+    const f = vi.fn(async (url: string, _init: any) => {
+      if (!String(url).endsWith('/lookup') || rows === 'down') return { ok: false, status: 503, text: async () => '', json: async () => ({}) }
+      const body = { type: 'output-list', outputs: rows.map(r => ({ ...r, beef: [1, 2, 3] })) }
+      return { ok: true, status: 200, text: async () => JSON.stringify(body), json: async () => body }
+    })
+    vi.stubGlobal('fetch', f)
+    return f
+  }
+
+  it('the payout journals a pending intent with every receipt input before the submit, and nothing is sent while pending', async () => {
+    let atSubmit: any
+    vi.mocked(submitAndBroadcast).mockImplementationOnce(async (...args: any[]) => {
+      atSubmit = await notifyList()
+      expect(mb.sendMessage).not.toHaveBeenCalled()
+      // A pass while the payout is in flight never sends the pending entry.
+      const other = mkMb()
+      expect(await reconcileNotifications(other)).toEqual([])
+      expect(other.sendMessage).not.toHaveBeenCalled()
+      return await (vi.mocked(submitAndBroadcast).getMockImplementation() as any)(...args)
+    })
+    const r = await payoutTokens(P({ note: 'october' }))
+    const env = vi.mocked(submitAndBroadcast).mock.calls[0][2]!
+    expect(atSubmit).toHaveLength(1)
+    expect(atSubmit[0]).toMatchObject({
+      txid: TXID,
+      pending: true,
+      recipient: RECIPIENT,
+      messageBox: MESSAGEBOX,
+      intent: {
+        assetId: ID,
+        recipientKey: RECIPIENT,
+        outputIndex: 0,
+        derivationPrefix: r.receipt.derivationPrefix,
+        derivationSuffix: r.receipt.derivationSuffix,
+        senderIdentityKey: r.receipt.senderIdentityKey,
+        note: 'october',
+        declarationTxHex: DEPLOY_HEX,
+        txHex: Utils.toHex(ATOMIC),
+        offChainHex: Utils.toHex(env),
+        topics: [colorTopic(ID)]
+      }
+    })
+    expect(atSubmit[0].body).toBeUndefined()
+    // After admission the final body replaced the intent, was sent and cleared.
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('a blinded payout commits r to the recipient outpoint before the submit', async () => {
+    let atSubmit: unknown
+    vi.mocked(submitAndBroadcast).mockImplementationOnce(async (...args: any[]) => {
+      atSubmit = await blindingGet(`${TXID}.0`)
+      return await (vi.mocked(submitAndBroadcast).getMockImplementation() as any)(...args)
+    })
+    await payoutTokens(P({ blind: true }))
+    expect(atSubmit).toMatchObject({ recipient: RECIPIENT, assetId: ID })
+  })
+
+  it('an intent write that fails fails the payout before the submit and releases the inputs', async () => {
+    const mem = memoryStorage()
+    configureStorage({
+      ...mem,
+      setItem: async (k: string, v: string) => {
+        if (k.startsWith('mandala.notifyJournal.')) throw new Error('disk full')
+        await mem.setItem(k, v)
+      }
+    })
+    try {
+      await expect(payoutTokens(P())).rejects.toThrow(/disk full/)
+      expect(submitAndBroadcast).not.toHaveBeenCalled()
+      expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-1' })
+      expect(mb.sendMessage).not.toHaveBeenCalled()
+    } finally {
+      configureStorage(null)
+    }
+  })
+
+  it('a reissue journals its intent before the submit; a failed intent write aborts before the submit', async () => {
+    wallet.listOutputs.mockImplementation(async () => ({ outputs: [{ outpoint: asset.authOutpoint }], BEEF: [1] }) as any)
+    const reissue = async () => await submitAdminAction({
+      wallet: wallet as any,
+      asset,
+      details: { kind: 'reissue', outpoint: 'f'.repeat(64) + '.0', recipient: RECIPIENT },
+      ftOutput: { recipient: RECIPIENT, amount: 5n },
+      messageBoxClient: mb,
+      identityKey: ISSUER
+    } as any)
+    let atSubmit: any
+    vi.mocked(submitAndBroadcast).mockImplementationOnce(async (...args: any[]) => {
+      atSubmit = await notifyList()
+      return await (vi.mocked(submitAndBroadcast).getMockImplementation() as any)(...args)
+    })
+    await reissue()
+    expect(atSubmit).toMatchObject([{
+      txid: TXID,
+      pending: true,
+      intent: { assetId: ID, recipientKey: RECIPIENT, outputIndex: 0, senderIdentityKey: ISSUER, declarationTxHex: DEPLOY_HEX, topics: [colorTopic(ID)] }
+    }])
+    expect(await notifyList()).toEqual([])
+
+    clearAdminAuthGates()
+    vi.mocked(submitAndBroadcast).mockClear()
+    wallet.abortAction.mockClear()
+    const mem = memoryStorage()
+    configureStorage({
+      ...mem,
+      setItem: async (k: string, v: string) => {
+        if (k.startsWith('mandala.notifyJournal.')) throw new Error('disk full')
+        await mem.setItem(k, v)
+      }
+    })
+    try {
+      await expect(reissue()).rejects.toThrow(/disk full/)
+      expect(submitAndBroadcast).not.toHaveBeenCalled()
+      expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-1' })
+    } finally {
+      configureStorage(null)
+    }
+  })
+
+  it('a reissue refused by the overlay leaves no intent behind', async () => {
+    wallet.listOutputs.mockImplementation(async () => ({ outputs: [{ outpoint: asset.authOutpoint }], BEEF: [1] }) as any)
+    vi.mocked(submitAndBroadcast).mockRejectedValueOnce(new Error('overlay refused (ERR_FROZEN)'))
+    await expect(submitAdminAction({
+      wallet: wallet as any,
+      asset,
+      details: { kind: 'reissue', outpoint: 'f'.repeat(64) + '.0', recipient: RECIPIENT },
+      ftOutput: { recipient: RECIPIENT, amount: 5n },
+      messageBoxClient: mb,
+      identityKey: ISSUER
+    } as any)).rejects.toThrow(/ERR_FROZEN/)
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('crash after admission: the next pass completes the receipt from the accepted entry and sends it', async () => {
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P({ note: 'october' })), true)
+    // The live path removed the intent on the "crash" error; a real crash would not have.
+    const intent = (await restoreAged(raw, 61_000)).intent
+    const fetchSpy = lookupAnswers([])
+    const later = mkMb()
+    expect(await reconcileNotifications(later)).toEqual([TXID])
+    expect(fetchSpy).not.toHaveBeenCalled() // σ came from the journal, no lookup
+    expect(submitToOverlay).not.toHaveBeenCalled()
+    const receipt = issuerReceipt({
+      assetId: ID,
+      derivationPrefix: intent.derivationPrefix,
+      derivationSuffix: intent.derivationSuffix,
+      senderIdentityKey: intent.senderIdentityKey,
+      declarationTx: DEPLOY.toBinary(),
+      attestation: ATT,
+      offChainValues: Utils.toArray(intent.offChainHex, 'hex')
+    })
+    expect(later.sendMessage).toHaveBeenCalledTimes(1)
+    expect(later.sendMessage.mock.calls[0][0]).toEqual({
+      recipient: RECIPIENT,
+      messageBox: MESSAGEBOX,
+      body: handoverBody({ assetId: ID, outputIndex: 0, tx: ATOMIC, receipt, note: 'october' })
+    })
+    expect(await notifyList()).toEqual([])
+    // The broadcast owns the 'accepted' entry; completion never touches it.
+    expect((await journalGet(TXID))?.stage).toBe('accepted')
+  })
+
+  it('a failed completion send keeps the final body (not the intent) for the next pass', async () => {
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), true)
+    await restoreAged(raw, 61_000)
+    const down = { sendMessage: vi.fn(async () => { throw new Error('box down') }) }
+    expect(await reconcileNotifications(down)).toEqual([])
+    const kept = await notifyList()
+    expect(kept).toHaveLength(1)
+    expect(kept[0]).toMatchObject({ txid: TXID, attempts: 1, body: { v: 3, kind: 'handover' } })
+    expect((kept[0] as any).pending).toBeUndefined()
+  })
+
+  it('an intent younger than 60 s is left alone, even with an accepted entry (the live payout is still delivering)', async () => {
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), true)
+    await restoreAged(raw, 10_000)
+    const later = mkMb()
+    expect(await reconcileNotifications(later)).toEqual([])
+    expect(later.sendMessage).not.toHaveBeenCalled()
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true }])
+  })
+
+  it('no accepted entry and younger than INTENT_TTL_MS: waits, with no lookup and no submit', async () => {
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
+    await restoreAged(raw, 120_000)
+    const fetchSpy = lookupAnswers([{ txid: TXID, outputIndex: 0 }])
+    const later = mkMb()
+    expect(await reconcileNotifications(later)).toEqual([])
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(submitToOverlay).not.toHaveBeenCalled()
+    expect(later.sendMessage).not.toHaveBeenCalled()
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true }])
+  })
+
+  it('no accepted entry, past INTENT_TTL_MS, output absent from color-admission: dropped with no submit', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
+    await restoreAged(raw, INTENT_TTL_MS + 1000)
+    const fetchSpy = lookupAnswers([{ txid: 'a'.repeat(64), outputIndex: 0 }, { txid: TXID, outputIndex: 1 }])
+    const later = mkMb()
+    expect(await reconcileNotifications(later)).toEqual([])
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    const sent = JSON.parse(fetchSpy.mock.calls[0][1].body)
+    expect(sent).toEqual({
+      service: `ls_color_${ID}`,
+      query: { type: 'color-admission', version: 1, assetId: ID, topic: colorTopic(ID), outpoints: [`${TXID}.0`] }
+    })
+    expect(submitToOverlay).not.toHaveBeenCalled()
+    expect(later.sendMessage).not.toHaveBeenCalled()
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('no accepted entry, past INTENT_TTL_MS, lookup unavailable: kept, no submit', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
+    await restoreAged(raw, INTENT_TTL_MS + 1000)
+    lookupAnswers('down')
+    expect(await reconcileNotifications(mkMb())).toEqual([])
+    expect(submitToOverlay).not.toHaveBeenCalled()
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true }])
+  })
+
+  it('no accepted entry, past INTENT_TTL_MS, output admitted: re-POSTs the journaled bytes and completes the receipt', async () => {
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
+    const intent = (await restoreAged(raw, INTENT_TTL_MS + 1000)).intent
+    lookupAnswers([{ txid: TXID, outputIndex: 0 }])
+    vi.mocked(submitToOverlay).mockResolvedValue({ topic: colorTopic(ID), outputsToAdmit: ATT.outputs, admissionSignature: ATT.signature, admissionIdentityKey: ATT.signer, attestation: ATT } as any)
+    const later = mkMb()
+    expect(await reconcileNotifications(later)).toEqual([TXID])
+    expect(submitToOverlay).toHaveBeenCalledTimes(1)
+    const [beef, offChain, , topics] = vi.mocked(submitToOverlay).mock.calls[0]
+    expect(beef).toEqual(ATOMIC)
+    expect(offChain).toEqual(Utils.toArray(intent.offChainHex, 'hex'))
+    expect(topics).toEqual([colorTopic(ID)])
+    const body = later.sendMessage.mock.calls[0][0].body as any
+    expect(body.receipt.profileData[ATTESTED_PROFILE_ID][ID].attestations).toEqual([ATT])
+    expect(body.receipt.derivationPrefix).toBe(intent.derivationPrefix)
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('an admitted re-POST whose attestation does not cover the recipient output keeps the intent pending', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
+    await restoreAged(raw, INTENT_TTL_MS + 1000)
+    lookupAnswers([{ txid: TXID, outputIndex: 0 }])
+    const other = await attest([1])
+    vi.mocked(submitToOverlay).mockResolvedValue({ topic: colorTopic(ID), outputsToAdmit: [1], admissionSignature: other.signature, admissionIdentityKey: other.signer, attestation: other } as any)
+    const later = mkMb()
+    expect(await reconcileNotifications(later)).toEqual([])
+    expect(later.sendMessage).not.toHaveBeenCalled()
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true }])
+  })
+
+  it('S5: with the overlay key unset a pending intent is neither looked up nor dropped', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
+    await restoreAged(raw, INTENT_TTL_MS + 1000)
+    const fetchSpy = lookupAnswers([])
+    configureMandala({ overlayIdentityKey: '' })
+    expect(await reconcileNotifications(mkMb())).toEqual([])
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true }])
   })
 })

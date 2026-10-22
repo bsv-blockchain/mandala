@@ -22,6 +22,7 @@ import {
 import { colorTopic } from './naming.js'
 import { encodeEnvelope, SpecificLinkage } from './encoding.js'
 import { OverlayAdmitResult, submitAndBroadcast } from './overlay.js'
+import { journalPut } from './txJournal.js'
 import { revealIssuerLinkage } from './treasury/linkage.js'
 import { issuerUnlock } from './treasury/unlock.js'
 
@@ -137,6 +138,13 @@ export async function runAuthorityTx (p: {
   labels: string[]
   /** X-Topics override (the KYC registry names tm_mandala_kyc); default tm_<id> of every token touched. */
   topics?: string[]
+  /**
+   * Awaited after signing and before the submit, with what a receipt needs
+   * (a reissue journals its receipt intent here, plan 04 R6). A throw aborts
+   * the held action (a failed abort is journaled) and is rethrown: nothing is
+   * submitted.
+   */
+  beforeSubmit?: (s: { txid: string, tx: number[], offChainValues: number[], topics: string[], foreignIndices: number[] }) => Promise<void>
 }): Promise<AuthorityTxResult> {
   const { wallet, identityKey, legs } = p
   const valueIns = p.valueIns ?? []
@@ -217,6 +225,19 @@ export async function runAuthorityTx (p: {
     admin: legs.map((_, i) => ({ index: authIndices[i], details: detailsHex[i] }))
   })
   const topics = p.topics ?? [...new Set([...legs.map(l => l.prior.tokenId), ...valueOuts.map(v => v.tokenId)].map(colorTopic))]
+  if (p.beforeSubmit != null) {
+    const reference = created.signableTransaction.reference
+    try {
+      await p.beforeSubmit({ txid: signed.txid, tx: signed.tx as number[], offChainValues: env, topics, foreignIndices })
+    } catch (e) {
+      try {
+        await wallet.abortAction({ reference })
+      } catch {
+        await journalPut({ txid: `abort:${reference}`, stage: 'abort', reference, at: Date.now() })
+      }
+      throw e
+    }
+  }
   const admitted = await submitAndBroadcast(
     wallet,
     { tx: signed.tx as number[], txid: signed.txid },

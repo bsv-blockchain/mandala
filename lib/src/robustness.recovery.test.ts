@@ -248,6 +248,15 @@ describe('reconcileNotifications — hand-over redelivery', () => {
     expect(await stageOf('f'.repeat(64))).toBe('signed')
   })
 
+  it('a signed self-send entry (receipt sender = recipient) aged 61 s is promoted to delivered without any send', async () => {
+    await journalPut(signedEntry({ recipientKey: RECEIPT.senderIdentityKey }))
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    expect(await reconcileNotifications(mbc)).toEqual([])
+    expect(mbc.sendMessage).not.toHaveBeenCalled()
+    expect(await stageOf(TXID)).toBe('delivered')
+    expect(await notifyList()).toEqual([])
+  })
+
   it('two concurrent passes deliver once', async () => {
     await journalPut(signedEntry())
     let release!: () => void

@@ -19,17 +19,31 @@
  * REDELIVER_AFTER_MS with no pending notification (a crash between sign and
  * deliver) is redelivered with its body rebuilt from the journal.
  *
- * This module imports txJournal and constants only (plus a type from
+ * A self-send (receipt sender = recipient) owes no delivery: a 'signed'
+ * self entry is promoted to 'delivered' without a send.
+ *
+ * Issuer receipt intents (plan 04 R6): a payout or reissue journals a
+ * `pending: true` entry with its receipt inputs BEFORE its submit (a throwing
+ * write, `notifyPutIntent`); it is removed when the submit fails and
+ * replaced by the final body after admission. A pending entry is never sent
+ * as is. A pass completes one left behind by a crash (issuerIntent.ts
+ * `resolveIssuerIntent`): rebuilt from the 'accepted' entry's σ, or after
+ * INTENT_TTL_MS only once a color-admission lookup shows the output admitted;
+ * dropped when the lookup shows it absent.
+ *
+ * This module imports txJournal, constants and issuerIntent (plus a type from
  * receipt.ts): receipt.ts and handover.ts import it, so it must not import
  * them back. That is why `handoverBody` lives here.
  */
 import { Transaction, Utils } from '@bsv/sdk'
 import { getStorage } from './storage.js'
-import { MESSAGEBOX } from './constants.js'
+import { MESSAGEBOX, OVERLAY_IDENTITY_KEY } from './constants.js'
 import { journalListHandovers, journalPromoteSigned, type HandoverJournalEntry } from './txJournal.js'
 import { tryWithLock } from './webLocks.js'
+import { isIssuerReceiptIntent, resolveIssuerIntent, type IssuerReceiptIntent } from './issuerIntent.js'
 import type { ReceiptInstruction } from './receipt.js'
 
+/** A notification ready to send. */
 export interface PendingNotification {
   /** The committed txid — one notification per transfer. */
   txid: string
@@ -38,18 +52,37 @@ export interface PendingNotification {
   body: object
   attempts?: number
   at: number
+  pending?: undefined
 }
+
+/**
+ * An issuer receipt intent (R6): journaled before the submit, never sent as
+ * is. `recipient`/`messageBox` say where its completed body will go.
+ */
+export interface PendingReceiptIntent {
+  txid: string
+  recipient: string
+  messageBox: string
+  pending: true
+  intent: IssuerReceiptIntent
+  attempts?: number
+  at: number
+}
+
+/** Every entry of the notification journal. */
+export type NotifyJournalEntry = PendingNotification | PendingReceiptIntent
 
 const PREFIX = 'mandala.notifyJournal.'
 
-export async function notifyList (): Promise<PendingNotification[]> {
+/** Every journaled notification and receipt intent, oldest first. */
+export async function notifyList (): Promise<NotifyJournalEntry[]> {
   const store = getStorage()
-  const byId = new Map<string, PendingNotification>()
+  const byId = new Map<string, NotifyJournalEntry>()
   for (const key of await store.keys(PREFIX)) {
     try {
       const raw = await store.getItem(key)
       if (raw == null) continue // removed between keys() and getItem
-      const entry = JSON.parse(raw) as PendingNotification
+      const entry = JSON.parse(raw) as NotifyJournalEntry
       if (typeof entry?.txid === 'string') byId.set(entry.txid, entry)
     } catch { /* one corrupted entry — skip it, keep the rest */ }
   }
@@ -66,6 +99,22 @@ export async function notifyPut (entry: PendingNotification): Promise<void> {
     await getStorage().setItem(PREFIX + entry.txid, JSON.stringify(entry))
   } catch (e) {
     console.warn(`[mandala] notifyJournal write failed for ${entry.txid}; the retry is not durable:`, e)
+  }
+}
+
+/**
+ * Journal an issuer receipt intent for `txid` BEFORE its submit (R6). Throws
+ * when the write fails or does not read back: the caller must then release
+ * its action and fail before the submit, because without this entry a crash
+ * after admission would strand the recipient's output.
+ */
+export async function notifyPutIntent (txid: string, intent: IssuerReceiptIntent): Promise<void> {
+  const entry: PendingReceiptIntent = { txid, recipient: intent.recipientKey, messageBox: MESSAGEBOX, pending: true, intent, at: Date.now() }
+  const store = getStorage()
+  await store.setItem(PREFIX + txid, JSON.stringify(entry))
+  const back = await store.getItem(PREFIX + txid)
+  if (back == null || (JSON.parse(back) as { pending?: unknown })?.pending !== true) {
+    throw new Error(`@bsv/mandala: the receipt intent for ${txid} was not stored; nothing was submitted`)
   }
 }
 
@@ -140,9 +189,20 @@ function rebuildNotification (entry: HandoverJournalEntry, now: number): Pending
   }
 }
 
+/** A hand-over to the sender's own key (unblinded, so the receipt shows the recipient as sender). */
+function isSelfSend (entry: HandoverJournalEntry): boolean {
+  try {
+    return (JSON.parse(entry.receipt) as ReceiptInstruction)?.senderIdentityKey === entry.recipientKey
+  } catch {
+    return false
+  }
+}
+
 /**
- * Retry every pending recipient notification, and redeliver every 'signed'
- * hand-over older than REDELIVER_AFTER_MS that has none. Success clears the
+ * Retry every pending recipient notification, complete every issuer receipt
+ * intent left behind by a crash (R6, see above; a pending intent is never
+ * sent as is), and redeliver every 'signed' hand-over older than
+ * REDELIVER_AFTER_MS that has none (a self-send is promoted, not sent). Success clears the
  * notification (and promotes a 'signed' hand-over to 'delivered'); failure
  * keeps it journaled (attempts++) for the next pass, so a rebuilt one is not
  * rebuilt again. Returns delivered txids.
@@ -157,13 +217,78 @@ export async function reconcileNotifications (messageBoxClient: Sender): Promise
   return acquired && result != null ? result : []
 }
 
+/**
+ * Complete a receipt intent left behind (R6), or undefined to keep waiting.
+ * Younger than REDELIVER_AFTER_MS it is presumed to be a live payout's.
+ */
+async function completeIntent (entry: PendingReceiptIntent, now: number, s5: { warned: boolean }): Promise<PendingNotification | undefined> {
+  if (now - entry.at < REDELIVER_AFTER_MS) return undefined
+  if (!isIssuerReceiptIntent(entry.intent)) {
+    console.warn(`[mandala] the receipt intent for ${entry.txid} is malformed; it is kept, never acted on`)
+    return undefined
+  }
+  if (OVERLAY_IDENTITY_KEY === '') {
+    if (!s5.warned) console.warn('[mandala] receipt intents wait: the overlay identity key is not configured (S5)')
+    s5.warned = true
+    return undefined
+  }
+  const outcome = await resolveIssuerIntent(entry.txid, entry.intent, now - entry.at)
+  if (outcome.status === 'wait') return undefined
+  if (outcome.status === 'drop') {
+    // Re-read first: a live payout whose submit outlived the TTL may have
+    // just replaced the intent with its final body.
+    if ((await notifyGet(entry.txid))?.pending === true) {
+      console.warn(`[mandala] dropping the receipt intent for ${entry.txid}: ${outcome.reason}`)
+      await notifyRemove(entry.txid)
+    }
+    return undefined
+  }
+  const { intent } = entry
+  const body = handoverBody({
+    assetId: intent.assetId,
+    outputIndex: intent.outputIndex,
+    tx: Utils.toArray(intent.txHex, 'hex'),
+    receipt: outcome.receipt,
+    ...(intent.note != null ? { note: intent.note } : {})
+  })
+  const done: PendingNotification = { txid: entry.txid, recipient: intent.recipientKey, messageBox: MESSAGEBOX, body, at: now }
+  // The final body replaces the intent before the send, exactly like the live path.
+  await notifyPut(done)
+  return done
+}
+
+async function notifyGet (txid: string): Promise<NotifyJournalEntry | undefined> {
+  try {
+    const raw = await getStorage().getItem(PREFIX + txid)
+    return raw == null ? undefined : JSON.parse(raw) as NotifyJournalEntry
+  } catch {
+    return undefined
+  }
+}
+
 async function notifyPass (messageBoxClient: Sender): Promise<string[]> {
   const now = Date.now()
-  const pending = await notifyList()
-  const pendingTxids = new Set(pending.map(n => n.txid))
+  const journaled = await notifyList()
+  const pendingTxids = new Set(journaled.map(n => n.txid))
+  const pending: PendingNotification[] = []
+  const s5 = { warned: false }
+  for (const entry of journaled) {
+    if (entry.pending === true) {
+      // Never sent as is: completed into a final body, or left.
+      const done = await completeIntent(entry, now, s5)
+      if (done != null) pending.push(done)
+      continue
+    }
+    pending.push(entry)
+  }
   for (const entry of await journalListHandovers()) {
     if (entry.stage !== 'signed' || pendingTxids.has(entry.txid)) continue
     if (now - entry.at < REDELIVER_AFTER_MS) continue
+    if (isSelfSend(entry)) {
+      // No delivery is owed to ourselves: the sender may submit (B5).
+      await journalPromoteSigned(entry.txid)
+      continue
+    }
     const rebuilt = rebuildNotification(entry, now)
     if (rebuilt != null) pending.push(rebuilt)
   }
