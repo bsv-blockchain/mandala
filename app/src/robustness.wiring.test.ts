@@ -184,6 +184,13 @@ describe('robustness wiring (shipped source)', () => {
     expect(mut).toMatch(/issueTokens\(\{[\s\S]*depositHash/)
   })
 
+  it('ReceiveTokens uses receiveHandovers', () => {
+    const s = src('components/ReceiveTokens.tsx')
+    expect(s).toContain('receiveHandovers(')
+    expect(s).not.toContain('receiveTokens')
+    expect(s).not.toMatch(/Number\(/)
+  })
+
   it('holder views read no basket and format bigint amounts', () => {
     for (const f of ['components/holder/HolderHome.tsx', 'components/holder/AssetAccount.tsx', 'components/holder/TransactionHistory.tsx', 'components/holder/AlertBanners.tsx', 'components/TokenWallet.tsx']) {
       const s = src(f)

@@ -2,27 +2,38 @@ import { useState, useEffect, useRef } from 'react'
 import { Card, CardContent } from './ui/card'
 import { toast } from 'sonner'
 import { useWallet } from '../context/WalletContext'
-import { Check } from 'lucide-react'
-import { receiveTokens, ReceivedTransfer } from '@bsv/mandala/receive'
-import { useInvalidateHolderData } from '../hooks/useHolderData'
-import { formatAmount } from '@bsv/mandala/amount'
+import { Check, Clock } from 'lucide-react'
+import { receiveHandovers, type ReceiveResult } from '@bsv/mandala'
+import { useHolderData, useInvalidateHolderData } from '../hooks/useHolderData'
+import { describeAccepted, describeFailed } from '../lib/mandala/receiveView'
 import ReceivePanel from './holder/ReceivePanel'
 import { Spinner } from './ui/spinner'
 
-interface ReceivedToken extends ReceivedTransfer {
-  at: number
-}
+type ReceivedToken = ReceiveResult['accepted'][number] & { at: number }
 
 /**
- * Incoming transfers are ACCEPTED AUTOMATICALLY — there is no manual
- * accept/reject step. On load (and on refresh) the @bsv/mandala receive
- * pipeline internalizes every pending message-box transfer into the wallet
- * basket and acknowledges it; we show a read-only confirmation. The
- * QR/identity panel lets others send to you.
+ * Incoming hand-overs are ACCEPTED AUTOMATICALLY — there is no manual
+ * accept/reject step. On load the @bsv/mandala receive pipeline
+ * (`receiveHandovers`) internalizes every pending MessageBox hand-over into
+ * the wallet's BRC-207 module with its receipt, then acknowledges it; we show a
+ * read-only confirmation. The QR/identity panel lets others send to you.
+ *
+ * Re-entry: a second pass (StrictMode double effect, wallet re-init) shares
+ * `processedRef`; the lib checks and marks each id synchronously, so an
+ * in-flight message is never internalized twice by this tab, and a retryable
+ * failure is dropped from the set so a later pass retries it. Unacknowledged
+ * messages survive a crash in the MessageBox and are received on next load.
  */
 export default function ReceiveTokens() {
   const { wallet, messageBoxClient } = useWallet()
   const invalidateHolderData = useInvalidateHolderData()
+  // Rows are described at render time from the live metas, so the first
+  // hand-over of a not-yet-known asset backfills its label and decimals once
+  // the invalidated holder data refetches.
+  const { data: holderData } = useHolderData()
+  const metas = holderData?.metas ?? {}
+  const metasRef = useRef(metas)
+  metasRef.current = metas
   const [received, setReceived] = useState<ReceivedToken[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const processedRef = useRef<Set<string>>(new Set())
@@ -36,7 +47,7 @@ export default function ReceiveTokens() {
     setIsLoading(true)
     try {
       if (messageBoxClient == null || wallet == null) return
-      const { accepted, failed } = await receiveTokens({
+      const { accepted, failed } = await receiveHandovers({
         wallet,
         messageBoxClient,
         processed: processedRef.current
@@ -45,20 +56,21 @@ export default function ReceiveTokens() {
         // Balance + history changed — refresh the shared holder cache in the background.
         void invalidateHolderData()
         const at = Date.now()
-        setReceived(prev => [...accepted.map(t => ({ ...t, at })), ...prev])
+        // Keyed by messageId: a message re-accepted after a failed ack replaces its row.
+        const ids = new Set(accepted.map(t => t.messageId))
+        setReceived(prev => [...accepted.map(t => ({ ...t, at })), ...prev.filter(r => !ids.has(r.messageId))])
         for (const t of accepted) {
-          toast.success('Tokens received', {
-            description: `+${formatAmount(Number(t.amount), t.decimals)} ${t.label}`,
+          const v = describeAccepted(t, metasRef.current)
+          toast.success(v.title, {
+            description: `${v.amountText} ${v.label}`,
             duration: 4000
           })
         }
       }
       for (const f of failed) {
-        // One bad transfer doesn't block the rest; it stays un-acknowledged for retry.
-        console.error('Auto-receive failed for', f.messageId, f.error)
-        toast.error('Could not receive a transfer', {
-          description: f.error instanceof Error ? f.error.message : 'Unexpected error'
-        })
+        // One bad hand-over doesn't block the rest; a retryable one stays un-acknowledged.
+        console.error('Auto-receive failed for', f.messageId, f.code, f.error)
+        toast.error('Could not receive a transfer', { description: describeFailed(f) })
       }
     } catch (error) {
       console.error('Error checking for incoming transfers:', error)
@@ -90,27 +102,32 @@ export default function ReceiveTokens() {
           </p>
         ) : (
           <div className="space-y-3">
-            {received.map((r) => (
-              <div key={r.id} className="rounded-md border border-separator p-4">
-                <div className="flex items-center justify-between gap-4">
-                  <div className="min-w-0 flex-1">
-                    <div className="mb-2 flex items-center gap-2">
-                      <span className="inline-flex items-center gap-1 rounded-full bg-success/15 px-2.5 py-0.5 text-[11px] font-semibold text-success">
-                        <Check className="h-3 w-3" /> Received
-                      </span>
-                      <span className="text-[12px] text-subtle-foreground">{new Date(r.at).toLocaleTimeString()}</span>
+            {received.map((r) => {
+              const v = describeAccepted(r, metas)
+              return (
+                <div key={v.key} className="rounded-md border border-separator p-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="min-w-0 flex-1">
+                      <div className="mb-2 flex items-center gap-2">
+                        <span className="inline-flex items-center gap-1 rounded-full bg-success/15 px-2.5 py-0.5 text-[11px] font-semibold text-success">
+                          <Check className="h-3 w-3" /> Received
+                        </span>
+                        {v.pending && (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-warning/10 px-2.5 py-0.5 text-[11px] font-semibold text-warning">
+                            <Clock className="h-3 w-3" /> Awaiting settlement
+                          </span>
+                        )}
+                        <span className="text-[12px] text-subtle-foreground">{new Date(r.at).toLocaleTimeString()}</span>
+                      </div>
+                      <p className="tabular text-[28px] font-semibold leading-none tracking-[-0.02em] text-success">
+                        {v.amountText}
+                      </p>
+                      <p className="mt-2 text-[15px] font-semibold">{v.label}</p>
                     </div>
-                    <p className="tabular text-[28px] font-semibold leading-none tracking-[-0.02em] text-success">
-                      +{formatAmount(Number(r.amount), r.decimals)}
-                    </p>
-                    <p className="mt-2 text-[15px] font-semibold">{r.label}</p>
-                    <p className="mt-1 text-[13px] text-muted-foreground">
-                      From <span className="tabular text-foreground">{r.sender.slice(0, 16)}…</span>
-                    </p>
                   </div>
                 </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         )}
       </CardContent>
