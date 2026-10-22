@@ -808,12 +808,68 @@ describe('submitAndBroadcast — holdRetryable: false (receipt-bearing txs)', ()
     expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'abort', reference: 'ref-1' }])
   })
 
+  it('a typed 4xx verdict proves nothing was applied (outcome refused)', async () => {
+    const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockResolvedValue({ aborted: true }) }
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing('ERR_PAUSED'), [colorTopicOf()], { holdRetryable: false }))
+      .rejects.toMatchObject({ code: 'ERR_PAUSED', outcome: 'refused' })
+    expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-1' })
+  })
+
+  // An ambiguous outcome: the overlay may have folded (and broadcast) these
+  // bytes. The action is never aborted and the error never says "nothing was
+  // committed": the entry is journaled for reconcile to settle.
+  const expectHeldUnknown = async (facilitator: any, code: string): Promise<void> => {
+    const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockResolvedValue({ aborted: true }) }
+    const err = await submitAndBroadcast(wallet as any, signed, [7], 'ref-1', facilitator, [colorTopicOf()], { holdRetryable: false })
+      .then(() => undefined, (e: unknown) => e)
+    expect(err).toBeInstanceOf(OverlayRefusedError)
+    expect(err).toMatchObject({ code, outcome: 'unknown' })
+    expect(String((err as Error).message)).toMatch(/outcome unknown/)
+    expect(String((err as Error).message)).not.toMatch(/nothing was committed/)
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+    expect(wallet.createAction).not.toHaveBeenCalled()
+    expect(await journalList()).toMatchObject([{
+      txid: TXID, stage: 'retryable', reference: 'ref-1', code,
+      submit: { txHex: BEEF_HEX, offChainHex: '07', topics: [colorTopicOf()] }
+    }])
+  }
+
+  it('a 200 STEAK that admitted outputs but carries no signature: held, outcome unknown', async () => {
+    await expectHeldUnknown({ send: vi.fn().mockResolvedValue({ [colorTopicOf()]: { outputsToAdmit: [0] } }) }, 'ERR_NO_ADMISSION')
+  })
+
+  it('a transport fault after the send: held, outcome unknown', async () => {
+    await expectHeldUnknown({ send: vi.fn().mockRejectedValue(new Error('socket hang up')) }, 'ERR_UNAVAILABLE')
+  })
+
+  it('a typed 503 ERR_UNAVAILABLE: held, outcome unknown', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: false, status: 503, text: async () => JSON.stringify({ status: 'error', code: 'ERR_UNAVAILABLE', retryable: true })
+    })
+    await expectHeldUnknown(createOverlayFacilitator(fetchImpl), 'ERR_UNAVAILABLE')
+  })
+
   it('holdRetryable: true (the default) still holds and journals the refusal', async () => {
     const wallet = { createAction: vi.fn(), abortAction: vi.fn() }
     await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing(), ['tm_mandala'], { holdRetryable: true }))
       .rejects.toMatchObject({ retryable: true })
     expect(wallet.abortAction).not.toHaveBeenCalled()
     expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'retryable' }])
+  })
+})
+
+describe('OverlayRefusedError.outcome', () => {
+  it("is 'refused' only for a typed 4xx verdict; everything else is 'unknown'", () => {
+    const typed = (code: string): string => JSON.stringify({ status: 'error', code })
+    expect(overlayErrorFromResponse(409, typed('ERR_PAUSED')).outcome).toBe('refused')
+    expect(overlayErrorFromResponse(400, typed('ERR_CONSERVATION')).outcome).toBe('refused')
+    expect(overlayErrorFromResponse(503, typed('ERR_UNAVAILABLE')).outcome).toBe('unknown')
+    expect(overlayErrorFromResponse(500, typed('ERR_PAUSED')).outcome).toBe('unknown')
+    expect(overlayErrorFromResponse(409, 'not json').outcome).toBe('unknown')
+    expect(overlayErrorFromResponse(400, '').outcome).toBe('unknown')
+    expect(overlayErrorFromResponse(409, typed('ERR_UNAVAILABLE')).outcome).toBe('unknown')
+    expect(new OverlayRefusedError({ code: 'ERR_NO_ADMISSION', httpStatus: 200 }).outcome).toBe('unknown')
+    expect(new OverlayRefusedError({ code: 'ERR_UNAVAILABLE', httpStatus: 0 }).outcome).toBe('unknown')
   })
 })
 

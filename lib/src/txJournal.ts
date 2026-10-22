@@ -16,7 +16,11 @@
  *   'abort'    — the overlay rejected the tx and the abortAction that releases
  *                its inputs failed. Recovery = retry the abort.
  *   'retryable'— the overlay refused with a LIFTABLE condition (pause, freeze,
- *                screening, membership, plain unavailability). The noSend
+ *                screening, membership, plain unavailability), or the submit's
+ *                outcome is UNKNOWN (transport fault, 5xx, a 200 that admitted
+ *                outputs without a verifying σ: the overlay may have folded
+ *                these bytes; always held, even with holdRetryable false,
+ *                and an issuer receipt intent for the txid waits on it). The noSend
  *                action is still alive and its inputs are still held — on
  *                purpose, so the identical bytes can be re-submitted — which
  *                means it needs a durable record or a crash leaks the action

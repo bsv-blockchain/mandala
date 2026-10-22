@@ -18,7 +18,10 @@
  *    `color-admission` lookup of `<txid>.<outputIndex>` on `ls_color_<id>`
  *    (C§6). Present ⇒ the journaled bytes are re-POSTed (idempotent /submit,
  *    a fresh attestation) and the receipt completed. Absent ⇒ the intent is
- *    dropped (the tx was never admitted, so it was never broadcast).
+ *    dropped (the tx was never admitted, so it was never broadcast) — unless
+ *    a 'retryable' txJournal entry still holds the action (an unknown submit
+ *    outcome): reconcile may yet admit it, so the intent waits until that
+ *    entry becomes 'accepted' (σ, step 1) or is released.
  *    Unknown (lookup or submit failure) ⇒ wait for the next pass.
  *
  * Never re-POSTs blindly: that could admit a tx whose action was aborted.
@@ -167,6 +170,11 @@ export async function resolveIssuerIntent (txid: string, intent: IssuerReceiptIn
       outpoints: [outpoint]
     })
     if (!answer.outputs.some(r => r.txid === txid && r.outputIndex === outputIndex)) {
+      // Absent now, but a 'retryable' entry still holds the action (an
+      // unknown submit outcome, overlay.ts): reconcile may yet admit and
+      // broadcast it, so dropping the receipt inputs could strand the output.
+      // Re-read: the entry may have moved on since step (1).
+      if ((await journalGet(txid))?.stage === 'retryable') return { status: 'wait' }
       return { status: 'drop', reason: `${outpoint} is not admitted on ${colorTopic(assetId)}` }
     }
     // Admitted: re-POST the exact bytes for a fresh attestation (idempotent).

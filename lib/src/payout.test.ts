@@ -165,6 +165,23 @@ async function overlayRefusesRetryably (code = 'ERR_PAUSED'): Promise<void> {
     : { ok: false, status: 503, text: async () => '', json: async () => ({}) }))
 }
 
+/**
+ * Route submitAndBroadcast through the REAL implementation, with /submit
+ * giving an AMBIGUOUS answer: a 200 STEAK that admitted output 0 with no
+ * signature (the overlay folded and broadcast the tx), or a transport fault
+ * after the request left (it may have arrived).
+ */
+async function overlayOutcomeUnknown (kind: 'unsigned-200' | 'network'): Promise<void> {
+  const actual = await vi.importActual<typeof import('./overlay.js')>('./overlay.js')
+  vi.mocked(submitAndBroadcast).mockImplementation(actual.submitAndBroadcast)
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (!String(url).endsWith('/submit')) return { ok: false, status: 503, text: async () => '', json: async () => ({}) }
+    if (kind === 'network') throw new TypeError('fetch failed: socket hang up')
+    const steak = { [colorTopic(ID)]: { outputsToAdmit: [0] } }
+    return { ok: true, status: 200, text: async () => JSON.stringify(steak), json: async () => steak }
+  }))
+}
+
 describe('receipt helpers', () => {
   it('newRemittance is base64 of 16 random bytes', () => {
     const a = newRemittance()
@@ -380,6 +397,21 @@ describe('payoutTokens (B4)', () => {
     expect(await notifyList()).toEqual([])
   })
 
+  it.each(['unsigned-200', 'network'] as const)('an ambiguous submit (%s) keeps the action and the R6 intent and says the outcome is unknown', async kind => {
+    await overlayOutcomeUnknown(kind)
+    const err = await payoutTokens(P()).then(() => undefined, (e: unknown) => e)
+    expect(err).toMatchObject({ outcome: 'unknown', retryable: true })
+    expect((err as { code: string }).code).toMatch(kind === 'network' ? /^ERR_UNAVAILABLE$/ : /^ERR_(NO|BAD)_ADMISSION$/)
+    expect(String((err as Error).message)).toMatch(/outcome unknown/)
+    expect(String((err as Error).message)).not.toMatch(/nothing was committed/)
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+    // The held action is protected from the sweep and settled by reconcile.
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'retryable', reference: 'ref-1', submit: { topics: [colorTopic(ID)] } }])
+    // The receipt inputs stay journaled (pending, never sent as is).
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true, intent: { outputIndex: 0 } }])
+    expect(mb.sendMessage).not.toHaveBeenCalled()
+  })
+
   it('a retryable refusal whose abort fails journals an abort entry, never a retryable one', async () => {
     await overlayRefusesRetryably('ERR_FROZEN')
     wallet.abortAction.mockRejectedValue(new Error('wallet down'))
@@ -467,6 +499,18 @@ describe('reissue through the payout path (submitAdminAction ftOutput)', () => {
     expect(vi.mocked(submitAndBroadcast).mock.calls[0][6]).toEqual({ holdRetryable: false })
     await submitAdminAction({ wallet: wallet as any, asset, details: { kind: 'pause' }, identityKey: ISSUER } as any)
     expect(vi.mocked(submitAndBroadcast).mock.calls[1][6]).toEqual({ holdRetryable: true })
+  })
+
+  it.each(['unsigned-200', 'network'] as const)('an ambiguous reissue submit (%s) keeps the action and the R6 intent', async kind => {
+    await overlayOutcomeUnknown(kind)
+    const err = await reissue().then(() => undefined, (e: unknown) => e)
+    expect(err).toMatchObject({ outcome: 'unknown' })
+    expect(String((err as Error).message)).toMatch(/outcome unknown/)
+    expect(String((err as Error).message)).not.toMatch(/nothing was committed/)
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'retryable', reference: 'ref-1' }])
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true, intent: { outputIndex: 0 } }])
+    expect(mb.sendMessage).not.toHaveBeenCalled()
   })
 
   it('a retryable refusal on a reissue releases the inputs: no retryable hold, nothing sent', async () => {
@@ -774,6 +818,20 @@ describe('R6: issuer receipt intents', () => {
     expect(submitToOverlay).not.toHaveBeenCalled()
     expect(later.sendMessage).not.toHaveBeenCalled()
     expect(await notifyList()).toEqual([])
+  })
+
+  it('past INTENT_TTL_MS, output absent, but a retryable entry still holds the action: kept (reconcile may yet admit it)', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
+    await restoreAged(raw, INTENT_TTL_MS + 1000)
+    await journalPut({
+      txid: TXID, stage: 'retryable', at: Date.now(), reference: 'ref-1', code: 'ERR_UNAVAILABLE', attempts: 0,
+      submit: { txHex: Utils.toHex(ATOMIC), topics: [colorTopic(ID)] }
+    })
+    lookupAnswers([])
+    expect(await reconcileNotifications(mkMb())).toEqual([])
+    expect(submitToOverlay).not.toHaveBeenCalled()
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true }])
   })
 
   it('no accepted entry, past INTENT_TTL_MS, lookup unavailable: kept, no submit', async () => {

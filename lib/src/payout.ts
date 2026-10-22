@@ -20,11 +20,20 @@
  *   journal entry is written before the broadcast (submitAndBroadcast) and
  *   the final body replaces the intent before the send. A failure between
  *   createAction and the submit aborts the action so its inputs are
- *   released; a failed submit also removes the intent.
- * - Retry: a retryable overlay refusal (pause, freeze) is NOT held for
- *   reconcile (holdRetryable false): the action is aborted, nothing is
- *   committed, and re-running the payout is the retry. A blinded payout's r
- *   record then names an outpoint that never exists (sender-local, harmless).
+ *   released; a submit failure that released the action also removes the
+ *   intent (an unknown outcome keeps both, see below).
+ * - Retry: a retryable overlay refusal that proves nothing was applied (a
+ *   typed 4xx: pause, freeze) is NOT held for reconcile (holdRetryable
+ *   false): the action is aborted, nothing is committed, and re-running the
+ *   payout is the retry. A blinded payout's r record then names an outpoint
+ *   that never exists (sender-local, harmless).
+ * - Unknown outcome (`OverlayRefusedError.outcome === 'unknown'`: a 200 that
+ *   admitted outputs without a verifying signature, a transport fault, a
+ *   5xx): the overlay may have committed the payout. The action is held
+ *   ('retryable' entry) and the receipt intent is kept; the error says the
+ *   outcome is unknown and must NOT be answered by re-running the payout.
+ *   reconcileWallet settles the action; reconcileNotifications delivers the
+ *   receipt if it landed, or drops the intent once the action is released.
  */
 import { Utils, WalletInterface } from '@bsv/sdk'
 import { OneColor } from '@bsv/templates'
@@ -32,7 +41,7 @@ import { ADMIN_PROTOCOL, OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, TREAS
 import { lockIssuerToken } from './brc162.js'
 import { colorTopic } from './naming.js'
 import { encodeEnvelope } from './encoding.js'
-import { AdmissionReceipt, admissionReceipt, submitAndBroadcast } from './overlay.js'
+import { AdmissionReceipt, admissionReceipt, isOutcomeUnknown, submitAndBroadcast } from './overlay.js'
 import { fetchDeployTx } from './overlayLookup.js'
 import { loadTreasuryCandidates } from './treasury/candidates.js'
 import { selectTreasuryInputs } from './treasury/select.js'
@@ -191,17 +200,22 @@ async function payoutPipeline (p: PayoutParams): Promise<PayoutResult> {
   }
 
   // (10) Overlay-first submit, then the background broadcast (journaled commit point).
-  //     holdRetryable false: a retryable refusal (pause, freeze) aborts like a
-  //     final one. Holding it would let reconcile broadcast this tx later
-  //     while the operator, told "retry later", re-runs the payout and pays
-  //     twice. Released and uncommitted, re-running the payout IS the retry.
-  //     Every submit failure released the action (or journaled its abort), so
-  //     the intent goes too: these bytes are never re-POSTed.
+  //     holdRetryable false: a refusal that PROVES nothing was applied (a
+  //     typed 4xx verdict: pause, freeze) aborts like a final one. Holding it
+  //     would let reconcile broadcast this tx later while the operator, told
+  //     "retry later", re-runs the payout and pays twice. Released and
+  //     uncommitted, re-running the payout IS the retry, and the intent goes.
+  //     An UNKNOWN outcome (a 200 that admitted output 0 without a verifying
+  //     signature, a transport fault, a 5xx) is different: the overlay may
+  //     have folded and broadcast the tx. submitAndBroadcast keeps the action
+  //     (journaled 'retryable'), so the intent stays too: reconcile settles
+  //     the action, and reconcileNotifications completes the receipt from the
+  //     'accepted' σ or a color-admission lookup, or drops it once absent.
   let admitted
   try {
     admitted = await submitAndBroadcast(wallet, signed, env, reference, undefined, topics, { holdRetryable: false })
   } catch (e) {
-    await notifyRemove(signed.txid)
+    if (!isOutcomeUnknown(e)) await notifyRemove(signed.txid)
     throw e
   }
 

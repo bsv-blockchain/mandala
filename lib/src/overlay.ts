@@ -112,6 +112,31 @@ function isTransientStatus (httpStatus: number | undefined): boolean {
 }
 
 /**
+ * Codes that never prove the overlay applied nothing: ERR_UNAVAILABLE covers
+ * storage and broadcast faults that may follow a fold, and the two client-side
+ * codes are raised on a 200 STEAK that ADMITTED outputs (the overlay folded and
+ * broadcast the tx; only its signature is missing or unverifiable).
+ */
+const AMBIGUOUS_CODES = new Set(['ERR_UNAVAILABLE', 'ERR_NO_ADMISSION', 'ERR_BAD_ADMISSION'])
+
+/**
+ * What a refusal proves about the overlay's state:
+ * - `'refused'`: a typed `{status:'error', code}` verdict with a 4xx status.
+ *   Only the topic manager's own reject produces one (wire contract), so the
+ *   overlay folded nothing and broadcast nothing.
+ * - `'unknown'`: everything else. A transport fault (the request may have
+ *   arrived), a 5xx, an untyped body, an unparseable 200, or a 200 that
+ *   admitted outputs without a verifying signature. The overlay MAY have
+ *   applied (and broadcast) these bytes, so the action must never be aborted
+ *   on it and nobody may be told "nothing was committed".
+ */
+export type OverlayRefusalOutcome = 'refused' | 'unknown'
+
+function refusalOutcome (code: string, httpStatus: number | undefined): OverlayRefusalOutcome {
+  return httpStatus != null && httpStatus >= 400 && httpStatus < 500 && !AMBIGUOUS_CODES.has(code) ? 'refused' : 'unknown'
+}
+
+/**
  * A structured refusal from `POST /submit` (wire contract §2).
  *
  * `retryable` is the only field callers should branch on for liveness: a
@@ -128,15 +153,30 @@ export class OverlayRefusedError extends Error {
   readonly spendTxid?: string
   /** 0 when the request never produced a response (network fault). */
   readonly httpStatus: number
+  /**
+   * Whether this refusal PROVES the overlay applied nothing (`'refused'`) or
+   * leaves it open (`'unknown'`); see `OverlayRefusalOutcome`. Branch on this,
+   * not on `retryable`, before releasing an action or telling a user that
+   * nothing happened.
+   */
+  readonly outcome: OverlayRefusalOutcome
 
-  constructor (p: { code: string, description?: string, retryable?: boolean, spendTxid?: string, httpStatus?: number }) {
+  constructor (p: { code: string, description?: string, retryable?: boolean, spendTxid?: string, httpStatus?: number, outcome?: OverlayRefusalOutcome }) {
     super(p.description != null && p.description !== '' ? `overlay refused (${p.code}): ${p.description}` : `overlay refused (${p.code})`)
     this.name = 'OverlayRefusedError'
     this.code = p.code
     this.retryable = (RETRYABLE_BY_CODE[p.code] ?? p.retryable === true) || isTransientStatus(p.httpStatus)
     this.spendTxid = p.spendTxid
     this.httpStatus = p.httpStatus ?? 0
+    // An explicit 'unknown' always wins; 'refused' must also satisfy the rule.
+    const derived = refusalOutcome(p.code, this.httpStatus)
+    this.outcome = p.outcome === 'unknown' ? 'unknown' : derived
   }
+}
+
+/** True when `e` is a refusal that leaves open whether the overlay applied the bytes. */
+export function isOutcomeUnknown (e: unknown): boolean {
+  return e instanceof OverlayRefusedError && e.outcome === 'unknown'
 }
 
 /**
@@ -166,7 +206,9 @@ export function overlayErrorFromResponse (httpStatus: number, body: string | nul
     code: 'ERR_UNAVAILABLE',
     description: `overlay returned ${httpStatus} with no structured error body`,
     retryable: true,
-    httpStatus
+    httpStatus,
+    // No typed verdict: a proxy, a crash mid-request, anything. Not proof.
+    outcome: 'unknown'
   })
 }
 
@@ -474,8 +516,10 @@ export interface SubmitAndBroadcastOptions {
  * protection — a failure keeps the 'accepted' entry and reconcileWallet
  * retries it; it must never be aborted (that would desync wallet from overlay).
  *
- * **Nothing is ever broadcast after an `OverlayRefusedError`** — retryable or
- * not, a refusal means the overlay has not folded these bytes into its state.
+ * **Nothing is ever broadcast by the wallet after an `OverlayRefusedError`**
+ * — the lib only broadcasts on a verified admission. A refusal with outcome
+ * `'refused'` means the overlay has not folded these bytes; one with outcome
+ * `'unknown'` means it may have, which is why it is never aborted either.
  *
  * **A RETRYABLE refusal does not abort the action.** Pause, freeze, screening,
  * membership and plain unavailability all lift; the same transaction may be
@@ -485,16 +529,26 @@ export interface SubmitAndBroadcastOptions {
  * retry, and the action stays alive for it. Only a FINAL verdict (or any
  * non-refusal failure, e.g. an unconfigured overlay URL) aborts.
  *
+ * **An UNKNOWN outcome is always held** (`OverlayRefusedError.outcome`): a
+ * transport fault after the send, a 5xx, an untyped or unparseable body, or a
+ * 200 that admitted outputs without a verifying signature (ERR_NO_ADMISSION /
+ * ERR_BAD_ADMISSION — the overlay folded and broadcast the tx). The overlay
+ * may have applied these bytes, so the action is never aborted: a
+ * `'retryable'` entry with the exact bytes is journaled, and reconcile's
+ * idempotent re-POST settles it ('accepted' + broadcast, or abort on a
+ * final verdict).
+ *
  * **`holdRetryable: false`** (receipt-bearing txs: issuer payouts, reissues)
- * turns that hold off: a retryable refusal takes the final path (abort,
+ * turns the hold off for refusals that PROVE nothing was applied (a typed 4xx
+ * verdict such as ERR_PAUSED / ERR_FROZEN): they take the final path (abort,
  * `'abort'` journal entry if the abort fails) and NO `'retryable'` entry is
- * written. Such a tx carries a recipient output whose receipt inputs
- * (remittances, sender key, note) live only in the caller's memory; a held
- * refusal that reconcile later re-POSTs and broadcasts would put an output on
- * chain that its recipient can never derive, and the operator, told "retry
- * later", would run the payout again and pay twice. The error keeps its code
- * and `retryable: true` (the condition still lifts) and its message says
- * nothing was committed, so re-running the whole operation is the retry.
+ * written. Holding one would let reconcile admit the tx later while the
+ * operator, told "retry later", re-runs the payout and pays twice. The error
+ * keeps its code and `retryable: true` (the condition still lifts) and its
+ * message says nothing was committed, so re-running the whole operation is
+ * the retry. An unknown outcome is still held (see above) and its message
+ * says the outcome is unknown and NOT to re-run; the caller must keep its
+ * receipt intent (R6) so the receipt can be completed if the tx lands.
  *
  * `reference` is the `createAction` signableTransaction.reference; pass it for
  * signable actions so a rejected tx's inputs are released. Genesis/register
@@ -517,11 +571,21 @@ export async function submitAndBroadcast (
   } catch (e) {
     // Retryable: keep the inputs held so the identical tx can be re-submitted
     // once the overlay's condition lifts — unless the caller opted out.
+    // Unknown outcome: ALWAYS keep them held. The overlay may already have
+    // folded (and broadcast) these bytes; aborting would desync the wallet
+    // from the chain, and only a reconcile pass can tell which it was.
     const retryable = e instanceof OverlayRefusedError && e.retryable
-    if (retryable && options.holdRetryable === false) {
-      (e as OverlayRefusedError).message += ': the inputs were released and nothing was committed; re-run the operation once the condition lifts'
+    const unknown = isOutcomeUnknown(e)
+    const hold = unknown || (retryable && options.holdRetryable !== false)
+    if (options.holdRetryable === false && e instanceof OverlayRefusedError) {
+      e.message += unknown
+        ? ': outcome unknown — the overlay may have applied this transaction, so its action is held (not aborted) ' +
+          'and reconcileWallet settles it; do NOT re-run the operation'
+        : retryable
+          ? ': the inputs were released and nothing was committed; re-run the operation once the condition lifts'
+          : ''
     }
-    if (retryable && options.holdRetryable !== false) {
+    if (hold) {
       // §9.11. A live noSend action with NO durable record was the hole: the
       // caller is told "retry later", and if it never does (crash, tab closed,
       // user walks away) the inputs stay held by an action nothing remembers,
@@ -545,7 +609,8 @@ export async function submitAndBroadcast (
         }
       })
     } else if (reference != null) {
-      // Final refusal — release the held inputs.
+      // A refusal that proves nothing was applied (or a failure before the
+      // send) — release the held inputs.
       try {
         await wallet.abortAction({ reference })
       } catch {

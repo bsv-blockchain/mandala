@@ -2,7 +2,7 @@ import { Utils, WalletInterface } from '@bsv/sdk'
 import { OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, TREASURY_BASKET } from './constants.js'
 import { MandalaActionDetails } from './brc162.js'
 import { outpoint } from './tokens.js'
-import { AdmissionReceipt, admissionReceipt } from './overlay.js'
+import { AdmissionReceipt, admissionReceipt, isOutcomeUnknown } from './overlay.js'
 import { withAdminAuthGate, withAdminAuthGates, assertSpendablePrior } from './adminAuthGate.js'
 import { withIntent } from './txJournal.js'
 import { notifyPutIntent, notifyRemove } from './notifyJournal.js'
@@ -205,8 +205,11 @@ function checkReissue (p: SubmitAdminActionParams): void {
  * journaled before the submit, R6). `notified` is false when
  * the send failed (reconcileNotifications retries); the action itself is
  * committed and must never be retried. A retryable overlay refusal on a
- * reissue is not held (holdRetryable false): the action is aborted, nothing
- * is committed, and re-running the reissue is the retry. An admission
+ * reissue that proves nothing was applied (a typed 4xx) is not held
+ * (holdRetryable false): the action is aborted, nothing is committed, and
+ * re-running the reissue is the retry. An unknown outcome
+ * (`OverlayRefusedError.outcome === 'unknown'`) keeps the action held and the
+ * receipt intent journaled; do NOT re-run it, reconcile settles it. An admission
  * without an attestation for the recipient output throws a committed
  * ReceiptUnavailableError (do not retry; the authority is spent, so a stale
  * retry fails closed with StaleAdminAuthError).
@@ -226,7 +229,8 @@ export async function submitAdminAction (
       ? await issuerRecipientOutput(wallet, { identityKey, recipientKey: ftOutput.recipient, assetId: asset.assetId, amount: ftOutput.amount })
       : undefined
     // R6: a reissue journals its receipt intent before the submit; any
-    // failure from there to admission removes it (the action was released).
+    // failure from there to admission that released the action removes it.
+    // An unknown outcome (the action is held) keeps it.
     let intentTxid: string | undefined
     const journalIntent = ftOutput != null && foreign != null && declarationTx != null
       ? async (s: { txid: string, tx: number[], offChainValues: number[], topics: string[], foreignIndices: number[] }) => {
@@ -264,7 +268,9 @@ export async function submitAdminAction (
         ...(journalIntent != null ? { beforeSubmit: journalIntent } : {})
       })
     } catch (e) {
-      if (intentTxid != null) await notifyRemove(intentTxid)
+      // An unknown submit outcome keeps the action held (submitAndBroadcast)
+      // and so keeps the intent: the reissue may have landed (see payout.ts).
+      if (intentTxid != null && !isOutcomeUnknown(e)) await notifyRemove(intentTxid)
       throw e
     }
 
