@@ -34,9 +34,9 @@ func TestStartBootUnionJournalOnlyNarrowedAndReadFault(t *testing.T) {
 		t.Fatal(err)
 	}
 	journal := []mandala.OwnerRecord{
-		{Txid: y, OutputIndex: 0, Topic: "tm_" + y, TokenID: y + "_0", Role: brc162.RoleDeploy, Amount: 0, IdentityKey: mandalatest.Issuer.Identity, CreatedAt: journaled},
-		{Txid: z, OutputIndex: 0, Topic: "tm_" + z, TokenID: z + "_0", Role: brc162.RoleDeploy, Amount: 0, IdentityKey: mandalatest.Issuer.Identity, CreatedAt: journaled},
-		{Txid: k, OutputIndex: 0, Topic: mandala.KYCTopic, TokenID: k + "_0", Role: brc162.RoleDeploy, Amount: 0, IdentityKey: mandalatest.Issuer.Identity, CreatedAt: journaled},
+		{Txid: y, OutputIndex: 0, Topic: "tm_" + y, TokenID: y + "_0", Role: brc162.RoleDeploy, Amount: amt(0), IdentityKey: mandalatest.Issuer.Identity, CreatedAt: journaled},
+		{Txid: z, OutputIndex: 0, Topic: "tm_" + z, TokenID: z + "_0", Role: brc162.RoleDeploy, Amount: amt(0), IdentityKey: mandalatest.Issuer.Identity, CreatedAt: journaled},
+		{Txid: k, OutputIndex: 0, Topic: mandala.KYCTopic, TokenID: k + "_0", Role: brc162.RoleDeploy, Amount: amt(0), IdentityKey: mandalatest.Issuer.Identity, CreatedAt: journaled},
 	}
 	if err := app.Store.RecordOwners(ctx, journal); err != nil {
 		t.Fatal(err)

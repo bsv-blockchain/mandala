@@ -88,7 +88,10 @@ func balanceOf(t *testing.T, app *App, p mandalatest.Party) int64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return b
+	if !b.Big().IsInt64() {
+		t.Fatalf("balance %s is not an int64", b)
+	}
+	return b.Big().Int64()
 }
 
 func tokenRowOf(t *testing.T, app *App, txid string, vout uint32) *mandala.TokenRecord {
@@ -166,7 +169,7 @@ func TestEvictTwoTokenTransferRestoresEachInputUnderItsOwnTopic(t *testing.T) {
 			t.Fatalf("%s.1 is not live again on %s (%v)", c.txid, c.topic, err)
 		}
 		row := tokenRowOf(t, app, c.txid, 1)
-		if row == nil || row.TokenID != c.tokenID || int64(row.Amount) != c.amount || row.IdentityKey != mandalatest.Holder.Identity {
+		if row == nil || row.TokenID != c.tokenID || row.Amount.Cmp(amt(c.amount)) != 0 || row.IdentityKey != mandalatest.Holder.Identity {
 			t.Fatalf("restored row %+v, want %s %d owned by the holder", row, c.tokenID, c.amount)
 		}
 		rows, err := app.Store.OwnerJournalByOutpoint(ctx, c.txid, 1)

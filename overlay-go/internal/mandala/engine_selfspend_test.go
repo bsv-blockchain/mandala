@@ -209,7 +209,7 @@ func TestEngineResubmitAfterAPostBroadcastFaultFoldsTheAdminAction(t *testing.T)
 	flowEntry(t, f.mustSubmit(freeze, topic), topic, []uint32{0}, []uint32{0})
 	flowCommitted(t, f, topic, iss.Txid, 0, freeze.Txid)
 	state, err := f.store.GetAssetState(f.ctx, id)
-	if err != nil || !slices.Equal(state.FrozenOutpoints, []FrozenRef{{Outpoint: frozenOp, Amount: 100, Owner: holder.Identity}}) {
+	if err != nil || !sameJSON(state.FrozenOutpoints, []FrozenRef{{Outpoint: frozenOp, Amount: amt(100), Owner: holder.Identity}}) {
 		t.Fatalf("folded freeze = %+v, %v", state.FrozenOutpoints, err)
 	}
 	_, err = f.submit(mandalatest.Transfer(t, iss, 1, receiver, 40), topic)

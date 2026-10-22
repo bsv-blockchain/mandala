@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/overlay/lookup"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 )
 
@@ -94,7 +95,7 @@ func lookupEveryStep(steps ...func() error) error {
 }
 
 // lookupDelta is Δ = value out − value in of the output's token over every token input of the tx
-// (TS deltaOf), clamped to the JS safe range Amount can persist.
+// (TS deltaOf), clamped to ±(2^53-1) until Task 6 makes it exact.
 func lookupDelta(a *lookupAdmitted) Amount {
 	all := make([]uint32, len(a.tx.Inputs))
 	for i := range all {
@@ -102,17 +103,18 @@ func lookupDelta(a *lookupAdmitted) Amount {
 	}
 	tl, ok := brc162.BuildLedger(a.txid, a.outputs, brc162.ClassifyAdmittedInputs(a.tx, all)).Get(a.output.TokenID)
 	if !ok {
-		return 0
+		return zeroAmount()
 	}
 	d := new(big.Int).Sub(tl.ValueOut, tl.ValueIn)
 	limit := big.NewInt(maxSafeInteger)
 	if d.Cmp(limit) > 0 {
-		return Amount(maxSafeInteger)
+		d = limit
 	}
 	if d.Cmp(new(big.Int).Neg(limit)) < 0 {
-		return Amount(-maxSafeInteger)
+		d = new(big.Int).Neg(limit)
 	}
-	return Amount(d.Int64())
+	v, _ := amount.FromBig(d) // |d| <= 2^53-1 after the clamp: always within the storage range
+	return v
 }
 
 var (
@@ -281,11 +283,11 @@ func (l *TokenLookupService) storeOwnerRow(ctx context.Context, a *lookupAdmitte
 		return err
 	}
 	inserted, err := l.store.StoreTokenIfAbsent(ctx, TokenRecord{Txid: a.txid, OutputIndex: o.Index, TokenID: o.TokenID,
-		Amount: Amount(o.Amount), IdentityKey: identityKey, CreatedAt: createdAt})
+		Amount: amount.FromUint64(o.Amount), IdentityKey: identityKey, CreatedAt: createdAt})
 	if err != nil || !inserted {
 		return err // credit on insert only: a replay never credits twice
 	}
-	return l.store.AdjustBalance(ctx, identityKey, int64(o.Amount))
+	return l.store.AdjustBalance(ctx, identityKey, amount.FromUint64(o.Amount))
 }
 
 func (l *TokenLookupService) OutputSpent(ctx context.Context, p *engine.OutputSpent) error {

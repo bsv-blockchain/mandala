@@ -3,6 +3,7 @@ package mandala
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/big"
 	"slices"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 	"github.com/sirdeggen/mandala/overlay-go/internal/testmongo"
 )
@@ -146,24 +148,24 @@ func TestRecordOwnersIsFirstWriteWinsAndAppendOnly(t *testing.T) {
 	if n := stCount(t, db, OwnersCollection, bson.D{}); n != 0 {
 		t.Fatalf("an empty batch wrote %d rows", n)
 	}
-	first := stOwner(stHex(1), 0, topicA, brc162.RoleValue, 100, stKeyA)
+	first := stOwner(stHex(1), 0, topicA, brc162.RoleValue, amt(100), stKeyA)
 	if err := s.RecordOwners(ctx, []OwnerRecord{first}); err != nil {
 		t.Fatal(err)
 	}
 	rewrite := first
-	rewrite.IdentityKey, rewrite.Amount = stKeyB, 7
-	second := stOwner(stHex(1), 1, topicA, brc162.RoleAuthority, 0, stKeyB)
+	rewrite.IdentityKey, rewrite.Amount = stKeyB, amt(7)
+	second := stOwner(stHex(1), 1, topicA, brc162.RoleAuthority, amt(0), stKeyB)
 	if err := s.RecordOwners(ctx, []OwnerRecord{rewrite, second}); err != nil {
 		t.Fatal("a partly-duplicate batch:", err)
 	}
 	got, err := s.GetOwnerJournal(ctx, stHex(1), 0, topicA)
-	if err != nil || got == nil || got.IdentityKey != stKeyA || got.Amount != 100 || !got.CreatedAt.Equal(stEpoch) {
+	if err != nil || got == nil || got.IdentityKey != stKeyA || got.Amount.Cmp(amt(100)) != 0 || !got.CreatedAt.Equal(stEpoch) {
 		t.Fatalf("first write must win: %+v %v", got, err)
 	}
 	if got, _ := s.GetOwnerJournal(ctx, stHex(1), 1, topicA); got == nil || got.Role != brc162.RoleAuthority {
 		t.Fatalf("the batch's new row was not inserted: %+v", got)
 	}
-	if err := s.RecordOwners(ctx, []OwnerRecord{stOwner(stHex(1), 0, topicB, brc162.RoleValue, 100, stKeyA)}); err != nil {
+	if err := s.RecordOwners(ctx, []OwnerRecord{stOwner(stHex(1), 0, topicB, brc162.RoleValue, amt(100), stKeyA)}); err != nil {
 		t.Fatal(err)
 	}
 	if n := stCount(t, db, OwnersCollection, bson.D{{Key: "txid", Value: stHex(1)}, {Key: "outputIndex", Value: 0}}); n != 2 {
@@ -172,8 +174,8 @@ func TestRecordOwnersIsFirstWriteWinsAndAppendOnly(t *testing.T) {
 	if got, err := s.GetOwnerJournal(ctx, stHex(1), 0, "tm_mandala_kyc"); got != nil || err != nil {
 		t.Fatalf("another topic's journal must read nil: %+v %v", got, err)
 	}
-	if v := stRaw(t, db, OwnersCollection, bson.D{{Key: "topic", Value: topicA}, {Key: "outputIndex", Value: 0}}, "amount"); v.Type != bson.TypeDouble {
-		t.Fatalf("journal amount written as %v, want double", v.Type)
+	if v := stRaw(t, db, OwnersCollection, bson.D{{Key: "topic", Value: topicA}, {Key: "outputIndex", Value: 0}}, "amount"); v.Type != bson.TypeDecimal128 {
+		t.Fatalf("journal amount written as %v, want decimal128", v.Type)
 	}
 	var wg sync.WaitGroup
 	errs := make(chan error, 8)
@@ -181,7 +183,7 @@ func TestRecordOwnersIsFirstWriteWinsAndAppendOnly(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs <- s.RecordOwners(ctx, []OwnerRecord{stOwner(stHex(2), 0, topicA, brc162.RoleValue, 5, stKeyA), stOwner(stHex(2), 1, topicA, brc162.RoleValue, 6, stKeyA)})
+			errs <- s.RecordOwners(ctx, []OwnerRecord{stOwner(stHex(2), 0, topicA, brc162.RoleValue, amt(5), stKeyA), stOwner(stHex(2), 1, topicA, brc162.RoleValue, amt(6), stKeyA)})
 		}()
 	}
 	wg.Wait()
@@ -196,7 +198,7 @@ func TestRecordOwnersIsFirstWriteWinsAndAppendOnly(t *testing.T) {
 	}
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	if err := s.RecordOwners(cancelled, []OwnerRecord{stOwner(stHex(3), 0, topicA, brc162.RoleValue, 1, stKeyA)}); err == nil {
+	if err := s.RecordOwners(cancelled, []OwnerRecord{stOwner(stHex(3), 0, topicA, brc162.RoleValue, amt(1), stKeyA)}); err == nil {
 		t.Fatal("a non-duplicate failure must be returned")
 	}
 }
@@ -206,9 +208,9 @@ func TestOwnerJournalByOutpointAndDistinctTopics(t *testing.T) {
 	s, _ := newTestStore(t)
 	topicA, topicB := "tm_"+stHex(0xaa), "tm_"+stHex(0xbb)
 	if err := s.RecordOwners(ctx, []OwnerRecord{
-		stOwner(stHex(9), 0, topicB, brc162.RoleValue, 3, stKeyB),
-		stOwner(stHex(9), 0, topicA, brc162.RoleValue, 3, stKeyA),
-		stOwner(stHex(9), 1, KYCTopic, brc162.RoleAuthority, 0, stKeyA),
+		stOwner(stHex(9), 0, topicB, brc162.RoleValue, amt(3), stKeyB),
+		stOwner(stHex(9), 0, topicA, brc162.RoleValue, amt(3), stKeyA),
+		stOwner(stHex(9), 1, KYCTopic, brc162.RoleAuthority, amt(0), stKeyA),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -240,39 +242,39 @@ func stToken(txid string, vout uint32, tokenID string, amount Amount, key string
 	return TokenRecord{Txid: txid, OutputIndex: vout, TokenID: tokenID, Amount: amount, IdentityKey: key, CreatedAt: stEpoch}
 }
 
-func TestTokenRowFirstWriteWinsAndTheCapIsADouble(t *testing.T) {
+func TestTokenRowFirstWriteWinsAndTheAmountIsADecimal128(t *testing.T) {
 	ctx := context.Background()
 	s, db := newTestStore(t)
 	tok := stHex(0xaa) + "_0"
 	if got, err := s.GetTokenRow(ctx, stHex(1), 0); got != nil || err != nil {
 		t.Fatalf("absent row: %+v %v", got, err)
 	}
-	ok, err := s.StoreTokenIfAbsent(ctx, stToken(stHex(1), 0, tok, Amount(MaxSafeAmount), stKeyA))
+	ok, err := s.StoreTokenIfAbsent(ctx, stToken(stHex(1), 0, tok, amount.FromUint64(math.MaxUint64), stKeyA))
 	if err != nil || !ok {
 		t.Fatalf("first store: %v %v", ok, err)
 	}
-	ok, err = s.StoreTokenIfAbsent(ctx, stToken(stHex(1), 0, tok, 1, stKeyB))
+	ok, err = s.StoreTokenIfAbsent(ctx, stToken(stHex(1), 0, tok, amt(1), stKeyB))
 	if err != nil || ok {
 		t.Fatalf("second store must lose: %v %v", ok, err)
 	}
 	got, err := s.GetTokenRow(ctx, stHex(1), 0)
-	if err != nil || got.Amount != Amount(MaxSafeAmount) || got.IdentityKey != stKeyA {
+	if err != nil || got.Amount.String() != "18446744073709551615" || got.IdentityKey != stKeyA {
 		t.Fatalf("row: %+v %v", got, err)
 	}
-	if v := stRaw(t, db, TokensCollection, bson.D{{Key: "txid", Value: stHex(1)}}, "amount"); v.Type != bson.TypeDouble || v.Double() != 9007199254740991 {
+	if v := stRaw(t, db, TokensCollection, bson.D{{Key: "txid", Value: stHex(1)}}, "amount"); v.Type != bson.TypeDecimal128 || v.Decimal128().String() != "18446744073709551615" {
 		t.Fatalf("amount stored as %v", v)
 	}
-	// A TS-written row holds a small amount as int32; a Go-era row as int64.
+	// An old-format row (a TS-written int32, a Go-era int64) is a read error, never 0 or a guess.
 	if _, err := db.Collection(TokensCollection).InsertMany(ctx, []any{
 		bson.D{{Key: "txid", Value: stHex(2)}, {Key: "outputIndex", Value: int32(0)}, {Key: "tokenId", Value: tok}, {Key: "amount", Value: int32(5)}, {Key: "identityKey", Value: stKeyA}, {Key: "createdAt", Value: stEpoch}},
 		bson.D{{Key: "txid", Value: stHex(3)}, {Key: "outputIndex", Value: int64(0)}, {Key: "tokenId", Value: tok}, {Key: "amount", Value: int64(7)}, {Key: "identityKey", Value: stKeyA}, {Key: "createdAt", Value: stEpoch}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if r, err := s.GetTokenRow(ctx, stHex(2), 0); err != nil || r.Amount != 5 {
+	if r, err := s.GetTokenRow(ctx, stHex(2), 0); err == nil || !strings.Contains(err.Error(), "want decimal128") {
 		t.Fatalf("int32 row: %+v %v", r, err)
 	}
-	if r, err := s.GetTokenRow(ctx, stHex(3), 0); err != nil || r.Amount != 7 {
+	if r, err := s.GetTokenRow(ctx, stHex(3), 0); err == nil || !strings.Contains(err.Error(), "want decimal128") {
 		t.Fatalf("int64 row: %+v %v", r, err)
 	}
 }
@@ -281,7 +283,7 @@ func TestTakeTokenRemovesExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTestStore(t)
 	tok := stHex(0xaa) + "_0"
-	if _, err := s.StoreTokenIfAbsent(ctx, stToken(stHex(1), 2, tok, 40, stKeyA)); err != nil {
+	if _, err := s.StoreTokenIfAbsent(ctx, stToken(stHex(1), 2, tok, amt(40), stKeyA)); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
@@ -300,7 +302,7 @@ func TestTakeTokenRemovesExactlyOnce(t *testing.T) {
 				mu.Lock()
 				taken++
 				mu.Unlock()
-				if r.Amount != 40 || r.IdentityKey != stKeyA {
+				if r.Amount.Cmp(amt(40)) != 0 || r.IdentityKey != stKeyA {
 					t.Errorf("taken row %+v", r)
 				}
 			}
@@ -320,11 +322,11 @@ func TestFindTokensByTokenIDPagesLiveRowsInOutpointOrder(t *testing.T) {
 	s, _ := newTestStore(t)
 	tok, other := stHex(0xaa)+"_0", stHex(0xbb)+"_0"
 	for _, r := range []TokenRecord{
-		stToken(stHex(2), 0, tok, 1, stKeyA),
-		stToken(stHex(1), 1, tok, 2, stKeyA),
-		stToken(stHex(1), 0, tok, 3, stKeyA),
-		stToken(stHex(3), 0, tok, 4, stKeyA),
-		stToken(stHex(4), 0, other, 5, stKeyA),
+		stToken(stHex(2), 0, tok, amt(1), stKeyA),
+		stToken(stHex(1), 1, tok, amt(2), stKeyA),
+		stToken(stHex(1), 0, tok, amt(3), stKeyA),
+		stToken(stHex(3), 0, tok, amt(4), stKeyA),
+		stToken(stHex(4), 0, other, amt(5), stKeyA),
 	} {
 		if _, err := s.StoreTokenIfAbsent(ctx, r); err != nil {
 			t.Fatal(err)
@@ -369,10 +371,10 @@ func TestCirculatingSupply(t *testing.T) {
 		t.Fatalf("no rows: %s", got)
 	}
 	for _, r := range []TokenRecord{
-		stToken(stHex(1), 0, tok, 100, stKeyA),
-		stToken(stHex(1), 1, tok, 50, stKeyB),
-		stToken(stHex(2), 1, tok, 7, stKeyB), // same vout as an evicted outpoint, another tx: counted
-		stToken(stHex(3), 0, other, 9, stKeyA),
+		stToken(stHex(1), 0, tok, amt(100), stKeyA),
+		stToken(stHex(1), 1, tok, amt(50), stKeyB),
+		stToken(stHex(2), 1, tok, amt(7), stKeyB), // same vout as an evicted outpoint, another tx: counted
+		stToken(stHex(3), 0, other, amt(9), stKeyA),
 	} {
 		if _, err := s.StoreTokenIfAbsent(ctx, r); err != nil {
 			t.Fatal(err)
@@ -400,7 +402,7 @@ func TestCirculatingSupply(t *testing.T) {
 	}
 	big2 := stHex(0xcc) + "_0"
 	for i := byte(0); i < 2; i++ {
-		if _, err := s.StoreTokenIfAbsent(ctx, stToken(stHex(0x10+i), 0, big2, Amount(MaxSafeAmount), stKeyA)); err != nil {
+		if _, err := s.StoreTokenIfAbsent(ctx, stToken(stHex(0x10+i), 0, big2, amount.FromUint64(MaxSafeAmount), stKeyA)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -414,7 +416,7 @@ func TestIndexedVoutsByTxidUnionsTokensAndAuthorities(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTestStore(t)
 	tok := stHex(0xaa) + "_0"
-	if _, err := s.StoreTokenIfAbsent(ctx, stToken(stHex(1), 2, tok, 5, stKeyA)); err != nil {
+	if _, err := s.StoreTokenIfAbsent(ctx, stToken(stHex(1), 2, tok, amt(5), stKeyA)); err != nil {
 		t.Fatal(err)
 	}
 	for _, v := range []uint32{0, 2} {
@@ -473,23 +475,23 @@ func TestRepairOwnerRow(t *testing.T) {
 	ctx := context.Background()
 	s, db := newTestStore(t)
 	topic := "tm_" + stHex(0xaa)
-	value := stOwner(stHex(1), 1, topic, brc162.RoleValue, 40, stKeyA)
+	value := stOwner(stHex(1), 1, topic, brc162.RoleValue, amt(40), stKeyA)
 
 	inserted, err := s.RepairOwnerRow(ctx, value)
 	if err != nil || !inserted {
 		t.Fatalf("missing row: inserted=%v err=%v", inserted, err)
 	}
-	if b, _ := s.GetBalance(ctx, stKeyA); b != 40 {
+	if b, _ := s.GetBalance(ctx, stKeyA); b.Cmp(amt(40)) != 0 {
 		t.Fatalf("insert credits once: balance %d", b)
 	}
 	row, _ := s.GetTokenRow(ctx, stHex(1), 1)
-	if row == nil || row.Amount != 40 || row.TokenID != value.TokenID || !row.CreatedAt.Equal(stEpoch) {
+	if row == nil || row.Amount.Cmp(amt(40)) != 0 || row.TokenID != value.TokenID || !row.CreatedAt.Equal(stEpoch) {
 		t.Fatalf("repaired row %+v", row)
 	}
 	if inserted, err := s.RepairOwnerRow(ctx, value); err != nil || inserted {
 		t.Fatalf("an existing row is corrected, not inserted: %v %v", inserted, err)
 	}
-	if b, _ := s.GetBalance(ctx, stKeyA); b != 40 {
+	if b, _ := s.GetBalance(ctx, stKeyA); b.Cmp(amt(40)) != 0 {
 		t.Fatalf("a correction must not re-credit: balance %d", b)
 	}
 	// A wrong row (amount 99) is corrected from the journal without a credit.
@@ -499,18 +501,18 @@ func TestRepairOwnerRow(t *testing.T) {
 	if inserted, err := s.RepairOwnerRow(ctx, value); err != nil || inserted {
 		t.Fatalf("correction: %v %v", inserted, err)
 	}
-	if row, _ := s.GetTokenRow(ctx, stHex(1), 1); row.Amount != 40 {
+	if row, _ := s.GetTokenRow(ctx, stHex(1), 1); row.Amount.Cmp(amt(40)) != 0 {
 		t.Fatalf("corrected amount %d", row.Amount)
 	}
-	if b, _ := s.GetBalance(ctx, stKeyA); b != 40 {
+	if b, _ := s.GetBalance(ctx, stKeyA); b.Cmp(amt(40)) != 0 {
 		t.Fatalf("balance after correction %d", b)
 	}
 
-	auth := stOwner(stHex(2), 0, topic, brc162.RoleAuthority, 0, stKeyB)
+	auth := stOwner(stHex(2), 0, topic, brc162.RoleAuthority, amt(0), stKeyB)
 	if inserted, err := s.RepairOwnerRow(ctx, auth); err != nil || !inserted {
 		t.Fatalf("authority: %v %v", inserted, err)
 	}
-	deploy := stOwner(stHex(3), 0, topic, brc162.RoleDeploy, 0, stKeyB)
+	deploy := stOwner(stHex(3), 0, topic, brc162.RoleDeploy, amt(0), stKeyB)
 	if inserted, err := s.RepairOwnerRow(ctx, deploy); err != nil || !inserted {
 		t.Fatalf("deploy: %v %v", inserted, err)
 	}
@@ -523,7 +525,7 @@ func TestRepairOwnerRow(t *testing.T) {
 			t.Fatal("a deploy/authority journal must not write a value row")
 		}
 	}
-	if b, _ := s.GetBalance(ctx, stKeyB); b != 0 {
+	if b, _ := s.GetBalance(ctx, stKeyB); b.Cmp(amt(0)) != 0 {
 		t.Fatalf("an authority repair never credits: balance %d", b)
 	}
 	if n := stCount(t, db, OwnersCollection, bson.D{}); n != 0 {
@@ -534,7 +536,7 @@ func TestRepairOwnerRow(t *testing.T) {
 func TestConcurrentRepairCreditsOnce(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTestStore(t)
-	j := stOwner(stHex(7), 0, "tm_"+stHex(0xaa), brc162.RoleValue, 25, stKeyA)
+	j := stOwner(stHex(7), 0, "tm_"+stHex(0xaa), brc162.RoleValue, amt(25), stKeyA)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	inserts := 0
@@ -558,7 +560,7 @@ func TestConcurrentRepairCreditsOnce(t *testing.T) {
 	if inserts != 1 {
 		t.Fatalf("%d repairs reported an insert, want 1", inserts)
 	}
-	if b, _ := s.GetBalance(ctx, stKeyA); b != 25 {
+	if b, _ := s.GetBalance(ctx, stKeyA); b.Cmp(amt(25)) != 0 {
 		t.Fatalf("balance %d, want 25 (credited once)", b)
 	}
 }
@@ -568,23 +570,26 @@ func TestConcurrentRepairCreditsOnce(t *testing.T) {
 func TestBalances(t *testing.T) {
 	ctx := context.Background()
 	s, db := newTestStore(t)
-	if b, err := s.GetBalance(ctx, stKeyA); b != 0 || err != nil {
+	if b, err := s.GetBalance(ctx, stKeyA); b.Cmp(amt(0)) != 0 || err != nil {
 		t.Fatalf("unknown identity: %d %v", b, err)
 	}
-	if err := s.AdjustBalance(ctx, stKeyA, 40); err != nil {
+	if err := s.AdjustBalance(ctx, stKeyA, amt(40)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AdjustBalance(ctx, stKeyA, -15); err != nil {
+	if err := s.AdjustBalance(ctx, stKeyA, amt(-15)); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := s.GetBalance(ctx, stKeyA); b != 25 {
+	if b, _ := s.GetBalance(ctx, stKeyA); b.Cmp(amt(25)) != 0 {
 		t.Fatalf("balance %d", b)
 	}
 	if _, err := db.Collection(BalancesCollection).InsertOne(ctx, bson.D{{Key: "identityKey", Value: stKeyB}, {Key: "balance", Value: 12.0}}); err != nil {
 		t.Fatal(err)
 	}
-	if b, err := s.GetBalance(ctx, stKeyB); b != 12 || err != nil {
-		t.Fatalf("a TS double balance: %d %v", b, err)
+	if b, err := s.GetBalance(ctx, stKeyB); err == nil || !strings.Contains(err.Error(), "want decimal128") {
+		t.Fatalf("an old-format double balance must not read: %s %v", b, err)
+	}
+	if v := stRaw(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: stKeyA}}, "balance"); v.Type != bson.TypeDecimal128 {
+		t.Fatalf("balance stored as %v, want decimal128", v.Type)
 	}
 }
 
@@ -598,6 +603,7 @@ func TestRebuildBalancesHealsTheBalanceIndex(t *testing.T) {
 	keyC := "02" + strings.Repeat("c3", 32)
 	keyD := "03" + strings.Repeat("d4", 32)
 	keyE := "02" + strings.Repeat("e5", 32)
+	keyF := "03" + strings.Repeat("f6", 32)
 	mustRow := func(r TokenRecord) {
 		t.Helper()
 		if ok, err := s.StoreTokenIfAbsent(ctx, r); err != nil || !ok {
@@ -606,74 +612,86 @@ func TestRebuildBalancesHealsTheBalanceIndex(t *testing.T) {
 	}
 	credit := func(key string, delta int64) {
 		t.Helper()
-		if err := s.AdjustBalance(ctx, key, delta); err != nil {
+		if err := s.AdjustBalance(ctx, key, amt(delta)); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	// A: one repaired row credited normally, then a row whose credit was lost (the row write landed,
 	// the process died before the $inc). The retried repair finds the row and does not credit.
-	if inserted, err := s.RepairOwnerRow(ctx, stOwner(stHex(1), 0, topic, brc162.RoleValue, 40, stKeyA)); err != nil || !inserted {
+	if inserted, err := s.RepairOwnerRow(ctx, stOwner(stHex(1), 0, topic, brc162.RoleValue, amt(40), stKeyA)); err != nil || !inserted {
 		t.Fatalf("repair: %v %v", inserted, err)
 	}
-	mustRow(stToken(stHex(1), 1, tok, 25, stKeyA))
-	if inserted, err := s.RepairOwnerRow(ctx, stOwner(stHex(1), 1, topic, brc162.RoleValue, 25, stKeyA)); err != nil || inserted {
+	mustRow(stToken(stHex(1), 1, tok, amt(25), stKeyA))
+	if inserted, err := s.RepairOwnerRow(ctx, stOwner(stHex(1), 1, topic, brc162.RoleValue, amt(25), stKeyA)); err != nil || inserted {
 		t.Fatalf("retried repair: %v %v", inserted, err)
 	}
 	// A also lost a debit: a spent row of another token was taken, its owner never debited.
-	mustRow(stToken(stHex(2), 0, other, 5, stKeyA))
+	mustRow(stToken(stHex(2), 0, other, amt(5), stKeyA))
 	credit(stKeyA, 5)
 	if r, err := s.TakeToken(ctx, stHex(2), 0); err != nil || r == nil {
 		t.Fatalf("take: %+v %v", r, err)
 	}
-	if b, _ := s.GetBalance(ctx, stKeyA); b != 45 {
+	if b, _ := s.GetBalance(ctx, stKeyA); b.Cmp(amt(45)) != 0 {
 		t.Fatalf("precondition: A's balance %d, want the drifted 45", b)
 	}
 	// B: a balance document with no rows left (the last row's debit was lost).
 	credit(stKeyB, 30)
 	// C: a row with no balance document, on an outpoint a reissue evicted. No path debits a
 	// reissued row, so it still counts (CirculatingSupply excludes it; balances do not).
-	mustRow(stToken(stHex(3), 0, tok, 7, keyC))
+	mustRow(stToken(stHex(3), 0, tok, amt(7), keyC))
 	st := DefaultAssetState(tok, nil)
 	st.EvictedOutpoints = []string{stHex(3) + ".0"}
 	if err := s.PutAssetState(ctx, st); err != nil {
 		t.Fatal(err)
 	}
-	// D: already right, across two tokens, as the int64 the Go $inc writes: it is not rewritten.
-	mustRow(stToken(stHex(4), 0, tok, 12, keyD))
-	mustRow(stToken(stHex(4), 1, other, 3, keyD))
-	credit(keyD, 15)
+	// D: already right, across two tokens, as a Decimal128 15.0 (an exact integer with exponent -1,
+	// a shape the Go $inc never writes): it decodes equal to the sum, so it is not rewritten.
+	mustRow(stToken(stHex(4), 0, tok, amt(12), keyD))
+	mustRow(stToken(stHex(4), 1, other, amt(3), keyD))
+	d15, err := bson.ParseDecimal128("15.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Collection(BalancesCollection).InsertOne(ctx, bson.D{{Key: "identityKey", Value: keyD}, {Key: "balance", Value: d15}}); err != nil {
+		t.Fatal(err)
+	}
 	// E: a stored balance that does not decode (fractional) is replaced.
-	mustRow(stToken(stHex(5), 0, tok, 9, keyE))
+	mustRow(stToken(stHex(5), 0, tok, amt(9), keyE))
 	if _, err := db.Collection(BalancesCollection).InsertOne(ctx, bson.D{{Key: "identityKey", Value: keyE}, {Key: "balance", Value: 2.5}}); err != nil {
+		t.Fatal(err)
+	}
+	// F: an old-format int64 balance equal to the sum does not decode as an Amount: it is rewritten.
+	mustRow(stToken(stHex(6), 0, tok, amt(4), keyF))
+	if _, err := db.Collection(BalancesCollection).InsertOne(ctx, bson.D{{Key: "identityKey", Value: keyF}, {Key: "balance", Value: int64(4)}}); err != nil {
 		t.Fatal(err)
 	}
 
 	res, err := s.RebuildBalances(ctx)
-	if err != nil || res.Changed != 4 || res.Unsafe == nil || len(res.Unsafe) != 0 {
-		t.Fatalf("rebuild = %+v, %v; want 4 changed (A, B, C, E) and no unsafe key", res, err)
+	if err != nil || res.Changed != 5 || res.Unsafe == nil || len(res.Unsafe) != 0 {
+		t.Fatalf("rebuild = %+v, %v; want 5 changed (A, B, C, E, F) and no unsafe key", res, err)
 	}
 	for _, want := range []struct {
 		key string
 		bal int64
-	}{{stKeyA, 65}, {stKeyB, 0}, {keyC, 7}, {keyD, 15}, {keyE, 9}} {
-		if b, err := s.GetBalance(ctx, want.key); b != want.bal || err != nil {
+	}{{stKeyA, 65}, {stKeyB, 0}, {keyC, 7}, {keyD, 15}, {keyE, 9}, {keyF, 4}} {
+		if b, err := s.GetBalance(ctx, want.key); b.Cmp(amt(want.bal)) != 0 || err != nil {
 			t.Fatalf("balance of %s = %d, %v; want %d", want.key[:4], b, err, want.bal)
 		}
 	}
 	if n := stCount(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: stKeyB}}); n != 1 {
 		t.Fatalf("an identity with no rows keeps its document (at 0): %d documents", n)
 	}
-	if n := stCount(t, db, BalancesCollection, bson.D{}); n != 5 {
-		t.Fatalf("%d balance documents, want 5", n)
+	if n := stCount(t, db, BalancesCollection, bson.D{}); n != 6 {
+		t.Fatalf("%d balance documents, want 6", n)
 	}
-	for _, key := range []string{stKeyA, stKeyB, keyC, keyE} {
-		if v := stRaw(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: key}}, "balance"); v.Type != bson.TypeDouble {
-			t.Fatalf("rebuilt balance of %s stored as %v, want double", key[:4], v.Type)
+	for _, key := range []string{stKeyA, stKeyB, keyC, keyE, keyF} {
+		if v := stRaw(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: key}}, "balance"); v.Type != bson.TypeDecimal128 {
+			t.Fatalf("rebuilt balance of %s stored as %v, want decimal128", key[:4], v.Type)
 		}
 	}
-	if v := stRaw(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: keyD}}, "balance"); v.Type != bson.TypeInt64 {
-		t.Fatalf("an unchanged balance was rewritten: stored as %v", v.Type)
+	if v := stRaw(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: keyD}}, "balance"); v.Type != bson.TypeDecimal128 || v.Decimal128().String() != "15.0" {
+		t.Fatalf("an unchanged balance was rewritten: stored as %v %v", v.Type, v)
 	}
 
 	again, err := s.RebuildBalances(ctx)
@@ -682,26 +700,31 @@ func TestRebuildBalancesHealsTheBalanceIndex(t *testing.T) {
 	}
 }
 
-// V-11: an identity's balance sums every token it holds, so it can pass 2^53-1 although no single
-// token's supply can. RebuildBalances reports such an identity instead of failing and leaves its
-// document as it is; the same run still heals every other identity.
+// V-11: an identity's balance sums every token it holds, so it can pass the storage range 10^34-1
+// although no single token's supply can (the submit bound, Task 6). RebuildBalances reports such an
+// identity instead of failing and leaves its document as it is; the same run still heals every
+// other identity.
 func TestRebuildBalancesReportsAnUnsafeSumWithoutFailing(t *testing.T) {
 	ctx := context.Background()
 	s, db := newTestStore(t)
 	tokX, tokY := stHex(0xaa)+"_0", stHex(0xbb)+"_0"
 	keyC := "02" + strings.Repeat("c3", 32)
+	top, err := amount.FromBig(amount.MaxStorable())
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, r := range []TokenRecord{
-		stToken(stHex(1), 0, tokX, Amount(MaxSafeAmount), stKeyA), // A: 2^53 in all, the second credit lost
-		stToken(stHex(1), 1, tokY, 1, stKeyA),
-		stToken(stHex(2), 0, tokX, Amount(MaxSafeAmount), keyC), // C: 2^54-2 in all, no balance document
-		stToken(stHex(2), 1, tokY, Amount(MaxSafeAmount), keyC),
-		stToken(stHex(3), 0, tokX, 10, stKeyB), // B: safe, its credit lost
+		stToken(stHex(1), 0, tokX, top, stKeyA), // A: 10^34 in all, the second credit lost
+		stToken(stHex(1), 1, tokY, amt(1), stKeyA),
+		stToken(stHex(2), 0, tokX, top, keyC), // C: 2*10^34-2 in all, no balance document
+		stToken(stHex(2), 1, tokY, top, keyC),
+		stToken(stHex(3), 0, tokX, amt(10), stKeyB), // B: storable, its credit lost
 	} {
 		if ok, err := s.StoreTokenIfAbsent(ctx, r); err != nil || !ok {
 			t.Fatalf("store row %s.%d: %v %v", r.Txid[:2], r.OutputIndex, ok, err)
 		}
 	}
-	if err := s.AdjustBalance(ctx, stKeyA, int64(MaxSafeAmount)); err != nil {
+	if err := s.AdjustBalance(ctx, stKeyA, top); err != nil {
 		t.Fatal(err)
 	}
 
@@ -714,14 +737,14 @@ func TestRebuildBalancesReportsAnUnsafeSumWithoutFailing(t *testing.T) {
 		if err != nil || res.Changed != wantChanged || strings.Join(res.Unsafe, ",") != stKeyA+","+keyC {
 			t.Fatalf("run %d = %+v, %v; want %d changed and unsafe [A C]", run, res, err, wantChanged)
 		}
-		if b, err := s.GetBalance(ctx, stKeyA); b != int64(MaxSafeAmount) || err != nil {
-			t.Fatalf("run %d: an unsafe identity's document must be left readable as it was: %d %v", run, b, err)
+		if b, err := s.GetBalance(ctx, stKeyA); b.Cmp(top) != 0 || err != nil {
+			t.Fatalf("run %d: an unsafe identity's document must be left readable as it was: %s %v", run, b, err)
 		}
 		if n := stCount(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: keyC}}); n != 0 {
 			t.Fatalf("run %d: an unsafe identity got a document", run)
 		}
-		if b, err := s.GetBalance(ctx, stKeyB); b != 10 || err != nil {
-			t.Fatalf("run %d: B's balance %d, %v; want 10", run, b, err)
+		if b, err := s.GetBalance(ctx, stKeyB); b.Cmp(amt(10)) != 0 || err != nil {
+			t.Fatalf("run %d: B's balance %s, %v; want 10", run, b, err)
 		}
 	}
 }
@@ -854,12 +877,12 @@ func TestAssetStateDefaultPutAndIfAbsent(t *testing.T) {
 	if got, _ := s.GetAssetState(ctx, tok); got.IsPaused || got.FeeRatePerKb == nil || *got.FeeRatePerKb != 500 {
 		t.Fatalf("first kept: %+v", got)
 	}
-	replaced := AssetAdminState{TokenID: tok, AccessMode: "allowlist", FrozenOutpoints: []FrozenRef{{Outpoint: stHex(1) + ".0", Amount: 10, Owner: stKeyA}}, LastAdmitSeq: 9}
+	replaced := AssetAdminState{TokenID: tok, AccessMode: "allowlist", FrozenOutpoints: []FrozenRef{{Outpoint: stHex(1) + ".0", Amount: amt(10), Owner: stKeyA}}, LastAdmitSeq: 9}
 	if err := s.PutAssetState(ctx, replaced); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := s.GetAssetState(ctx, tok)
-	if got.AccessMode != "allowlist" || got.FeeRatePerKb != nil || len(got.FrozenOutpoints) != 1 || got.FrozenOutpoints[0].Amount != 10 || got.LastAdmitSeq != 9 {
+	if got.AccessMode != "allowlist" || got.FeeRatePerKb != nil || len(got.FrozenOutpoints) != 1 || got.FrozenOutpoints[0].Amount.Cmp(amt(10)) != 0 || got.LastAdmitSeq != 9 {
 		t.Fatalf("put replaces: %+v", got)
 	}
 	if v := stRaw(t, db, AssetStatesCollection, bson.D{{Key: "tokenId", Value: tok}}, "blockedIdentities"); v.Type != bson.TypeArray {
@@ -873,19 +896,19 @@ func TestAssetStateDefaultPutAndIfAbsent(t *testing.T) {
 // ---- admin history and counters ----
 
 func stHistory(tok, txid string, vout uint32, kind string, height, offset, seq int64) AdminHistoryEntry {
-	return AdminHistoryEntry{TokenID: tok, Txid: txid, OutputIndex: vout, Kind: kind, DetailsHex: "a1", Commitment: stHex(0xcc), Delta: 0, Height: height, Offset: offset, AdmitSeq: seq, CreatedAt: stEpoch}
+	return AdminHistoryEntry{TokenID: tok, Txid: txid, OutputIndex: vout, Kind: kind, DetailsHex: "a1", Commitment: stHex(0xcc), Delta: amt(0), Height: height, Offset: offset, AdmitSeq: seq, CreatedAt: stEpoch}
 }
 
 func TestAdminHistory(t *testing.T) {
 	ctx := context.Background()
 	s, db := newTestStore(t)
 	tok, other := stHex(0xaa)+"_0", stHex(0xbb)+"_0"
-	frozen := Amount(30)
+	frozen := amt(30)
 	owner := stKeyA
 	freeze := stHistory(tok, stHex(4), 0, "freezeOutput", 100, 0, 4)
 	freeze.FrozenAmount, freeze.FrozenOwner = &frozen, &owner
 	issue := stHistory(tok, stHex(1), 0, "issue", 100, 2, 1)
-	issue.Delta = -40
+	issue.Delta = amt(-40)
 	for _, e := range []AdminHistoryEntry{
 		stHistory(tok, stHex(3), 0, "pause", 9007199254740991, 0, 3),
 		issue,
@@ -912,14 +935,14 @@ func TestAdminHistory(t *testing.T) {
 	if err != nil || kinds(rows) != "freezeOutput,issue,unpause,pause" {
 		t.Fatalf("fold order (height, offset, admitSeq) = %s %v", kinds(rows), err)
 	}
-	if rows[1].Delta != -40 || rows[0].FrozenAmount == nil || *rows[0].FrozenAmount != 30 || *rows[0].FrozenOwner != stKeyA || rows[1].FrozenAmount != nil {
+	if rows[1].Delta.Cmp(amt(-40)) != 0 || rows[0].FrozenAmount == nil || (*rows[0].FrozenAmount).Cmp(amt(30)) != 0 || *rows[0].FrozenOwner != stKeyA || rows[1].FrozenAmount != nil {
 		t.Fatalf("delta and freeze context round trip: %+v", rows[:2])
 	}
 	if v := stRaw(t, db, AdminHistoryCollection, bson.D{{Key: "txid", Value: stHex(1)}, {Key: "tokenId", Value: tok}}, "frozenAmount"); v.Type != 0 {
 		t.Fatalf("frozenAmount must be absent on a non-freeze row, got %v", v.Type)
 	}
-	if v := stRaw(t, db, AdminHistoryCollection, bson.D{{Key: "txid", Value: stHex(1)}, {Key: "tokenId", Value: tok}}, "delta"); v.Type != bson.TypeDouble {
-		t.Fatalf("delta stored as %v, want double", v.Type)
+	if v := stRaw(t, db, AdminHistoryCollection, bson.D{{Key: "txid", Value: stHex(1)}, {Key: "tokenId", Value: tok}}, "delta"); v.Type != bson.TypeDecimal128 || v.Decimal128().String() != "-40" {
+		t.Fatalf("delta stored as %v %v, want decimal128 -40", v.Type, v)
 	}
 	if page, _ := s.FindAdminHistory(ctx, tok, 2, 1); kinds(page) != "issue,unpause" {
 		t.Fatalf("page (2,1) = %s", kinds(page))
@@ -1121,4 +1144,80 @@ func TestListMethodsReturnEmptyNotNil(t *testing.T) {
 	check("IndexedVoutsByTxid", len(m), m == nil, err)
 	n, err := s.AllMetadata(ctx)
 	check("AllMetadata", len(n), n == nil, err)
+}
+
+// ---- exact amounts (1Color Task 5; Review Focus 1 and 5) ----
+
+// Two max-uint64 rows of one token held by one identity: every row, the supply, the balance and a
+// rebuild stay exact above 2^64 (Decimal128 with exponent 0 in Mongo).
+func TestStoreAmountsAboveUint64Exact(t *testing.T) {
+	ctx := context.Background()
+	s, db := newTestStore(t)
+	tok := stHex(0xaa) + "_0"
+	max := amount.FromUint64(math.MaxUint64)
+	for i, txid := range []string{stHex(1), stHex(2)} {
+		ok, err := s.StoreTokenIfAbsent(ctx, stToken(txid, uint32(i), tok, max, stKeyA))
+		if err != nil || !ok {
+			t.Fatalf("store %d: %v %v", i, ok, err)
+		}
+		if err := s.AdjustBalance(ctx, stKeyA, max); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row, err := s.GetTokenRow(ctx, stHex(1), 0)
+	if err != nil || row == nil || row.Amount.String() != "18446744073709551615" {
+		t.Fatalf("row: %+v %v", row, err)
+	}
+	if v := stRaw(t, db, TokensCollection, bson.D{{Key: "txid", Value: stHex(1)}}, "amount"); v.Type != bson.TypeDecimal128 {
+		t.Fatalf("amount stored as %v, want decimal128", v.Type)
+	}
+	sup, err := s.CirculatingSupply(ctx, tok)
+	if err != nil || sup.String() != "36893488147419103230" {
+		t.Fatalf("supply %v %v", sup, err)
+	}
+	bal, err := s.GetBalance(ctx, stKeyA)
+	if err != nil || bal.String() != "36893488147419103230" {
+		t.Fatalf("balance %v %v", bal, err)
+	}
+	if v := stRaw(t, db, BalancesCollection, bson.D{{Key: "identityKey", Value: stKeyA}}, "balance"); v.Type != bson.TypeDecimal128 {
+		t.Fatalf("balance stored as %v, want decimal128", v.Type)
+	}
+	res, err := s.RebuildBalances(ctx)
+	if err != nil || res.Changed != 0 || len(res.Unsafe) != 0 {
+		t.Fatalf("rebuild %+v %v", res, err)
+	}
+	// A debit of one max row leaves exactly one max row's worth.
+	if err := s.AdjustBalance(ctx, stKeyA, max.Neg()); err != nil {
+		t.Fatal(err)
+	}
+	if bal, err := s.GetBalance(ctx, stKeyA); err != nil || bal.Cmp(max) != 0 {
+		t.Fatalf("after debit %v %v", bal, err)
+	}
+}
+
+// The new binary pointed at an old-format store (BSON double/int amounts): every read of such an
+// amount is an error, never a silent 0 or a truncated value.
+func TestGetTokenRowRefusesOldDoubleAmount(t *testing.T) {
+	ctx := context.Background()
+	s, db := newTestStore(t)
+	tok := stHex(0xaa) + "_0"
+	if _, err := db.Collection(TokensCollection).InsertOne(ctx, bson.D{{Key: "txid", Value: stHex(1)}, {Key: "outputIndex", Value: int64(0)},
+		{Key: "tokenId", Value: tok}, {Key: "amount", Value: 5.0}, {Key: "identityKey", Value: stKeyA}, {Key: "createdAt", Value: stEpoch}}); err != nil {
+		t.Fatal(err)
+	}
+	if row, err := s.GetTokenRow(ctx, stHex(1), 0); err == nil {
+		t.Fatalf("old double read as %+v", row)
+	}
+	if _, err := s.CirculatingSupply(ctx, tok); err == nil {
+		t.Fatal("supply read an old double")
+	}
+	if _, err := s.RebuildBalances(ctx); err == nil {
+		t.Fatal("rebuild read an old double row")
+	}
+	if _, err := db.Collection(BalancesCollection).InsertOne(ctx, bson.D{{Key: "identityKey", Value: stKeyB}, {Key: "balance", Value: int32(12)}}); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := s.GetBalance(ctx, stKeyB); err == nil {
+		t.Fatalf("old int32 balance read as %v", b)
+	}
 }

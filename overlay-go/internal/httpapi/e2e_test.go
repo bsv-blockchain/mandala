@@ -169,7 +169,10 @@ func e2eBalance(t *testing.T, o e2eOverlay, p mandalatest.Party) int64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return b
+	if !b.Big().IsInt64() {
+		t.Fatalf("balance %s is not an int64", b)
+	}
+	return b.Big().Int64()
 }
 
 // A1.1 success criterion, part 1: one overlay following every token admits a deploy (both topics), an issue, a

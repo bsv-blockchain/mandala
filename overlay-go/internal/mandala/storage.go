@@ -15,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 )
 
@@ -332,7 +333,8 @@ func (s *Store) ListTokenRowsByTokenID(ctx context.Context, tokenID string, limi
 	return storeAll[TokenRecord](ctx, cur, err)
 }
 
-// CirculatingSupply sums the token's live value rows exactly (big.Int, so past 2^53 too).
+// CirculatingSupply sums the token's live value rows exactly (big.Int over Decimal128 rows). A row
+// whose amount is not a Decimal128 (an old-format store) fails the read.
 func (s *Store) CirculatingSupply(ctx context.Context, tokenID string) (*big.Int, error) {
 	filter, err := s.liveTokenFilter(ctx, tokenID)
 	if err != nil {
@@ -351,7 +353,7 @@ func (s *Store) CirculatingSupply(ctx context.Context, tokenID string) (*big.Int
 		if err := cur.Decode(&row); err != nil {
 			return nil, err
 		}
-		sum.Add(sum, big.NewInt(int64(row.Amount)))
+		sum.Add(sum, row.Amount.Big())
 	}
 	return sum, cur.Err()
 }
@@ -459,7 +461,7 @@ func (s *Store) RepairOwnerRow(ctx context.Context, journal OwnerRecord) (bool, 
 		return false, err
 	}
 	if journal.Role == brc162.RoleValue {
-		if err := s.AdjustBalance(ctx, journal.IdentityKey, int64(journal.Amount)); err != nil {
+		if err := s.AdjustBalance(ctx, journal.IdentityKey, journal.Amount); err != nil {
 			return true, err
 		}
 	}
@@ -468,30 +470,37 @@ func (s *Store) RepairOwnerRow(ctx context.Context, journal OwnerRecord) (bool, 
 
 // ---- balances ----
 
-// AdjustBalance adds delta to the identity's balance ($inc, upsert). Balances are a derived index
-// of mandalaTokens, written apart from the row they follow: a credit or debit missed between the
-// row write and this $inc is healed by RebuildBalances at the next maintenance run.
-func (s *Store) AdjustBalance(ctx context.Context, identityKey string, delta int64) error {
+// AdjustBalance adds delta to the identity's balance ($inc of a Decimal128, upsert). Balances are a
+// derived index of mandalaTokens, written apart from the row they follow: a credit or debit missed
+// between the row write and this $inc is healed by RebuildBalances at the next maintenance run.
+// Mongo rounds a Decimal128 $inc whose result passes 34 digits; such a balance reads back as out of
+// range (GetBalance errors, RebuildBalances reports it Unsafe), never as a wrong exact value.
+func (s *Store) AdjustBalance(ctx context.Context, identityKey string, delta Amount) error {
 	_, err := s.balances.UpdateOne(ctx, bson.D{{Key: "identityKey", Value: identityKey}},
 		bson.D{{Key: "$inc", Value: bson.D{{Key: "balance", Value: delta}}}}, options.UpdateOne().SetUpsert(true))
 	return err
 }
 
-// GetBalance reads the identity's balance, 0 when it has none.
-func (s *Store) GetBalance(ctx context.Context, identityKey string) (int64, error) {
+// GetBalance reads the identity's balance exactly, 0 when it has none. A balance that is not a
+// Decimal128 within the storage range (old-format store, or a rounded $inc) is an error.
+func (s *Store) GetBalance(ctx context.Context, identityKey string) (Amount, error) {
 	var rec struct {
 		Balance Amount `bson:"balance"`
 	}
-	if _, err := storeFindOne(ctx, s.balances, bson.D{{Key: "identityKey", Value: identityKey}}, &rec); err != nil {
-		return 0, err
+	found, err := storeFindOne(ctx, s.balances, bson.D{{Key: "identityKey", Value: identityKey}}, &rec)
+	if err != nil {
+		return zeroAmount(), err
 	}
-	return int64(rec.Balance), nil
+	if !found {
+		return zeroAmount(), nil
+	}
+	return rec.Balance, nil
 }
 
 // BalanceRebuild is what one RebuildBalances run did.
 type BalanceRebuild struct {
 	Changed int      // balance documents written: created, corrected or set to 0
-	Unsafe  []string // sorted identity keys whose sum exceeds MaxSafeAmount; their documents are left as they are
+	Unsafe  []string // sorted identity keys whose sum exceeds amount.MaxStorable (10^34-1); their documents are left as they are
 }
 
 // RebuildBalances recomputes mandalaBalances from mandalaTokens. Balances are a derived index of
@@ -502,12 +511,12 @@ type BalanceRebuild struct {
 // its row and no path debits it, so it counts here, although CirculatingSupply leaves it out.
 //
 // An identity with a balance document but no rows is set to 0 and keeps its document; one with
-// rows but no document gets one; a document whose stored balance (int32, int64 or double) already
-// equals the sum is not rewritten, and one that does not decode is. A balance is written as a BSON
-// double through Amount, the amount shape of D §6.6. A sum above MaxSafeAmount (possible only
-// across tokens) is not written, because GetBalance could not read such a double back, and it never
-// fails the run: its identity key is returned in Unsafe for the caller to log. A row whose amount
-// does not decode fails the run, as it fails CirculatingSupply.
+// rows but no document gets one; a document whose stored Decimal128 balance already equals the sum
+// is not rewritten, and one that does not decode as an Amount (an old-format double/int balance, a
+// rounded $inc) is. A balance is written as a Decimal128 through Amount (contract §6, D13). A sum
+// beyond the storage range 10^34-1 is not written, because Decimal128 cannot hold it exactly, and it
+// never fails the run: its identity key is returned in Unsafe for the caller to log. A row whose
+// amount does not decode (old-format store) fails the run, as it fails CirculatingSupply.
 //
 // It reads every row and then writes, so the caller must hold the maintenance gate's exclusive
 // section: no balance writer may run beside it (Task 22 runs it in owner-index maintenance).
@@ -533,7 +542,7 @@ func (s *Store) RebuildBalances(ctx context.Context) (BalanceRebuild, error) {
 			sum = new(big.Int)
 			sums[row.IdentityKey] = sum
 		}
-		sum.Add(sum, big.NewInt(int64(row.Amount)))
+		sum.Add(sum, row.Amount.Big())
 	}
 	if err := cur.Err(); err != nil {
 		return res, err
@@ -562,21 +571,20 @@ func (s *Store) RebuildBalances(ctx context.Context) (BalanceRebuild, error) {
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
-	maxSafe := new(big.Int).SetUint64(MaxSafeAmount)
 	for _, key := range keys {
-		sum := sums[key]
-		if sum.CmpAbs(maxSafe) > 0 {
+		want, err := amount.FromBig(sums[key])
+		if err != nil { // beyond 10^34-1: not storable exactly
 			res.Unsafe = append(res.Unsafe, key)
 			continue
 		}
 		if raw, ok := stored[key]; ok {
 			var have Amount
-			if have.UnmarshalBSONValue(byte(raw.Type), raw.Value) == nil && int64(have) == sum.Int64() {
+			if have.UnmarshalBSONValue(byte(raw.Type), raw.Value) == nil && have.Cmp(want) == 0 {
 				continue // already right: not rewritten
 			}
 		}
 		if err := storeUpsertSet(ctx, s.balances, bson.D{{Key: "identityKey", Value: key}},
-			bson.D{{Key: "balance", Value: Amount(sum.Int64())}}); err != nil {
+			bson.D{{Key: "balance", Value: want}}); err != nil {
 			return res, err
 		}
 		res.Changed++

@@ -18,7 +18,7 @@ type StateStore interface {
 	RepairOwnerRow(ctx context.Context, journal OwnerRecord) (inserted bool, err error)
 	TakeToken(ctx context.Context, txid string, vout uint32) (*TokenRecord, error)
 	TakeAuthority(ctx context.Context, txid string, vout uint32) (*AuthorityRecord, error)
-	AdjustBalance(ctx context.Context, identityKey string, delta int64) error
+	AdjustBalance(ctx context.Context, identityKey string, delta Amount) error
 	CirculatingSupply(ctx context.Context, tokenID string) (*big.Int, error)
 }
 
@@ -26,7 +26,7 @@ type StateStore interface {
 type RepairUndoStore interface {
 	TakeToken(ctx context.Context, txid string, vout uint32) (*TokenRecord, error)
 	TakeAuthority(ctx context.Context, txid string, vout uint32) (*AuthorityRecord, error)
-	AdjustBalance(ctx context.Context, identityKey string, delta int64) error
+	AdjustBalance(ctx context.Context, identityKey string, delta Amount) error
 }
 
 // EngineOutputReader is the engine's admitted-output view (TS types.ts EngineOutputReader). It

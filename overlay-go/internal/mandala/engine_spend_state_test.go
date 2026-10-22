@@ -110,7 +110,10 @@ func flowBalance(t *testing.T, f *engineFlow, identityKey string) int64 {
 	if err != nil {
 		t.Fatalf("balance: %v", err)
 	}
-	return b
+	if !b.Big().IsInt64() {
+		t.Fatalf("balance %s is not an int64", b)
+	}
+	return b.Big().Int64()
 }
 
 // C6: two submits of T (a double-click) both pass the dupe gate; the first commits; the holder spends T's change T.1

@@ -280,8 +280,9 @@ func authRequireReissue(ctx context.Context, l *brc162.TokenLedger, a *Committed
 		return rReissue(l.TokenID, "target is not frozen")
 	}
 	delta := authDelta(l)
-	safe := frozen.Amount >= -Amount(MaxSafeAmount) && frozen.Amount <= Amount(MaxSafeAmount) // TS Number.isSafeInteger
-	if !safe || big.NewInt(int64(frozen.Amount)).Cmp(delta) != 0 {
+	frozenAmount := frozen.Amount.Big()
+	safe := frozenAmount.CmpAbs(authMaxSafe) <= 0 // TS Number.isSafeInteger (Task 6 makes this exact)
+	if !safe || frozenAmount.Cmp(delta) != 0 {
 		return rReissue(l.TokenID, "amount does not match the frozen row")
 	}
 	if len(l.ValueInIndices) > 0 {

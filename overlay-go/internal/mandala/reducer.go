@@ -100,7 +100,7 @@ func FoldAction(prev AssetAdminState, d AdminDetails, fc FoldContext) AssetAdmin
 		if foldIsFrozen(s.FrozenOutpoints, op) {
 			break
 		}
-		ref := FrozenRef{Outpoint: op}
+		ref := FrozenRef{Outpoint: op, Amount: zeroAmount()}
 		if fc.FrozenAmount != nil {
 			ref.Amount = *fc.FrozenAmount
 		}
@@ -156,7 +156,7 @@ func liveFoldContext(ctx context.Context, s StateStore, d AdminDetails, tokenID 
 	if d.Kind != "freezeOutput" || d.Outpoint == "" {
 		return FoldContext{}, nil
 	}
-	zero, none := Amount(0), ""
+	zero, none := zeroAmount(), ""
 	txid, vout, ok := foldOutpoint(d.Outpoint)
 	if !ok {
 		return FoldContext{FrozenAmount: &zero, FrozenOwner: &none}, nil

@@ -25,7 +25,7 @@ func TestKYCLookupClaimsAndIndexesFromAnAgreeingJournalOnly(t *testing.T) {
 		t.Fatalf("authority indexed with no journal row: %+v", a)
 	}
 	if err := st.RecordOwners(ctx, []OwnerRecord{{Txid: d.Txid, OutputIndex: 0, Topic: KYCTopic, TokenID: id,
-		Role: brc162.RoleDeploy, Amount: 0, IdentityKey: mandalatest.Issuer.Identity, CreatedAt: time.Now().UTC()}}); err != nil {
+		Role: brc162.RoleDeploy, Amount: amt(0), IdentityKey: mandalatest.Issuer.Identity, CreatedAt: time.Now().UTC()}}); err != nil {
 		t.Fatal(err)
 	}
 	lkAdmit(t, ls, d, KYCTopic, 0) // a replayed notification after the journal write

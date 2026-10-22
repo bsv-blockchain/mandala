@@ -148,13 +148,13 @@ func TestCompensationUnmarksAndRestoresOnlyLiveCoins(t *testing.T) {
 	if by, _ := es.SpendStateOf(ctx, topicA, src.String(), 1); by != competitor.String() {
 		t.Fatalf("the competitor's spend was clobbered: spent by %q", by)
 	}
-	if row, _ := store.GetTokenRow(ctx, src.String(), 0); row == nil || row.Amount != 40 {
+	if row, _ := store.GetTokenRow(ctx, src.String(), 0); row == nil || row.Amount.Cmp(amt(40)) != 0 {
 		t.Fatalf("the live coin's row must come back from the journal: %+v", row)
 	}
 	if row, _ := store.GetTokenRow(ctx, src.String(), 1); row != nil {
 		t.Fatalf("the competitor's coin got a row: %+v", row)
 	}
-	if bal, _ := store.GetBalance(ctx, mandalatest.Holder.Identity); bal != 40 {
+	if bal, _ := store.GetBalance(ctx, mandalatest.Holder.Identity); bal.Cmp(amt(40)) != 0 {
 		t.Fatalf("holder balance = %d, want 40", bal)
 	}
 }
@@ -237,7 +237,7 @@ func TestCompensationIsSkippedWhenAnUnnamedTopicIsApplied(t *testing.T) {
 			t.Fatalf("compensation restored the row of %s.0 on %s: %+v, %v", c.src, c.topic, row, err)
 		}
 	}
-	if bal, err := store.GetBalance(ctx, mandalatest.Holder.Identity); err != nil || bal != 0 {
+	if bal, err := store.GetBalance(ctx, mandalatest.Holder.Identity); err != nil || bal.Cmp(amt(0)) != 0 {
 		t.Fatalf("holder balance = %d, %v; want 0 (no credit)", bal, err)
 	}
 }

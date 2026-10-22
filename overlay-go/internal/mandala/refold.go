@@ -108,7 +108,7 @@ func takeRow(ctx context.Context, store *Store, txid string, vout uint32) (bool,
 		return false, err
 	}
 	if row != nil {
-		return true, store.AdjustBalance(ctx, row.IdentityKey, -int64(row.Amount))
+		return true, store.AdjustBalance(ctx, row.IdentityKey, row.Amount.Neg())
 	}
 	a, err := store.TakeAuthority(ctx, txid, vout)
 	if err != nil {

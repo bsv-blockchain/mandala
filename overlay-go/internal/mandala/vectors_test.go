@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/overlay"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
 )
 
@@ -63,7 +64,7 @@ type vectorToken struct {
 	Txid        string `json:"txid"`
 	OutputIndex uint32 `json:"outputIndex"`
 	TokenID     string `json:"tokenId"`
-	Amount      int64  `json:"amount"`
+	Amount      uint64 `json:"amount"`
 	IdentityKey string `json:"identityKey"`
 }
 
@@ -97,7 +98,7 @@ func (s vectorState) memStore() *memStore {
 	st := newMemStore()
 	epoch := time.Unix(0, 0).UTC()
 	for _, r := range s.Tokens {
-		st.putToken(TokenRecord{Txid: r.Txid, OutputIndex: r.OutputIndex, TokenID: r.TokenID, Amount: Amount(r.Amount), IdentityKey: r.IdentityKey, CreatedAt: epoch})
+		st.putToken(TokenRecord{Txid: r.Txid, OutputIndex: r.OutputIndex, TokenID: r.TokenID, Amount: amount.FromUint64(r.Amount), IdentityKey: r.IdentityKey, CreatedAt: epoch})
 	}
 	for _, r := range s.Authorities {
 		st.putAuthority(AuthorityRecord{Txid: r.Txid, OutputIndex: r.OutputIndex, Topic: r.Topic, TokenID: r.TokenID, IdentityKey: r.IdentityKey, CreatedAt: epoch})
@@ -431,7 +432,7 @@ func TestRejectVectorsRepairTheMissingOwnerRowInline(t *testing.T) {
 		t.Fatalf("token rows = %+v, want exactly the repaired row", st.tokens)
 	}
 	r := st.tokens[0]
-	if r.Txid != lost.Txid || r.OutputIndex != lost.OutputIndex || r.TokenID != lost.TokenID || r.Amount != lost.Amount || r.IdentityKey != lost.IdentityKey {
+	if r.Txid != lost.Txid || r.OutputIndex != lost.OutputIndex || r.TokenID != lost.TokenID || r.Amount.Cmp(lost.Amount) != 0 || r.IdentityKey != lost.IdentityKey {
 		t.Fatalf("repaired row = %+v, want the journal row %+v", r, *lost)
 	}
 }

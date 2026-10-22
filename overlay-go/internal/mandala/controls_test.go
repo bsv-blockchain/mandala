@@ -117,7 +117,7 @@ func ctlRefusal(t *testing.T, err error, code Code, reason string) {
 func TestControlsFrozenThenEvictedPerInput(t *testing.T) {
 	st := newMemStore()
 	st.putState(ctlState(ctlTokenA, func(s *AssetAdminState) {
-		s.FrozenOutpoints = []FrozenRef{{Outpoint: strings.ToUpper(ctlCoin), Amount: 10, Owner: ctlHolder}}
+		s.FrozenOutpoints = []FrozenRef{{Outpoint: strings.ToUpper(ctlCoin), Amount: amt(10), Owner: ctlHolder}}
 		s.EvictedOutpoints = []string{ctlCoin}
 	}))
 	ctlRefusal(t, ctlTransfer().check(st, NoSanctions{}, nil), CodeFrozen, "input 0: coin "+ctlCoin+" is frozen")

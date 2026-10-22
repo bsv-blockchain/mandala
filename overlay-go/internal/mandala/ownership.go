@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 )
 
@@ -39,10 +40,11 @@ type InputOwnerDeps struct {
 	OnRepair func(outpoint string, inserted bool) // never nil here; managers default it to LogOwnerRepair(<topic>); nil falls back to that too
 }
 
-// sameAmount: a stored amount equals amount only when it is a safe non-negative integer (TS
-// Number.isSafeInteger(stored) && BigInt(stored) === amount).
-func sameAmount(stored Amount, amount uint64) bool {
-	return stored >= 0 && uint64(stored) <= MaxSafeAmount && uint64(stored) == amount
+// sameAmount: a stored amount equals a script amount only when it is a uint64 equal to it
+// (exact; a negative or larger stored value never matches).
+func sameAmount(stored Amount, want uint64) bool {
+	u, ok := stored.Uint64()
+	return ok && u == want
 }
 
 // ownFirstFailing returns the index of the first output (index order) that fails.
@@ -131,7 +133,7 @@ func VerifyOutputOwners(ctx context.Context, outputs []brc162.Output, env *Envel
 }
 
 // journalAgrees: the journal row names this token, the source script's own role (a spent genesis
-// deploy journals as "deploy"), this amount as a safe integer, and a compressed identity key.
+// deploy journals as "deploy"), exactly this amount, and a compressed identity key.
 func journalAgrees(j *OwnerRecord, tokenID string, role brc162.Role, amount uint64) bool {
 	return j != nil && j.TokenID == tokenID && j.Role == role && sameAmount(j.Amount, amount) && IsIdentity(j.IdentityKey)
 }
@@ -302,7 +304,7 @@ func TakeBackRepair(ctx context.Context, s RepairUndoStore, txid string, vout ui
 	if err != nil || row == nil {
 		return err
 	}
-	return s.AdjustBalance(ctx, row.IdentityKey, -int64(row.Amount))
+	return s.AdjustBalance(ctx, row.IdentityKey, row.Amount.Neg())
 }
 
 // JournalOwners writes one journal row per verified owner (D §4.2a rule 1) with one shared
@@ -313,7 +315,7 @@ func JournalOwners(ctx context.Context, s StateStore, topic, txid string, owners
 	for _, o := range owners {
 		rows = append(rows, OwnerRecord{
 			Txid: txid, OutputIndex: o.Index, Topic: topic, TokenID: o.TokenID, Role: o.Role,
-			Amount:      Amount(o.Amount), // layer B caps every amount at 2^53-1, so this is exact
+			Amount:      amount.FromUint64(o.Amount),
 			IdentityKey: o.IdentityKey, CreatedAt: at,
 		})
 	}

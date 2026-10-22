@@ -149,7 +149,7 @@ func TestTokenLookupRecordsAnIssueOnceAndCreditsOnce(t *testing.T) {
 		t.Fatalf("history = %+v, %v; want one row", history, err)
 	}
 	h := history[0]
-	if h.Kind != "issue" || h.Txid != iss.Txid || h.OutputIndex != 0 || h.Delta != 100 || h.Height != 9007199254740991 ||
+	if h.Kind != "issue" || h.Txid != iss.Txid || h.OutputIndex != 0 || h.Delta.Cmp(amt(100)) != 0 || h.Height != 9007199254740991 ||
 		h.Offset != 0 || len(h.Commitment) != 64 || h.FrozenAmount != nil || h.AdmitSeq < 1 {
 		t.Fatalf("history row = %+v", h)
 	}
@@ -158,7 +158,7 @@ func TestTokenLookupRecordsAnIssueOnceAndCreditsOnce(t *testing.T) {
 		t.Fatalf("state not folded at the action: %+v", state)
 	}
 	row, _ := st.GetTokenRow(ctx, iss.Txid, 1)
-	if row == nil || row.Amount != 100 || row.IdentityKey != mandalatest.Holder.Identity || row.TokenID != id {
+	if row == nil || row.Amount.Cmp(amt(100)) != 0 || row.IdentityKey != mandalatest.Holder.Identity || row.TokenID != id {
 		t.Fatalf("value row = %+v", row)
 	}
 	if a, _ := st.GetAuthorityRow(ctx, iss.Txid, 0); a == nil || a.Topic != ls.Topic() {
@@ -171,7 +171,7 @@ func TestTokenLookupRecordsAnIssueOnceAndCreditsOnce(t *testing.T) {
 	}
 
 	lkAdmit(t, ls, iss, ls.Topic(), 0, 1) // a replayed notification
-	if bal, _ := st.GetBalance(ctx, mandalatest.Holder.Identity); bal != 100 {
+	if bal, _ := st.GetBalance(ctx, mandalatest.Holder.Identity); bal.Cmp(amt(100)) != 0 {
 		t.Fatalf("balance = %d after a replay, want 100", bal)
 	}
 	if again, _ := st.FindAdminHistory(ctx, id, 0, 0); len(again) != 1 {
@@ -202,12 +202,12 @@ func TestTokenLookupRecordsTheFreezeContext(t *testing.T) {
 			row = &history[i]
 		}
 	}
-	if row == nil || row.FrozenAmount == nil || *row.FrozenAmount != 100 || row.FrozenOwner == nil || *row.FrozenOwner != mandalatest.Holder.Identity {
+	if row == nil || row.FrozenAmount == nil || (*row.FrozenAmount).Cmp(amt(100)) != 0 || row.FrozenOwner == nil || *row.FrozenOwner != mandalatest.Holder.Identity {
 		t.Fatalf("freeze history row = %+v", row)
 	}
 	state, _ := st.GetAssetState(ctx, id)
-	want := []FrozenRef{{Outpoint: frozenOp, Amount: 100, Owner: mandalatest.Holder.Identity}}
-	if !slices.Equal(state.FrozenOutpoints, want) {
+	want := []FrozenRef{{Outpoint: frozenOp, Amount: amt(100), Owner: mandalatest.Holder.Identity}}
+	if !sameJSON(state.FrozenOutpoints, want) {
 		t.Fatalf("frozen = %+v, want %+v", state.FrozenOutpoints, want)
 	}
 }
@@ -225,7 +225,7 @@ func TestTokenLookupSpendsAndEvictions(t *testing.T) {
 	if err := ls.OutputSpent(ctx, &engine.OutputSpent{Outpoint: lkOutpoint(t, iss.Txid, 1), Topic: mgrTopic(t, mgrUntouched)}); err != nil {
 		t.Fatal(err)
 	}
-	if bal, _ := st.GetBalance(ctx, holder); bal != 100 {
+	if bal, _ := st.GetBalance(ctx, holder); bal.Cmp(amt(100)) != 0 {
 		t.Fatalf("another topic's spend debited: balance %d", bal)
 	}
 	for i := 0; i < 2; i++ {
@@ -235,7 +235,7 @@ func TestTokenLookupSpendsAndEvictions(t *testing.T) {
 		if row, _ := st.GetTokenRow(ctx, iss.Txid, 1); row != nil {
 			t.Fatalf("spent row kept: %+v", row)
 		}
-		if bal, _ := st.GetBalance(ctx, holder); bal != 0 {
+		if bal, _ := st.GetBalance(ctx, holder); bal.Cmp(amt(0)) != 0 {
 			t.Fatalf("balance after spend #%d = %d, want 0", i+1, bal)
 		}
 	}
@@ -245,7 +245,7 @@ func TestTokenLookupSpendsAndEvictions(t *testing.T) {
 	if err := ls.OutputEvicted(ctx, lkOutpoint(t, iss2.Txid, 1)); err != nil {
 		t.Fatal(err)
 	}
-	if bal, _ := st.GetBalance(ctx, receiver); bal != 0 {
+	if bal, _ := st.GetBalance(ctx, receiver); bal.Cmp(amt(0)) != 0 {
 		t.Fatalf("eviction did not debit: balance %d", bal)
 	}
 	if err := ls.OutputEvicted(ctx, lkOutpoint(t, iss2.Txid, 0)); err != nil {

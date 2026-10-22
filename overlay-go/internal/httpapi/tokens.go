@@ -308,7 +308,7 @@ func summarizeAdminHistory(rows []mandala.AdminHistoryEntry) adminSummary {
 			continue
 		}
 		seen[key] = true
-		switch d := int64(r.Delta); {
+		switch d := r.Delta.Big().Int64(); { // Delta is clamped to ±(2^53-1) until Task 6
 		case d > 0:
 			s.TotalIssued += d
 		case d < 0:

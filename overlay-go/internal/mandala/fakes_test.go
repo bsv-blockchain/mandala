@@ -19,6 +19,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 	mt "github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
 )
@@ -31,7 +32,7 @@ type memStore struct {
 	authorities []AuthorityRecord
 	owners      []OwnerRecord
 	states      map[string]AssetAdminState
-	balances    map[string]int64
+	balances    map[string]Amount
 	claim       *string
 	failures    map[string]error
 }
@@ -44,7 +45,7 @@ var (
 )
 
 func newMemStore() *memStore {
-	return &memStore{states: map[string]AssetAdminState{}, balances: map[string]int64{}, failures: map[string]error{}}
+	return &memStore{states: map[string]AssetAdminState{}, balances: map[string]Amount{}, failures: map[string]error{}}
 }
 
 var memEpoch = time.Unix(0, 0).UTC()
@@ -90,10 +91,37 @@ func (m *memStore) failNext(method string, err error) {
 	m.failures[method] = err
 }
 
+// balance is the identity's balance as an int64 (every memStore test balance is small); a balance
+// outside int64 panics rather than truncate. balanceExact reads it as an Amount.
 func (m *memStore) balance(identityKey string) int64 {
+	b := m.balanceExact(identityKey).Big()
+	if !b.IsInt64() {
+		panic("memStore: balance " + b.String() + " is not an int64; use balanceExact")
+	}
+	return b.Int64()
+}
+
+func (m *memStore) balanceExact(identityKey string) Amount {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.balances[identityKey]
+}
+
+// sameJSON compares two values by their JSON form. Use it for records holding an Amount: Amount
+// wraps a *big.Int, so == and slices.Equal compare pointers, never values.
+func sameJSON(a, b any) bool {
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && string(ja) == string(jb)
+}
+
+// amt is a test amount literal (negative for a debit or a delta).
+func amt(v int64) Amount {
+	a, err := amount.FromBig(big.NewInt(v))
+	if err != nil {
+		panic(err)
+	}
+	return a
 }
 
 // fail consumes a pending failure for method; callers hold m.mu.
@@ -189,7 +217,11 @@ func (m *memStore) RepairOwnerRow(_ context.Context, j OwnerRecord) (bool, error
 			}
 		}
 		m.tokens = append(m.tokens, TokenRecord{Txid: j.Txid, OutputIndex: j.OutputIndex, TokenID: j.TokenID, Amount: j.Amount, IdentityKey: j.IdentityKey, CreatedAt: memEpoch})
-		m.balances[j.IdentityKey] += int64(j.Amount)
+		sum, err := m.balances[j.IdentityKey].Add(j.Amount)
+		if err != nil {
+			return true, err
+		}
+		m.balances[j.IdentityKey] = sum
 		return true, nil
 	}
 	for i, r := range m.authorities {
@@ -232,13 +264,17 @@ func (m *memStore) TakeAuthority(_ context.Context, txid string, vout uint32) (*
 	return nil, nil
 }
 
-func (m *memStore) AdjustBalance(_ context.Context, identityKey string, delta int64) error {
+func (m *memStore) AdjustBalance(_ context.Context, identityKey string, delta Amount) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.fail("AdjustBalance"); err != nil {
 		return err
 	}
-	m.balances[identityKey] += delta
+	sum, err := m.balances[identityKey].Add(delta)
+	if err != nil {
+		return err
+	}
+	m.balances[identityKey] = sum
 	return nil
 }
 
@@ -257,7 +293,7 @@ func (m *memStore) CirculatingSupply(_ context.Context, tokenID string) (*big.In
 	sum := new(big.Int)
 	for _, r := range m.tokens {
 		if r.TokenID == tokenID && !evicted[strings.ToLower(fmt.Sprintf("%s.%d", r.Txid, r.OutputIndex))] {
-			sum.Add(sum, big.NewInt(int64(r.Amount)))
+			sum.Add(sum, r.Amount.Big())
 		}
 	}
 	return sum, nil

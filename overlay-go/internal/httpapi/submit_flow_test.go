@@ -242,7 +242,7 @@ func TestSubmitRetryWithExtraTopicReachesTheUncoveredTopic(t *testing.T) {
 	if err != nil || len(rows) != 1 || rows[0].Topic != topicB {
 		t.Fatalf("journal for x:1 = %+v (%v), want one row under tm_<B>", rows, err)
 	}
-	if bal, _ := f.app.Store.GetBalance(ctx, mandalatest.Receiver.Identity); bal != 170 {
+	if bal, _ := f.app.Store.GetBalance(ctx, mandalatest.Receiver.Identity); bal.Cmp(amt(170)) != 0 {
 		t.Fatalf("receiver balance = %d, want 170 (100 of A + 70 of B)", bal)
 	}
 
@@ -267,7 +267,7 @@ func TestSubmitRetryWithExtraTopicReachesTheUncoveredTopic(t *testing.T) {
 	if !reflect.DeepEqual(outputsOf(t, entryOf(t, third, topicB)), []uint32{1}) {
 		t.Fatalf("replay = %v", third)
 	}
-	if bal, _ := f.app.Store.GetBalance(ctx, mandalatest.Receiver.Identity); bal != 170 {
+	if bal, _ := f.app.Store.GetBalance(ctx, mandalatest.Receiver.Identity); bal.Cmp(amt(170)) != 0 {
 		t.Fatalf("receiver balance after the replay = %d, want 170", bal)
 	}
 }

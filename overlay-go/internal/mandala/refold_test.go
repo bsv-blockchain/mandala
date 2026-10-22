@@ -121,8 +121,8 @@ func TestRebuildStateFoldContexts(t *testing.T) {
 	tokA, tokB, tokC := refoldTx(0x14)+"_0", refoldTx(0x15)+"_0", refoldTx(0x16)+"_0"
 	rowTx, rowTxC := refoldTx(0x31), refoldTx(0x32)
 	for _, r := range []TokenRecord{
-		{Txid: rowTx, OutputIndex: 1, TokenID: tokA, Amount: 100, IdentityKey: holder, CreatedAt: time.Now().UTC()},
-		{Txid: rowTxC, OutputIndex: 1, TokenID: tokC, Amount: 50, IdentityKey: holder, CreatedAt: time.Now().UTC()},
+		{Txid: rowTx, OutputIndex: 1, TokenID: tokA, Amount: amt(100), IdentityKey: holder, CreatedAt: time.Now().UTC()},
+		{Txid: rowTxC, OutputIndex: 1, TokenID: tokC, Amount: amt(50), IdentityKey: holder, CreatedAt: time.Now().UTC()},
 	} {
 		if _, err := st.StoreTokenIfAbsent(ctx, r); err != nil {
 			t.Fatal(err)
@@ -137,16 +137,16 @@ func TestRebuildStateFoldContexts(t *testing.T) {
 		tok  string
 		want FrozenRef
 	}{
-		{tokA, FrozenRef{Outpoint: rowTx + ".1", Amount: 7, Owner: receiver}}, // the recorded context wins over the live row
-		{tokB, FrozenRef{Outpoint: rowTx + ".1", Amount: 0, Owner: ""}},       // another token's row is no target
-		{tokC, FrozenRef{Outpoint: rowTxC + ".1", Amount: 50, Owner: holder}}, // nothing recorded: read live
+		{tokA, FrozenRef{Outpoint: rowTx + ".1", Amount: amt(7), Owner: receiver}}, // the recorded context wins over the live row
+		{tokB, FrozenRef{Outpoint: rowTx + ".1", Amount: amt(0), Owner: ""}},       // another token's row is no target
+		{tokC, FrozenRef{Outpoint: rowTxC + ".1", Amount: amt(50), Owner: holder}}, // nothing recorded: read live
 	}
 	for _, c := range cases {
 		if err := RebuildState(ctx, st, c.tok, ""); err != nil {
 			t.Fatal(err)
 		}
 		s, _ := st.GetAssetState(ctx, c.tok)
-		if !slices.Equal(s.FrozenOutpoints, []FrozenRef{c.want}) {
+		if !sameJSON(s.FrozenOutpoints, []FrozenRef{c.want}) {
 			t.Fatalf("%s frozen = %+v, want [%+v]", c.tok, s.FrozenOutpoints, c.want)
 		}
 	}
@@ -209,14 +209,14 @@ func TestRestoreInputRowCreditsOnce(t *testing.T) {
 	st, _, ctx := refoldStore(t)
 	holder := mandalatest.Holder.Identity
 	j := OwnerRecord{Txid: refoldTx(0x71), OutputIndex: 1, Topic: "tm_" + refoldTx(0x1a), TokenID: refoldTx(0x1a) + "_0",
-		Role: "value", Amount: 100, IdentityKey: holder, CreatedAt: time.Now().UTC()}
+		Role: "value", Amount: amt(100), IdentityKey: holder, CreatedAt: time.Now().UTC()}
 	for i, want := range []bool{true, false} {
 		inserted, err := RestoreInputRow(ctx, st, j)
 		if err != nil || inserted != want {
 			t.Fatalf("restore #%d: inserted=%v err=%v, want %v", i+1, inserted, err, want)
 		}
 	}
-	if bal, err := st.GetBalance(ctx, holder); err != nil || bal != 100 {
+	if bal, err := st.GetBalance(ctx, holder); err != nil || bal.Cmp(amt(100)) != 0 {
 		t.Fatalf("balance = %d, %v; want 100 (credited once)", bal, err)
 	}
 }
@@ -227,10 +227,10 @@ func TestRetireOutputsDebitsOnceAndKeepsKYCRows(t *testing.T) {
 	tok := tx + "_0"
 	holder, issuer := mandalatest.Holder.Identity, mandalatest.Issuer.Identity
 	now := time.Now().UTC()
-	if _, err := st.StoreTokenIfAbsent(ctx, TokenRecord{Txid: tx, OutputIndex: 1, TokenID: tok, Amount: 100, IdentityKey: holder, CreatedAt: now}); err != nil {
+	if _, err := st.StoreTokenIfAbsent(ctx, TokenRecord{Txid: tx, OutputIndex: 1, TokenID: tok, Amount: amt(100), IdentityKey: holder, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.AdjustBalance(ctx, holder, 100); err != nil {
+	if err := st.AdjustBalance(ctx, holder, amt(100)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.StoreAuthorityIfAbsent(ctx, AuthorityRecord{Txid: tx, OutputIndex: 0, Topic: "tm_" + tx, TokenID: tok, IdentityKey: issuer, CreatedAt: now}); err != nil {
@@ -270,7 +270,7 @@ func TestRetireOutputsDebitsOnceAndKeepsKYCRows(t *testing.T) {
 		t.Fatalf("%d KYC rows, want the row kept", n)
 	}
 	for i := 0; i < 2; i++ {
-		if bal, _ := st.GetBalance(ctx, holder); bal != 0 {
+		if bal, _ := st.GetBalance(ctx, holder); bal.Cmp(amt(0)) != 0 {
 			t.Fatalf("balance = %d, want 0 (debited exactly once)", bal)
 		}
 		if n, err := RetireOutputs(ctx, st, tx); err != nil || n != 0 {

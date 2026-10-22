@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
 )
@@ -59,9 +60,9 @@ func mgrSeed(t *testing.T, st *memStore, b *mandalatest.Built, topic string) {
 			at = own
 		}
 		st.putOwner(OwnerRecord{Txid: b.Txid, OutputIndex: vout, Topic: at, TokenID: tokenID, Role: role,
-			Amount: Amount(o.Amount), IdentityKey: o.Owner.Identity, CreatedAt: mgrEpoch})
+			Amount: amount.FromUint64(o.Amount), IdentityKey: o.Owner.Identity, CreatedAt: mgrEpoch})
 		if role == brc162.RoleValue {
-			st.putToken(TokenRecord{Txid: b.Txid, OutputIndex: vout, TokenID: tokenID, Amount: Amount(o.Amount),
+			st.putToken(TokenRecord{Txid: b.Txid, OutputIndex: vout, TokenID: tokenID, Amount: amount.FromUint64(o.Amount),
 				IdentityKey: o.Owner.Identity, CreatedAt: mgrEpoch})
 		} else {
 			st.putAuthority(AuthorityRecord{Txid: b.Txid, OutputIndex: vout, Topic: at, TokenID: tokenID,

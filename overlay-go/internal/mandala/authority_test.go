@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 	mt "github.com/sirdeggen/mandala/overlay-go/internal/mandalatest"
 )
@@ -241,7 +242,7 @@ func TestCheckAuthorityStep9Caps(t *testing.T) {
 	requireReject(t, err, CodeShape, "token "+acTokA+": value sum exceeds 2^53-1")
 	outs, env = commit("issue")
 	near := newMemStore()
-	near.putToken(TokenRecord{Txid: strings.Repeat("ee", 32), TokenID: acTokA, Amount: Amount(MaxSafeAmount - 50), IdentityKey: mt.Holder.Identity})
+	near.putToken(TokenRecord{Txid: strings.Repeat("ee", 32), TokenID: acTokA, Amount: amount.FromUint64(MaxSafeAmount - 50), IdentityKey: mt.Holder.Identity})
 	_, err = acCase{outs: append(outs, acValue(1, acTokA, 100)), ins: []brc162.Input{authIn}, env: env, store: near}.run(t)
 	requireReject(t, err, CodeShape, "token "+acTokA+": circulating supply would exceed 2^53-1")
 	if _, err := (acCase{outs: append(outs, acValue(1, acTokA, 50)), ins: []brc162.Input{authIn}, env: env, store: near}).run(t); err != nil {
@@ -279,21 +280,21 @@ func TestCheckAuthorityStep10Reissue(t *testing.T) {
 		}
 		return o
 	}
-	res, err := acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env, store: frozenStore(30)}.run(t)
+	res, err := acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env, store: frozenStore(amt(30))}.run(t)
 	if err != nil || res.Actions[0].Details.Kind != "reissue" {
 		t.Fatalf("a valid reissue (frozen outpoint matched case-insensitively): %+v %v", res, err)
 	}
 	reason := func(d string) string { return "token " + acTokA + ": reissue " + d }
 	_, err = acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env}.run(t)
 	requireReject(t, err, CodeShape, reason("target is not frozen"))
-	_, err = acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env, store: frozenStore(31)}.run(t)
+	_, err = acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env, store: frozenStore(amt(31))}.run(t)
 	requireReject(t, err, CodeShape, reason("amount does not match the frozen row"))
 	spends := []brc162.Output{acAuthority(0, acTokA, reissue), acValue(1, acTokA, 40)}
-	_, err = acCase{outs: spends, owners: toHolder(spends), ins: []brc162.Input{authIn, acIn(1, acTokA, 10)}, env: env, store: frozenStore(30)}.run(t)
+	_, err = acCase{outs: spends, owners: toHolder(spends), ins: []brc162.Input{authIn, acIn(1, acTokA, 10)}, env: env, store: frozenStore(amt(30))}.run(t)
 	requireReject(t, err, CodeShape, reason("must not spend value inputs"))
-	_, err = acCase{outs: outs, ins: []brc162.Input{authIn}, env: env, store: frozenStore(30)}.run(t) // value output owned by the issuer
+	_, err = acCase{outs: outs, ins: []brc162.Input{authIn}, env: env, store: frozenStore(amt(30))}.run(t) // value output owned by the issuer
 	requireReject(t, err, CodeShape, reason("outputs must go to the recipient"))
-	faulty := frozenStore(30)
+	faulty := frozenStore(amt(30))
 	faulty.failNext("GetAssetState", errStoreDown)
 	_, err = acCase{outs: outs, owners: toHolder(outs), ins: []brc162.Input{authIn}, env: env, store: faulty}.run(t)
 	requireReject(t, err, CodeUnavailable, "the asset state could not be read; retry")

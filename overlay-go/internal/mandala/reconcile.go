@@ -194,7 +194,7 @@ func reconcileRowAgrees(ctx context.Context, s ReconcileStore, txid string, vout
 	if err != nil {
 		return false, err
 	}
-	// sameAmount (Task 12): a safe, non-negative stored amount equal to the script's (TS Number.isSafeInteger).
+	// sameAmount: a stored uint64 amount exactly equal to the script's.
 	return row != nil && row.TokenID == tok.tokenID && sameAmount(row.Amount, tok.amount) && IsIdentity(row.IdentityKey), nil
 }
 

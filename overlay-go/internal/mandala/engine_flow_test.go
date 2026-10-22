@@ -258,7 +258,7 @@ func TestEngineFullFlowDeployIssueTransferTwoToken(t *testing.T) {
 	flowEntry(t, steak, topicB, []uint32{1}, []uint32{1})
 
 	for key, want := range map[string]int64{holder.Identity: 0, receiver.Identity: 150, issuer.Identity: 0} {
-		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal != want {
+		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal.Cmp(amt(want)) != 0 {
 			t.Fatalf("balance of %s = %d, %v; want %d", key, bal, err, want)
 		}
 	}
@@ -349,7 +349,7 @@ func TestRegistryRecordSurvivesAnIssueThatNamesTmMandala(t *testing.T) {
 	if r, err := f.store.FindRegistryRecord(f.ctx, id); err != nil || r == nil {
 		t.Fatalf("registry record = %+v, %v; want it kept (T7)", r, err)
 	}
-	if bal, _ := f.store.GetBalance(f.ctx, mandalatest.Holder.Identity); bal != 100 {
+	if bal, _ := f.store.GetBalance(f.ctx, mandalatest.Holder.Identity); bal.Cmp(amt(100)) != 0 {
 		t.Fatalf("holder balance = %d, want 100 (credited once)", bal)
 	}
 	if got := flowTokenOutpoints(t, f, id); !slices.Equal(got, []string{iss.Txid + ".1"}) {
@@ -376,7 +376,7 @@ func TestEngineOwnerIndexRepairOnTheRealEngine(t *testing.T) {
 	if took, err := takeRow(f.ctx, f.store, iss.Txid, 1); err != nil || !took {
 		t.Fatalf("take iss:1 = %v, %v", took, err)
 	}
-	if bal, _ := f.store.GetBalance(f.ctx, holder.Identity); bal != 0 {
+	if bal, _ := f.store.GetBalance(f.ctx, holder.Identity); bal.Cmp(amt(0)) != 0 {
 		t.Fatalf("holder balance after the lost write = %d, want 0", bal)
 	}
 	tr := mandalatest.Transfer(t, iss, 1, receiver, 40)
@@ -385,7 +385,7 @@ func TestEngineOwnerIndexRepairOnTheRealEngine(t *testing.T) {
 		t.Fatalf("repairs = %v, want %v (one inline repair)", f.repairs, want)
 	}
 	for key, want := range map[string]int64{holder.Identity: 60, receiver.Identity: 40} {
-		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal != want {
+		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal.Cmp(amt(want)) != 0 {
 			t.Fatalf("balance of %s = %d, %v; want %d (credited once)", key, bal, err, want)
 		}
 	}
@@ -418,7 +418,7 @@ func TestEngineOwnerIndexRepairOnTheRealEngine(t *testing.T) {
 	if row, _ := f.store.GetTokenRow(f.ctx, iss2.Txid, 1); row != nil || len(f.repairs) != 1 {
 		t.Fatalf("an unrepairable coin was repaired: row %+v, repairs %v", row, f.repairs)
 	}
-	if bal, _ := f.store.GetBalance(f.ctx, holder.Identity); bal != 60 {
+	if bal, _ := f.store.GetBalance(f.ctx, holder.Identity); bal.Cmp(amt(60)) != 0 {
 		t.Fatalf("holder balance = %d, want 60 (nothing credited for the refused spend)", bal)
 	}
 }
@@ -441,7 +441,7 @@ func TestEngineAdminActionsGateTheNextSubmit(t *testing.T) {
 		[]mandalatest.Out{mgrActionOut(t, id, AdminDetails{Kind: "freezeOutput", Outpoint: frozenOp})}, nil)
 	flowEntry(t, f.mustSubmit(freeze, topic), topic, []uint32{0}, []uint32{0})
 	state, err := f.store.GetAssetState(f.ctx, id)
-	if err != nil || !slices.Equal(state.FrozenOutpoints, []FrozenRef{{Outpoint: frozenOp, Amount: 100, Owner: holder.Identity}}) {
+	if err != nil || !sameJSON(state.FrozenOutpoints, []FrozenRef{{Outpoint: frozenOp, Amount: amt(100), Owner: holder.Identity}}) {
 		t.Fatalf("folded freeze = %+v, %v", state.FrozenOutpoints, err)
 	}
 	_, err = f.submit(mandalatest.Transfer(t, iss, 1, receiver, 40), topic)
@@ -455,7 +455,7 @@ func TestEngineAdminActionsGateTheNextSubmit(t *testing.T) {
 	if state, err = f.store.GetAssetState(f.ctx, id); err != nil || len(state.FrozenOutpoints) != 0 || !slices.Contains(state.EvictedOutpoints, frozenOp) {
 		t.Fatalf("folded reissue: frozen %+v, evicted %v, %v", state.FrozenOutpoints, state.EvictedOutpoints, err)
 	}
-	if bal, _ := f.store.GetBalance(f.ctx, receiver.Identity); bal != 100 {
+	if bal, _ := f.store.GetBalance(f.ctx, receiver.Identity); bal.Cmp(amt(100)) != 0 {
 		t.Fatalf("receiver balance after the reissue = %d, want 100", bal)
 	}
 
@@ -471,7 +471,7 @@ func TestEngineAdminActionsGateTheNextSubmit(t *testing.T) {
 	redeem := mandalatest.Build(t, []mandalatest.In{{Src: pause, Vout: 0}, {Src: reissue, Vout: 1}},
 		[]mandalatest.Out{mgrActionOut(t, id, AdminDetails{Kind: "redeem"})}, nil)
 	flowEntry(t, f.mustSubmit(redeem, topic), topic, []uint32{0}, []uint32{0, 1})
-	if bal, _ := f.store.GetBalance(f.ctx, receiver.Identity); bal != 0 {
+	if bal, _ := f.store.GetBalance(f.ctx, receiver.Identity); bal.Cmp(amt(0)) != 0 {
 		t.Fatalf("receiver balance after the redeem = %d, want 0", bal)
 	}
 	history, err := f.store.FindAdminHistory(f.ctx, id, 0, 0)
