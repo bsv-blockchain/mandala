@@ -37,7 +37,7 @@
  */
 import { Transaction, Utils } from '@bsv/sdk'
 import { getStorage } from './storage.js'
-import { MESSAGEBOX, OVERLAY_IDENTITY_KEY } from './constants.js'
+import { MESSAGEBOX, OVERLAY_IDENTITY_KEY, OVERLAY_URL } from './constants.js'
 import { journalListHandovers, journalPromoteSigned, type HandoverJournalEntry } from './txJournal.js'
 import { tryWithLock } from './webLocks.js'
 import { isIssuerReceiptIntent, resolveIssuerIntent, type IssuerReceiptIntent } from './issuerIntent.js'
@@ -227,8 +227,10 @@ async function completeIntent (entry: PendingReceiptIntent, now: number, s5: { w
     console.warn(`[mandala] the receipt intent for ${entry.txid} is malformed; it is kept, never acted on`)
     return undefined
   }
-  if (OVERLAY_IDENTITY_KEY === '') {
-    if (!s5.warned) console.warn('[mandala] receipt intents wait: the overlay identity key is not configured (S5)')
+  if (!COMPRESSED_KEY.test(OVERLAY_IDENTITY_KEY) || OVERLAY_URL === '') {
+    // S5, a malformed key or no overlay URL: nothing can be looked up or
+    // verified. A configuration fault, not a verdict: the intent waits.
+    if (!s5.warned) console.warn('[mandala] receipt intents wait: the overlay identity key or URL is not configured (or the key is malformed)')
     s5.warned = true
     return undefined
   }
@@ -256,6 +258,9 @@ async function completeIntent (entry: PendingReceiptIntent, now: number, s5: { w
   await notifyPut(done)
   return done
 }
+
+/** The overlay identity key shape every attestation is verified under (reconcile.ts uses the same check). */
+const COMPRESSED_KEY = /^0[23][0-9a-f]{64}$/
 
 async function notifyGet (txid: string): Promise<NotifyJournalEntry | undefined> {
   try {

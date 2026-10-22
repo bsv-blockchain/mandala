@@ -213,8 +213,9 @@ async function payoutPipeline (p: PayoutParams): Promise<PayoutResult> {
   })
 
   // (12) Journal (replacing the intent), send, clear. A ReceiptUnavailableError
-  //      above keeps the intent: the output is committed, and a later pass can
-  //      complete its receipt once the overlay attests it.
+  //      above keeps the intent (the tx is committed): after INTENT_TTL_MS a
+  //      reconcile pass completes it only if the color-admission lookup shows
+  //      the recipient output admitted, and drops it when it is absent.
   const notified = await deliverIssuerReceipt({
     messageBoxClient: p.messageBoxClient,
     recipientKey,

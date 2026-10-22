@@ -817,6 +817,19 @@ describe('R6: issuer receipt intents', () => {
     expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true }])
   })
 
+  it('a malformed overlay key is treated like S5: the intent is neither looked up, re-POSTed nor dropped', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
+    await restoreAged(raw, INTENT_TTL_MS + 1000)
+    const fetchSpy = lookupAnswers([])
+    configureMandala({ overlayIdentityKey: 'not-a-key' })
+    expect(await reconcileNotifications(mkMb())).toEqual([])
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(submitToOverlay).not.toHaveBeenCalled()
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true }])
+    expect(warn.mock.calls.filter(c => /receipt intents wait/.test(String(c[0])))).toHaveLength(1)
+  })
+
   it('S5: with the overlay key unset a pending intent is neither looked up nor dropped', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {})
     const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
