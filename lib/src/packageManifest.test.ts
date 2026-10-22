@@ -39,6 +39,15 @@ describe('package manifest', () => {
     expect(pkg.devDependencies['@bsv/message-box-client']).toBe('^2.5.4')
   })
 
+  it('installs the color module and toolbox client (profile entry, tests) from vendored tarballs with overrides', () => {
+    for (const n of ['@bsv/color-permission-module', '@bsv/wallet-toolbox-client']) {
+      expect(pkg.devDependencies[n]).toMatch(/^file:\.\.\/vendor-ts-stack\/bsv-[a-z-]+-\d+\.\d+\.\d+-[0-9a-f]{7,9}\.tgz$/)
+      expect(pkg.overrides?.[n]).toBe(`$${n}`)
+    }
+    expect(pkg.devDependencies['@bsv/color-permission-module']).toContain('bsv-color-permission-module-0.2.0-')
+    expect(pkg.devDependencies['@bsv/wallet-toolbox-client']).toContain('bsv-wallet-toolbox-client-2.15.0-')
+  })
+
   it('overrides every vendored name to its direct spec', () => {
     const vendored = Object.keys(pkg.devDependencies).filter(n => pkg.devDependencies[n].startsWith('file:'))
     expect(vendored.length).toBeGreaterThan(0)
