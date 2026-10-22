@@ -349,6 +349,54 @@ describe('receiveHandovers', () => {
     expect(mb.acknowledgeMessage).toHaveBeenCalledTimes(1)
   })
 
+  it.each([
+    ['the MessageBox decrypt-failure sentinel', '[Error: Failed to decrypt or parse message]'],
+    ['the live unstringifiable sentinel', '[Error: Unstringifiable message]'],
+    ['a non-JSON string', '{not json']
+  ])('%s body is retried: never acknowledged, never internalized, id freed', async (_n, b) => {
+    const wallet = mkWallet()
+    const mb = mkMb([{ messageId: 'm1', body: b }])
+    const processed = new Set<string>()
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, processed })
+    expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
+    expect(wallet.internalizeAction).not.toHaveBeenCalled()
+    expect(processed.has('m1')).toBe(false)
+    expect(r.accepted).toEqual([])
+    expect(r.failed).toHaveLength(1)
+    expect(r.failed[0].messageId).toBe('m1')
+    expect(r.failed[0].code).toBe('ERR_BODY_UNREADABLE')
+    // A later pass (wallet unlocked) still sees the message.
+    await receiveHandovers({ wallet, messageBoxClient: mb, processed })
+    expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
+    expect(r.failed[0].error).toBeInstanceOf(InvalidTransferError)
+  })
+
+  it('an unreadable body next to a good one: the good one is credited, the unreadable one stays', async () => {
+    const wallet = mkWallet()
+    const mb = mkMb([{ messageId: 'm1', body: '[Error: Failed to decrypt or parse message]' }, { messageId: 'm2', body: body() }])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb })
+    expect(r.accepted.map(a => a.messageId)).toEqual(['m2'])
+    expect(r.failed.map(f => f.messageId)).toEqual(['m1'])
+    expect(mb.acknowledgeMessage).toHaveBeenCalledTimes(1)
+    expect(mb.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m2'] })
+  })
+
+  it('under an assetId filter the sentinel body is skipped and not acknowledged', async () => {
+    const wallet = mkWallet()
+    const mb = mkMb([{ messageId: 'm1', body: '[Error: Failed to decrypt or parse message]' }])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, assetId: ID })
+    expect(r.failed).toEqual([])
+    expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
+  })
+
+  it('a JSON body that parses but is definitively invalid is still acknowledged', async () => {
+    const wallet = mkWallet()
+    const mb = mkMb([{ messageId: 'm1', body: JSON.stringify(body({ amount: '5' })) }])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb })
+    expect(r.failed[0].code).toBeUndefined()
+    expect(mb.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m1'] })
+  })
+
   it('one bad message does not block the rest', async () => {
     const wallet = mkWallet()
     wallet.internalizeAction.mockRejectedValueOnce(new Error('fetch failed'))

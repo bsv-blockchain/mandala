@@ -19,6 +19,15 @@
  * - Retryable verdicts and transport faults stay unacknowledged and leave
  *   `processed`, so a later pass retries them. Definitive refusals are
  *   acknowledged so a poisoned message cannot wedge the inbox.
+ * - An unreadable body (a string that is not JSON) is never a definitive
+ *   refusal. `@bsv/message-box-client` substitutes a sentinel string such as
+ *   "[Error: Failed to decrypt or parse message]" when decryption fails
+ *   transiently (wallet locked, prompt dismissed, HTTP fault). The sender has
+ *   already counted the hand-over delivered and may have broadcast it, so
+ *   acknowledging would delete the recipient's only receipt for an on-chain
+ *   output. It is retried (`ERR_BODY_UNREADABLE`): only a body that parsed and
+ *   was judged invalid on its contents is acknowledged. A message that can
+ *   never be decrypted stays listed with that code for the host to surface.
  */
 import { PublicKey, Transaction, Utils, WalletInterface } from '@bsv/sdk'
 import { ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID, MESSAGEBOX } from './constants.js'
@@ -28,7 +37,9 @@ import type { ReceiptInstruction } from './receipt.js'
 
 /**
  * The hand-over body is malformed, or contradicts the transaction it carries.
- * Never retried: the message is acknowledged and dropped.
+ * Never retried: the message is acknowledged and dropped. The one exception is
+ * `code === 'ERR_BODY_UNREADABLE'` (a string body that is not JSON, e.g. the
+ * MessageBox decrypt-failure sentinel): nothing was judged, so it is retried.
  */
 export class InvalidTransferError extends Error {
   /** Machine-readable reason, surfaced as `code` on the failed row. */
@@ -57,6 +68,8 @@ const DEFAULT_DESCRIPTION = 'Receive Mandala tokens'
 const ASSETS_VIEW_BASKET = 'p color assets'
 const OFFLINE_TAG = 'color_offline'
 const LIST_LIMIT = 1000
+/** InvalidTransferError code for a body that could not be read at all: retried, never acknowledged. */
+const BODY_UNREADABLE = 'ERR_BODY_UNREADABLE'
 
 function invalid (message: string, code?: string): never {
   throw new InvalidTransferError(`@bsv/mandala: invalid hand-over: ${message}`, code)
@@ -106,7 +119,8 @@ function checkReceipt (r: unknown, assetId: string): ReceiptInstruction {
  * Strictly parse a MessageBox hand-over body (C§7.2). A JSON string body is
  * parsed first. The returned `receipt` is the body's own object (validated,
  * never rebuilt), so `JSON.stringify(receipt)` is what the sender sent.
- * Anything else throws InvalidTransferError.
+ * Anything else throws InvalidTransferError; a string body that is not JSON
+ * throws it with code `ERR_BODY_UNREADABLE` (retried by receive, not acked).
  */
 export function parseHandoverBody (body: unknown): { assetId: string, outputIndex: number, tx: number[], receipt: ReceiptInstruction, note?: string } {
   let b: unknown = body
@@ -114,7 +128,7 @@ export function parseHandoverBody (body: unknown): { assetId: string, outputInde
     try {
       b = JSON.parse(b)
     } catch {
-      invalid('body is not JSON')
+      invalid('body is not JSON (undecryptable or unreadable)', BODY_UNREADABLE)
     }
   }
   if (!isPlainObject(b)) invalid('body is not an object')
@@ -198,6 +212,8 @@ export function classifyReceiveError (e: unknown): { disposition: Disposition, c
   }
   if (named('InvalidTransferError')) {
     const c = typeof err?.code === 'string' ? err.code : code
+    // Unreadable is not a verdict on the contents: never acknowledge it.
+    if (c === BODY_UNREADABLE) return { disposition: 'retry', code: c }
     return { disposition: 'ack', ...(c != null ? { code: c } : {}) }
   }
   if (named(DECLINED)) return { disposition: 'declined', ...(code != null ? { code } : {}) }
@@ -261,7 +277,9 @@ export interface ReceiveResult {
  * - ColorConsentDeclinedError: not acknowledged and the id stays in
  *   `processed`, so this session does not prompt again (G17).
  * - Everything else (retryable verdicts, transport, UnsupportedProfileError,
- *   ProfileParamsError): not acknowledged and removed from `processed`.
+ *   ProfileParamsError, an unreadable body `ERR_BODY_UNREADABLE` such as the
+ *   MessageBox decrypt-failure sentinel): not acknowledged and removed from
+ *   `processed`.
  *
  * `offline` is read once per pass from the `p color assets` view (its
  * `color_offline` tag is the module's view tag: stored and not settled); a
