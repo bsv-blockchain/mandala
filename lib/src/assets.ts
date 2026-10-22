@@ -1,12 +1,43 @@
-import { WalletInterface } from '@bsv/sdk'
-import { TREASURY_BASKET, MESSAGEBOX, ADMIN_PROTOCOL } from './constants.js'
+import { Utils, WalletInterface } from '@bsv/sdk'
+import { TREASURY_BASKET } from './constants.js'
 import { MandalaActionDetails } from './brc162.js'
 import { outpoint } from './tokens.js'
 import { AdmissionReceipt, admissionReceipt } from './overlay.js'
 import { withAdminAuthGate, withAdminAuthGates, assertSpendablePrior } from './adminAuthGate.js'
 import { withIntent } from './txJournal.js'
-import { notifyPut, notifyRemove, PendingNotification } from './notifyJournal.js'
 import { runAuthorityTx } from './authority.js'
+
+const DESCRIPTION_MIN = 5
+const DESCRIPTION_MAX = 50
+const ELLIPSIS = '…'
+const utf8Length = (s: string): number => Utils.toArray(s, 'utf8').length
+
+/**
+ * A BRC-100 action description from free text. The wallet validates
+ * `description` as 5..50 UTF-8 *bytes* (sdk validateStringLength), and a
+ * label is up to 64 code points that may be multibyte, so every lib-built
+ * createAction/internalizeAction description goes through here. Trims; over
+ * 50 bytes it cuts whole code points from the end and appends `…` inside the
+ * limit; under 5 bytes it pads with '.'. Only the tail is ever cut, so a
+ * fixed prefix such as `Redeem <amount>` (≤ 27 bytes at 2^64-1) survives.
+ */
+export function actionDescription (text: string): string {
+  let s = String(text).trim()
+  if (utf8Length(s) > DESCRIPTION_MAX) {
+    const budget = DESCRIPTION_MAX - utf8Length(ELLIPSIS)
+    let head = ''
+    let used = 0
+    for (const cp of s) {
+      const n = utf8Length(cp)
+      if (used + n > budget) break
+      head += cp
+      used += n
+    }
+    s = head.trimEnd() + ELLIPSIS
+  }
+  while (utf8Length(s) < DESCRIPTION_MIN) s += '.'
+  return s
+}
 
 // Admin auth bookkeeping lives in the authority output's customInstructions,
 // so the wallet basket is the single source of truth. The live authority UTXO
@@ -98,10 +129,12 @@ export interface SubmitAdminActionParams {
   asset: AdminAsset
   details: MandalaActionDetails
   /**
-   * For reissue: the recipient + amount for the value output (the amount must
-   * equal the frozen row's; details must carry {outpoint, recipient}).
+   * For reissue: the recipient + exact amount for the value output (the
+   * amount must equal the frozen row's; details must carry {outpoint,
+   * recipient}). Refused until the payout path builds the recipient's
+   * `p color` output and BRC-207 receipt (plan 04 Task 12).
    */
-  ftOutput?: { recipient: string, amount: number }
+  ftOutput?: { recipient: string, amount: bigint }
   messageBoxClient?: any
   identityKey: string
 }
@@ -112,10 +145,10 @@ export interface SubmitAdminActionResult extends AdmissionReceipt {
   /** keyID of the new authority coin. */
   nextAuthKeyID: string
   /**
-   * False when the action committed but the reissue recipient's MessageBox
-   * notification did not go out (no client, or the send failed). The
-   * notification is journaled and retried by reconcileNotifications; the
-   * action itself must never be reported as failed or retried.
+   * False when the action committed but a recipient notification is still
+   * pending (journaled, retried by reconcileNotifications); the action itself
+   * must never be reported as failed or retried. Always true while no admin
+   * action carries a recipient output (reissue goes through the payout path).
    */
   notified: boolean
 }
@@ -130,20 +163,24 @@ async function spendableBeef (wallet: WalletInterface, priors: string[]): Promis
   return list.BEEF as number[]
 }
 
+/** Thrown for a reissue until the payout path builds its recipient output (Task 12). */
+export const REISSUE_VIA_PAYOUT = 'reissue builds its recipient output through the payout path'
+
 /**
- * Spend the asset's live authority, producing the next authority (and, for a
- * reissue, a value output to the recipient). Submits to tm_<tokenId>.
+ * Spend the asset's live authority, producing the next authority. Submits to
+ * exactly tm_color_<assetId>. A reissue (an `ftOutput`, or `details.kind ===
+ * 'reissue'`) is refused before any gate or wallet call: its recipient output
+ * must be a holder `p color` output with a BRC-207 receipt, which only the
+ * payout path builds.
  */
 export async function submitAdminAction (
   p: SubmitAdminActionParams
 ): Promise<SubmitAdminActionResult> {
-  const { wallet, asset, details, ftOutput, messageBoxClient, identityKey } = p
-  // Transitional (Task 9 makes ftOutput.amount bigint): convert before any gate or wallet call.
-  const ftUnits = ftOutput != null ? BigInt(ftOutput.amount) : 0n
+  const { wallet, asset, details, ftOutput, identityKey } = p
+  if (ftOutput != null || details.kind === 'reissue') throw new Error(REISSUE_VIA_PAYOUT)
 
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
     const inputBEEF = await spendableBeef(wallet, [asset.authOutpoint])
-    const ftKeyID = ftOutput != null ? 'reissue-' + Date.now() : ''
     const res = await runAuthorityTx({
       wallet,
       identityKey,
@@ -152,61 +189,15 @@ export async function submitAdminAction (
         details,
         customInstructions: keyID => adminCustomInstructions(asset.assetId, asset.label, keyID, asset.metadata)
       }],
-      valueOuts: ftOutput != null
-        ? [{ tokenId: asset.assetId, amount: ftUnits, owner: ftOutput.recipient, keyID: ftKeyID, outputDescription: 'reissued FT' }]
-        : [],
       inputBEEF,
-      description: `${details.kind} ${asset.label}`,
+      description: actionDescription(`${details.kind} ${asset.label}`),
       labels: ['mandala', details.kind]
     })
-
-    // The reissue is committed (overlay accepted); a notify failure must not
-    // undo it. Journal the notification FIRST so a crash or send failure is
-    // retried by reconcileNotifications.
-    let notified = true
-    if (ftOutput != null) {
-      const notification: PendingNotification = {
-        txid: res.txid,
-        recipient: ftOutput.recipient,
-        messageBox: MESSAGEBOX,
-        body: {
-          assetId: asset.assetId,
-          amount: ftOutput.amount,
-          transaction: res.tx,
-          keyID: ftKeyID,
-          outputIndex: res.valueIndices[0],
-          protocolID: ADMIN_PROTOCOL,
-          // Issuer remittances are not blinded — the recipient derives
-          // against the issuer identity key directly.
-          sender: identityKey,
-          senderMode: 'unblinded'
-        },
-        at: Date.now()
-      }
-      await notifyPut(notification)
-      if (messageBoxClient == null) {
-        console.warn('[mandala] reissue committed with no MessageBox client; recipient notify journaled for reconcileNotifications')
-        notified = false
-      } else {
-        try {
-          await messageBoxClient.sendMessage({
-            recipient: notification.recipient,
-            messageBox: notification.messageBox,
-            body: notification.body
-          })
-          await notifyRemove(res.txid)
-        } catch (e) {
-          console.warn('[mandala] reissue committed but recipient notify failed; will retry via reconcileNotifications:', e)
-          notified = false
-        }
-      }
-    }
-
     return {
       txid: res.txid,
       nextAuthOutpoint: outpoint(res.txid, res.authIndices[0]),
       nextAuthKeyID: res.authKeyIDs[0],
-      notified,
+      notified: true,
       ...admissionReceipt(res.admitted)
     }
   }))
@@ -243,7 +234,7 @@ export async function submitGlobalAdminAction (p: {
         customInstructions: keyID => adminCustomInstructions(a.assetId, a.label, keyID, a.metadata)
       })),
       inputBEEF,
-      description: `global ${details[0]?.kind ?? 'admin'} (${assets.length} assets)`,
+      description: actionDescription(`global ${details[0]?.kind ?? 'admin'} (${assets.length} assets)`),
       labels: ['mandala', details[0]?.kind ?? 'admin']
     })
     return { txid: res.txid, ...admissionReceipt(res.admitted) }

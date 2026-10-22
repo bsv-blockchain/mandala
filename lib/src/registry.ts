@@ -12,6 +12,7 @@ import { guardIdentityKey } from './submitGuards.js'
 import { outpoint } from './tokens.js'
 import { withIntent } from './txJournal.js'
 import { runAuthorityTx, runDeployTx } from './authority.js'
+import { actionDescription } from './assets.js'
 
 export interface RegistryActionDetails {
   kind: 'admitIdentity' | 'revokeIdentity'
@@ -101,7 +102,7 @@ export async function registerIdentities (p: { wallet: WalletInterface, identity
       topics: () => [REGISTRY_TOPIC],
       customInstructions: registryCustomInstructions('', 'deploy'),
       tags: ['mandala-registry'],
-      description: 'Register identity chain',
+      description: actionDescription('Register identity chain'),
       labels: ['mandala', 'registry', 'register']
     })
     return { authOutpoint: outpoint(res.txid, 0), authKeyID: 'deploy', tokenId: res.tokenId, ...admissionReceipt(res.admitted) }
@@ -142,7 +143,7 @@ export async function admitOrRevokeIdentity (p: {
           tags: ['mandala-registry']
         }],
         inputBEEF,
-        description: `${p.kind} ${p.targetKey.slice(0, 16)}`,
+        description: actionDescription(`${p.kind} ${p.targetKey.slice(0, 16)}`),
         labels: ['mandala', 'registry', p.kind],
         topics: [REGISTRY_TOPIC]
       })

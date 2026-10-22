@@ -12,7 +12,7 @@
  */
 import { Transaction, Utils, WalletInterface } from '@bsv/sdk'
 import { TREASURY_BASKET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
-import { AdminAsset, adminCustomInstructions, listAdminAssets } from './assets.js'
+import { AdminAsset, actionDescription, adminCustomInstructions, listAdminAssets } from './assets.js'
 import { resolveAssetMetadata } from './metadata.js'
 import { authorityKeyIdOf } from './brc162.js'
 import { beefFromWhatsOnChain, toAtomicBeef } from './registryRecover.js'
@@ -121,7 +121,7 @@ export async function recoverAdminAuth (p: {
           tags: ['mandala-admin']
         }
       }],
-      description: `Re-attach ${label} asset authority`
+      description: actionDescription(`Re-attach ${label} asset authority`)
     })
   } catch (e) {
     if (!/already|duplicate|exists/i.test(String(e))) throw e

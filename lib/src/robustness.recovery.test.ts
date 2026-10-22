@@ -5,8 +5,7 @@
  * semantics.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { PrivateKey, Hash, Transaction, P2PKH, LockingScript, UnlockingScript } from '@bsv/sdk'
-import type { MandalaActionDetails } from './brc162.js'
+import { PrivateKey } from '@bsv/sdk'
 import {
   journalPut,
   journalList,
@@ -22,18 +21,13 @@ import {
   notifyPut,
   notifyList,
   notifyClear,
-  reconcileNotifications,
-  PendingNotification
+  reconcileNotifications
 } from './notifyJournal.js'
 import { tryWithLock } from './webLocks.js'
 import { isAlreadyBroadcast, submitAndBroadcast } from './overlay.js'
-import { submitAdminAction } from './assets.js'
-import type { AdminAsset } from './assets.js'
 import { registerAsset } from './issuerOps.js'
-import { clearAdminAuthGates } from './adminAuthGate.js'
 import { BusyError } from './singleFlight.js'
-import { MESSAGEBOX, configureMandala } from './constants.js'
-import { colorTopic } from './naming.js'
+import { configureMandala } from './constants.js'
 
 // Label lookup only; an unconfigured overlay URL now throws (see overlayUrlGuard.test.ts),
 // and these tests are about journal/receive ordering, not metadata.
@@ -166,24 +160,7 @@ describe('webLocks', () => {
 // Admin pipelines driven end-to-end with the wallet + templates stubbed.
 // ---------------------------------------------------------------------------
 
-const ASSET_ID = 'a'.repeat(64) + '_0'
-const PRIOR = 'b'.repeat(64) + '.1'
 const ISSUER = '02' + 'ab'.repeat(32)
-const RECIPIENT = '03' + 'cd'.repeat(32)
-const COMMIT_TXID = 'c'.repeat(64)
-
-/** A signable BEEF with `n` inputs — what createAction hands back for signing. */
-function signableBeef (n = 1): number[] {
-  const pkh = Hash.hash160(PrivateKey.fromRandom().toPublicKey().encode(true) as number[])
-  const src = new Transaction()
-  for (let i = 0; i < n; i++) src.addOutput({ satoshis: 2, lockingScript: new P2PKH().lock(pkh) })
-  const tx = new Transaction()
-  for (let i = 0; i < n; i++) {
-    tx.addInput({ sourceTransaction: src, sourceOutputIndex: i, unlockingScript: new UnlockingScript([]), sequence: 0xffffffff })
-  }
-  tx.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(pkh) })
-  return tx.toBEEF(true)
-}
 
 // BRC-162 locks/unlocks run for real against these wallet key stubs.
 function stubTemplates (): void {}
@@ -202,115 +179,6 @@ const revealStub = () => vi.fn(async (a: { counterparty: string, verifier: strin
 const keyStubs = () => ({
   getPublicKey: vi.fn().mockResolvedValue({ publicKey: STUB_KEY.toPublicKey().toString() }),
   createSignature: vi.fn().mockResolvedValue({ signature: STUB_KEY.sign([1, 2, 3]).toDER() as number[] })
-})
-
-const mkAdminWallet = () => ({
-  listOutputs: vi.fn().mockResolvedValue({ outputs: [{ outpoint: PRIOR }], BEEF: [1] }),
-  createAction: vi.fn().mockResolvedValue({ signableTransaction: { tx: signableBeef(1), reference: 'ref-1' } }),
-  signAction: vi.fn().mockResolvedValue({ tx: [9, 9, 9], txid: COMMIT_TXID }),
-  revealSpecificKeyLinkage: revealStub(),
-  abortAction: vi.fn().mockResolvedValue({ aborted: true }),
-  listActions: vi.fn().mockResolvedValue({ actions: [] }),
-  ...keyStubs()
-})
-
-const asset: AdminAsset = {
-  assetId: ASSET_ID,
-  label: 'USD',
-  authOutpoint: PRIOR,
-  authKeyID: 'deploy'
-}
-
-describe('A08 reissue notification is journaled before the send (submitAdminAction)', () => {
-  const reissue: MandalaActionDetails = {
-    kind: 'reissue', outpoint: 'f'.repeat(64) + '.0', recipient: RECIPIENT
-  }
-  const run = (messageBoxClient: any, details: MandalaActionDetails = reissue, ftOutput?: { recipient: string, amount: number }) =>
-    submitAdminAction({
-      wallet: mkAdminWallet() as any,
-      asset,
-      details,
-      ftOutput: ftOutput ?? (details.kind === 'reissue' ? { recipient: RECIPIENT, amount: 5 } : undefined),
-      messageBoxClient,
-      identityKey: ISSUER
-    })
-
-  beforeEach(() => {
-    clearAdminAuthGates()
-    stubTemplates()
-    vi.mocked(submitAndBroadcast).mockReset().mockResolvedValue({ outputsToAdmit: [0, 1] })
-    // S5: authority txs refuse before createAction without the overlay key.
-    configureMandala({ overlayIdentityKey: STUB_KEY.toPublicKey().toString() })
-  })
-  afterEach(() => {
-    configureMandala({ overlayIdentityKey: '' })
-    vi.restoreAllMocks()
-  })
-
-  it('writes the journal entry before sendMessage, with outputIndex + senderMode, and clears it on success', async () => {
-    const seenAtSend: PendingNotification[] = []
-    const mbc = { sendMessage: vi.fn(async () => { seenAtSend.push(...(await notifyList())); return {} }) }
-
-    const res = await run(mbc)
-
-    expect(res.notified).toBe(true)
-    expect(res.txid).toBe(COMMIT_TXID)
-    // Journaled BEFORE the send — a crash between the two is recovered at boot.
-    expect(seenAtSend).toHaveLength(1)
-    expect(seenAtSend[0].txid).toBe(COMMIT_TXID)
-    expect(seenAtSend[0].recipient).toBe(RECIPIENT)
-    expect(seenAtSend[0].body).toMatchObject({
-      assetId: ASSET_ID,
-      amount: 5,
-      transaction: [9, 9, 9],
-      outputIndex: 0,
-      sender: ISSUER,
-      senderMode: 'unblinded'
-    })
-    expect(mbc.sendMessage).toHaveBeenCalledWith({ recipient: RECIPIENT, messageBox: MESSAGEBOX, body: seenAtSend[0].body })
-    // Delivered → entry cleared.
-    expect(await notifyList()).toEqual([])
-    // An admin tx names exactly its asset's tm_color_<assetId> topic (C§0).
-    expect(vi.mocked(submitAndBroadcast).mock.calls[0][5]).toEqual([colorTopic(ASSET_ID)])
-  })
-
-  it('a throwing sendMessage keeps the entry, does not throw out of the committed action, and reconcileNotifications retries it', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const mbc = { sendMessage: vi.fn().mockRejectedValue(new Error('messagebox down')) }
-
-    const res = await run(mbc)
-
-    expect(res.notified).toBe(false)
-    expect(res.nextAuthOutpoint).toBe(`${COMMIT_TXID}.1`)
-    expect(warn).toHaveBeenCalled()
-    const pending = await notifyList()
-    expect(pending).toHaveLength(1)
-    expect(pending[0].txid).toBe(COMMIT_TXID)
-
-    const retry = { sendMessage: vi.fn().mockResolvedValue({}) }
-    expect(await reconcileNotifications(retry)).toEqual([COMMIT_TXID])
-    expect(retry.sendMessage).toHaveBeenCalledWith({
-      recipient: RECIPIENT,
-      messageBox: MESSAGEBOX,
-      body: expect.objectContaining({ outputIndex: 0, senderMode: 'unblinded', sender: ISSUER })
-    })
-    expect(await notifyList()).toEqual([])
-  })
-
-  it('a reissue with no MessageBox client is still journaled for the boot-time retry', async () => {
-    const res = await run(undefined)
-    expect(res.notified).toBe(false)
-    expect((await notifyList()).map(n => n.txid)).toEqual([COMMIT_TXID])
-  })
-
-  it('actions without an FT output journal nothing and report notified', async () => {
-    const mbc = { sendMessage: vi.fn() }
-    const res = await run(mbc, { kind: 'pause' })
-    expect(res.notified).toBe(true)
-    expect(res.nextAuthOutpoint).toBe(`${COMMIT_TXID}.0`)
-    expect(mbc.sendMessage).not.toHaveBeenCalled()
-    expect(await notifyList()).toEqual([])
-  })
 })
 
 describe('A15 registerAsset runs under an intent marker and the mandala.register lock', () => {
@@ -339,7 +207,7 @@ describe('A15 registerAsset runs under an intent marker and the mandala.register
   it('refuses before createAction while the overlay identity key is unset (no req K)', async () => {
     configureMandala({ overlayIdentityKey: '' })
     const wallet = mkRegWallet()
-    await expect(registerAsset(params(wallet))).rejects.toThrow(TypeError)
+    await expect(registerAsset(params(wallet))).rejects.toThrow(/overlay identity key/)
     expect(wallet.createAction).not.toHaveBeenCalled()
     expect(await hasFreshIntent()).toBe(false)
   })

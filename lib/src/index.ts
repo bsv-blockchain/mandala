@@ -42,8 +42,8 @@ export interface MandalaClient {
   /** Issuer treasury ops. */
   register: (args: { label: string, ticker: string, decimals: number }) => Promise<RegisterResult>
   /** `depositHash`: sha256 hex of the deposit record, committed on-chain as bankRef. */
-  issue: (args: { asset: AdminAsset, amount: number, depositHash?: string }) => Promise<IssuerOpResult>
-  redeem: (args: { asset: AdminAsset, amount: number, balance?: number }) => Promise<IssuerOpResult>
+  issue: (args: { asset: AdminAsset, amount: bigint, depositHash?: string }) => Promise<IssuerOpResult>
+  redeem: (args: { asset: AdminAsset, amount: bigint, balance?: bigint }) => Promise<IssuerOpResult>
   assets: () => Promise<AdminAsset[]>
   /**
    * Self-heal half-finished state (stuck aborts, pending broadcasts). Pass
