@@ -7,10 +7,12 @@
  * inputs are treasury coins, and the tip itself is attested), the tip's
  * attestation, and one submission per unattested tx including the tip.
  */
-import { Random, Utils } from '@bsv/sdk'
-import { ATTESTED_PROFILE_ID, MESSAGEBOX } from './constants.js'
+import { Random, Utils, WalletInterface } from '@bsv/sdk'
+import { OneColor } from '@bsv/templates'
+import { ATTESTED_PROFILE_ID, MESSAGEBOX, OVERLAY_IDENTITY_KEY } from './constants.js'
 import type { Attestation } from './attestation.js'
 import { notifyPut, notifyRemove } from './notifyJournal.js'
+import { recipientLinkage } from './linkage.js'
 
 /** The MessageBox slice payouts and hand-overs send through (structural; `MessageBoxClient` fits). */
 export interface MessageBoxSender {
@@ -118,4 +120,80 @@ export async function deliverIssuerReceipt (p: {
   }
   await notifyRemove(p.txid)
   return true
+}
+
+/**
+ * The overlay admitted (committed) an issuer-built tx but its attestation does
+ * not cover the recipient output, so no receipt can be built. Unreachable with
+ * a conforming overlay (it admits every token output or refuses the tx).
+ * `committed` is always true: value moved, and the caller must NOT re-run the
+ * payout or reissue (that would pay twice).
+ */
+export class ReceiptUnavailableError extends Error {
+  readonly committed = true as const
+  readonly txid: string
+  readonly outputIndex: number
+  constructor (txid: string, outputIndex: number) {
+    super(`overlay admitted ${txid} without an attestation covering output ${outputIndex}: the tx is committed (do not retry) but no receipt can be built for the recipient`)
+    this.name = 'ReceiptUnavailableError'
+    this.txid = txid
+    this.outputIndex = outputIndex
+  }
+}
+
+/** The verified attestation of `admitted`, which must cover the recipient output `index`; else ReceiptUnavailableError. */
+export function requireAttestedOutput (admitted: { attestation?: Attestation }, index: number, txid: string): Attestation {
+  const a = admitted.attestation
+  if (a == null || a.txid !== txid || !a.outputs.includes(index)) throw new ReceiptUnavailableError(txid, index)
+  return a
+}
+
+/** Arguments every issuer-built recipient output shares (payout and reissue); TypeError before any wallet call. */
+export function checkRecipient (p: { identityKey: string, recipientKey: string, messageBoxClient?: MessageBoxSender }): void {
+  if (typeof p.recipientKey !== 'string' || !/^0[23][0-9a-f]{64}$/.test(p.recipientKey)) {
+    throw new TypeError('@bsv/mandala: recipientKey must be a 66-hex compressed lowercase public key')
+  }
+  if (p.recipientKey === p.identityKey) {
+    throw new TypeError('@bsv/mandala: a payout needs a recipient other than the issuer (self uses owned outputs)')
+  }
+  if (p.messageBoxClient == null || typeof p.messageBoxClient.sendMessage !== 'function') {
+    throw new TypeError('@bsv/mandala: a payout needs a messageBoxClient to deliver the receipt')
+  }
+}
+
+/**
+ * The recipient `p color` output of an issuer-built tx (a reissue): remittances,
+ * linkage and the 1-sat lock, unblinded (the receipt shows the issuer key).
+ * Used by submitAdminAction; payoutTokens builds its own (it may blind).
+ */
+export async function issuerRecipientOutput (wallet: WalletInterface, a: {
+  identityKey: string
+  recipientKey: string
+  assetId: string
+  amount: bigint
+}): Promise<{
+  lockingScript: string
+  linkage: Awaited<ReturnType<typeof recipientLinkage>>['linkage']
+  derivationPrefix: string
+  derivationSuffix: string
+  senderIdentityKey: string
+}> {
+  const derivationPrefix = newRemittance()
+  const derivationSuffix = newRemittance()
+  const r = await recipientLinkage(wallet, {
+    identityKey: a.identityKey,
+    recipientKey: a.recipientKey,
+    assetId: a.assetId,
+    derivationPrefix,
+    derivationSuffix,
+    overlayIdentityKey: OVERLAY_IDENTITY_KEY,
+    blind: false
+  })
+  return {
+    lockingScript: new OneColor().lock(a.assetId, a.amount, r.pubKeyHash).toHex(),
+    linkage: r.linkage,
+    derivationPrefix,
+    derivationSuffix,
+    senderIdentityKey: r.senderIdentityKey
+  }
 }

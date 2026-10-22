@@ -223,7 +223,11 @@ export async function runAuthorityTx (p: {
     env,
     created.signableTransaction.reference,
     undefined,
-    topics
+    topics,
+    // A foreign (recipient) output carries a receipt whose inputs live only in
+    // the caller's memory: never hold it on a retryable refusal (see
+    // submitAndBroadcast). Plain authority txs keep the hold.
+    { holdRetryable: foreignOuts.length === 0 }
   )
   return { txid: signed.txid, tx: signed.tx as number[], foreignIndices, authIndices, valueIndices, admitted, authKeyIDs, detailsHex, offChainValues: env }
 }

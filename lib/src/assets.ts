@@ -8,8 +8,10 @@ import { withIntent } from './txJournal.js'
 import { runAuthorityTx } from './authority.js'
 import { fetchDeployTx } from './overlayLookup.js'
 import { guardPositiveAmount } from './submitGuards.js'
-import { deliverIssuerReceipt, handoverBody, issuerReceipt, MessageBoxSender } from './receipt.js'
-import { checkRecipient, issuerRecipientOutput, requireAttestedOutput } from './payout.js'
+import {
+  checkRecipient, deliverIssuerReceipt, handoverBody, issuerReceipt, issuerRecipientOutput, MessageBoxSender,
+  requireAttestedOutput
+} from './receipt.js'
 
 const DESCRIPTION_MIN = 5
 const DESCRIPTION_MAX = 50
@@ -200,7 +202,12 @@ function checkReissue (p: SubmitAdminActionParams): void {
  * coin is held; after admission the attested BRC-207 receipt is journaled
  * and delivered on MESSAGEBOX exactly like a payout. `notified` is false when
  * the send failed (reconcileNotifications retries); the action itself is
- * committed and must never be retried.
+ * committed and must never be retried. A retryable overlay refusal on a
+ * reissue is not held (holdRetryable false): the action is aborted, nothing
+ * is committed, and re-running the reissue is the retry. An admission
+ * without an attestation for the recipient output throws a committed
+ * ReceiptUnavailableError (do not retry; the authority is spent, so a stale
+ * retry fails closed with StaleAdminAuthError).
  */
 export async function submitAdminAction (
   p: SubmitAdminActionParams

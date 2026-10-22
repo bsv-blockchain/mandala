@@ -778,3 +778,45 @@ describe('submitToOverlay on tm_color_* (attested v1), tm_mandala (σI v3), S5',
     expect([...init.body]).toEqual([beef.length, ...beef, 7, 8])
   })
 })
+
+describe('submitAndBroadcast — holdRetryable: false (receipt-bearing txs)', () => {
+  // A payout or reissue carries a recipient receipt whose inputs exist only in
+  // memory. Holding a retryable refusal would let reconcile re-POST and
+  // broadcast the tx later with no receipt ever sent (a stranded output) and
+  // invite the operator to pay again. So such a tx takes the final path.
+  const signed = { tx: BEEF, txid: TXID }
+  const refusing = (code = 'ERR_PAUSED'): any => ({
+    send: vi.fn().mockRejectedValue(new OverlayRefusedError({ code, httpStatus: 409 }))
+  })
+
+  it('a retryable refusal aborts the action, journals nothing and keeps the code', async () => {
+    const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockResolvedValue({ aborted: true }) }
+    const err = await submitAndBroadcast(wallet as any, signed, [7], 'ref-1', refusing(), [colorTopicOf()], { holdRetryable: false })
+      .then(() => undefined, (e: unknown) => e)
+    expect(err).toBeInstanceOf(OverlayRefusedError)
+    expect(err).toMatchObject({ code: 'ERR_PAUSED', retryable: true })
+    expect(String((err as Error).message)).toMatch(/nothing was committed/)
+    expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-1' })
+    expect(wallet.createAction).not.toHaveBeenCalled()
+    expect(await journalList()).toEqual([])
+  })
+
+  it('a failed abort journals an abort entry, never a retryable one', async () => {
+    const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockRejectedValue(new Error('wallet down')) }
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing('ERR_FROZEN'), [colorTopicOf()], { holdRetryable: false }))
+      .rejects.toMatchObject({ code: 'ERR_FROZEN', retryable: true })
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'abort', reference: 'ref-1' }])
+  })
+
+  it('holdRetryable: true (the default) still holds and journals the refusal', async () => {
+    const wallet = { createAction: vi.fn(), abortAction: vi.fn() }
+    await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing(), ['tm_mandala'], { holdRetryable: true }))
+      .rejects.toMatchObject({ retryable: true })
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'retryable' }])
+  })
+})
+
+function colorTopicOf (): string {
+  return `tm_color_${'c'.repeat(64)}_0`
+}

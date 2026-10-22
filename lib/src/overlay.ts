@@ -453,6 +453,14 @@ export function isAlreadyBroadcast (e: unknown): boolean {
   return /already|known|duplicate|mempool|txn-already/i.test(String(e))
 }
 
+export interface SubmitAndBroadcastOptions {
+  /**
+   * Default true: a retryable refusal keeps the noSend action and journals
+   * 'retryable' for reconcile. False: abort like a final refusal (see below).
+   */
+  holdRetryable?: boolean
+}
+
 /**
  * Overlay-gated finalize. The transaction must already be created + signed with
  * `noSend` (built, not broadcast). Submit it to the overlay FIRST; only when the
@@ -477,6 +485,17 @@ export function isAlreadyBroadcast (e: unknown): boolean {
  * retry, and the action stays alive for it. Only a FINAL verdict (or any
  * non-refusal failure, e.g. an unconfigured overlay URL) aborts.
  *
+ * **`holdRetryable: false`** (receipt-bearing txs: issuer payouts, reissues)
+ * turns that hold off: a retryable refusal takes the final path (abort,
+ * `'abort'` journal entry if the abort fails) and NO `'retryable'` entry is
+ * written. Such a tx carries a recipient output whose receipt inputs
+ * (remittances, sender key, note) live only in the caller's memory; a held
+ * refusal that reconcile later re-POSTs and broadcasts would put an output on
+ * chain that its recipient can never derive, and the operator, told "retry
+ * later", would run the payout again and pay twice. The error keeps its code
+ * and `retryable: true` (the condition still lifts) and its message says
+ * nothing was committed, so re-running the whole operation is the retry.
+ *
  * `reference` is the `createAction` signableTransaction.reference; pass it for
  * signable actions so a rejected tx's inputs are released. Genesis/register
  * actions have no signable reference — omit it (only wallet-managed funding is
@@ -489,16 +508,20 @@ export async function submitAndBroadcast (
   reference?: string,
   facilitator?: OverlayBroadcastFacilitator,
   /** Required (see submitToOverlay). */
-  topics: string[] = []
+  topics: string[] = [],
+  options: SubmitAndBroadcastOptions = {}
 ): Promise<OverlayAdmitResult> {
   let admitted: OverlayAdmitResult
   try {
     admitted = await submitToOverlay(signed.tx, offChainValues, facilitator, topics)
   } catch (e) {
     // Retryable: keep the inputs held so the identical tx can be re-submitted
-    // once the overlay's condition lifts.
+    // once the overlay's condition lifts — unless the caller opted out.
     const retryable = e instanceof OverlayRefusedError && e.retryable
-    if (retryable) {
+    if (retryable && options.holdRetryable === false) {
+      (e as OverlayRefusedError).message += ': the inputs were released and nothing was committed; re-run the operation once the condition lifts'
+    }
+    if (retryable && options.holdRetryable !== false) {
       // §9.11. A live noSend action with NO durable record was the hole: the
       // caller is told "retry later", and if it never does (crash, tab closed,
       // user walks away) the inputs stay held by an action nothing remembers,

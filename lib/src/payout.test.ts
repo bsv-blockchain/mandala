@@ -21,10 +21,10 @@ import { colorProtocolID, colorTopic } from './naming.js'
 import { MAX_UINT64 } from './amount.js'
 import { notifyClear, notifyList, reconcileNotifications } from './notifyJournal.js'
 import { blindingClear, blindingGet, blindingListReserved } from './blindingJournal.js'
-import { hasFreshIntent, journalClear } from './txJournal.js'
-import { clearAdminAuthGates } from './adminAuthGate.js'
+import { hasFreshIntent, journalClear, journalList } from './txJournal.js'
+import { adminAuthInFlightPrior, clearAdminAuthGates } from './adminAuthGate.js'
 import { attestationFromSteak, verifyAttestation, type Attestation } from './attestation.js'
-import { handoverBody, issuerAttestedLeaf, newRemittance } from './receipt.js'
+import { handoverBody, issuerAttestedLeaf, newRemittance, ReceiptUnavailableError } from './receipt.js'
 import { OVERLAY_KEY, signedSteak } from './__fixtures__/overlaySigner.js'
 
 vi.mock('./overlay.js', async (importOriginal) => ({
@@ -148,6 +148,19 @@ afterEach(() => {
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
+
+/**
+ * Route submitAndBroadcast through the REAL implementation, with /submit
+ * answering a retryable refusal (409 `code`), so the hold/abort decision is
+ * exercised end to end.
+ */
+async function overlayRefusesRetryably (code = 'ERR_PAUSED'): Promise<void> {
+  const actual = await vi.importActual<typeof import('./overlay.js')>('./overlay.js')
+  vi.mocked(submitAndBroadcast).mockImplementation(actual.submitAndBroadcast)
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => String(url).endsWith('/submit')
+    ? { ok: false, status: 409, text: async () => JSON.stringify({ status: 'error', code, description: 'asset paused' }), json: async () => ({}) }
+    : { ok: false, status: 503, text: async () => '', json: async () => ({}) }))
+}
 
 describe('receipt helpers', () => {
   it('newRemittance is base64 of 16 random bytes', () => {
@@ -347,9 +360,37 @@ describe('payoutTokens (B4)', () => {
     expect(await notifyList()).toEqual([])
   })
 
+  it('submits with holdRetryable: false (a receipt-bearing tx is never held on a retryable refusal)', async () => {
+    await payoutTokens(P())
+    expect(vi.mocked(submitAndBroadcast).mock.calls[0][6]).toEqual({ holdRetryable: false })
+  })
+
+  it('a retryable refusal (ERR_PAUSED) releases the inputs: no retryable hold, nothing sent, safe to re-run', async () => {
+    await overlayRefusesRetryably('ERR_PAUSED')
+    const err = await payoutTokens(P()).then(() => undefined, (e: unknown) => e)
+    expect(err).toMatchObject({ code: 'ERR_PAUSED', retryable: true })
+    expect(String((err as Error).message)).toMatch(/nothing was committed/)
+    expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-1' })
+    expect((await journalList()).filter(e => e.stage === 'retryable')).toEqual([])
+    expect(await journalList()).toEqual([])
+    expect(mb.sendMessage).not.toHaveBeenCalled()
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('a retryable refusal whose abort fails journals an abort entry, never a retryable one', async () => {
+    await overlayRefusesRetryably('ERR_FROZEN')
+    wallet.abortAction.mockRejectedValue(new Error('wallet down'))
+    await expect(payoutTokens(P())).rejects.toMatchObject({ code: 'ERR_FROZEN' })
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'abort', reference: 'ref-1' }])
+    expect(mb.sendMessage).not.toHaveBeenCalled()
+  })
+
   it('an admission whose attestation does not cover the recipient output delivers nothing', async () => {
     ATT = await attest([1])
-    await expect(payoutTokens(P())).rejects.toThrow(/attestation covering output 0.*do not retry/)
+    const err = await payoutTokens(P()).then(() => undefined, (e: unknown) => e)
+    expect(err).toBeInstanceOf(ReceiptUnavailableError)
+    expect(err).toMatchObject({ name: 'ReceiptUnavailableError', committed: true, txid: TXID })
+    await expect(Promise.reject(err)).rejects.toThrow(/attestation covering output 0.*do not retry/)
     expect(mb.sendMessage).not.toHaveBeenCalled()
     expect(await notifyList()).toEqual([])
   })
@@ -412,6 +453,33 @@ describe('reissue through the payout path (submitAdminAction ftOutput)', () => {
       forSelf: true
     })
     expect(args.outputs[0].lockingScript).toBe(new OneColor().lock(ID, 5n, Hash.hash160(Utils.toArray(publicKey, 'hex'))).toHex())
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('a reissue submits with holdRetryable: false; an action without a recipient output keeps the hold', async () => {
+    await reissue()
+    expect(vi.mocked(submitAndBroadcast).mock.calls[0][6]).toEqual({ holdRetryable: false })
+    await submitAdminAction({ wallet: wallet as any, asset, details: { kind: 'pause' }, identityKey: ISSUER } as any)
+    expect(vi.mocked(submitAndBroadcast).mock.calls[1][6]).toEqual({ holdRetryable: true })
+  })
+
+  it('a retryable refusal on a reissue releases the inputs: no retryable hold, nothing sent', async () => {
+    await overlayRefusesRetryably('ERR_PAUSED')
+    await expect(reissue()).rejects.toMatchObject({ code: 'ERR_PAUSED', retryable: true, message: expect.stringMatching(/nothing was committed/) })
+    expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-1' })
+    expect(await journalList()).toEqual([])
+    expect(mb.sendMessage).not.toHaveBeenCalled()
+    expect(await notifyList()).toEqual([])
+    expect(adminAuthInFlightPrior(ID)).toBeUndefined()
+  })
+
+  it('an admission without an attestation for output 0 throws a committed ReceiptUnavailableError and releases the admin gate', async () => {
+    ATT = await attest([1])
+    const err = await reissue().then(() => undefined, (e: unknown) => e)
+    expect(err).toBeInstanceOf(ReceiptUnavailableError)
+    expect(err).toMatchObject({ committed: true, txid: TXID, message: expect.stringMatching(/do not retry/) })
+    expect(adminAuthInFlightPrior(ID)).toBeUndefined()
+    expect(mb.sendMessage).not.toHaveBeenCalled()
     expect(await notifyList()).toEqual([])
   })
 

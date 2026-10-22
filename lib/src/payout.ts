@@ -17,6 +17,12 @@
  *   broadcast (submitAndBroadcast) and the notification before the send.
  *   A failure between createAction and the submit aborts the action so its
  *   inputs are released.
+ * - Retry: a retryable overlay refusal (pause, freeze) is NOT held for
+ *   reconcile (holdRetryable false): the action is aborted, nothing is
+ *   committed, and re-running the payout is the retry. A blinded payout's r
+ *   reservation is then orphaned and pruned (blindingPruneReserved).
+ * - Known gap (plan 04 risk R6, Task 15): a crash after admission and before
+ *   the notification is journaled loses the in-memory receipt inputs.
  */
 import { WalletInterface } from '@bsv/sdk'
 import { OneColor } from '@bsv/templates'
@@ -38,9 +44,9 @@ import { tryWithLock } from './webLocks.js'
 import { BusyError } from './singleFlight.js'
 import type { AdminAsset } from './assets.js'
 import { actionDescription } from './assets.js'
-import type { Attestation } from './attestation.js'
 import {
-  deliverIssuerReceipt, handoverBody, issuerReceipt, MessageBoxSender, newRemittance, ReceiptInstruction
+  checkRecipient, deliverIssuerReceipt, handoverBody, issuerReceipt, MessageBoxSender, newRemittance,
+  ReceiptInstruction, requireAttestedOutput
 } from './receipt.js'
 
 /** Contract gap G4 (closed): a payout spends no authority, so no nextAuth* fields. */
@@ -63,31 +69,6 @@ export interface PayoutParams {
   blind?: boolean
   messageBoxClient: MessageBoxSender
   note?: string
-}
-
-/** The verified attestation of `admitted`, which must cover the recipient output `index`. */
-export function requireAttestedOutput (admitted: { attestation?: Attestation }, index: number, txid: string): Attestation {
-  const a = admitted.attestation
-  if (a == null || a.txid !== txid || !a.outputs.includes(index)) {
-    // Unreachable with a conforming overlay (it admits every token output or
-    // refuses the tx). The tx is committed, so the caller must NOT retry it
-    // (that would pay twice); there is just no receipt the recipient could use.
-    throw new Error(`overlay admitted ${txid} without an attestation covering output ${index}: the tx is committed (do not retry) but no receipt can be built for the recipient`)
-  }
-  return a
-}
-
-/** Arguments every issuer-built recipient output shares (payout and reissue); TypeError before any wallet call. */
-export function checkRecipient (p: { identityKey: string, recipientKey: string, messageBoxClient?: MessageBoxSender }): void {
-  if (typeof p.recipientKey !== 'string' || !/^0[23][0-9a-f]{64}$/.test(p.recipientKey)) {
-    throw new TypeError('@bsv/mandala: recipientKey must be a 66-hex compressed lowercase public key')
-  }
-  if (p.recipientKey === p.identityKey) {
-    throw new TypeError('@bsv/mandala: a payout needs a recipient other than the issuer (self uses owned outputs)')
-  }
-  if (p.messageBoxClient == null || typeof p.messageBoxClient.sendMessage !== 'function') {
-    throw new TypeError('@bsv/mandala: a payout needs a messageBoxClient to deliver the receipt')
-  }
 }
 
 export async function payoutTokens (p: PayoutParams): Promise<PayoutResult> {
@@ -180,7 +161,12 @@ async function payoutPipeline (p: PayoutParams): Promise<PayoutResult> {
   }
 
   // (8) Overlay-first submit, then the background broadcast (journaled commit point).
-  const admitted = await submitAndBroadcast(wallet, signed, env, reference, undefined, [colorTopic(assetId)])
+  //     holdRetryable false: a retryable refusal (pause, freeze) aborts like a
+  //     final one. Holding it would let reconcile broadcast this tx later with
+  //     no receipt ever sent (the receipt inputs above live only in memory),
+  //     stranding the output, while the operator re-runs the payout and pays
+  //     twice. Released and uncommitted, re-running the payout IS the retry.
+  const admitted = await submitAndBroadcast(wallet, signed, env, reference, undefined, [colorTopic(assetId)], { holdRetryable: false })
 
   // (9) r now belongs to the recipient outpoint.
   if (recipient.r != null) await blindingCommit(derivationSuffix, `${signed.txid}.0`)
@@ -208,42 +194,5 @@ async function releaseAction (wallet: WalletInterface, reference: string): Promi
     await wallet.abortAction({ reference })
   } catch {
     await journalPut({ txid: `abort:${reference}`, stage: 'abort', reference, at: Date.now() })
-  }
-}
-
-/**
- * The recipient `p color` output of an issuer-built tx (a reissue): remittances,
- * linkage and the 1-sat lock, unblinded (the receipt shows the issuer key).
- * Exposed for submitAdminAction; payoutTokens builds its own.
- */
-export async function issuerRecipientOutput (wallet: WalletInterface, a: {
-  identityKey: string
-  recipientKey: string
-  assetId: string
-  amount: bigint
-}): Promise<{
-  lockingScript: string
-  linkage: Awaited<ReturnType<typeof recipientLinkage>>['linkage']
-  derivationPrefix: string
-  derivationSuffix: string
-  senderIdentityKey: string
-}> {
-  const derivationPrefix = newRemittance()
-  const derivationSuffix = newRemittance()
-  const r = await recipientLinkage(wallet, {
-    identityKey: a.identityKey,
-    recipientKey: a.recipientKey,
-    assetId: a.assetId,
-    derivationPrefix,
-    derivationSuffix,
-    overlayIdentityKey: OVERLAY_IDENTITY_KEY,
-    blind: false
-  })
-  return {
-    lockingScript: new OneColor().lock(a.assetId, a.amount, r.pubKeyHash).toHex(),
-    linkage: r.linkage,
-    derivationPrefix,
-    derivationSuffix,
-    senderIdentityKey: r.senderIdentityKey
   }
 }
