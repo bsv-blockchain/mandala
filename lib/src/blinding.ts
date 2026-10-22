@@ -130,7 +130,7 @@ export async function rootSharedSecret (
  */
 export async function prepareBlindedPayment (
   wallet: WalletInterface,
-  args: { identityKey: string, recipientKey: string, keyID: string, protocolID: WalletProtocol }
+  args: { identityKey: string, recipientKey: string, keyID: string, protocolID: [2, string] }
 ): Promise<BlindedPayment> {
   const protocolID = args.protocolID
   const r = sampleBlindingFactor()

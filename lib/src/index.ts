@@ -8,7 +8,7 @@
  * the 1Color rewrite).
  *
  * Lower-level building blocks (coin selection, guards, journal, reconcile)
- * are exported via subpaths, e.g. `@bsv/mandala/ftSelect`.
+ * are exported via subpaths, e.g. `@bsv/mandala/treasury/select`.
  */
 import { WalletClient, WalletInterface } from '@bsv/sdk'
 import { MessageBoxClient } from '@bsv/message-box-client'

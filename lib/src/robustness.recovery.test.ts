@@ -188,6 +188,17 @@ function signableBeef (n = 1): number[] {
 // BRC-162 locks/unlocks run for real against these wallet key stubs.
 function stubTemplates (): void {}
 const STUB_KEY = PrivateKey.fromHex('11'.repeat(32))
+// A wallet's revelation echoes the request (BRC-72), as revealIssuerLinkage checks.
+const revealStub = () => vi.fn(async (a: { counterparty: string, verifier: string, protocolID: [2, string], keyID: string }) => ({
+  prover: STUB_KEY.toPublicKey().toString(),
+  verifier: a.verifier,
+  counterparty: a.counterparty,
+  protocolID: a.protocolID,
+  keyID: a.keyID,
+  encryptedLinkage: [1],
+  encryptedLinkageProof: [2],
+  proofType: 0
+}))
 const keyStubs = () => ({
   getPublicKey: vi.fn().mockResolvedValue({ publicKey: STUB_KEY.toPublicKey().toString() }),
   createSignature: vi.fn().mockResolvedValue({ signature: STUB_KEY.sign([1, 2, 3]).toDER() as number[] })
@@ -197,7 +208,7 @@ const mkAdminWallet = () => ({
   listOutputs: vi.fn().mockResolvedValue({ outputs: [{ outpoint: PRIOR }], BEEF: [1] }),
   createAction: vi.fn().mockResolvedValue({ signableTransaction: { tx: signableBeef(1), reference: 'ref-1' } }),
   signAction: vi.fn().mockResolvedValue({ tx: [9, 9, 9], txid: COMMIT_TXID }),
-  revealSpecificKeyLinkage: vi.fn().mockResolvedValue({ keyID: 'k' }),
+  revealSpecificKeyLinkage: revealStub(),
   abortAction: vi.fn().mockResolvedValue({ aborted: true }),
   listActions: vi.fn().mockResolvedValue({ actions: [] }),
   ...keyStubs()
@@ -228,8 +239,13 @@ describe('A08 reissue notification is journaled before the send (submitAdminActi
     clearAdminAuthGates()
     stubTemplates()
     vi.mocked(submitAndBroadcast).mockReset().mockResolvedValue({ outputsToAdmit: [0, 1] })
+    // S5: authority txs refuse before createAction without the overlay key.
+    configureMandala({ overlayIdentityKey: STUB_KEY.toPublicKey().toString() })
   })
-  afterEach(() => vi.restoreAllMocks())
+  afterEach(() => {
+    configureMandala({ overlayIdentityKey: '' })
+    vi.restoreAllMocks()
+  })
 
   it('writes the journal entry before sendMessage, with outputIndex + senderMode, and clears it on success', async () => {
     const seenAtSend: PendingNotification[] = []
@@ -303,7 +319,7 @@ describe('A15 registerAsset runs under an intent marker and the mandala.register
     createAction: vi.fn().mockResolvedValue({ tx: [1, 2, 3], txid: REG_TXID }),
     listActions: vi.fn().mockResolvedValue({ actions: [{ txid: 'stuck' }] }),
     abortAction: vi.fn().mockResolvedValue({ aborted: true }),
-    revealSpecificKeyLinkage: vi.fn().mockResolvedValue({ keyID: 'deploy' }),
+    revealSpecificKeyLinkage: revealStub(),
     ...keyStubs()
   })
   const params = (wallet: ReturnType<typeof mkRegWallet>) =>

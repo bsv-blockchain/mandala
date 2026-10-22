@@ -11,8 +11,8 @@ import { colorTopic } from './naming.js'
 import { assertFeeRate } from './feeRate.js'
 import { AdmissionReceipt, admissionReceipt } from './overlay.js'
 import { outpoint } from './tokens.js'
-import { loadFtCandidates } from './ftCandidates.js'
-import { selectFtInputs } from './ftSelect.js'
+import { loadTreasuryCandidates } from './treasury/candidates.js'
+import { selectTreasuryInputs } from './treasury/select.js'
 import { AdminAsset, adminCustomInstructions, withBankRef } from './assets.js'
 import { withAdminAuthGate, assertSpendablePrior } from './adminAuthGate.js'
 import { guardRedeemSubmit } from './submitGuards.js'
@@ -213,13 +213,15 @@ export async function redeemTokens (p: RedeemParams): Promise<IssuerOpResult> {
   if (!amountGate.ok) throw new Error(amountGate.reason)
 
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
-    const { candidates, beef: beefBytes } = await loadFtCandidates(wallet as any, asset.assetId, {
+    const { candidates, beef: beefBytes } = await loadTreasuryCandidates(wallet as any, asset.assetId, {
       requireSpendable: asset.authOutpoint
     })
-    const { selected, total: gathered } = selectFtInputs(candidates, amount) // throws if insufficient
+    // Transitional: Task 9 makes `amount` a bigint; the guard above already refused a non-integer.
+    const target = units(amount)
+    const { selected, total: gathered } = selectTreasuryInputs(candidates, target) // throws if insufficient
     const beef = new Beef()
     beef.mergeBeef(beefBytes)
-    const change = gathered - amount
+    const change = gathered - target
     const redeemDetails: MandalaActionDetails = { kind: 'redeem' }
     const keyIDChange = 'rchg-' + Date.now()
 
@@ -232,10 +234,10 @@ export async function redeemTokens (p: RedeemParams): Promise<IssuerOpResult> {
         customInstructions: k => adminCustomInstructions(asset.assetId, asset.label, k, asset.metadata)
       }],
       valueIns: selected.map(s => ({ outpoint: s.outpoint, keyID: s.keyID, counterparty: s.counterparty })),
-      valueOuts: change > 0
+      valueOuts: change > 0n
         ? [{
             tokenId: asset.assetId,
-            amount: BigInt(change),
+            amount: change,
             owner: identityKey,
             keyID: keyIDChange,
             basket: TREASURY_BASKET,

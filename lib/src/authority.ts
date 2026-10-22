@@ -14,16 +14,16 @@
  * lost track of.
  */
 import { Transaction, WalletInterface } from '@bsv/sdk'
-import { TREASURY_BASKET } from './constants.js'
+import { OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, TREASURY_BASKET } from './constants.js'
 import {
   commitmentHex, commitmentPayload, DEPLOY_KEY_ID, encodeAdminDetails, lockIssuerToken,
   MandalaActionDetails, signDeploy, tokenIdOfDeploy
 } from './brc162.js'
 import { colorTopic } from './naming.js'
-import { encodeLinkagePayload, MandalaLinkagePayload } from './encoding.js'
+import { encodeEnvelope, SpecificLinkage } from './encoding.js'
 import { OverlayAdmitResult, submitAndBroadcast } from './overlay.js'
-import { revealLinkage } from './tokens.js'
-import { walletMandalaUnlock } from './unlock.js'
+import { revealIssuerLinkage } from './treasury/linkage.js'
+import { issuerUnlock } from './treasury/unlock.js'
 
 /** A live authority coin this wallet can spend. */
 export interface AuthorityRef {
@@ -93,6 +93,9 @@ export async function runAuthorityTx (p: {
   const valueIns = p.valueIns ?? []
   const valueOuts = p.valueOuts ?? []
   if (legs.length === 0) throw new Error('authority tx needs at least one leg')
+  // S5: the envelope linkages and the submit need the overlay key; refuse
+  // before createAction so no wallet action is left behind.
+  if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
 
   const detailsBytes = legs.map(l => encodeAdminDetails(l.details))
   const authKeyIDs = detailsBytes.map(commitmentHex)
@@ -149,7 +152,7 @@ export async function runAuthorityTx (p: {
   const indices = spendPlan.map((s, k) => {
     const i = positional ? k : located[k]
     if (i < 0) throw new Error(`createAction did not spend ${s.outpoint}`)
-    tx.inputs[i].unlockingScriptTemplate = walletMandalaUnlock(wallet, s.keyID, s.counterparty)
+    tx.inputs[i].unlockingScriptTemplate = issuerUnlock(wallet, s.keyID, s.counterparty)
     return i
   })
   await tx.sign()
@@ -164,16 +167,16 @@ export async function runAuthorityTx (p: {
 
   const valueIndices = valueOuts.map((_, i) => i)
   const authIndices = legs.map((_, i) => valueOuts.length + i)
-  const outLinks: MandalaLinkagePayload['outputs'] = []
+  const outLinks: Array<{ index: number, linkage: SpecificLinkage }> = []
   for (let i = 0; i < valueOuts.length; i++) {
-    outLinks.push({ index: valueIndices[i], linkage: await revealLinkage(wallet, valueOuts[i].keyID, valueOuts[i].owner) })
+    outLinks.push({ index: valueIndices[i], linkage: await revealIssuerLinkage(wallet, valueOuts[i].keyID, valueOuts[i].owner) })
   }
   for (let i = 0; i < legs.length; i++) {
-    outLinks.push({ index: authIndices[i], linkage: await revealLinkage(wallet, authKeyIDs[i], identityKey) })
+    outLinks.push({ index: authIndices[i], linkage: await revealIssuerLinkage(wallet, authKeyIDs[i], identityKey) })
   }
   const detailsHex = detailsBytes.map(b => b.map(x => x.toString(16).padStart(2, '0')).join(''))
-  const env = encodeLinkagePayload({
-    inputs: [],
+  // Issuer/admin envelope: outputs + admin; `inputs` is omitted (optional for the overlay).
+  const env = encodeEnvelope({
     outputs: outLinks,
     admin: legs.map((_, i) => ({ index: authIndices[i], details: detailsHex[i] }))
   })
@@ -206,6 +209,8 @@ export async function runDeployTx (p: {
   labels: string[]
 }): Promise<{ txid: string, tokenId: string, admitted: OverlayAdmitResult }> {
   const { wallet, identityKey } = p
+  // S5: refuse before createAction (see runAuthorityTx).
+  if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
   const script = await lockIssuerToken(wallet, null, 0n, DEPLOY_KEY_ID, identityKey, p.payload)
   const created = await wallet.createAction({
     description: p.description,
@@ -222,10 +227,8 @@ export async function runDeployTx (p: {
   })
   if (created.tx == null || created.txid == null) throw new Error('deploy: no tx returned')
   const txid = created.txid
-  const env = encodeLinkagePayload({
-    inputs: [],
-    outputs: [{ index: 0, linkage: await revealLinkage(wallet, DEPLOY_KEY_ID, identityKey) }],
-    admin: [],
+  const env = encodeEnvelope({
+    outputs: [{ index: 0, linkage: await revealIssuerLinkage(wallet, DEPLOY_KEY_ID, identityKey) }],
     deploySig: await signDeploy(wallet, txid)
   })
   const admitted = await submitAndBroadcast(

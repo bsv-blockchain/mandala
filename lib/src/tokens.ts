@@ -1,19 +1,22 @@
-import { WalletInterface, WalletCounterparty } from '@bsv/sdk'
-import { decodeValue } from './brc162.js'
-import { ADMIN_PROTOCOL, OVERLAY_IDENTITY_KEY } from './constants.js'
-import { SpecificLinkage } from './encoding.js'
+import { decodeToken, isTokenId } from './brc162.js'
 
-export interface TokenBalance { assetId: string, amount: number }
+/** Exact (unbounded) sum of an asset's value coins. */
+export interface TokenBalance { assetId: string, amount: bigint }
 
 export const outpoint = (txid: string, index: number): string => `${txid}.${index}`
 
+/**
+ * Sum 1Color value coins per Mandala asset id (`<txid>_0`). Authority and
+ * deploy coins, other remainders and non-Mandala ids are skipped. Exact bigint.
+ */
 export function decodeBalances (
   outputs: Array<{ lockingScript: string }>
 ): TokenBalance[] {
-  const totals = new Map<string, number>()
+  const totals = new Map<string, bigint>()
   for (const o of outputs) {
-    const d = decodeValue(o.lockingScript)
-    if (d != null) totals.set(d.tokenId, (totals.get(d.tokenId) ?? 0) + d.amount)
+    const d = decodeToken(o.lockingScript)
+    if (d == null || d.role !== 'value' || d.assetId == null || !isTokenId(d.assetId)) continue
+    totals.set(d.assetId, (totals.get(d.assetId) ?? 0n) + d.amount)
   }
   return [...totals.entries()].map(([assetId, amount]) => ({ assetId, amount }))
 }
@@ -42,16 +45,4 @@ export function matchOutputIndices (
     if (idx === -1) throw new Error(`ambiguous output script (duplicate) in tx: ${hex.slice(0, 16)}…`)
     return idx
   })
-}
-
-export async function revealLinkage (
-  wallet: WalletInterface, keyID: string, counterparty: WalletCounterparty
-): Promise<SpecificLinkage> {
-  const linkage = await wallet.revealSpecificKeyLinkage({
-    counterparty: counterparty as string,
-    verifier: OVERLAY_IDENTITY_KEY,
-    protocolID: ADMIN_PROTOCOL,
-    keyID
-  })
-  return linkage as unknown as SpecificLinkage
 }

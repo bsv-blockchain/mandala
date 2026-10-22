@@ -2,11 +2,11 @@ import { describe, it, expect } from 'vitest'
 import {
   ProtoWallet, PrivateKey, Transaction, Spend
 } from '@bsv/sdk'
-import { MandalaToken } from './__fixtures__/token.js'
-import { walletMandalaUnlock } from './unlock.js'
-import { ADMIN_PROTOCOL } from './constants.js'
+import { MandalaToken } from '../__fixtures__/token.js'
+import { issuerUnlock } from './unlock.js'
+import { ADMIN_PROTOCOL } from '../constants.js'
 
-describe('walletMandalaUnlock', () => {
+describe('issuerUnlock', () => {
   it('produces an unlocking script that satisfies a MandalaToken output locked to a wallet-derived key', async () => {
     const wallet = new ProtoWallet(PrivateKey.fromRandom())
     const keyID = 'tkn-1'
@@ -22,7 +22,7 @@ describe('walletMandalaUnlock', () => {
     spendTx.addInput({ sourceTransaction: sourceTx, sourceOutputIndex: 0, sequence: 0xffffffff })
     spendTx.addOutput({ lockingScript, satoshis: 1 })
 
-    const unlocker = walletMandalaUnlock(wallet as any, keyID, counterparty)
+    const unlocker = issuerUnlock(wallet as any, keyID, counterparty)
     spendTx.inputs[0].unlockingScript = await unlocker.sign(spendTx, 0)
 
     const spend = new Spend({
@@ -59,7 +59,7 @@ describe('walletMandalaUnlock', () => {
     spendTx.addOutput({ lockingScript, satoshis: 1 })
 
     // Recipient spends, deriving against the sender's identity (as stored in CI on accept).
-    const unlocker = walletMandalaUnlock(recipient as any, keyID, senderId)
+    const unlocker = issuerUnlock(recipient as any, keyID, senderId)
     spendTx.inputs[0].unlockingScript = await unlocker.sign(spendTx, 0)
 
     const spend = new Spend({

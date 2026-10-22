@@ -2,7 +2,7 @@ import {
   Transaction, TransactionSignature, Signature, UnlockingScript,
   ScriptTemplateUnlock, WalletInterface, WalletCounterparty, Hash, Utils
 } from '@bsv/sdk'
-import { ADMIN_PROTOCOL } from './constants.js'
+import { ADMIN_PROTOCOL } from '../constants.js'
 
 type SignOutputs = 'all' | 'none' | 'single'
 
@@ -39,7 +39,13 @@ function buildSighashPreimage (
   return { preimage, scope }
 }
 
-export function walletMandalaUnlock (
+/**
+ * Unlocking template for a Mandala-key 1Color output (treasury, authority,
+ * deploy, registry, payout change): a wallet signature under ADMIN_PROTOCOL
+ * `[2, 'mandala admin']`, `keyID`, `counterparty`. The DER signature is used
+ * as the wallet returns it: S is never normalized (BSV Chronicle).
+ */
+export function issuerUnlock (
   wallet: WalletInterface,
   keyID: string,
   counterparty: WalletCounterparty,

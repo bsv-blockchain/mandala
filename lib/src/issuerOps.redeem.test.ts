@@ -1,6 +1,6 @@
 /**
  * Shipped redeemTokens path — stale admin prior and amount-above-balance must
- * refuse before loadFtCandidates / createAction (no fuzzy partial work).
+ * refuse before loadTreasuryCandidates / createAction (no fuzzy partial work).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { redeemTokens } from './issuerOps.js'
@@ -87,7 +87,7 @@ describe('redeemTokens pre-flight (shipped issuerOps)', () => {
 
     // First (and only needed) wallet call is the auth spendability list.
     expect(listOutputs).toHaveBeenCalled()
-    // loadFtCandidates uses listActions for confirmation meta — must not run
+    // loadTreasuryCandidates uses listActions for confirmation meta — must not run
     // after a stale-prior refusal.
     expect(listActions).not.toHaveBeenCalled()
     expect(wallet.createAction).not.toHaveBeenCalled()
@@ -95,7 +95,7 @@ describe('redeemTokens pre-flight (shipped issuerOps)', () => {
 
   it('lists auth basket before proceeding when prior is still spendable', async () => {
     // Stops at FT selection (empty candidates) — proves auth check passed first
-    // and we only then enter loadFtCandidates (listActions).
+    // and we only then enter loadTreasuryCandidates (listActions).
     const listOutputs = vi.fn().mockImplementation(async (args: { include?: string }) => {
       if (args?.include === 'entire transactions') {
         return { outputs: [], BEEF: [] }
@@ -123,7 +123,7 @@ describe('redeemTokens pre-flight (shipped issuerOps)', () => {
       })
     ).rejects.toThrow() // insufficient FT — expected after prior check
 
-    // Auth list first, then loadFtCandidates path (listActions and/or further listOutputs)
+    // Auth list first, then loadTreasuryCandidates path (listActions and/or further listOutputs)
     expect(listOutputs.mock.calls.length).toBeGreaterThanOrEqual(1)
     expect(listOutputs.mock.calls[0][0]).not.toEqual(
       expect.objectContaining({ include: 'entire transactions' })

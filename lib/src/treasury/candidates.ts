@@ -1,14 +1,15 @@
 /**
- * Loads spendable FT outputs of an asset as coin-selection candidates, enriched
+ * Loads the issuer's spendable treasury value coins of an asset (basket
+ * `mandala treasury`, Mandala keys) as coin-selection candidates, enriched
  * with confirmation status and relative age via a listActions cross-reference
- * (listOutputs exposes neither). Feeds selectFtInputs (see ftSelect.ts).
+ * (listOutputs exposes neither). Feeds selectTreasuryInputs (select.ts).
  */
 import { Beef, LockingScript, WalletInterface } from '@bsv/sdk'
-import { decodeValue } from './brc162.js'
-import { TREASURY_BASKET } from './constants.js'
-import { FtCandidate } from './ftSelect.js'
-import { resolveAssetState } from './adminState.js'
-import { assertSpendablePrior } from './adminAuthGate.js'
+import { decodeToken } from '../brc162.js'
+import { TREASURY_BASKET } from '../constants.js'
+import { TreasuryCandidate } from './select.js'
+import { resolveAssetState } from '../adminState.js'
+import { assertSpendablePrior } from '../adminAuthGate.js'
 
 // Wallet action statuses we treat as confirmed for coin-selection purposes.
 // Everything else (nosend/unproven/sending/unprocessed/…) is "unconfirmed" and
@@ -36,19 +37,21 @@ async function loadTxMeta(wallet: WalletInterface): Promise<Map<string, TxMeta>>
 
 /**
  * Drop candidates the overlay has frozen or evicted. Pure so it is unit-testable; the
- * excluded set is sourced from the admin-state endpoint by loadFtCandidates.
+ * excluded set is sourced from the admin-state endpoint by loadTreasuryCandidates.
  */
-export function excludeFrozen (candidates: FtCandidate[], excluded: Set<string>): FtCandidate[] {
+export function excludeFrozen (candidates: TreasuryCandidate[], excluded: Set<string>): TreasuryCandidate[] {
   if (excluded.size === 0) return candidates
   return candidates.filter(c => !excluded.has(c.outpoint))
 }
 
 /**
- * Fetch FT candidates for `assetId` plus the merged input BEEF needed to spend
- * them. Outputs whose txid is unknown to listActions are treated as unconfirmed
- * and sorted last (newest).
+ * Fetch treasury value coins of `assetId` plus the merged input BEEF needed
+ * to spend them. Only 1Color value outputs (`decodeToken` role 'value') of
+ * exactly this asset qualify; authority and deploy coins and other assets are
+ * skipped. Amounts are exact bigint. Outputs whose txid is unknown to
+ * listActions are treated as unconfirmed and sorted last (newest).
  */
-export async function loadFtCandidates(
+export async function loadTreasuryCandidates (
   wallet: WalletInterface,
   assetId: string,
   opts?: {
@@ -60,7 +63,7 @@ export async function loadFtCandidates(
      */
     requireSpendable?: string
   }
-): Promise<{ candidates: FtCandidate[], beef: number[] }> {
+): Promise<{ candidates: TreasuryCandidate[], beef: number[] }> {
   const scriptRes = await wallet.listOutputs({
     basket: TREASURY_BASKET,
     include: 'locking scripts',
@@ -100,15 +103,16 @@ export async function loadFtCandidates(
     return scriptsFromBeef.get(String(o.outpoint))
   }
 
-  const candidates: FtCandidate[] = []
+  const candidates: TreasuryCandidate[] = []
   for (const o of scriptRes.outputs) {
     let decoded
     try {
       const script = scriptOf(o)
       if (script == null) continue
-      decoded = decodeValue(script, assetId)
-    } catch { continue } // not a Mandala FT output
-    if (decoded == null) continue // not a value coin of this token (authority, deploy, other token)
+      decoded = decodeToken(script)
+    } catch { continue } // not a 1Color output
+    // Only a value coin of exactly this asset (not authority, deploy or another asset).
+    if (decoded == null || decoded.role !== 'value' || decoded.assetId !== assetId) continue
 
     let ci: { keyID?: string, counterparty?: string } = {}
     try { ci = JSON.parse((o.customInstructions as string) ?? '{}') } catch { /* malformed */ }
