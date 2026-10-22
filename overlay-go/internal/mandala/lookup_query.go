@@ -25,7 +25,22 @@ var (
 	errLookupShape    = errors.New("lookup query is not a JSON object")
 )
 
-func lookupInvalid(message string) error { return errors.New("Invalid lookup query: " + message) }
+// LookupQueryError is a lookup refused for its question (an invalid or unsupported query, or another service's
+// question): POST /lookup answers it 400, final. Every other lookup error is a store or engine fault, answered
+// 503 ERR_UNAVAILABLE retryable (contract §6). The message is the pinned TS string, unchanged.
+type LookupQueryError struct{ Message string }
+
+func (e *LookupQueryError) Error() string { return e.Message }
+
+// NewLookupQueryError is the typed refusal for message.
+func NewLookupQueryError(message string) error { return &LookupQueryError{Message: message} }
+
+func lookupInvalid(message string) error {
+	return NewLookupQueryError("Invalid lookup query: " + message)
+}
+
+// errUnsupportedQuery is the TS "Unsupported query" refusal (a valid query no answer path serves).
+func errUnsupportedQuery() error { return NewLookupQueryError("Unsupported query") }
 
 // RequireLookupQuery ports TS requireLookupQuery (Q2/shared/queryValidation.ts:16-44) with its
 // strings: the question, its service, a JSON object query, and every key allowed and safe, judged
@@ -35,7 +50,7 @@ func RequireLookupQuery(q *lookup.LookupQuestion, service string, allowed []stri
 		return nil, lookupInvalid("a question object is required")
 	}
 	if q.Service != service {
-		return nil, errors.New("Lookup service not supported!")
+		return nil, NewLookupQueryError("Lookup service not supported!")
 	}
 	keys, query, err := lookupObject(q.Query)
 	if err != nil {

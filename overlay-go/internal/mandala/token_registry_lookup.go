@@ -2,7 +2,6 @@ package mandala
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -150,7 +149,9 @@ func (l *TokenRegistryLookupService) OutputBlockHeightUpdated(context.Context, *
 }
 
 // Lookup: every key validated first; {tokenId} answers the deploy outpoint or nothing; {list:
-// true} answers a page of deploy outpoints in record order; anything else is "Unsupported query".
+// true} answers a page of deploy outpoints in record order; anything else is "Unsupported query". A refusal is a
+// *LookupQueryError (400); a store read fault wraps ErrLookupUnavailable (503 retryable). Read-only: a retry or a
+// concurrent query changes nothing.
 func (l *TokenRegistryLookupService) Lookup(ctx context.Context, q *lookup.LookupQuestion) (*lookup.LookupAnswer, error) {
 	query, err := RequireLookupQuery(q, MandalaLookup, tokenRegistryLookupQueryKeys)
 	if err != nil {
@@ -175,7 +176,7 @@ func (l *TokenRegistryLookupService) Lookup(ctx context.Context, q *lookup.Looku
 	if hasToken {
 		r, err := l.store.FindRegistryRecord(ctx, tokenID)
 		if err != nil {
-			return nil, err
+			return nil, lookupUnavailable(MandalaLookup, err)
 		}
 		if r == nil {
 			return lookupFormulas()
@@ -183,11 +184,11 @@ func (l *TokenRegistryLookupService) Lookup(ctx context.Context, q *lookup.Looku
 		return lookupFormulas(Outpoint{Txid: r.DeployTxid, OutputIndex: 0})
 	}
 	if !list {
-		return nil, errors.New("Unsupported query")
+		return nil, errUnsupportedQuery()
 	}
 	records, err := l.store.ListRegistryRecords(ctx, limit, skip)
 	if err != nil {
-		return nil, err
+		return nil, lookupUnavailable(MandalaLookup, err)
 	}
 	ops := make([]Outpoint, 0, len(records))
 	for _, r := range records {

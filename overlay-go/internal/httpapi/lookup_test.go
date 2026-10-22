@@ -13,7 +13,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
 	"github.com/bsv-blockchain/go-sdk/overlay/lookup"
+	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
@@ -168,20 +170,19 @@ func TestLookup_ForwardsServiceAndRawQuery(t *testing.T) {
 	}
 }
 
+// An untyped lookup error is a fault, never a final refusal: 503 ERR_UNAVAILABLE retryable (contract §6).
 func TestLookup_EngineError(t *testing.T) {
 	stub := &stubLookuper{err: errors.New("boom")}
 	app := newServer(&stubSubmitter{}, stub, nil, nil)
 
 	resp := doRequest(t, app, lookupRequest(`{"service":"ls_mandala","query":{"metadataAssetId":"abc.0"}}`))
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 (body: %s)", resp.StatusCode, readRawBody(t, resp))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body: %s)", resp.StatusCode, readRawBody(t, resp))
 	}
 	body := decodeJSON(t, resp)
-	if body["status"] != "error" {
-		t.Fatalf("body = %v, want status:error", body)
-	}
-	if _, ok := body["message"]; !ok {
-		t.Fatalf("body = %v, missing message field", body)
+	if body["status"] != "error" || body["code"] != "ERR_UNAVAILABLE" || body["retryable"] != true ||
+		body["message"] != "lookup unavailable: ls_mandala: boom" {
+		t.Fatalf("body = %v", body)
 	}
 }
 
@@ -265,7 +266,7 @@ func TestLookupNonAtomicBeefIs500(t *testing.T) {
 	}
 }
 
-// A lookup store or engine read fault is retryable: 503 ERR_UNAVAILABLE (contract §6); any other error stays 400.
+// A lookup store or engine read fault is retryable: 503 ERR_UNAVAILABLE (contract §6); a *LookupQueryError stays 400.
 func TestLookupStoreFaultIs503(t *testing.T) {
 	stub := &stubLookuper{err: fmt.Errorf("%w: x", mandala.ErrLookupUnavailable)}
 	resp := doRequest(t, newServer(&stubSubmitter{}, stub, nil, nil), lookupRequest(`{"service":"ls_mandala","query":{}}`))
@@ -277,8 +278,63 @@ func TestLookupStoreFaultIs503(t *testing.T) {
 		body["description"] != "lookup unavailable: x" || body["message"] != "lookup unavailable: x" {
 		t.Fatalf("body = %v", body)
 	}
-	stub.err = errors.New("Invalid lookup query: x")
-	if resp := doRequest(t, newServer(&stubSubmitter{}, stub, nil, nil), lookupRequest(`{"service":"ls_mandala","query":{}}`)); resp.StatusCode != http.StatusBadRequest {
+	stub.err = fmt.Errorf("ls_x: %w", mandala.NewLookupQueryError("Invalid lookup query: x"))
+	resp = doRequest(t, newServer(&stubSubmitter{}, stub, nil, nil), lookupRequest(`{"service":"ls_mandala","query":{}}`))
+	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("a query error status = %d, want 400", resp.StatusCode)
+	}
+	if body := decodeJSON(t, resp); body["message"] != "ls_x: Invalid lookup query: x" || body["code"] != nil {
+		t.Fatalf("query error body = %v", body)
+	}
+}
+
+// faultStorage is an engine.Storage whose FindOutput always faults; nothing else is called by Engine.Lookup.
+type faultStorage struct{ engine.Storage }
+
+var errHydrationDown = errors.New("mongo: server selection timeout")
+
+func (faultStorage) FindOutput(context.Context, *transaction.Outpoint, *string, *bool, bool) (*engine.Output, error) {
+	return nil, errHydrationDown
+}
+
+// formulaLookup answers one formula, as ls_color_<assetId> answers a color-admission query.
+type formulaLookup struct {
+	engine.LookupService
+	op *transaction.Outpoint
+}
+
+func (l formulaLookup) Lookup(context.Context, *lookup.LookupQuestion) (*lookup.LookupAnswer, error) {
+	return &lookup.LookupAnswer{Type: lookup.AnswerTypeFormula, Formulas: []lookup.LookupFormula{{Outpoint: l.op}}}, nil
+}
+
+// The real v1.3.7 engine returns a hydration (FindOutput) fault unwrapped: POST /lookup must still answer 503
+// ERR_UNAVAILABLE retryable, never a 400 a client takes as final. An unknown service stays 400 unknown-topic.
+func TestLookupEngineHydrationFaultIs503(t *testing.T) {
+	id := strings.Repeat("ab", 32) + "_0"
+	op, err := transaction.OutpointFromString(strings.Repeat("cd", 32) + ".0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := engine.NewEngine(&engine.Config{
+		Storage:        faultStorage{},
+		LookupServices: map[string]engine.LookupService{"ls_color_" + id: formulaLookup{op: op}},
+	})
+	app := newServer(&stubSubmitter{}, eng, nil, nil)
+	query := `{"type":"color-admission","version":1,"assetId":"` + id + `","topic":"tm_color_` + id + `","outpoints":["` + op.String() + `"]}`
+	resp := doRequest(t, app, lookupRequest(`{"service":"ls_color_`+id+`","query":`+query+`}`))
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body: %s)", resp.StatusCode, readRawBody(t, resp))
+	}
+	body := decodeJSON(t, resp)
+	if body["status"] != "error" || body["code"] != "ERR_UNAVAILABLE" || body["retryable"] != true ||
+		body["message"] != "lookup unavailable: ls_color_"+id+": "+errHydrationDown.Error() {
+		t.Fatalf("body = %v", body)
+	}
+	resp = doRequest(t, app, lookupRequest(`{"service":"ls_nope","query":{}}`))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown service status = %d, want 400", resp.StatusCode)
+	}
+	if body := decodeJSON(t, resp); body["message"] != "unknown-topic" || body["code"] != nil {
+		t.Fatalf("unknown service body = %v", body)
 	}
 }

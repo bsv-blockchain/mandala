@@ -4,7 +4,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 
+	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
 	"github.com/bsv-blockchain/go-sdk/overlay/lookup"
 	"github.com/gofiber/fiber/v2"
 
@@ -48,11 +50,15 @@ func lookupHandler(l Lookuper) fiber.Handler {
 			Query:   req.Query,
 		})
 		if err != nil {
-			if errors.Is(err, mandala.ErrLookupUnavailable) {
-				// a store or engine read fault is retryable, never a final 400 (contract §6)
-				return verdictResponse(c, verdictUnavailable, err.Error(), "")
+			if lookupRefusal(err) {
+				return errorResponse(c, fiber.StatusBadRequest, err.Error())
 			}
-			return errorResponse(c, fiber.StatusBadRequest, err.Error())
+			// a store or engine read fault (engine hydration faults come back unwrapped) is retryable, never a
+			// final 400 (contract §6)
+			if !errors.Is(err, mandala.ErrLookupUnavailable) {
+				err = fmt.Errorf("%w: %s: %w", mandala.ErrLookupUnavailable, req.Service, err)
+			}
+			return verdictResponse(c, verdictUnavailable, err.Error(), "")
 		}
 
 		wire, err := answerToWire(answer)
@@ -61,6 +67,14 @@ func lookupHandler(l Lookuper) fiber.Handler {
 		}
 		return c.Status(fiber.StatusOK).JSON(wire)
 	}
+}
+
+// lookupRefusal classifies a lookup error by type, never by message: a refusal of the question itself (a
+// *mandala.LookupQueryError, or engine.ErrUnknownTopic for an unhosted service) is a final 400; anything else is a
+// fault. A lookup is read-only, so answering a fault 503 and letting the client retry is always safe.
+func lookupRefusal(err error) bool {
+	var qe *mandala.LookupQueryError
+	return errors.As(err, &qe) || errors.Is(err, engine.ErrUnknownTopic)
 }
 
 // errNotAtomicBEEF fails a lookup answer closed: an item whose subject txid cannot be read is never served.

@@ -55,7 +55,7 @@ silent 0 or a truncated value.
 | Route | Access | Notes |
 |---|---|---|
 | `POST /submit` | public | Holds a maintenance-gate slot; pairing rule and deploy hook; typed verdicts; an unhosted topic answers 400 `unknown-topic: <name>`. |
-| `POST /lookup` | public | Outputs only, each item with its `txid` (read from the AtomicBEEF header). `ls_color_<assetId>` takes the Mandala keys (`metadataTokenId`, `authoritiesTokenId`, `tokenId`, `txid` + `outputIndex`) and the `color-spendability` / `color-admission` queries (`version` 1, 1-1000 unique lowercase `<txid>.<vout>` outpoints). A lookup store fault answers 503 `ERR_UNAVAILABLE` (retryable). |
+| `POST /lookup` | public | Outputs only, each item with its `txid` (read from the AtomicBEEF header). `ls_color_<assetId>` takes the Mandala keys (`metadataTokenId`, `authoritiesTokenId`, `tokenId`, `txid` + `outputIndex`) and the `color-spendability` / `color-admission` queries (`version` 1, 1-1000 unique lowercase `<txid>.<vout>` outpoints). An invalid or unsupported query, or an unknown service (`unknown-topic`), answers 400 (final); any other lookup error, a store fault or an engine fault while hydrating the answer on any lookup service, answers 503 `ERR_UNAVAILABLE` (retryable). |
 | `GET /admin/tokens?limit&skip` | public | The registry list with a `hosted` flag (`limit` 1–100, `skip` 0–100000). |
 | `GET /admin/authorities/:tokenId`, `/admin/asset-state/:tokenId`, `/admin/admin-history/:tokenId`, `/admin/admin-history-page/:tokenId?limit&offset`, `/admin/admin-summary/:tokenId` | public | 400 `invalid tokenId`; 404 `token not hosted`. |
 | `GET /admin/authorities/beef/:txid?vout=` | public | Served only from a `tm_color_<assetId>` copy. |

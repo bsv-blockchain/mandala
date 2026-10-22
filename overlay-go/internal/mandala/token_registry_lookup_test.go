@@ -1,12 +1,16 @@
 package mandala
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
+	"github.com/bsv-blockchain/go-sdk/overlay/lookup"
 	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
@@ -183,5 +187,33 @@ func TestTokenRegistryLookupRestoresMissingRecords(t *testing.T) {
 	}
 	if got, err := lkAsk(t, ls, MandalaLookup, `{"tokenId":"`+lost+`_0"}`); err != nil || !slices.Equal(got, []string{lost + ".0"}) {
 		t.Fatalf("the restored record does not answer {tokenId}: %v, %v", got, err)
+	}
+}
+
+// ls_mandala store faults are ErrLookupUnavailable (HTTP 503 retryable, contract §6); every validation or
+// unsupported-query refusal is a *LookupQueryError (HTTP 400, final), with its pinned message.
+func TestTokenRegistryLookupStoreFaultIsUnavailable(t *testing.T) {
+	st, _, _ := lkStore(t)
+	ls := NewTokenRegistryLookupService(overlayVerifier(t), st)
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, q := range []string{`{"tokenId":"` + mgrUntouched + `"}`, `{"list":true}`} {
+		_, err := ls.Lookup(dead, &lookup.LookupQuestion{Service: MandalaLookup, Query: json.RawMessage(q)})
+		var qe *LookupQueryError
+		if !errors.Is(err, ErrLookupUnavailable) || errors.As(err, &qe) {
+			t.Fatalf("%s on a dead context: %v, want ErrLookupUnavailable", q, err)
+		}
+	}
+	for _, q := range []string{`{}`, `{"list":false}`, `{"list":"yes"}`, `{"txid":"x"}`, `[]`} {
+		_, err := ls.Lookup(dead, &lookup.LookupQuestion{Service: MandalaLookup, Query: json.RawMessage(q)})
+		var qe *LookupQueryError
+		if !errors.As(err, &qe) || errors.Is(err, ErrLookupUnavailable) {
+			t.Fatalf("%s: %v, want a *LookupQueryError", q, err)
+		}
+	}
+	_, err := ls.Lookup(context.Background(), &lookup.LookupQuestion{Service: "ls_other", Query: json.RawMessage(`{}`)})
+	var qe *LookupQueryError
+	if !errors.As(err, &qe) || err.Error() != "Lookup service not supported!" {
+		t.Fatalf("wrong service: %v", err)
 	}
 }

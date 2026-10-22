@@ -1255,7 +1255,7 @@ These are planner calls on points the contract leaves open. Each is also listed 
 10. `mandala-rejects.json` stays byte-pinned. The replay uses a topic remap and a reviewed override table.
 11. Admin details keep a 4096-byte policy limit. `feeRatePerKb` keeps the JS safe-integer bound because it is not a token amount.
 12. The Bsv21Binary `id-*` rows of `brc162.json` are remapped to OneColor messages, because the upstream vector file was not updated for 36-byte ids.
-13. Lookup store faults answer 503 `ERR_UNAVAILABLE` (retryable) instead of 400.
+13. Lookup store faults answer 503 `ERR_UNAVAILABLE` (retryable) instead of 400. Classification is by type (review fix): only a `*mandala.LookupQueryError` (invalid or unsupported query, wrong service) or `engine.ErrUnknownTopic` answers 400; every other lookup error, including `ls_mandala` store faults and the engine's unwrapped hydration faults (`FindOutput`, `LoadAncillaryBeef`), answers 503.
 14. The `color-*` query validation strings are pinned by this plan (Task 11).
 15. A 36-byte id is refused as ERR_SHAPE `rLegacyTokenID` before token scoping.
 

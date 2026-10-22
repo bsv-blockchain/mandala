@@ -416,7 +416,11 @@ func TestTokenLookupLegacyStoreFaultIsUnavailable(t *testing.T) {
 			t.Fatalf("%s on a dead context: %v, want ErrLookupUnavailable", q, err)
 		}
 	}
-	if _, err := ls.Lookup(dead, &lookup.LookupQuestion{Service: ls.Name(), Query: json.RawMessage(`{"tokenId":"nope"}`)}); err == nil || errors.Is(err, ErrLookupUnavailable) {
-		t.Fatalf("a query error must stay a query error: %v", err)
+	for _, q := range []string{`{"tokenId":"nope"}`, `{}`, `{"assetStateTokenId":"` + id + `"}`, `{"type":"color-admission"}`} {
+		_, err := ls.Lookup(dead, &lookup.LookupQuestion{Service: ls.Name(), Query: json.RawMessage(q)})
+		var qe *LookupQueryError
+		if !errors.As(err, &qe) || errors.Is(err, ErrLookupUnavailable) {
+			t.Fatalf("%s: a query error must stay a *LookupQueryError: %v", q, err)
+		}
 	}
 }

@@ -35,7 +35,8 @@ served over HTTP.`
 tm_mandala admitted. {tokenId} answers the deploy outpoint; {list: true, limit, skip} answers a page
 of deploy outpoints. The record list itself is served by GET /admin/tokens. At boot, before
 submissions, the host runs RestoreMissingRecords: it rebuilds a lost record from the token's deploy
-metadata and its deploy's owner-journal row at output 0 on tm_color_<assetId> (first write wins).`
+metadata and its deploy's owner-journal row at output 0 on tm_color_<assetId> (first write wins). A store
+fault is retryable (503 ERR_UNAVAILABLE).`
 
 	docKYCTopic = `Mandala identity registry tm_mandala_kyc: one BRC-162 authority chain whose committed
 admitIdentity and revokeIdentity actions maintain the membership set. No value outputs; the first

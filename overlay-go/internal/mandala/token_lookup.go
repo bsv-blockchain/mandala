@@ -442,10 +442,10 @@ func (l *TokenLookupService) lookupMandala(ctx context.Context, q *lookup.Lookup
 		}
 		return lookupFormulas(ops...)
 	case "assetStateTokenId", "adminHistoryTokenId":
-		return nil, errors.New("Unsupported query") // D-9: served over HTTP, not /lookup
+		return nil, errUnsupportedQuery() // D-9: served over HTTP, not /lookup
 	}
 	if !hasTxid || !hasVout {
-		return nil, errors.New("Unsupported query")
+		return nil, errUnsupportedQuery()
 	}
 	// The value row at the outpoint, else the authority row (TS ??: a value row present ends the
 	// search), answered only when it is of this lookup's token.
