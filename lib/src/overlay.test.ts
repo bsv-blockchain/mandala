@@ -6,8 +6,22 @@ import {
 import { journalList, journalClear } from './txJournal.js'
 import { configureMandala } from './constants.js'
 import { configureStorage, memoryStorage } from './storage.js'
+import { Beef as SdkBeef, LockingScript as SdkScript, Transaction as SdkTx, Utils as SdkUtils } from '@bsv/sdk'
+import { OVERLAY_KEY, signedSteak } from './__fixtures__/overlaySigner.js'
 
 const OVERLAY = 'http://test-overlay'
+
+// A real AtomicBEEF: with the overlay identity key configured (S5), every
+// admitted STEAK entry is verified against the submitted tx's own id.
+const SUBJECT = new SdkTx()
+SUBJECT.addOutput({ satoshis: 1, lockingScript: SdkScript.fromHex('51') })
+const SUBJECT_BEEF = new SdkBeef(); SUBJECT_BEEF.mergeTransaction(SUBJECT)
+const TXID = SUBJECT.id('hex')
+const BEEF = SUBJECT_BEEF.toBinaryAtomic(TXID)
+const BEEF_HEX = SdkUtils.toHex(BEEF)
+/** A facilitator whose answer is the signed STEAK of `entries` for TXID. */
+const admitting = (entries: Record<string, number[]>): { send: any } =>
+  ({ send: vi.fn().mockImplementation(async () => await signedSteak(TXID, entries)) })
 
 /**
  * A wallet that really posts a `sendWith` batch: it answers with the
@@ -20,20 +34,21 @@ const postingWallet = async (args: any): Promise<any> => ({
 
 beforeEach(async () => {
   await journalClear()
-  configureMandala({ overlayUrl: OVERLAY })
+  configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: OVERLAY_KEY })
 })
 
 describe('submitToOverlay', () => {
   it('returns admitted indices on success', async () => {
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0, 1], coinsToRetain: [] } }) }
-    const res = await submitToOverlay([1, 2, 3], [4, 5], facilitator as any, ['tm_mandala'])
+    const facilitator = admitting({ tm_mandala: [0, 1] })
+    const res = await submitToOverlay(BEEF, [4, 5], facilitator as any, ['tm_mandala'])
     expect(res.outputsToAdmit).toEqual([0, 1])
-    expect(facilitator.send).toHaveBeenCalledWith(OVERLAY, { beef: [1, 2, 3], topics: ['tm_mandala'], offChainValues: [4, 5] })
+    expect(facilitator.send).toHaveBeenCalledWith(OVERLAY, { beef: BEEF, topics: ['tm_mandala'], offChainValues: [4, 5] })
   })
   it('surfaces the overlay admission signature', async () => {
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0], admissionSignature: 'dead', admissionIdentityKey: '02aa' } }) }
-    const res = await submitToOverlay([1], undefined, facilitator as any, ['tm_mandala'])
-    expect(res).toMatchObject({ outputsToAdmit: [0], admissionSignature: 'dead', admissionIdentityKey: '02aa' })
+    const steak = await signedSteak(TXID, { tm_mandala: [0] })
+    const facilitator = { send: vi.fn().mockResolvedValue(steak) }
+    const res = await submitToOverlay(BEEF, undefined, facilitator as any, ['tm_mandala'])
+    expect(res).toMatchObject({ outputsToAdmit: [0], admissionSignature: steak.tm_mandala.admissionSignature, admissionIdentityKey: OVERLAY_KEY })
   })
   it('throws when nothing is admitted', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [], coinsToRetain: [] } }) }
@@ -49,16 +64,16 @@ describe('submitToOverlay', () => {
 })
 
 describe('submitAndBroadcast (overlay-gated finalize)', () => {
-  const signed = { tx: [1, 2, 3], txid: 'abc' }
+  const signed = { tx: BEEF, txid: TXID }
 
   it('broadcasts via sendWith only after the overlay accepts', async () => {
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
+    const facilitator = admitting({ tm_mandala: [0] })
     const wallet = { createAction: vi.fn().mockResolvedValue({}), abortAction: vi.fn() }
     const res = await submitAndBroadcast(wallet as any, signed, [9], 'ref-1', facilitator as any, ['tm_mandala'])
     expect(res.outputsToAdmit).toEqual([0])
     expect(wallet.createAction).toHaveBeenCalledWith({
       description: 'broadcast overlay-accepted tx',
-      options: { sendWith: ['abc'], acceptDelayedBroadcast: false }
+      options: { sendWith: [TXID], acceptDelayedBroadcast: false }
     })
     expect(wallet.abortAction).not.toHaveBeenCalled()
   })
@@ -94,7 +109,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
   })
 
   it('resolves at accept and keeps the journal entry when the background broadcast fails', async () => {
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
+    const facilitator = admitting({ tm_mandala: [0] })
     const wallet = { createAction: vi.fn().mockRejectedValue(new Error('net down')), abortAction: vi.fn() }
     // Resolves at the overlay-accept commit point despite the doomed broadcast.
     await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala']))
@@ -102,7 +117,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
     await new Promise(r => setTimeout(r, 0)) // let the background broadcast settle
     // Accepted by the overlay → must NOT be aborted, must stay journaled for retry.
     expect(wallet.abortAction).not.toHaveBeenCalled()
-    expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'accepted' }])
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'accepted' }])
   })
 
   it('journals a pending abort when the overlay rejects and abortAction fails', async () => {
@@ -110,14 +125,15 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
     const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockRejectedValue(new Error('offline')) }
     await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala']))
       .rejects.toThrow('overlay rejected')
-    expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'abort', reference: 'ref-1' }])
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'abort', reference: 'ref-1' }])
   })
 
   it('clears the journal after a successful accept + broadcast', async () => {
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0], admissionSignature: 'ab' } }) }
+    const steak = await signedSteak(TXID, { tm_mandala: [0] })
+    const facilitator = { send: vi.fn().mockResolvedValue(steak) }
     const wallet = { createAction: vi.fn().mockImplementation(postingWallet), abortAction: vi.fn() }
     const res = await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
-    expect(res.admissionSignature).toBe('ab')
+    expect(res.admissionSignature).toBe(steak.tm_mandala.admissionSignature)
     await new Promise(r => setTimeout(r, 0)) // background broadcast
     expect(await journalList()).toEqual([])
   })
@@ -127,7 +143,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
     const broadcastGate = new Promise<void>(r => {
       resolveBroadcast = r
     })
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
+    const facilitator = admitting({ tm_mandala: [0] })
     const wallet = {
       createAction: vi.fn().mockImplementation(async (args: any) => {
         await broadcastGate
@@ -138,7 +154,7 @@ describe('submitAndBroadcast (overlay-gated finalize)', () => {
     const done = submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
     // Commit point resolves with journal already written; broadcast still pending.
     await expect(done).resolves.toMatchObject({ outputsToAdmit: [0] })
-    expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'accepted' }])
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'accepted' }])
     resolveBroadcast()
     await new Promise(r => setTimeout(r, 0))
     expect(await journalList()).toEqual([])
@@ -311,7 +327,7 @@ describe('submitToOverlay — refusal plumbing', () => {
 })
 
 describe('submitAndBroadcast — refusals never broadcast', () => {
-  const signed = { tx: [1, 2, 3], txid: 'abc' }
+  const signed = { tx: BEEF, txid: TXID }
 
   it.each([
     ['ERR_CONSERVATION', 400],
@@ -346,25 +362,23 @@ describe('submitAndBroadcast — refusals never broadcast', () => {
     expect(wallet.abortAction).not.toHaveBeenCalled()
     // …and §9.11: held inputs need a durable record, or a crash here leaks the
     // live noSend action forever.
-    expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'retryable', code, reference: 'ref-1' }])
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'retryable', code, reference: 'ref-1' }])
   })
 
   it('journals σ_I with the accepted entry (A12 durable receipt)', async () => {
-    const facilitator = {
-      send: vi.fn().mockResolvedValue({
-        tm_mandala: { outputsToAdmit: [0, 2], admissionSignature: 'de', admissionIdentityKey: '02aa' }
-      })
-    }
+    const steak = await signedSteak(TXID, { tm_mandala: [0, 2] })
+    const sig = steak.tm_mandala.admissionSignature
+    const facilitator = { send: vi.fn().mockResolvedValue(steak) }
     let release!: () => void
     const gate = new Promise<void>(r => { release = r })
     const wallet = { createAction: vi.fn().mockImplementation(async () => { await gate; return {} }), abortAction: vi.fn() }
     const res = await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
-    expect(res).toMatchObject({ outputsToAdmit: [0, 2], admissionSignature: 'de', admissionIdentityKey: '02aa' })
+    expect(res).toMatchObject({ outputsToAdmit: [0, 2], admissionSignature: sig, admissionIdentityKey: OVERLAY_KEY })
     expect(await journalList()).toMatchObject([{
-      txid: 'abc',
+      txid: TXID,
       stage: 'accepted',
-      admissionSignature: 'de',
-      admissionIdentityKey: '02aa',
+      admissionSignature: sig,
+      admissionIdentityKey: OVERLAY_KEY,
       outputsToAdmit: [0, 2]
     }])
     release()
@@ -377,7 +391,7 @@ describe('submitAndBroadcast — refusals never broadcast', () => {
 // ---------------------------------------------------------------------------
 
 describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () => {
-  const signed = { tx: [0xde, 0xad, 0xbe, 0xef], txid: 'abc' }
+  const signed = { tx: BEEF, txid: TXID }
 
   const refusing = (code = 'ERR_PAUSED'): any => ({
     send: vi.fn().mockRejectedValue(new OverlayRefusedError({ code, httpStatus: 409 }))
@@ -388,12 +402,12 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
     await expect(submitAndBroadcast(wallet as any, signed, [7, 8], 'ref-1', refusing(), ['tm_mandala_kyc']))
       .rejects.toMatchObject({ code: 'ERR_PAUSED', retryable: true })
     expect(await journalList()).toMatchObject([{
-      txid: 'abc',
+      txid: TXID,
       stage: 'retryable',
       code: 'ERR_PAUSED',
       reference: 'ref-1',
       attempts: 0,
-      submit: { txHex: 'deadbeef', offChainHex: '0708', topics: ['tm_mandala_kyc'] }
+      submit: { txHex: BEEF_HEX, offChainHex: '0708', topics: ['tm_mandala_kyc'] }
     }])
   })
 
@@ -410,7 +424,7 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
     const wallet = { createAction: vi.fn(), abortAction: vi.fn() }
     await expect(submitAndBroadcast(wallet as any, signed, undefined, undefined, refusing(), ['tm_mandala']))
       .rejects.toMatchObject({ retryable: true })
-    expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'retryable' }])
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'retryable' }])
     expect(wallet.abortAction).not.toHaveBeenCalled()
   })
 
@@ -437,10 +451,10 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
       void p.catch(() => { settled = true })
       await new Promise(r => setTimeout(r, 0))
       expect(settled).toBe(false) // error withheld until the write lands
-      expect(wrote).toBe('mandala.txJournal.abc')
+      expect(wrote).toBe(`mandala.txJournal.${TXID}`)
       landed()
       await expect(p).rejects.toMatchObject({ code: 'ERR_PAUSED' })
-      expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'retryable' }])
+      expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'retryable' }])
     } finally {
       configureStorage(null)
     }
@@ -451,7 +465,7 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
     await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing(), ['tm_mandala']))
       .rejects.toMatchObject({ retryable: true })
     expect(await journalList()).toMatchObject([{ stage: 'retryable' }])
-    const ok = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
+    const ok = admitting({ tm_mandala: [0] })
     await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', ok as any, ['tm_mandala'])
     await new Promise(r => setTimeout(r, 0))
     expect(await journalList()).toEqual([]) // accepted, broadcast, cleared
@@ -467,29 +481,29 @@ describe('submitAndBroadcast — retryable refusals are journaled (§9.11)', () 
 // ---------------------------------------------------------------------------
 
 describe('the wallet must prove it posted the tx', () => {
-  const signed = { tx: [1, 2, 3], txid: 'abc' }
-  const accepting = () => ({ send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) })
+  const signed = { tx: BEEF, txid: TXID }
+  const accepting = () => admitting({ tm_mandala: [0] })
 
   describe('sendWithPosted', () => {
     it.each(['unproven', 'sending'])('accepts a %s status for the txid', status => {
-      expect(sendWithPosted({ sendWithResults: [{ txid: 'abc', status }] }, 'abc')).toBe(true)
+      expect(sendWithPosted({ sendWithResults: [{ txid: TXID, status }] }, TXID)).toBe(true)
     })
 
     it.each([
       ['a hold-shaped result', {}],
       ['an undefined result', undefined],
       ['an empty batch', { sendWithResults: [] }],
-      ['a failed status', { sendWithResults: [{ txid: 'abc', status: 'failed' }] }],
-      ['a status nobody defines', { sendWithResults: [{ txid: 'abc', status: 'held' }] }],
+      ['a failed status', { sendWithResults: [{ txid: TXID, status: 'failed' }] }],
+      ['a status nobody defines', { sendWithResults: [{ txid: TXID, status: 'held' }] }],
       ['another txid entirely', { sendWithResults: [{ txid: 'zzz', status: 'unproven' }] }],
       ['a non-array sendWithResults', { sendWithResults: 'sent' }]
     ])('rejects %s', (_label, result) => {
-      expect(sendWithPosted(result, 'abc')).toBe(false)
+      expect(sendWithPosted(result, TXID)).toBe(false)
     })
 
     it('accepts a lone result the wallet did not label with a txid', () => {
       // The batch was `sendWith: [txid]` — a single unlabelled result is that one.
-      expect(sendWithPosted({ sendWithResults: [{ status: 'sending' }] }, 'abc')).toBe(true)
+      expect(sendWithPosted({ sendWithResults: [{ status: 'sending' }] }, TXID)).toBe(true)
     })
   })
 
@@ -505,18 +519,18 @@ describe('the wallet must prove it posted the tx', () => {
     await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', accepting() as any, ['tm_mandala'])
     await new Promise(r => setTimeout(r, 0)) // background broadcast settles
     expect(wallet.createAction).toHaveBeenCalled()
-    expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'accepted' }])
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'accepted' }])
     expect(wallet.abortAction).not.toHaveBeenCalled()
   })
 
   it("keeps the 'accepted' entry when the wallet reports the sendWith as failed", async () => {
     const wallet = {
-      createAction: vi.fn().mockResolvedValue({ sendWithResults: [{ txid: 'abc', status: 'failed' }] }),
+      createAction: vi.fn().mockResolvedValue({ sendWithResults: [{ txid: TXID, status: 'failed' }] }),
       abortAction: vi.fn()
     }
     await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', accepting() as any, ['tm_mandala'])
     await new Promise(r => setTimeout(r, 0))
-    expect(await journalList()).toMatchObject([{ txid: 'abc', stage: 'accepted' }])
+    expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'accepted' }])
   })
 })
 
@@ -588,5 +602,179 @@ describe('submitToOverlay does not demand σ_I for a registry-only submit', () =
   it('still demands σ_I when the submit names tm_mandala', async () => {
     const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] }, tm_mandala_kyc: { outputsToAdmit: [], coinsToRetain: [] } }) }
     await expect(submitToOverlay(bytes, undefined, facilitator as any, ['tm_mandala', 'tm_mandala_kyc'])).rejects.toMatchObject({ code: 'ERR_NO_ADMISSION' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 1Color (Task 7): tm_color_* topics, attested STEAK verification, S5 fail-closed
+// ---------------------------------------------------------------------------
+import { colorTopic } from './naming.js'
+import { signSigmaV3 } from './__fixtures__/overlaySigner.js'
+const C0_KEY = OVERLAY_KEY
+import { signAttestation } from './attestation.js'
+import { ProtoWallet } from '@bsv/sdk'
+
+describe('submitToOverlay on tm_color_* (attested v1), tm_mandala (σI v3), S5', () => {
+  const tx = new Transaction()
+  tx.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
+  tx.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('52') })
+  const BEEF = new Beef(); BEEF.mergeTransaction(tx)
+  const TXID = tx.id('hex')
+  const bytes = BEEF.toBinaryAtomic(TXID)
+  const ID = 'c7d0f61946bc8bde6c01219c67bb99cbf2f89a39bcaea9c2ecf67c54224edb4f_0'
+  const OTHER = new PrivateKey(7777)
+  const steakOf = (s: Record<string, any>) => ({ send: vi.fn().mockResolvedValue(s) })
+
+  beforeEach(() => configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: C0_KEY }))
+
+  it('submitToOverlay refuses without an identity key (S5)', async () => {
+    configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: '' })
+    const f = { send: vi.fn() }
+    await expect(submitToOverlay(bytes, [1], f as any, [colorTopic(ID)])).rejects.toThrow(/overlay identity key is not configured/)
+    expect(f.send).not.toHaveBeenCalled()
+  })
+
+  it('S5 holds for every topic family, KYC-only included, and for an explicit empty expectedSigner', async () => {
+    configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: '' })
+    for (const topics of [['tm_mandala'], ['tm_mandala_kyc'], [colorTopic(ID)]]) {
+      const f = { send: vi.fn() }
+      await expect(submitToOverlay(bytes, undefined, f as any, topics)).rejects.toThrow(/overlay identity key is not configured/)
+      expect(f.send).not.toHaveBeenCalled()
+    }
+    configureMandala({ overlayIdentityKey: C0_KEY })
+    const f = { send: vi.fn() }
+    await expect(submitToOverlay(bytes, undefined, f as any, [colorTopic(ID)], '')).rejects.toThrow(/overlay identity key is not configured/)
+    expect(f.send).not.toHaveBeenCalled()
+  })
+
+  it('submitAndBroadcast fails closed without an identity key: no send, no broadcast, no journal', async () => {
+    configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: '' })
+    const f = { send: vi.fn() }
+    const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockResolvedValue({}) }
+    await expect(submitAndBroadcast(wallet as any, { tx: bytes, txid: TXID }, undefined, 'ref-1', f as any, [colorTopic(ID)]))
+      .rejects.toThrow(/overlay identity key is not configured/)
+    expect(f.send).not.toHaveBeenCalled()
+    expect(wallet.createAction).not.toHaveBeenCalled()
+    expect(await journalList()).toEqual([])
+  })
+
+  it('an attested entry resolves with the verified attestation', async () => {
+    const steak = await signedSteak(TXID, { [colorTopic(ID)]: [0, 1] })
+    const res = await submitToOverlay(bytes, undefined, steakOf(steak) as any, [colorTopic(ID)])
+    expect(res.topic).toBe(colorTopic(ID))
+    expect(res.outputsToAdmit).toEqual([0, 1])
+    expect(res.attestation).toEqual({
+      txid: TXID, outputs: [0, 1], signer: C0_KEY, signature: steak[colorTopic(ID)].admissionSignature
+    })
+  })
+
+  it('verifies against an explicit expectedSigner instead of the configured key', async () => {
+    const steak = await signedSteak(TXID, { [colorTopic(ID)]: [0] }, OTHER)
+    await expect(submitToOverlay(bytes, undefined, steakOf(steak) as any, [colorTopic(ID)]))
+      .rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION', retryable: true })
+    await expect(submitToOverlay(bytes, undefined, steakOf(steak) as any, [colorTopic(ID)], OTHER.toPublicKey().toString()))
+      .resolves.toMatchObject({ outputsToAdmit: [0] })
+  })
+
+  it('a σI v3 signature on tm_color_<id> is ERR_BAD_ADMISSION (no fallback between schemes)', async () => {
+    const sig = U.toHex(new PrivateKey(5555).sign(U.toArray(admissionMessageV3(colorTopic(ID), TXID, [0]), 'utf8')).toDER() as number[])
+    const steak = { [colorTopic(ID)]: { outputsToAdmit: [0], admissionSignature: sig, admissionIdentityKey: C0_KEY } }
+    await expect(submitToOverlay(bytes, undefined, steakOf(steak) as any, [colorTopic(ID)]))
+      .rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION', retryable: true })
+  })
+
+  it('an attestation by another key is ERR_BAD_ADMISSION; an unsigned entry is ERR_NO_ADMISSION', async () => {
+    const other = await signedSteak(TXID, { [colorTopic(ID)]: [0] }, OTHER)
+    await expect(submitToOverlay(bytes, undefined, steakOf(other) as any, [colorTopic(ID)]))
+      .rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION', retryable: true })
+    const unsigned = { [colorTopic(ID)]: { outputsToAdmit: [0], coinsToRetain: [] } }
+    await expect(submitToOverlay(bytes, undefined, steakOf(unsigned) as any, [colorTopic(ID)]))
+      .rejects.toMatchObject({ code: 'ERR_NO_ADMISSION', retryable: true })
+  })
+
+  it('an attestation whose signer claims the expected key but was signed by another is ERR_BAD_ADMISSION', async () => {
+    const steak = await signedSteak(TXID, { [colorTopic(ID)]: [0] }, OTHER)
+    steak[colorTopic(ID)].admissionIdentityKey = C0_KEY
+    await expect(submitToOverlay(bytes, undefined, steakOf(steak) as any, [colorTopic(ID)]))
+      .rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION' })
+  })
+
+  it('a non-canonical (unsorted) admitted set on a color topic is ERR_BAD_ADMISSION, never re-sorted', async () => {
+    const steak = await signedSteak(TXID, { [colorTopic(ID)]: [0, 1] })
+    steak[colorTopic(ID)].outputsToAdmit = [1, 0]
+    await expect(submitToOverlay(bytes, undefined, steakOf(steak) as any, [colorTopic(ID)]))
+      .rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION' })
+  })
+
+  it('an attestation for another txid is ERR_BAD_ADMISSION', async () => {
+    const steak = await signedSteak('ab'.repeat(32), { [colorTopic(ID)]: [0] })
+    await expect(submitToOverlay(bytes, undefined, steakOf(steak) as any, [colorTopic(ID)]))
+      .rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION' })
+  })
+
+  it('a tm_mandala entry carrying an attested-format signature is ERR_BAD_ADMISSION', async () => {
+    const sig = await signAttestation(new ProtoWallet(new PrivateKey(5555)), ID, TXID, [0])
+    const steak = { tm_mandala: { outputsToAdmit: [0], admissionSignature: sig, admissionIdentityKey: C0_KEY } }
+    await expect(submitToOverlay(bytes, undefined, steakOf(steak) as any, ['tm_mandala']))
+      .rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION', retryable: true })
+  })
+
+  it('deploy topics [TOPIC, colorTopic(`${txid}_0`)]: both verified, primary is the color topic', async () => {
+    const id = `${TXID}_0`
+    const topics = ['tm_mandala', colorTopic(id)]
+    const steak = await signedSteak(TXID, { tm_mandala: [0], [colorTopic(id)]: [0] })
+    const res = await submitToOverlay(bytes, undefined, steakOf(steak) as any, topics)
+    expect(res.topic).toBe(colorTopic(id))
+    expect(res.attestation).toMatchObject({ txid: TXID, outputs: [0], signer: C0_KEY })
+    // σI v3 on tm_mandala is checked too.
+    const bad = await signedSteak(TXID, { tm_mandala: [0], [colorTopic(id)]: [0] })
+    bad.tm_mandala.admissionSignature = signSigmaV3(TXID, [0], OTHER)
+    await expect(submitToOverlay(bytes, undefined, steakOf(bad) as any, topics)).rejects.toMatchObject({ code: 'ERR_BAD_ADMISSION' })
+  })
+
+  it('deploy topics with tm_mandala admitting [] reject', async () => {
+    const id = `${TXID}_0`
+    const steak = await signedSteak(TXID, { tm_mandala: [], [colorTopic(id)]: [0] })
+    await expect(submitToOverlay(bytes, undefined, steakOf(steak) as any, ['tm_mandala', colorTopic(id)])).rejects.toThrow(/overlay rejected/)
+  })
+
+  it('a color topic missing from the STEAK or admitting [] rejects', async () => {
+    await expect(submitToOverlay(bytes, undefined, steakOf({}) as any, [colorTopic(ID)])).rejects.toThrow(/overlay rejected/)
+    const steak = await signedSteak(TXID, { [colorTopic(ID)]: [] })
+    await expect(submitToOverlay(bytes, undefined, steakOf(steak) as any, [colorTopic(ID)])).rejects.toThrow(/overlay rejected/)
+  })
+
+  it('a non-tm_mandala primary carries no attestation (σI v3 receipt fields only)', async () => {
+    const steak = await signedSteak(TXID, { tm_mandala: [0] })
+    const res = await submitToOverlay(bytes, undefined, steakOf(steak) as any, ['tm_mandala'])
+    expect(res).toMatchObject({ topic: 'tm_mandala', outputsToAdmit: [0], admissionIdentityKey: C0_KEY })
+    expect(res.attestation).toBeUndefined()
+  })
+
+  it('refuses legacy tm_<txid> and unknown topics before sending', async () => {
+    for (const t of ['tm_' + 'c'.repeat(64), 'tm_other', colorTopic(ID).toUpperCase(), `tm_color_${'c'.repeat(64)}_01`]) {
+      const f = { send: vi.fn() }
+      await expect(submitToOverlay(bytes, undefined, f as any, [t])).rejects.toThrow(TypeError)
+      expect(f.send).not.toHaveBeenCalled()
+    }
+  })
+
+  it('tm_mandala_kyc as the sole topic is unsigned and needs no parseable BEEF', async () => {
+    const steak = await signedSteak(TXID, { tm_mandala_kyc: [0] })
+    await expect(submitToOverlay([1, 2, 3], undefined, steakOf(steak) as any, ['tm_mandala_kyc'])).resolves.toMatchObject({ outputsToAdmit: [0] })
+  })
+
+  it('facilitator frames off-chain values iff non-empty', async () => {
+    const ok = { ok: true, status: 200, text: async () => '{}' }
+    const fetchImpl = vi.fn().mockResolvedValue(ok)
+    const beef = [1, 2, 3]
+    await createOverlayFacilitator(fetchImpl).send(OVERLAY, { beef, topics: ['tm_mandala'], offChainValues: [] })
+    let [, init] = fetchImpl.mock.calls[0]
+    expect(init.headers['x-includes-off-chain-values']).toBeUndefined()
+    expect([...init.body]).toEqual(beef)
+    await createOverlayFacilitator(fetchImpl).send(OVERLAY, { beef, topics: ['tm_mandala'], offChainValues: [7, 8] })
+    ;[, init] = fetchImpl.mock.calls[1]
+    expect(init.headers['x-includes-off-chain-values']).toBe('true')
+    expect([...init.body]).toEqual([beef.length, ...beef, 7, 8])
   })
 })

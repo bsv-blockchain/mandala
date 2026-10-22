@@ -33,6 +33,7 @@ import { registerAsset } from './issuerOps.js'
 import { clearAdminAuthGates } from './adminAuthGate.js'
 import { BusyError } from './singleFlight.js'
 import { MESSAGEBOX, configureMandala } from './constants.js'
+import { colorTopic } from './naming.js'
 
 // Label lookup only; an unconfigured overlay URL now throws (see overlayUrlGuard.test.ts),
 // and these tests are about journal/receive ordering, not metadata.
@@ -253,6 +254,8 @@ describe('A08 reissue notification is journaled before the send (submitAdminActi
     expect(mbc.sendMessage).toHaveBeenCalledWith({ recipient: RECIPIENT, messageBox: MESSAGEBOX, body: seenAtSend[0].body })
     // Delivered → entry cleared.
     expect(await notifyList()).toEqual([])
+    // An admin tx names exactly its asset's tm_color_<assetId> topic (C§0).
+    expect(vi.mocked(submitAndBroadcast).mock.calls[0][5]).toEqual([colorTopic(ASSET_ID)])
   })
 
   it('a throwing sendMessage keeps the entry, does not throw out of the committed action, and reconcileNotifications retries it', async () => {
@@ -372,6 +375,8 @@ describe('A15 registerAsset runs under an intent marker and the mandala.register
 
     await expect(registerAsset(params(wallet))).rejects.toThrow('overlay rejected')
     expect(vi.mocked(submitAndBroadcast).mock.calls[0][3]).toBe('reg-ref')
+    // Deploy submit topics are exactly [tm_mandala, tm_color_<txid>_0] (C§0).
+    expect(vi.mocked(submitAndBroadcast).mock.calls[0][5]).toEqual(['tm_mandala', `tm_color_${REG_TXID}_0`])
     // Intent cleared on settle either way.
     expect(await hasFreshIntent()).toBe(false)
   })

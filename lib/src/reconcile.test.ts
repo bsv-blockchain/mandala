@@ -4,6 +4,26 @@ import {
 } from './reconcile.js'
 import { journalPut, journalList, journalListStranded, journalClear, JournalEntry } from './txJournal.js'
 import { configureMandala } from './constants.js'
+import { Beef, LockingScript, Transaction, Utils } from '@bsv/sdk'
+import { OVERLAY_KEY, signedSteak } from './__fixtures__/overlaySigner.js'
+import { colorTopic } from './naming.js'
+
+// A real AtomicBEEF for the re-POST paths: with the overlay identity key
+// configured (S5), every admitted STEAK entry is verified against its txid.
+const SUBJECT = new Transaction()
+SUBJECT.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
+SUBJECT.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('52') })
+SUBJECT.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('53') })
+const SUBJECT_BEEF = new Beef(); SUBJECT_BEEF.mergeTransaction(SUBJECT)
+const SUBJECT_TXID = SUBJECT.id('hex')
+const BEEF = SUBJECT_BEEF.toBinaryAtomic(SUBJECT_TXID)
+const BEEF_HEX = Utils.toHex(BEEF)
+/** varint(len) ‖ beef ‖ off-chain values — the exact /submit body (C§6). */
+const framed = (offChain: number[]): number[] => {
+  const w = new Utils.Writer(); w.writeVarIntNum(BEEF.length); w.write(BEEF); w.write(offChain)
+  return w.toArray()
+}
+const ASSET = 'c7d0f61946bc8bde6c01219c67bb99cbf2f89a39bcaea9c2ecf67c54224edb4f_0'
 
 /**
  * A wallet that actually posts what it is handed: `createAction({sendWith})`
@@ -245,7 +265,7 @@ describe('reconcileWallet — retryable entries (§9.11)', () => {
     reference: 'ref-h',
     code: 'ERR_PAUSED',
     attempts: 0,
-    submit: { txHex: 'deadbeef', offChainHex: '0708', topics: ['tm_mandala'] },
+    submit: { txHex: BEEF_HEX, offChainHex: '0708', topics: ['tm_mandala'] },
     ...over
   })
 
@@ -260,21 +280,21 @@ describe('reconcileWallet — retryable entries (§9.11)', () => {
   beforeEach(() => {
     mockFetch.mockReset()
     vi.stubGlobal('fetch', mockFetch)
-    configureMandala({ overlayUrl: OVERLAY })
+    configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: OVERLAY_KEY })
   })
   afterEach(() => { vi.unstubAllGlobals() })
 
   it('re-POSTs the journaled bytes and, on acceptance, commits + broadcasts them', async () => {
     await journalPut(retryableEntry())
-    respond(200, { tm_mandala: { outputsToAdmit: [0], admissionSignature: 'de', admissionIdentityKey: '02aa' } })
+    respond(200, await signedSteak(SUBJECT_TXID, { tm_mandala: [0] }))
     const wallet = mkWallet()
     const r = await reconcileWallet(wallet as any)
 
     const [url, init] = mockFetch.mock.calls[0]
     expect(url).toBe(`${OVERLAY}/submit`)
     expect(init.headers['X-Topics']).toBe(JSON.stringify(['tm_mandala']))
-    // varint(4) ‖ deadbeef ‖ 0708 — the exact bytes first submitted.
-    expect([...init.body]).toEqual([4, 0xde, 0xad, 0xbe, 0xef, 0x07, 0x08])
+    // varint(len) ‖ beef ‖ 0708 — the exact bytes first submitted.
+    expect([...init.body]).toEqual(framed([0x07, 0x08]))
 
     expect(r.resubmitted).toEqual(['held'])
     expect(r.rebroadcast).toEqual(['held'])
@@ -288,7 +308,8 @@ describe('reconcileWallet — retryable entries (§9.11)', () => {
 
   it('an accepted re-submit whose broadcast fails leaves an accepted entry carrying σ_I', async () => {
     await journalPut(retryableEntry())
-    respond(200, { tm_mandala: { outputsToAdmit: [0, 2], admissionSignature: 'de', admissionIdentityKey: '02aa' } })
+    const steak = await signedSteak(SUBJECT_TXID, { tm_mandala: [0, 2] })
+    respond(200, steak)
     const wallet = mkWallet({ createAction: vi.fn().mockRejectedValue(new Error('net down')) })
     const r = await reconcileWallet(wallet as any)
     expect(r.resubmitted).toEqual(['held'])
@@ -297,8 +318,9 @@ describe('reconcileWallet — retryable entries (§9.11)', () => {
       txid: 'held',
       stage: 'accepted',
       reference: 'ref-h',
-      admissionSignature: 'de',
-      admissionIdentityKey: '02aa',
+      topic: 'tm_mandala',
+      admissionSignature: steak.tm_mandala.admissionSignature,
+      admissionIdentityKey: OVERLAY_KEY,
       outputsToAdmit: [0, 2]
     }])
     expect(wallet.abortAction).not.toHaveBeenCalled()
@@ -332,6 +354,29 @@ describe('reconcileWallet — retryable entries (§9.11)', () => {
     respond(503, { status: 'error', code: 'ERR_UNAVAILABLE', retryable: true, description: 'down' })
     const wallet = mkWallet()
     await reconcileWallet(wallet as any)
+    expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-h' })
+    expect(await journalList()).toEqual([])
+  })
+
+  it('S5: with no overlay identity key the retry never sends, never counts a pass and never releases the inputs', async () => {
+    // A configuration fault is not a verdict on the bytes: counting it toward
+    // RETRY_CAP would abort a live action (a wallet mutation) because a host
+    // forgot configureMandala({ overlayIdentityKey }).
+    configureMandala({ overlayIdentityKey: '' })
+    await journalPut(retryableEntry({ attempts: RETRY_CAP - 1 }))
+    const wallet = mkWallet()
+    const r = await reconcileWallet(wallet as any)
+    expect(mockFetch).not.toHaveBeenCalled()
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+    expect(r.resubmitted).toEqual([])
+    expect(await journalList()).toMatchObject([{ txid: 'held', stage: 'retryable', attempts: RETRY_CAP - 1, code: 'ERR_PAUSED' }])
+  })
+
+  it('a legacy tm_<txid> topic is never sent; it counts passes and is released at RETRY_CAP', async () => {
+    await journalPut(retryableEntry({ attempts: RETRY_CAP - 1, submit: { txHex: BEEF_HEX, topics: ['tm_' + 'c'.repeat(64)] } }))
+    const wallet = mkWallet()
+    await reconcileWallet(wallet as any)
+    expect(mockFetch).not.toHaveBeenCalled()
     expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-h' })
     expect(await journalList()).toEqual([])
   })
@@ -560,27 +605,29 @@ describe('reconcileWallet — handed_over entries (the payer’s optional later 
     stage: 'handed_over',
     at: 1,
     reference: 'ref-ho',
-    submit: { txHex: 'deadbeef', offChainHex: '0708', topics: ['tm_mandala'] },
+    submit: { txHex: BEEF_HEX, offChainHex: '0708', topics: [colorTopic(ASSET)] },
     ...over
   })
 
   beforeEach(() => {
     mockFetch.mockReset()
     vi.stubGlobal('fetch', mockFetch)
-    configureMandala({ overlayUrl: OVERLAY })
+    configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: OVERLAY_KEY })
   })
   afterEach(() => { vi.unstubAllGlobals() })
 
   it('re-POSTs the stored bytes when online and commits + broadcasts on acceptance', async () => {
     await journalPut(handedOver())
+    const steak = await signedSteak(SUBJECT_TXID, { [colorTopic(ASSET)]: [0, 1] })
     mockFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      text: async () => JSON.stringify({ tm_mandala: { outputsToAdmit: [0], admissionSignature: 'de', admissionIdentityKey: '02aa' } })
+      text: async () => JSON.stringify(steak)
     })
     const wallet = mkWallet()
     const r = await reconcileWallet(wallet as any)
     expect(mockFetch.mock.calls[0][0]).toBe(`${OVERLAY}/submit`)
+    expect(mockFetch.mock.calls[0][1].headers['X-Topics']).toBe(JSON.stringify([colorTopic(ASSET)]))
     expect(r.resubmitted).toEqual(['ho'])
     expect(r.rebroadcast).toEqual(['ho'])
     expect(await journalList()).toEqual([])

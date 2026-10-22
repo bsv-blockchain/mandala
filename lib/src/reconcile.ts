@@ -53,6 +53,7 @@ import {
 } from './overlay.js'
 import { JournalEntry, journalList, journalPut, journalRemove, INTENT_TTL_MS } from './txJournal.js'
 import { tryWithLock } from './webLocks.js'
+import { OVERLAY_IDENTITY_KEY_UNSET, OVERLAY_URL_UNSET } from './constants.js'
 
 /**
  * wallet-toolbox listActions spec-op: intercepts this "label" to list actions
@@ -503,6 +504,11 @@ async function retryRefused (
     resubmitted.push(entry.txid)
     await broadcastAccepted(accepted)
   } catch (e) {
+    // S5: an unconfigured overlay (URL or identity key) never sent the bytes
+    // and judged nothing. It must not count toward RETRY_CAP, whose abort is
+    // a wallet mutation; the entry waits untouched for configureMandala.
+    const msg = (e as { message?: unknown })?.message
+    if (!(e instanceof OverlayRefusedError) && (msg === OVERLAY_IDENTITY_KEY_UNSET || msg === OVERLAY_URL_UNSET)) return
     // A refusal the contract calls final means these bytes will never be
     // admitted — retrying is pointless, so release the inputs now.
     const final = e instanceof OverlayRefusedError && !e.retryable

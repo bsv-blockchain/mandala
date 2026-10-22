@@ -1,9 +1,8 @@
 /**
  * BRC-162 wire helpers: the 1Color (OneColor) token codec boundary, the strict
  * DAG-CBOR admin details / authority commitment / deploy payload and Mandala
- * `req` (C§4), the deploy
- * signature digest and the per-token topic names. Mirrors overlay-go
- * internal/mandala/{details,deploysig,topics}.go.
+ * `req` (C§4) and the deploy signature digest. Mirrors overlay-go
+ * internal/mandala/{details,deploysig}.go. Topic names are in naming.ts.
  *
  * Pure and React-Native safe (@bsv/templates 2.x imports only @bsv/sdk).
  */
@@ -15,29 +14,16 @@ import { ADMIN_PROTOCOL, ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID } from './const
 export const MANDALA_TOPIC = 'tm_mandala'
 
 const TOKEN_ID_RE = /^([0-9a-f]{64})_0$/
-const TOKEN_TOPIC_RE = /^tm_[0-9a-f]{64}$/
 
 /** `<64 lowercase hex deploy txid>_0` — the only token id the overlay accepts. */
 export const isTokenId = (id: string): boolean => TOKEN_ID_RE.test(id)
 
-function txidOfToken (tokenId: string): string {
-  const m = TOKEN_ID_RE.exec(tokenId)
-  if (m == null) throw new Error(`not a canonical Mandala token id: ${tokenId}`)
-  return m[1]
-}
-
-/** `<txid>_0` → `tm_<txid>`: the topic every non-deploy tx of the token names. */
-export const tokenTopic = (tokenId: string): string => `tm_${txidOfToken(tokenId)}`
-/** tokenTopic, or '' for a non-canonical id (a σI checked against '' never verifies). */
-export const tokenTopicOrEmpty = (tokenId: string): string => { try { return tokenTopic(tokenId) } catch { return '' } }
-/** `<txid>_0` → `ls_<txid>`. */
-export const tokenLookup = (tokenId: string): string => `ls_${txidOfToken(tokenId)}`
 /** The token id a deploy txid creates. */
 export const tokenIdOfDeploy = (deployTxid: string): string => `${deployTxid}_0`
-/** Topics whose STEAK entry carries σI: tm_mandala and every tm_<64 hex>, never tm_mandala_kyc. */
-export const isSigmaTopic = (t: string): boolean => t === MANDALA_TOPIC || TOKEN_TOPIC_RE.test(t)
-/** X-Topics of a token deploy: the registry plus the new token's own topic. */
-export const deployTopics = (deployTxid: string): string[] => [MANDALA_TOPIC, `tm_${deployTxid}`]
+
+// Topic and lookup names live in naming.ts (`colorTopic`, `colorLookup`): the
+// legacy `tm_<txid>` / `ls_<txid>` helpers and `deployTopics` are removed
+// (C§8.1). A deploy submits `[TOPIC, colorTopic(`${txid}_0`)]` inline.
 
 // ---------------------------------------------------------------------------
 // Codec boundary (BRC-162 1Color, @bsv/templates OneColor)

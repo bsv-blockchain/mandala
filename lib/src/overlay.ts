@@ -1,22 +1,31 @@
 import { Beef, Utils, WalletInterface } from '@bsv/sdk'
-import { OVERLAY_URL, OVERLAY_URL_UNSET, OVERLAY_IDENTITY_KEY } from './constants.js'
-import { isSigmaTopic } from './brc162.js'
+import {
+  OVERLAY_URL, OVERLAY_URL_UNSET, OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, REGISTRY_TOPIC, TOPIC
+} from './constants.js'
 import { verifyAdmission } from './admission.js'
+import { type Attestation, attestationFromSteak, verifyAttestation } from './attestation.js'
+import { isColorTopic } from './naming.js'
 import { journalPut, journalRemove } from './txJournal.js'
 
+/**
+ * The verified primary STEAK entry of a submit (contract gap G8: C§8.1 types
+ * the result as the raw STEAK; the lib keeps the verified primary). Every
+ * per-topic entry was verified before this resolves.
+ */
 export interface OverlayAdmitResult {
-  /** The STEAK topic this receipt (and its σI) speaks for — the first token topic submitted. */
+  /** The primary topic: the first `tm_color_*` submitted, else the first topic. */
   topic?: string
   /**
-   * The submitted topic's own admitted output indexes — for a token submission
-   * this is the `tm_mandala` entry's set, which is exactly what σ_I commits to
-   * (admission.ts; FIX A). Never trust an admission for an output that is not
-   * in here.
+   * The primary topic's own admitted output indexes: exactly the set its
+   * attestation (or, on `tm_mandala`, its σI v3) commits to. Never trust an
+   * admission for an output that is not in here.
    */
   outputsToAdmit: number[]
-  /** Overlay ECDSA signature over admissionDigestV3(topic, txid, outputsToAdmit). */
+  /** The primary topic's signature: attested v1 on `tm_color_*`, σI v3 on `tm_mandala`, none on KYC. */
   admissionSignature?: string
   admissionIdentityKey?: string
+  /** The verified BRC-207 attestation; set iff the primary topic is a color topic (C§3). */
+  attestation?: Attestation
 }
 
 /**
@@ -25,7 +34,7 @@ export interface OverlayAdmitResult {
  * without the set it signed over and the key that signed it.
  */
 export interface AdmissionReceipt {
-  /** Topic the σI was taken for (`tm_<deployTxid>`). */
+  /** Topic the signature was taken for (`tm_color_<assetId>` or `tm_mandala`). */
   topic?: string
   admissionSignature?: string
   admissionIdentityKey?: string
@@ -177,7 +186,7 @@ function asRefusal (e: unknown): OverlayRefusedError {
 // ---------------------------------------------------------------------------
 
 interface OverlayBroadcastFacilitator {
-  send: (url: string, taggedBEEF: { beef: number[], topics: string[], offChainValues?: number[] }) => Promise<Record<string, OverlayAdmitResult>>
+  send: (url: string, taggedBEEF: { beef: number[], topics: string[], offChainValues?: number[] }) => Promise<Record<string, any>>
 }
 
 /** The slice of `Response` the facilitator needs (keeps it mockable + RN-safe). */
@@ -206,7 +215,9 @@ export function createOverlayFacilitator (fetchImpl?: OverlayFetch): OverlayBroa
         'X-Topics': JSON.stringify(taggedBEEF.topics)
       }
       let body: Uint8Array
-      if (Array.isArray(taggedBEEF.offChainValues)) {
+      // C§6: the header and the varint framing iff there ARE off-chain values;
+      // an empty list is the bare BEEF, exactly as the overlay reads it.
+      if (Array.isArray(taggedBEEF.offChainValues) && taggedBEEF.offChainValues.length > 0) {
         headers['x-includes-off-chain-values'] = 'true'
         const w = new Utils.Writer()
         w.writeVarIntNum(taggedBEEF.beef.length)
@@ -243,18 +254,50 @@ export function createOverlayFacilitator (fetchImpl?: OverlayFetch): OverlayBroa
   }
 }
 
+/** The topic families a Mandala submit may name (C§0); anything else is refused before sending. */
+function isSubmitTopic (t: unknown): t is string {
+  return typeof t === 'string' && (isColorTopic(t) || t === TOPIC || t === REGISTRY_TOPIC)
+}
+
+/**
+ * POST the BEEF to the overlay and verify every per-topic STEAK entry before
+ * resolving (C§3, C§6).
+ *
+ * Fails closed (S5): with no effective signer (`expectedSigner`, default the
+ * configured overlay identity key) it throws `OVERLAY_IDENTITY_KEY_UNSET`
+ * before `facilitator.send`, so nothing is sent that could not be verified.
+ * Topics are exactly `tm_color_<assetId>`, `tm_mandala` and `tm_mandala_kyc`;
+ * a legacy `tm_<txid>` or any other name is a `TypeError` before sending.
+ *
+ * Per topic:
+ * - `tm_color_<assetId>`: must admit ≥ 1 output and carry the attested v1
+ *   statement by exactly the expected signer (missing ⇒ `ERR_NO_ADMISSION`,
+ *   anything unverifiable ⇒ `ERR_BAD_ADMISSION`, both retryable);
+ * - `tm_mandala`: must admit ≥ 1 output and carry σI v3 by the bare key;
+ * - `tm_mandala_kyc`: unsigned; must admit only when it is the sole topic.
+ */
 export async function submitToOverlay (
   beef: number[],
   offChainValues?: number[],
   facilitator: OverlayBroadcastFacilitator = createOverlayFacilitator(),
-  /** Required: `[tokenTopic(assetId)]`, `deployTopics(txid)` or `[REGISTRY_TOPIC]`. */
-  topics: string[] = []
+  /** Required: `[colorTopic(assetId)]`, `[TOPIC, colorTopic(`${txid}_0`)]` or `[REGISTRY_TOPIC]`. */
+  topics: string[] = [],
+  /** The overlay key every signature must verify under; default the configured OVERLAY_IDENTITY_KEY. */
+  expectedSigner?: string
 ): Promise<OverlayAdmitResult> {
-  if (!Array.isArray(topics) || topics.length === 0) throw new Error('submitToOverlay: topics are required (tokenTopic(assetId))')
+  if (!Array.isArray(topics) || topics.length === 0) throw new Error('submitToOverlay: topics are required (colorTopic(assetId))')
+  for (const t of topics) {
+    if (!isSubmitTopic(t)) {
+      throw new TypeError(`submitToOverlay: refusing topic ${JSON.stringify(t)} (expected tm_color_<assetId>, ${TOPIC} or ${REGISTRY_TOPIC})`)
+    }
+  }
   // Fail loudly: without configureMandala this would POST to a relative /submit.
   if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
+  // S5: an answer that cannot be verified is never asked for.
+  const signer = expectedSigner ?? OVERLAY_IDENTITY_KEY
+  if (typeof signer !== 'string' || signer === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
   const taggedBEEF = { beef, topics, offChainValues }
-  let steak: Record<string, OverlayAdmitResult>
+  let steak: Record<string, any>
   try {
     steak = await facilitator.send(OVERLAY_URL, taggedBEEF)
   } catch (e) {
@@ -262,88 +305,103 @@ export async function submitToOverlay (
     // so a retryable fault is never mistaken for a permanent refusal (FIX D).
     throw asRefusal(e)
   }
-  // Every submitted σI topic must admit: a multi-token tx that one token
-  // topic refused is not admitted (the overlay applies per topic). A
-  // non-σI topic (tm_mandala_kyc) only needs to admit when it is the sole
-  // topic. The primary receipt is the first token topic (tm_<64 hex>), else
-  // the first topic.
+  if (steak == null || typeof steak !== 'object') steak = {}
+  const entryOf = (t: string): any => Object.prototype.hasOwnProperty.call(steak, t) ? steak[t] : undefined
+  const admittedOf = (t: string): number[] => {
+    const o = entryOf(t)?.outputsToAdmit
+    return Array.isArray(o) ? o : []
+  }
+  // Every signed topic must admit: a tx that one topic refused is not
+  // admitted (the overlay applies per topic). KYC only needs to admit when it
+  // is the sole topic.
   for (const t of topics) {
-    if ((isSigmaTopic(t) || topics.length === 1) && (steak[t]?.outputsToAdmit?.length ?? 0) === 0) {
+    if ((t !== REGISTRY_TOPIC || topics.length === 1) && admittedOf(t).length === 0) {
       throw new Error(`overlay rejected the transaction on ${t}`)
     }
   }
-  const primary = topics.find(t => /^tm_[0-9a-f]{64}$/.test(t)) ?? topics[0]
-  const entry = steak[primary]
-  const result: OverlayAdmitResult = {
-    topic: primary,
-    outputsToAdmit: entry.outputsToAdmit,
-    admissionSignature: entry.admissionSignature,
-    admissionIdentityKey: entry.admissionIdentityKey
-  }
-  // σI v3 is per topic and only on tm_mandala / tm_<id> (never tm_mandala_kyc,
-  // whose chain is authenticated by spending its live head). Verify EVERY
-  // signed topic, not only the primary.
+  // Verify EVERY signed topic, not only the primary. The txid is read from the
+  // submitted bytes, never from the answer, and only when a signature needs it.
+  let txid: string | undefined
+  const attestations = new Map<string, Attestation>()
   for (const t of topics) {
-    if (!isSigmaTopic(t) || steak[t] == null) continue
-    const e = steak[t]
-    requireVerifiedAdmission(beef, t, {
-      outputsToAdmit: e.outputsToAdmit,
-      admissionSignature: e.admissionSignature,
-      admissionIdentityKey: e.admissionIdentityKey
-    })
+    if (t === REGISTRY_TOPIC) continue
+    txid ??= submittedTxid(beef)
+    const a = requireVerifiedAdmission(txid, t, entryOf(t), steak, signer)
+    if (a != null) attestations.set(t, a)
   }
-  return result
+  const primary = topics.find(t => isColorTopic(t)) ?? topics[0]
+  const entry = entryOf(primary) ?? {}
+  const attestation = attestations.get(primary)
+  return {
+    topic: primary,
+    outputsToAdmit: admittedOf(primary),
+    ...(typeof entry.admissionSignature === 'string' ? { admissionSignature: entry.admissionSignature } : {}),
+    ...(typeof entry.admissionIdentityKey === 'string' ? { admissionIdentityKey: entry.admissionIdentityKey } : {}),
+    ...(attestation != null ? { attestation } : {})
+  }
 }
 
-let warnedUnverifiable = false
-
-/**
- * An admitted set is not an admission. Only the overlay operator's σ_I over
- * (txid, outputsToAdmit), verifying under the CONFIGURED overlay identity key,
- * proves the operator folded this transaction into its state — an answer
- * without one could come from a misconfigured node, a stale deployment or a
- * man in the middle, and a wallet that broadcast on it would put an
- * unadmitted transaction on chain (2026-09-15 review). So an unsigned or
- * unverifiable "admitted" answer is a retryable refusal, never a success.
- *
- * With no identity key configured the answer cannot be checked at all; the
- * host is warned once, and the call behaves as before. Every production host
- * configures the key (`configureMandala({ overlayIdentityKey })`).
- */
-function requireVerifiedAdmission (beef: number[], topic: string, r: OverlayAdmitResult): void {
-  if (OVERLAY_IDENTITY_KEY === '') {
-    if (!warnedUnverifiable) {
-      warnedUnverifiable = true
-      console.warn('[mandala] overlayIdentityKey is not configured: admission signatures cannot be verified')
-    }
-    return
-  }
-  const sig = r.admissionSignature
-  const signer = r.admissionIdentityKey
-  if (sig == null || sig === '' || signer == null || signer === '') {
-    throw new OverlayRefusedError({
-      code: 'ERR_NO_ADMISSION',
-      description: 'the overlay admitted outputs but returned no admission signature',
-      httpStatus: 200
-    })
-  }
-  let txid: string
+/** The submitted transaction's id (AtomicBEEF subject, else the last tx). */
+function submittedTxid (beef: number[]): string {
   try {
     const parsed = Beef.fromBinary(beef)
-    txid = parsed.atomicTxid ?? parsed.txs[parsed.txs.length - 1].txid
+    const txid = parsed.atomicTxid ?? parsed.txs[parsed.txs.length - 1].txid
+    if (typeof txid !== 'string' || !/^[0-9a-f]{64}$/.test(txid)) throw new Error('no txid')
+    return txid
   } catch {
     throw new OverlayRefusedError({ code: 'ERR_BAD_ADMISSION', description: 'could not read the submitted txid', httpStatus: 200 })
   }
-  const ok =
-    signer.toLowerCase() === OVERLAY_IDENTITY_KEY.toLowerCase() &&
-    verifyAdmission({ topic, txid, outputsToAdmit: r.outputsToAdmit, signature: sig, signerKey: signer })
-  if (!ok) {
+}
+
+/**
+ * An admitted set is not an admission. Only the overlay operator's signature
+ * over (topic, txid, outputsToAdmit), verifying under the expected overlay
+ * identity key, proves the operator folded this transaction into its state:
+ * an answer without one could come from a misconfigured node, a stale
+ * deployment or a man in the middle, and a wallet that broadcast on it would
+ * put an unadmitted transaction on chain (2026-09-15 review). So an unsigned
+ * or unverifiable "admitted" answer is a retryable refusal, never a success.
+ *
+ * The scheme is fixed by the topic and never falls back (C§3): attested v1
+ * (BRC-42 child, exact lowercase signer, canonical outputs) on
+ * `tm_color_<assetId>`, σI v3 (bare key) on `tm_mandala`. Returns the
+ * verified attestation for a color topic.
+ */
+function requireVerifiedAdmission (
+  txid: string,
+  topic: string,
+  entry: any,
+  steak: Record<string, any>,
+  expectedSigner: string
+): Attestation | undefined {
+  const sig = entry?.admissionSignature
+  const signer = entry?.admissionIdentityKey
+  if (typeof sig !== 'string' || sig === '' || typeof signer !== 'string' || signer === '') {
     throw new OverlayRefusedError({
-      code: 'ERR_BAD_ADMISSION',
-      description: 'the admission signature does not verify under the configured overlay identity key',
+      code: 'ERR_NO_ADMISSION',
+      description: `the overlay admitted outputs on ${topic} but returned no admission signature`,
       httpStatus: 200
     })
   }
+  const bad = (): OverlayRefusedError => new OverlayRefusedError({
+    code: 'ERR_BAD_ADMISSION',
+    description: `the admission signature on ${topic} does not verify under the expected overlay identity key`,
+    httpStatus: 200
+  })
+  if (isColorTopic(topic)) {
+    const assetId = topic.slice('tm_color_'.length)
+    // Configuration may spell the key in any case; the wire signer must be
+    // exactly lowercase (verifyAttestation compares exactly).
+    const a = attestationFromSteak(txid, assetId, steak)
+    if (a == null || !verifyAttestation(a, assetId, expectedSigner.toLowerCase())) throw bad()
+    return a
+  }
+  // tm_mandala: σI v3 by the bare overlay key.
+  const ok =
+    signer.toLowerCase() === expectedSigner.toLowerCase() &&
+    verifyAdmission({ topic, txid, outputsToAdmit: entry.outputsToAdmit, signature: sig, signerKey: signer })
+  if (!ok) throw bad()
+  return undefined
 }
 
 /**

@@ -11,6 +11,8 @@
  *     'accepted' write has RESOLVED — that write is the commit point.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { Beef, LockingScript, Transaction } from '@bsv/sdk'
+import { OVERLAY_KEY, signedSteak } from './__fixtures__/overlaySigner.js'
 import {
   MandalaStorage,
   configureStorage,
@@ -211,18 +213,26 @@ describe('no stale read after a write (the mirror is gone)', () => {
 })
 
 describe('the commit point is an awaited write (deferred adapter)', () => {
-  const signed = { tx: [1, 2, 3], txid: 'abc' }
+  // A real AtomicBEEF: with the overlay identity key configured (S5) the
+  // admitted tm_mandala entry is verified against the submitted txid.
+  const subject = new Transaction()
+  subject.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
+  const subjectBeef = new Beef(); subjectBeef.mergeTransaction(subject)
+  const TXID = subject.id('hex')
+  const signed = { tx: subjectBeef.toBinaryAtomic(TXID), txid: TXID }
+  const admitting = (): { send: any } =>
+    ({ send: vi.fn().mockImplementation(async () => await signedSteak(TXID, { tm_mandala: [0] })) })
 
   beforeEach(async () => {
     configureStorage(null)
     await journalClear()
-    configureMandala({ overlayUrl: 'http://test-overlay' })
+    configureMandala({ overlayUrl: 'http://test-overlay', overlayIdentityKey: OVERLAY_KEY })
   })
 
   it("submitAndBroadcast does not call createAction({sendWith}) until the 'accepted' write resolves", async () => {
     const deferred = deferredStorage()
     configureStorage(deferred.store)
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
+    const facilitator = admitting()
     const wallet = { createAction: vi.fn().mockResolvedValue({}), abortAction: vi.fn() }
 
     const done = submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
@@ -236,7 +246,7 @@ describe('the commit point is an awaited write (deferred adapter)', () => {
     await expect(done).resolves.toMatchObject({ outputsToAdmit: [0] })
     await vi.waitFor(() => expect(wallet.createAction).toHaveBeenCalledWith({
       description: 'broadcast overlay-accepted tx',
-      options: { sendWith: ['abc'], acceptDelayedBroadcast: false }
+      options: { sendWith: [TXID], acceptDelayedBroadcast: false }
     }))
   })
 
@@ -244,14 +254,14 @@ describe('the commit point is an awaited write (deferred adapter)', () => {
     const seenAtBroadcast: string[] = []
     const { store, map } = spyStorage()
     configureStorage(store)
-    const facilitator = { send: vi.fn().mockResolvedValue({ tm_mandala: { outputsToAdmit: [0] } }) }
+    const facilitator = admitting()
     const wallet = {
       createAction: vi.fn(async () => { seenAtBroadcast.push(...map.keys()); return {} }),
       abortAction: vi.fn()
     }
     await submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', facilitator as any, ['tm_mandala'])
     await vi.waitFor(() => expect(wallet.createAction).toHaveBeenCalled())
-    expect(seenAtBroadcast).toEqual(['mandala.txJournal.abc'])
+    expect(seenAtBroadcast).toEqual([`mandala.txJournal.${TXID}`])
   })
 
   it('an intent write is awaited too, so the marker exists before the caller proceeds', async () => {

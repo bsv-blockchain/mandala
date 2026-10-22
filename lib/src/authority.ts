@@ -17,8 +17,9 @@ import { Transaction, WalletInterface } from '@bsv/sdk'
 import { TREASURY_BASKET } from './constants.js'
 import {
   commitmentHex, commitmentPayload, DEPLOY_KEY_ID, encodeAdminDetails, lockIssuerToken,
-  MandalaActionDetails, signDeploy, tokenIdOfDeploy, tokenTopic
+  MandalaActionDetails, signDeploy, tokenIdOfDeploy
 } from './brc162.js'
+import { colorTopic } from './naming.js'
 import { encodeLinkagePayload, MandalaLinkagePayload } from './encoding.js'
 import { OverlayAdmitResult, submitAndBroadcast } from './overlay.js'
 import { revealLinkage } from './tokens.js'
@@ -176,7 +177,7 @@ export async function runAuthorityTx (p: {
     outputs: outLinks,
     admin: legs.map((_, i) => ({ index: authIndices[i], details: detailsHex[i] }))
   })
-  const topics = p.topics ?? [...new Set([...legs.map(l => l.prior.tokenId), ...valueOuts.map(v => v.tokenId)].map(tokenTopic))]
+  const topics = p.topics ?? [...new Set([...legs.map(l => l.prior.tokenId), ...valueOuts.map(v => v.tokenId)].map(colorTopic))]
   const admitted = await submitAndBroadcast(
     wallet,
     { tx: signed.tx as number[], txid: signed.txid },
@@ -192,7 +193,7 @@ export async function runAuthorityTx (p: {
  * Deploy a new token (or the KYC registry): output 0 is the deploy, locked to
  * our own key under DEPLOY_KEY_ID with `payload`; the envelope carries its
  * linkage and the deploy signature over the txid. `topics(txid)` names the
- * X-Topics (deployTopics for a token, [REGISTRY_TOPIC] for the registry).
+ * X-Topics (`[TOPIC, colorTopic(`${txid}_0`)]` for a token, [REGISTRY_TOPIC] for the registry).
  */
 export async function runDeployTx (p: {
   wallet: WalletInterface

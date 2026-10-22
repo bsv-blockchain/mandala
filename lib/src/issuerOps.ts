@@ -5,8 +5,9 @@
  * (see submitAndBroadcast). Each resolves at the overlay-accept commit point.
  */
 import { Beef, WalletInterface } from '@bsv/sdk'
-import { TREASURY_BASKET, ADMIN_PROTOCOL, OVERLAY_IDENTITY_KEY } from './constants.js'
-import { deployPayload, deployTopics, MandalaActionDetails } from './brc162.js'
+import { TREASURY_BASKET, ADMIN_PROTOCOL, OVERLAY_IDENTITY_KEY, TOPIC } from './constants.js'
+import { deployPayload, MandalaActionDetails } from './brc162.js'
+import { colorTopic } from './naming.js'
 import { assertFeeRate } from './feeRate.js'
 import { AdmissionReceipt, admissionReceipt } from './overlay.js'
 import { outpoint } from './tokens.js'
@@ -107,7 +108,8 @@ async function registerPipeline (p: RegisterParams): Promise<RegisterResult> {
     wallet: wallet as any,
     identityKey,
     payload,
-    topics: deployTopics,
+    // Deploy submit topics are exactly [tm_mandala, tm_color_<txid>_0] (C§0).
+    topics: (txid: string) => [TOPIC, colorTopic(`${txid}_0`)],
     // The deploy CI can't name its own token id; adminAssetFromOutput resolves it.
     customInstructions: adminCustomInstructions('', String(metadata.label), 'deploy', metadata),
     description: `Register ${String(metadata.label)}`,

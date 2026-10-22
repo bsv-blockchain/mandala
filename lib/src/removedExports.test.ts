@@ -10,7 +10,9 @@ const mod = await import('./index.js')
 describe('removed exports', () => {
   it.each([
     'transferTokens', 'receiveTokens', 'defaultSettle', 'cover', 'canonicalBundleId',
-    'collectHandoverEvidence', 'journalEvidenceSource', 'derHex'
+    'collectHandoverEvidence', 'journalEvidenceSource', 'derHex',
+    // Task 7: legacy tm_<txid> topic helpers (C§8.1)
+    'tokenTopic', 'tokenLookup', 'tokenTopicOrEmpty', 'isSigmaTopic', 'deployTopics'
   ])('%s is gone', n => {
     expect(n in mod).toBe(false)
   })
