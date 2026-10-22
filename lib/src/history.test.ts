@@ -133,6 +133,43 @@ describe('parseActionsToHistory: treasury kinds', () => {
     expect(rows[0].amount).toBe(0n)
   })
 
+  // payoutTokens: output 0 = recipient (no basket), output 1 = treasury change.
+  const payout = (txid: string, amount: bigint, change: bigint, baskets = true): any => ({
+    txid,
+    description: `Payout ${amount} Test Dollar`,
+    labels: ['mandala', 'payout'],
+    outputs: [
+      { outputIndex: 0, satoshis: 1, lockingScript: lock(ID, amount) },
+      ...(change > 0n
+        ? [{ outputIndex: 1, satoshis: 1, lockingScript: lock(ID, change), ...(baskets ? { basket: TREASURY_BASKET } : {}) }]
+        : [])
+    ]
+  })
+
+  it('a payout reports the recipient amount, not recipient + treasury change', () => {
+    const rows = parseActionsToHistory([payout('p1', 10n, 990n)])
+    expect(rows).toEqual([expect.objectContaining({ txid: 'p1', kind: 'payout', direction: 'admin', assetId: ID, amount: 10n })])
+    expect(exportTransactionsCsv(rows).split('\n')[1]).toBe(`"p1","${ID}",admin,payout,10,"",0`)
+  })
+
+  it('a payout listed without baskets falls back to output 0 (the pinned recipient)', () => {
+    const rows = parseActionsToHistory([payout('p2', 10n, 990n, false)])
+    expect(rows[0].amount).toBe(10n)
+  })
+
+  it('a payout with no change reports its single recipient output', () => {
+    const rows = parseActionsToHistory([payout('p3', 1000n, 0n)])
+    expect(rows[0].amount).toBe(1000n)
+  })
+
+  it('a payout of MAX_UINT64 with change reports exactly MAX_UINT64', () => {
+    const rows = parseActionsToHistory([payout('p4', MAX_UINT64, 5n), payout('p5', MAX_UINT64, 5n, false)])
+    expect(rows.map(r => r.amount)).toEqual([MAX_UINT64, MAX_UINT64])
+    const csv = exportTransactionsCsv(rows).split('\n')
+    expect(csv[1]).toContain(',payout,18446744073709551615,')
+    expect(csv[2]).toContain(',payout,18446744073709551615,')
+  })
+
   it('skips a treasury action with no asset id', () => {
     const rows = parseActionsToHistory([{
       txid: 'bad',

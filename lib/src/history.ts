@@ -143,6 +143,19 @@ function holderRow (a: RawAction, kind: string): HistoryRow | null {
   return { txid: a.txid, assetId, direction, amount: sum(counted), counterparty: sender ?? '', when: 0, kind }
 }
 
+/**
+ * A payout's paid amount: its value outputs outside the treasury basket (the
+ * recipient; the change sits in TREASURY_BASKET). A listing that carries no
+ * TREASURY_BASKET basket cannot tell recipient from change, so it counts
+ * output 0, where payoutTokens pins the recipient (randomizeOutputs: false).
+ */
+function payoutAmount (own: Decoded[]): bigint {
+  const basketed = own.some(v => v.o.basket === TREASURY_BASKET)
+  return sum(basketed
+    ? own.filter(v => v.o.basket !== TREASURY_BASKET)
+    : own.filter(v => (v.o.outputIndex ?? -1) === 0))
+}
+
 /** One treasury row (issue/redeem/payout/reissue/register/admin), or null when no asset is attributable. */
 function treasuryRow (a: RawAction, kind: string, ciByOutpoint: Record<string, string>): HistoryRow | null {
   const outputs = a.outputs ?? []
@@ -172,6 +185,8 @@ function treasuryRow (a: RawAction, kind: string, ciByOutpoint: Record<string, s
       // A redeem burns inputs; its outputs are authority + change, so the
       // burned amount lives only in the description's fixed prefix.
       return { txid: a.txid, assetId, direction: 'redeemed', amount: redeemAmount(a.description), counterparty: '', when: 0, kind }
+    case 'payout':
+      return { txid: a.txid, assetId, direction: 'admin', amount: payoutAmount(own), counterparty: '', when: 0, kind }
     default:
       return { txid: a.txid, assetId, direction: kind === 'recover' ? 'received' : 'admin', amount: sum(own), counterparty: '', when: 0, kind }
   }
