@@ -92,6 +92,16 @@ describe('formatAmount (exact, plain)', () => {
   })
 })
 
+describe('formatAmount trailing-zero trim', () => {
+  it('trims only trailing fractional zeros, including all-zero fractions', () => {
+    expect(formatAmount(1000000000000000000n, 18)).toBe('1')
+    expect(formatAmount(1000000000000000001n, 18)).toBe('1.000000000000000001')
+    expect(formatAmount(1010000n, 6)).toBe('1.01')
+    expect(formatAmount(0n, 18)).toBe('0')
+    expect(formatAmount(MAX_UINT64, 18)).toBe('18.446744073709551615')
+  })
+})
+
 describe('formatAmountGrouped', () => {
   it('groups the whole part with commas, no locale APIs', () => {
     expect(formatAmountGrouped(123456789n, 2)).toBe('1,234,567.89')

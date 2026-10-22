@@ -23,6 +23,13 @@ function checkUnits (units: bigint): void {
   }
 }
 
+// Drop trailing '0' characters with a linear scan (no backtracking regex).
+function trimTrailingZeros (s: string): string {
+  let end = s.length
+  while (end > 0 && s.charCodeAt(end - 1) === 48) end--
+  return s.slice(0, end)
+}
+
 // Split base units into sign, whole digits and trimmed fractional digits.
 function toParts (units: bigint, dec: number): { negative: boolean, whole: string, frac: string } {
   checkUnits(units)
@@ -30,7 +37,7 @@ function toParts (units: bigint, dec: number): { negative: boolean, whole: strin
   const negative = units < 0n
   const digits = (negative ? -units : units).toString().padStart(dec + 1, '0')
   const whole = digits.slice(0, digits.length - dec)
-  const frac = digits.slice(digits.length - dec).replace(/0+$/, '')
+  const frac = trimTrailingZeros(digits.slice(digits.length - dec))
   return { negative, whole, frac }
 }
 
