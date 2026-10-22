@@ -265,7 +265,17 @@ var vectorOverrides = map[string]vectorOverride{
 		Reason: "output 1: token-shaped output is not a valid BRC-162 token output (token id must be a direct 32- or 36-byte push)"}}, // 02dead: a 2-byte id push
 	"token-id-36-bytes": {Why: oneColorIDWhy, Expected: rejectExpected{Code: "ERR_SHAPE", // id ab..ab ‖ 01020304 = vout 0x04030201
 		Reason: "output 1: legacy 36-byte token id " + strings.Repeat("ab", 32) + "_67305985 is refused by Mandala policy (32-byte ids only)"}},
+
+	// Task 6: no 2^53 cap on an amount, a sum or the supply; only the storage-range bound remains.
+	// The lone 2^53 output carries no linkage, so the next layer-B rule refuses it. The issue of
+	// 2^53-1 + 1 (value sum 2^53) and the issue of 1 onto a supply of 2^53-1 are admitted exactly.
+	"amount-above-2^53-1": {Why: uint64Why, Expected: rejectExpected{Code: "ERR_LINKAGE",
+		Reason: "output 0: token output with no verified linkage"}},
+	"value-sum-above-2^53-1":          {Why: uint64Why, Expected: rejectExpected{OutputsToAdmit: &[]uint32{0, 1, 2}, CoinsToRetain: &[]uint32{0}}},
+	"circulating-supply-above-2^53-1": {Why: uint64Why, Expected: rejectExpected{OutputsToAdmit: &[]uint32{0, 1}, CoinsToRetain: &[]uint32{0}}},
 }
+
+const uint64Why = "uint64 end to end (design §2 goal 2, 0162:140-143); caps removed"
 
 const fullDagCborWhy = "full strict DAG-CBOR (0162:148); Mandala payload policy 65536 B / depth 64 (contract §4.1)"
 

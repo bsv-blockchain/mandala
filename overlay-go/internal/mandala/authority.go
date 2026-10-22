@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 )
 
@@ -40,8 +41,6 @@ type AuthorityResult struct {
 }
 
 const authPlain = "plain authority"
-
-var authMaxSafe = new(big.Int).SetUint64(MaxSafeAmount)
 
 // ReadAssetState reads the token's admin state; a fault is the retryable ERR_UNAVAILABLE.
 func ReadAssetState(ctx context.Context, s StateStore, tokenID string) (AssetAdminState, error) {
@@ -240,22 +239,27 @@ func authRequireDeltaRule(l *brc162.TokenLedger, action *CommittedAction) error 
 	return nil
 }
 
-// 9. sums and, only for Δ > 0, the circulating supply against 2^53-1.
-func authRequireCaps(ctx context.Context, ledgers []*brc162.TokenLedger, s StateStore) error {
+// 9. the storage-range bound (contract §6, D13) in place of the 2^53 caps: amounts, sums and the
+// supply are exact and unbounded except where Mongo's Decimal128 could no longer hold them. For
+// Δ > 0 the circulating supply (read only then) plus Δ, and for Δ < 0 the burned |Δ|, must stay
+// within amount.MaxStorable() (10^34-1). Value sums themselves are not stored, so they are not bounded.
+func authRequireStorageRange(ctx context.Context, ledgers []*brc162.TokenLedger, s StateStore) error {
+	limit := amount.MaxStorable()
 	for _, l := range ledgers {
-		if l.ValueIn.Cmp(authMaxSafe) > 0 || l.ValueOut.Cmp(authMaxSafe) > 0 {
-			return rSumCap(l.TokenID)
-		}
 		delta := authDelta(l)
-		if delta.Sign() <= 0 {
-			continue
-		}
-		supply, err := authReadSupply(ctx, s, l.TokenID)
-		if err != nil {
-			return err
-		}
-		if new(big.Int).Add(supply, delta).Cmp(authMaxSafe) > 0 {
-			return rSupplyCap(l.TokenID)
+		switch delta.Sign() {
+		case 1:
+			supply, err := authReadSupply(ctx, s, l.TokenID)
+			if err != nil {
+				return err
+			}
+			if new(big.Int).Add(supply, delta).Cmp(limit) > 0 {
+				return rAggregateRange(l.TokenID)
+			}
+		case -1:
+			if delta.CmpAbs(limit) > 0 {
+				return rAggregateRange(l.TokenID)
+			}
 		}
 	}
 	return nil
@@ -280,9 +284,7 @@ func authRequireReissue(ctx context.Context, l *brc162.TokenLedger, a *Committed
 		return rReissue(l.TokenID, "target is not frozen")
 	}
 	delta := authDelta(l)
-	frozenAmount := frozen.Amount.Big()
-	safe := frozenAmount.CmpAbs(authMaxSafe) <= 0 // TS Number.isSafeInteger (Task 6 makes this exact)
-	if !safe || frozenAmount.Cmp(delta) != 0 {
+	if frozen.Amount.Big().Cmp(delta) != 0 { // exact: the frozen row's amount is any uint64
 		return rReissue(l.TokenID, "amount does not match the frozen row")
 	}
 	if len(l.ValueInIndices) > 0 {
@@ -309,7 +311,7 @@ func authLowered(keys map[string]bool) map[string]bool {
 
 // CheckAuthority is layer C for one transaction, steps 1-11 of F/ts-layers §3 in order: deploys,
 // trusted outputs, trusted authority inputs, authority inputs, continuity, commitments, registry
-// value outputs, delta rule, caps, reissues, result.
+// value outputs, delta rule, storage range, reissues, result.
 func CheckAuthority(ctx context.Context, txid string, l *brc162.Ledger, outputs []brc162.Output, owners []VerifiedOwner,
 	inputOwners map[uint32]string, env *Envelope, d AuthorityDeps) (*AuthorityResult, error) {
 	ledgers := l.Tokens()
@@ -349,7 +351,7 @@ func CheckAuthority(ctx context.Context, txid string, l *brc162.Ledger, outputs 
 			return nil, err
 		}
 	}
-	if err := authRequireCaps(ctx, ledgers, d.Store); err != nil {
+	if err := authRequireStorageRange(ctx, ledgers, d.Store); err != nil {
 		return nil, err
 	}
 	for _, t := range ledgers {

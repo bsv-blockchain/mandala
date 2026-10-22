@@ -402,11 +402,11 @@ func TestCirculatingSupply(t *testing.T) {
 	}
 	big2 := stHex(0xcc) + "_0"
 	for i := byte(0); i < 2; i++ {
-		if _, err := s.StoreTokenIfAbsent(ctx, stToken(stHex(0x10+i), 0, big2, amount.FromUint64(MaxSafeAmount), stKeyA)); err != nil {
+		if _, err := s.StoreTokenIfAbsent(ctx, stToken(stHex(0x10+i), 0, big2, amount.FromUint64(1<<53-1), stKeyA)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	want := new(big.Int).Mul(big.NewInt(2), new(big.Int).SetUint64(MaxSafeAmount))
+	want := new(big.Int).Mul(big.NewInt(2), new(big.Int).SetUint64(1<<53-1))
 	if got := supply(big2); got != want.String() {
 		t.Fatalf("past 2^53 = %s, want %s", got, want)
 	}

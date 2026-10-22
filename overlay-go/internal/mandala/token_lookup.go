@@ -95,26 +95,22 @@ func lookupEveryStep(steps ...func() error) error {
 }
 
 // lookupDelta is Δ = value out − value in of the output's token over every token input of the tx
-// (TS deltaOf), clamped to ±(2^53-1) until Task 6 makes it exact.
-func lookupDelta(a *lookupAdmitted) Amount {
+// (TS deltaOf), exact. It errors only past the storage range, which layer C's bound already refuses
+// at submit (a tx cannot carry enough uint64 outputs to reach 10^34-1 on its own).
+func lookupDelta(a *lookupAdmitted) (Amount, error) {
 	all := make([]uint32, len(a.tx.Inputs))
 	for i := range all {
 		all[i] = uint32(i)
 	}
 	tl, ok := brc162.BuildLedger(a.txid, a.outputs, brc162.ClassifyAdmittedInputs(a.tx, all)).Get(a.output.TokenID)
 	if !ok {
-		return zeroAmount()
+		return zeroAmount(), nil
 	}
-	d := new(big.Int).Sub(tl.ValueOut, tl.ValueIn)
-	limit := big.NewInt(maxSafeInteger)
-	if d.Cmp(limit) > 0 {
-		d = limit
+	d, err := amount.FromBig(new(big.Int).Sub(tl.ValueOut, tl.ValueIn))
+	if err != nil {
+		return Amount{}, fmt.Errorf("%s delta of %s: %w", a.output.TokenID, a.txid, err)
 	}
-	if d.Cmp(new(big.Int).Neg(limit)) < 0 {
-		d = new(big.Int).Neg(limit)
-	}
-	v, _ := amount.FromBig(d) // |d| <= 2^53-1 after the clamp: always within the storage range
-	return v
+	return d, nil
 }
 
 var (
@@ -178,6 +174,10 @@ func (l *TokenLookupService) recordAction(ctx context.Context, a *lookupAdmitted
 	}
 	height, offset := TxOrdering(a.tx, a.txid)
 	fc, readErr := liveFoldContext(ctx, l.store, action.Details, a.output.TokenID)
+	delta, err := lookupDelta(a)
+	if err != nil {
+		return err
+	}
 	seq, err := l.store.NextAdmitSeq(ctx)
 	if err != nil {
 		return err
@@ -189,7 +189,7 @@ func (l *TokenLookupService) recordAction(ctx context.Context, a *lookupAdmitted
 		Kind:        action.Details.Kind,
 		DetailsHex:  action.DetailsHex,
 		Commitment:  hex.EncodeToString(action.Commitment[:]),
-		Delta:       lookupDelta(a),
+		Delta:       delta,
 		Height:      height,
 		Offset:      offset,
 		AdmitSeq:    seq,

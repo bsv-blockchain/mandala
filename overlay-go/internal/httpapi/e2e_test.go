@@ -262,7 +262,7 @@ func TestE2EFollowAllDeployIssueTransferTwoToken(t *testing.T) {
 			Kind   string  `json:"kind"`
 			From   *string `json:"from"`
 			To     *string `json:"to"`
-			Amount int64   `json:"amount"`
+			Amount string  `json:"amount"` // a decimal string (contract §0)
 		} `json:"entries"`
 	}
 	if err := json.Unmarshal(body, &page); code != 200 || err != nil {

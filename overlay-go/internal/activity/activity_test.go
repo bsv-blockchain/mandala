@@ -7,7 +7,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"testing"
@@ -26,11 +28,11 @@ func baseParams() SummarizeParams {
 	return SummarizeParams{Txid: "t1", When: "2026-07-07T00:00:00.000Z", Proofs: noProofs}
 }
 
-func inp(identityKey string, amount int64) FtInput {
+func inp(identityKey string, amount uint64) FtInput {
 	return FtInput{IdentityKey: identityKey, Amount: amount, TokenID: tid, Role: brc162.RoleValue}
 }
 
-func out(outputIndex uint32, identityKey string, amount int64) FtOutput {
+func out(outputIndex uint32, identityKey string, amount uint64) FtOutput {
 	return FtOutput{OutputIndex: outputIndex, IdentityKey: identityKey, Amount: amount, TokenID: tid, Role: brc162.RoleValue}
 }
 
@@ -38,7 +40,7 @@ func TestSummarizeTx_IssueMint(t *testing.T) {
 	p := baseParams()
 	p.FtOutputs = []FtOutput{out(0, "alice", 100)}
 	e := SummarizeTx(p)
-	if e == nil || e.Kind != "issue" || e.From != nil || e.To == nil || *e.To != "alice" || e.Amount != 100 || e.TokenID != tid {
+	if e == nil || e.Kind != "issue" || e.From != nil || e.To == nil || *e.To != "alice" || e.Amount.String() != "100" || e.TokenID != tid {
 		t.Fatalf("entry = %+v", e)
 	}
 }
@@ -48,7 +50,7 @@ func TestSummarizeTx_TransferWithChange(t *testing.T) {
 	p.FtInputs = []FtInput{inp("alice", 100)}
 	p.FtOutputs = []FtOutput{out(0, "bob", 30), out(1, "alice", 70)}
 	e := SummarizeTx(p)
-	if e == nil || e.Kind != "transfer" || e.From == nil || *e.From != "alice" || e.To == nil || *e.To != "bob" || e.Amount != 30 {
+	if e == nil || e.Kind != "transfer" || e.From == nil || *e.From != "alice" || e.To == nil || *e.To != "bob" || e.Amount.String() != "30" {
 		t.Fatalf("entry = %+v", e)
 	}
 }
@@ -58,7 +60,7 @@ func TestSummarizeTx_SelfZeroUnit(t *testing.T) {
 	p.FtInputs = []FtInput{inp("alice", 100)}
 	p.FtOutputs = []FtOutput{out(0, "alice", 40), out(1, "alice", 60)}
 	e := SummarizeTx(p)
-	if e == nil || e.Kind != "self" || *e.From != "alice" || *e.To != "alice" || e.Amount != 0 {
+	if e == nil || e.Kind != "self" || *e.From != "alice" || *e.To != "alice" || e.Amount.String() != "0" {
 		t.Fatalf("entry = %+v", e)
 	}
 }
@@ -68,7 +70,7 @@ func TestSummarizeTx_RedeemPartialBurn(t *testing.T) {
 	p.FtInputs = []FtInput{inp("alice", 100)}
 	p.FtOutputs = []FtOutput{out(0, "alice", 25)}
 	e := SummarizeTx(p)
-	if e == nil || e.Kind != "redeem" || *e.From != "alice" || e.To != nil || e.Amount != 75 {
+	if e == nil || e.Kind != "redeem" || *e.From != "alice" || e.To != nil || e.Amount.String() != "75" {
 		t.Fatalf("entry = %+v", e)
 	}
 }
@@ -77,7 +79,7 @@ func TestSummarizeTx_RedeemFullBurn(t *testing.T) {
 	p := baseParams()
 	p.FtInputs = []FtInput{inp("alice", 100)}
 	e := SummarizeTx(p)
-	if e == nil || e.Kind != "redeem" || *e.From != "alice" || e.To != nil || e.Amount != 100 {
+	if e == nil || e.Kind != "redeem" || *e.From != "alice" || e.To != nil || e.Amount.String() != "100" {
 		t.Fatalf("entry = %+v", e)
 	}
 }
@@ -93,7 +95,7 @@ func TestSummarizeTx_MultipleExternalOutputsSumAndPickLargest(t *testing.T) {
 	p.FtInputs = []FtInput{inp("alice", 100)}
 	p.FtOutputs = []FtOutput{out(0, "bob", 10), out(1, "carol", 50), out(2, "alice", 40)}
 	e := SummarizeTx(p)
-	if e == nil || e.Kind != "transfer" || *e.To != "carol" || e.Amount != 60 {
+	if e == nil || e.Kind != "transfer" || *e.To != "carol" || e.Amount.String() != "60" {
 		t.Fatalf("entry = %+v", e)
 	}
 }
@@ -103,7 +105,7 @@ func TestSummarizeTx_UnknownOwnerOutputIgnored(t *testing.T) {
 	p.FtInputs = []FtInput{inp("alice", 100)}
 	p.FtOutputs = []FtOutput{out(0, "", 30), out(1, "alice", 70)}
 	e := SummarizeTx(p)
-	if e == nil || e.Kind != "self" || e.Amount != 0 {
+	if e == nil || e.Kind != "self" || e.Amount.String() != "0" {
 		t.Fatalf("entry = %+v", e)
 	}
 }
@@ -118,7 +120,7 @@ func TestSummarizeTx_AuthorityAndDeployNeverMoveValue(t *testing.T) {
 		out(1, "holder", 1000),
 	}
 	e := SummarizeTx(p)
-	if e == nil || e.Kind != "issue" || e.From != nil || e.To == nil || *e.To != "holder" || e.Amount != 1000 {
+	if e == nil || e.Kind != "issue" || e.From != nil || e.To == nil || *e.To != "holder" || e.Amount.String() != "1000" {
 		t.Fatalf("entry = %+v, want an issue to holder of 1000", e)
 	}
 	p.FtOutputs = p.FtOutputs[:1] // authority in, authority out: a pure admin tx
@@ -137,11 +139,11 @@ func TestDecodeToken(t *testing.T) {
 		return s
 	}
 	txid := strings.Repeat("ff", 32)
-	if id, amt, role, ok := decodeToken(lock(tid, 9007199254740991), txid); !ok || id != tid || amt != 9007199254740991 || role != brc162.RoleValue {
-		t.Fatalf("2^53-1 value: %s %d %s %v", id, amt, role, ok)
-	}
-	if _, _, _, ok := decodeToken(lock(tid, 9007199254740992), txid); ok {
-		t.Fatal("an amount above 2^53-1 must be skipped (TS decodeToken returns null)")
+	// uint64 end to end (design §2 goal 2, 0162:140-143): no amount is skipped for its size.
+	for _, u := range []uint64{9007199254740991, 9007199254740992, math.MaxUint64} {
+		if id, amt, role, ok := decodeToken(lock(tid, u), txid); !ok || id != tid || amt != u || role != brc162.RoleValue {
+			t.Fatalf("value %d: %s %d %s %v", u, id, amt, role, ok)
+		}
 	}
 	if id, _, role, ok := decodeToken(lock("", 0), txid); !ok || role != brc162.RoleDeploy || id != txid+"_0" {
 		t.Fatalf("deploy: %s %s %v, want %s_0 deploy", id, role, ok, txid)
@@ -333,7 +335,7 @@ func TestBuildActivity_AuthoritySplitAcrossThePageBoundaryIsReservedWhole(t *tes
 		t.Fatalf("page 2 entries = %+v, want the issue alone (the deploy moves no value)", page2.Entries)
 	}
 	e := page2.Entries[0]
-	if e.Txid != iss.Txid || e.Kind != "issue" || e.Amount != 1000 || len(e.Proofs) != 2 {
+	if e.Txid != iss.Txid || e.Kind != "issue" || e.Amount.String() != "1000" || len(e.Proofs) != 2 {
 		t.Fatalf("page 2 entry = %+v, want the complete issue with both proofs", e)
 	}
 }
@@ -383,7 +385,7 @@ func TestBuild_IssueReadsIssueAndTheDeployYieldsNoEntry(t *testing.T) {
 	}
 	e := page.Entries[0]
 	if e.Txid != iss.Txid || e.Kind != "issue" || e.From != nil || e.To == nil || *e.To != H.Identity ||
-		e.Amount != 1000 || e.TokenID != dep.Txid+"_0" || len(e.Proofs) != 2 {
+		e.Amount.String() != "1000" || e.TokenID != dep.Txid+"_0" || len(e.Proofs) != 2 {
 		t.Fatalf("issue entry = %+v", e)
 	}
 }
@@ -419,10 +421,10 @@ func TestBuild_TransferPauseAndTokenFilter(t *testing.T) {
 		t.Fatal("a pause moves no value and must yield no entry")
 	}
 	tr, ok := byTx[trA.Txid]
-	if !ok || tr.Kind != "transfer" || *tr.From != H.Identity || *tr.To != R.Identity || tr.Amount != 400 || tr.TokenID != depA.Txid+"_0" {
+	if !ok || tr.Kind != "transfer" || *tr.From != H.Identity || *tr.To != R.Identity || tr.Amount.String() != "400" || tr.TokenID != depA.Txid+"_0" {
 		t.Fatalf("transfer entry = %+v", tr)
 	}
-	if e := byTx[issB.Txid]; e.Kind != "issue" || e.TokenID != depB.Txid+"_0" || e.Amount != 500 {
+	if e := byTx[issB.Txid]; e.Kind != "issue" || e.TokenID != depB.Txid+"_0" || e.Amount.String() != "500" {
 		t.Fatalf("token B issue = %+v", e)
 	}
 
@@ -432,5 +434,31 @@ func TestBuild_TransferPauseAndTokenFilter(t *testing.T) {
 	}
 	if len(onlyB.Entries) != 1 || onlyB.Entries[0].Txid != issB.Txid {
 		t.Fatalf("tokenId filter = %+v, want only token B's issue", onlyB.Entries)
+	}
+}
+
+func TestEntryAmountIsDecimalString(t *testing.T) {
+	e := SummarizeTx(SummarizeParams{Txid: "t1", FtOutputs: []FtOutput{{OutputIndex: 1, IdentityKey: "holder", Amount: math.MaxUint64, TokenID: tid, Role: brc162.RoleValue}}})
+	b, err := json.Marshal(e)
+	if err != nil || !strings.Contains(string(b), `"amount":"18446744073709551615"`) {
+		t.Fatalf("%s %v", b, err)
+	}
+	// sums past 2^64 are exact: a transfer of two max outputs, and a redeem of a max coin
+	p := baseParams()
+	p.FtInputs = []FtInput{inp("alice", math.MaxUint64), inp("alice", math.MaxUint64), inp("alice", math.MaxUint64)}
+	p.FtOutputs = []FtOutput{out(0, "bob", math.MaxUint64), out(1, "bob", math.MaxUint64), out(2, "alice", math.MaxUint64-1)}
+	if e := SummarizeTx(p); e == nil || e.Kind != "transfer" || e.Amount.String() != "36893488147419103230" {
+		t.Fatalf("transfer of 2*(2^64-1) = %+v", e)
+	}
+	p.FtOutputs = []FtOutput{out(0, "alice", math.MaxUint64)}
+	if e := SummarizeTx(p); e == nil || e.Kind != "redeem" || e.Amount.String() != "36893488147419103230" {
+		t.Fatalf("redeem of 2*(2^64-1) = %+v", e)
+	}
+	p.FtOutputs = []FtOutput{out(0, "alice", math.MaxUint64), out(1, "alice", math.MaxUint64), out(2, "alice", math.MaxUint64)}
+	if e := SummarizeTx(p); e == nil || e.Kind != "self" {
+		t.Fatalf("self = %+v", e)
+	}
+	if b, _ := json.Marshal(SummarizeTx(p)); !strings.Contains(string(b), `"amount":"0"`) {
+		t.Fatalf("self amount must be the string \"0\": %s", b)
 	}
 }

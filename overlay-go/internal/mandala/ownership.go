@@ -73,7 +73,8 @@ func RequireNoLegacyTokenIDs(outputs []brc162.Output) error {
 }
 
 // RequireValidTokenOutputs is the shape policy, rule-major (each rule scans every output before
-// the next rule runs): codec refusals, deploy at vout 0, P2PKH remainder, 1 satoshi, amount cap.
+// the next rule runs): codec refusals, deploy at vout 0, P2PKH remainder, 1 satoshi. Any uint64
+// amount is valid (no 2^53 cap: design §2 goal 2, 0162:140-143).
 func RequireValidTokenOutputs(invalid []brc162.InvalidOutput, outputs []brc162.Output) error {
 	if len(invalid) > 0 {
 		return rInvalidTokenOutput(invalid[0].Index, invalid[0].Detail)
@@ -86,9 +87,6 @@ func RequireValidTokenOutputs(invalid []brc162.InvalidOutput, outputs []brc162.O
 	}
 	if i, bad := ownFirstFailing(outputs, func(o brc162.Output) bool { return o.Satoshis != 1 }); bad {
 		return rOneSat(i)
-	}
-	if i, bad := ownFirstFailing(outputs, func(o brc162.Output) bool { return o.Amount > MaxSafeAmount }); bad {
-		return rAmountCap(i)
 	}
 	return nil
 }

@@ -2,7 +2,9 @@ package mandala
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
 	"sort"
@@ -484,5 +486,53 @@ func TestEngineAdminActionsGateTheNextSubmit(t *testing.T) {
 	}
 	if want := []string{"issue", "freezeOutput", "reissue", "pause", "redeem"}; !slices.Equal(kinds, want) {
 		t.Fatalf("history kinds = %v, want %v", kinds, want)
+	}
+}
+
+// Review Focus 1: uint64 end to end (design §2 goal 2; 0162:140-143). An issue of two 2^64-1
+// outputs is admitted; the supply, the balances and the history Δ are exact past 2^64.
+func TestIssueTwoMaxOutputsAdmittedAndExact(t *testing.T) {
+	f := newEngineFlow(t, "mandala3_test_flow_uint64")
+	issuer, holder, receiver := mandalatest.Issuer, mandalatest.Holder, mandalatest.Receiver
+	d := mandalatest.Deploy(t, issuer, "MAX")
+	id := mandalatest.TokenIDOf(d, 0)
+	topic := f.hostWithLookup(id) // ls_ then tm_, registered once
+	f.mustSubmit(d, MandalaTopic, topic)
+	issueDetails := mandalatest.Details(brc162.CborMap{"kind": "issue"})
+	is := mandalatest.Build(t, []mandalatest.In{{Src: d, Vout: 0}}, []mandalatest.Out{
+		{Owner: issuer, Prover: issuer, TokenID: id, Payload: mandalatest.AdmPayload(sha256.Sum256(issueDetails)), HasPayload: true, Details: issueDetails},
+		{Owner: holder, Prover: issuer, TokenID: id, Amount: math.MaxUint64},
+		{Owner: holder, Prover: issuer, TokenID: id, Amount: math.MaxUint64},
+	}, nil)
+	steak := f.mustSubmit(is, topic)
+	if !slices.Equal(steak[topic].OutputsToAdmit, []uint32{0, 1, 2}) {
+		t.Fatalf("issue steak = %+v", steak[topic])
+	}
+	const twoMax = "36893488147419103230"
+	if sup, err := f.store.CirculatingSupply(f.ctx, id); err != nil || sup.String() != twoMax {
+		t.Fatalf("supply = %v, %v", sup, err)
+	}
+	if bal, err := f.store.GetBalance(f.ctx, holder.Identity); err != nil || bal.String() != twoMax {
+		t.Fatalf("holder balance = %v, %v", bal, err)
+	}
+	hist, err := f.store.FindAdminHistory(f.ctx, id, 0, 0)
+	if err != nil || len(hist) != 1 || hist[0].Delta.String() != twoMax {
+		t.Fatalf("history = %+v, %v; want one issue with delta %s", hist, err, twoMax)
+	}
+	if row, err := f.store.GetTokenRow(f.ctx, is.Txid, 2); err != nil || row == nil || row.Amount.String() != "18446744073709551615" {
+		t.Fatalf("row 2 = %+v, %v", row, err)
+	}
+
+	tr := mandalatest.Transfer(t, is, 1, receiver, math.MaxUint64) // the whole max coin moves holder -> receiver
+	if steak := f.mustSubmit(tr, topic); !slices.Equal(steak[topic].OutputsToAdmit, []uint32{0}) {
+		t.Fatalf("transfer steak = %+v", steak[topic])
+	}
+	for key, want := range map[string]string{holder.Identity: "18446744073709551615", receiver.Identity: "18446744073709551615"} {
+		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal.String() != want {
+			t.Fatalf("balance of %s = %v, %v; want %s", key, bal, err, want)
+		}
+	}
+	if sup, err := f.store.CirculatingSupply(f.ctx, id); err != nil || sup.String() != twoMax {
+		t.Fatalf("supply after the transfer = %v, %v", sup, err)
 	}
 }

@@ -18,11 +18,13 @@ package activity
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"sort"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
+	"github.com/sirdeggen/mandala/overlay-go/internal/amount"
 	"github.com/sirdeggen/mandala/overlay-go/internal/brc162"
 	"github.com/sirdeggen/mandala/overlay-go/internal/mandala"
 )
@@ -31,9 +33,6 @@ import (
 // straddle the boundary can be dropped whole and re-served complete on the next page. A transfer writes up to 9
 // rows (recipient + 8 split change); an admin tx adds one authority row (Open Risk R15).
 const groupOverlap = 9
-
-// maxSafeAmount is JS Number.MAX_SAFE_INTEGER: TS decodeToken drops any larger amount (activity.ts:93-100).
-const maxSafeAmount = 9007199254740991
 
 // Deps are the overlay operator's data sources (TS ActivityDeps).
 type Deps struct {
@@ -65,14 +64,14 @@ type Proof struct {
 
 // Entry is TS ActivityEntry. From/To are nullable; Proofs is never nil.
 type Entry struct {
-	Txid    string  `json:"txid"`
-	When    string  `json:"when"`
-	TokenID string  `json:"tokenId"`
-	Kind    string  `json:"kind"` // issue | transfer | self | redeem
-	From    *string `json:"from"`
-	To      *string `json:"to"`
-	Amount  int64   `json:"amount"`
-	Proofs  []Proof `json:"proofs"`
+	Txid    string        `json:"txid"`
+	When    string        `json:"when"`
+	TokenID string        `json:"tokenId"`
+	Kind    string        `json:"kind"` // issue | transfer | self | redeem
+	From    *string       `json:"from"`
+	To      *string       `json:"to"`
+	Amount  amount.Amount `json:"amount"` // exact; a decimal string in JSON (contract §0)
+	Proofs  []Proof       `json:"proofs"`
 }
 
 // Page is TS ActivityPage. NextCursor is inclusive (createdAt <= cursor): consumers dedupe entries by txid.
@@ -84,7 +83,7 @@ type Page struct {
 // FtInput is one token input: the source outpoint's linkage owner and the source output's decode.
 type FtInput struct {
 	IdentityKey string
-	Amount      int64
+	Amount      uint64
 	TokenID     string
 	Role        brc162.Role
 }
@@ -93,7 +92,7 @@ type FtInput struct {
 type FtOutput struct {
 	OutputIndex uint32
 	IdentityKey string
-	Amount      int64
+	Amount      uint64
 	TokenID     string
 	Role        brc162.Role
 }
@@ -131,12 +130,12 @@ func SummarizeTx(p SummarizeParams) *Entry {
 	} else {
 		tokenID = ins[0].TokenID
 	}
-	var inTotal, outTotal int64
+	inTotal, outTotal := new(big.Int), new(big.Int)
 	for _, i := range ins {
-		inTotal += i.Amount
+		inTotal.Add(inTotal, new(big.Int).SetUint64(i.Amount))
 	}
 	for _, o := range outs {
-		outTotal += o.Amount
+		outTotal.Add(outTotal, new(big.Int).SetUint64(o.Amount))
 	}
 	proofs := p.Proofs
 	if proofs == nil {
@@ -149,7 +148,7 @@ func SummarizeTx(p SummarizeParams) *Entry {
 	}
 	if sender == "" {
 		// Nothing verifiably spent: minted supply. Recipient = largest output.
-		return &Entry{Txid: p.Txid, When: p.When, TokenID: tokenID, Kind: "issue", From: nil, To: largestOutputIdentity(outs), Amount: outTotal, Proofs: proofs}
+		return withAmount(Entry{Txid: p.Txid, When: p.When, TokenID: tokenID, Kind: "issue", From: nil, To: largestOutputIdentity(outs), Proofs: proofs}, outTotal)
 	}
 
 	var external []FtOutput
@@ -160,22 +159,34 @@ func SummarizeTx(p SummarizeParams) *Entry {
 	}
 	if len(external) > 0 {
 		best := 0
-		var sum int64
+		sum := new(big.Int)
 		for i, o := range external {
 			if o.Amount > external[best].Amount {
 				best = i
 			}
-			sum += o.Amount
+			sum.Add(sum, new(big.Int).SetUint64(o.Amount))
 		}
 		from, to := sender, external[best].IdentityKey
-		return &Entry{Txid: p.Txid, When: p.When, TokenID: tokenID, Kind: "transfer", From: &from, To: &to, Amount: sum, Proofs: proofs}
+		return withAmount(Entry{Txid: p.Txid, When: p.When, TokenID: tokenID, Kind: "transfer", From: &from, To: &to, Proofs: proofs}, sum)
 	}
-	if inTotal > outTotal {
+	if inTotal.Cmp(outTotal) > 0 {
 		from := sender
-		return &Entry{Txid: p.Txid, When: p.When, TokenID: tokenID, Kind: "redeem", From: &from, To: nil, Amount: inTotal - outTotal, Proofs: proofs}
+		return withAmount(Entry{Txid: p.Txid, When: p.When, TokenID: tokenID, Kind: "redeem", From: &from, To: nil, Proofs: proofs}, new(big.Int).Sub(inTotal, outTotal))
 	}
 	from, to := sender, sender
-	return &Entry{Txid: p.Txid, When: p.When, TokenID: tokenID, Kind: "self", From: &from, To: &to, Amount: 0, Proofs: proofs}
+	return &Entry{Txid: p.Txid, When: p.When, TokenID: tokenID, Kind: "self", From: &from, To: &to, Amount: amount.FromUint64(0), Proofs: proofs}
+}
+
+// withAmount sets e.Amount to v exactly. v is a sum of one transaction's uint64 amounts, below 2^32 * 2^64
+// (an output or input count fits a uint32), far inside the storage range (10^34-1), so FromBig cannot fail;
+// if it ever did, the entry is dropped (nil, like a tx with no value movement) rather than clamped or panicking.
+func withAmount(e Entry, v *big.Int) *Entry {
+	a, err := amount.FromBig(v)
+	if err != nil {
+		return nil
+	}
+	e.Amount = a
+	return &e
 }
 
 // largestOutputIdentity picks the identity of the largest output, first wins ties; nil only when outs is empty.
@@ -193,15 +204,16 @@ func largestOutputIdentity(outs []FtOutput) *string {
 	return &id
 }
 
-// decodeToken is TS decodeToken (activity.ts:93-100): ok is false for a non-token or codec-refused script and for
-// an amount above 2^53-1. A deploy is labelled with its own transaction's <txid>_0.
-func decodeToken(script []byte, txid string) (tokenID string, amount int64, role brc162.Role, ok bool) {
+// decodeToken is TS decodeToken (activity.ts:93-100): ok is false for a non-token or codec-refused script. Any
+// uint64 amount decodes (no 2^53 cap: design §2 goal 2, 0162:140-143). A deploy is labelled with its own
+// transaction's <txid>_0.
+func decodeToken(script []byte, txid string) (tokenID string, amount uint64, role brc162.Role, ok bool) {
 	d, err := brc162.Decode(script)
-	if err != nil || d.Amount > maxSafeAmount {
+	if err != nil {
 		return "", 0, "", false
 	}
 	if d.Role == brc162.RoleDeploy {
-		return brc162.DeployTokenID(txid, 0), int64(d.Amount), d.Role, true
+		return brc162.DeployTokenID(txid, 0), d.Amount, d.Role, true
 	}
 	if d.TokenID == nil {
 		return "", 0, "", false
@@ -210,7 +222,7 @@ func decodeToken(script []byte, txid string) (tokenID string, amount int64, role
 	if err != nil {
 		return "", 0, "", false
 	}
-	return tokenID, int64(d.Amount), d.Role, true
+	return tokenID, d.Amount, d.Role, true
 }
 
 func lockingScriptBytes(o *transaction.TransactionOutput) []byte {

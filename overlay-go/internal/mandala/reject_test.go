@@ -24,9 +24,7 @@ func TestRejectCatalogue(t *testing.T) {
 		{"invalidTokenOutput", rInvalidTokenOutput(2, "truncated push"), CodeShape, "output 2: token-shaped output is not a valid BRC-162 token output (truncated push)"},
 		{"nonP2pkhRemainder", rNonP2pkhRemainder(1), CodeShape, "output 1: token output remainder must be a P2PKH lock"},
 		{"oneSat", rOneSat(1), CodeSatoshis, "output 1: token output must carry exactly 1 satoshi"},
-		{"amountCap", rAmountCap(0), CodeShape, "output 0: token amount exceeds 2^53-1"},
-		{"sumCap", rSumCap(id), CodeShape, "token " + id + ": value sum exceeds 2^53-1"},
-		{"supplyCap", rSupplyCap(id), CodeShape, "token " + id + ": circulating supply would exceed 2^53-1"},
+		{"aggregateRange", rAggregateRange(id), CodeShape, "token " + id + ": amount aggregate exceeds storage range"},
 		{"noLinkage", rNoLinkage(3), CodeLinkage, "output 3: token output with no verified linkage"},
 		{"inputLinkageControl", rInputLinkageControl(0), CodeLinkage, "input 0: linkage does not control the coin being spent"},
 		{"inputLinkageOwner", rInputLinkageOwner(1, k, k2), CodeLinkage, "input 1: linkage names " + k + " but the coin is owned by " + k2},
@@ -63,8 +61,8 @@ func TestRejectCatalogue(t *testing.T) {
 		{"registryValue", rRegistryValue(1), CodeShape, "output 1: tm_mandala_registry does not admit value outputs"},
 		{"inputSpent", rInputSpent(op, strings.Repeat("ef", 32)), CodeInputSpent, "input " + op + ": already spent by " + strings.Repeat("ef", 32)},
 	}
-	if len(cases) != 41 {
-		t.Fatalf("catalogue table has %d rows, want 41 (40 constructors, deltaRule twice)", len(cases))
+	if len(cases) != 39 {
+		t.Fatalf("catalogue table has %d rows, want 39 (38 constructors, deltaRule twice)", len(cases))
 	}
 	for _, c := range cases {
 		if c.err.Code != c.code || c.err.Reason != c.reason || c.err.Error() != c.reason || c.err.Topic != "" {

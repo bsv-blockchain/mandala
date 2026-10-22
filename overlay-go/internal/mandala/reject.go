@@ -82,16 +82,11 @@ func rOneSat(i uint32) *RejectError {
 	return newReject(CodeSatoshis, "output %d: token output must carry exactly 1 satoshi", i)
 }
 
-func rAmountCap(i uint32) *RejectError {
-	return newReject(CodeShape, "output %d: token amount exceeds 2^53-1", i)
-}
-
-func rSumCap(tokenID string) *RejectError {
-	return newReject(CodeShape, "token %s: value sum exceeds 2^53-1", tokenID)
-}
-
-func rSupplyCap(tokenID string) *RejectError {
-	return newReject(CodeShape, "token %s: circulating supply would exceed 2^53-1", tokenID)
+// rAggregateRange replaces the 2^53 caps (uint64 end to end; design §2 goal 2, 0162:140-143). An
+// output amount is any uint64; only an aggregate past the Decimal128 storage range (10^34-1) is
+// refused, because Mongo could no longer hold it exactly (contract §6, D13).
+func rAggregateRange(tokenID string) *RejectError {
+	return newReject(CodeShape, "token %s: amount aggregate exceeds storage range", tokenID)
 }
 
 func rNoLinkage(i uint32) *RejectError {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"math/big"
 	"strings"
 	"testing"
@@ -231,31 +232,79 @@ func TestCheckAuthorityStep8DeltaRules(t *testing.T) {
 	requireReject(t, err, CodeConservation, "token "+acTokA+": pause requires delta = 0 but delta is -40")
 }
 
-func TestCheckAuthorityStep9Caps(t *testing.T) {
-	commit := func(kind string) ([]brc162.Output, *Envelope) {
-		d := acDetails(t, brc162.CborMap{"kind": kind})
-		return []brc162.Output{acAuthority(0, acTokA, d)}, acEnv(AdminEntry{Index: 0, Details: hex.EncodeToString(d)})
-	}
+func acCommit(t *testing.T, kind string) ([]brc162.Output, *Envelope) {
+	t.Helper()
+	d := acDetails(t, brc162.CborMap{"kind": kind})
+	return []brc162.Output{acAuthority(0, acTokA, d)}, acEnv(AdminEntry{Index: 0, Details: hex.EncodeToString(d)})
+}
+
+// Step 9 is the storage-range bound (contract §6, D13): no 2^53 cap on any amount, sum or supply.
+func TestCheckAuthorityStep9StorageRange(t *testing.T) {
 	authIn := acIn(0, acTokA, 0)
-	outs, env := commit("redeem")
-	_, err := acCase{outs: append(outs, acValue(1, acTokA, MaxSafeAmount)), ins: []brc162.Input{authIn, acIn(1, acTokA, MaxSafeAmount), acIn(2, acTokA, MaxSafeAmount)}, env: env}.run(t)
-	requireReject(t, err, CodeShape, "token "+acTokA+": value sum exceeds 2^53-1")
-	outs, env = commit("issue")
-	near := newMemStore()
-	near.putToken(TokenRecord{Txid: strings.Repeat("ee", 32), TokenID: acTokA, Amount: amount.FromUint64(MaxSafeAmount - 50), IdentityKey: mt.Holder.Identity})
-	_, err = acCase{outs: append(outs, acValue(1, acTokA, 100)), ins: []brc162.Input{authIn}, env: env, store: near}.run(t)
-	requireReject(t, err, CodeShape, "token "+acTokA+": circulating supply would exceed 2^53-1")
-	if _, err := (acCase{outs: append(outs, acValue(1, acTokA, 50)), ins: []brc162.Input{authIn}, env: env, store: near}).run(t); err != nil {
-		t.Fatalf("an issue up to exactly 2^53-1: %v", err)
+	outs, env := acCommit(t, "redeem")
+	// value in 2*(2^64-1) and value out 2^64-1: sums past 2^64 are exact and admitted
+	res, err := acCase{outs: append(outs, acValue(1, acTokA, math.MaxUint64)), ins: []brc162.Input{authIn, acIn(1, acTokA, math.MaxUint64), acIn(2, acTokA, math.MaxUint64)}, env: env}.run(t)
+	if err != nil || res.Deltas[acTokA].String() != "-18446744073709551615" {
+		t.Fatalf("a redeem of 2^64-1 from 2*(2^64-1): %+v %v", res, err)
+	}
+	outs, env = acCommit(t, "issue")
+	past53 := newMemStore()
+	past53.putToken(TokenRecord{Txid: strings.Repeat("ee", 32), TokenID: acTokA, Amount: amount.FromUint64(math.MaxUint64), IdentityKey: mt.Holder.Identity})
+	if _, err := (acCase{outs: append(outs, acValue(1, acTokA, math.MaxUint64), acValue(2, acTokA, math.MaxUint64)), ins: []brc162.Input{authIn}, env: env, store: past53}).run(t); err != nil {
+		t.Fatalf("an issue taking the supply to 3*(2^64-1): %v", err)
 	}
 	faulty := newMemStore()
 	faulty.failNext("CirculatingSupply", errStoreDown)
-	pauseOuts, pauseEnv := commit("pause")
+	pauseOuts, pauseEnv := acCommit(t, "pause")
 	if _, err := (acCase{outs: pauseOuts, ins: []brc162.Input{authIn}, env: pauseEnv, store: faulty}).run(t); err != nil {
 		t.Fatalf("the supply is read only when the delta is positive: %v", err)
 	}
 	_, err = acCase{outs: append(outs, acValue(1, acTokA, 5)), ins: []brc162.Input{authIn}, env: env, store: faulty}.run(t)
 	requireReject(t, err, CodeUnavailable, "the circulating supply could not be read; retry")
+}
+
+// acNearMax is a store whose acTokA supply is MaxStorable() - below.
+func acNearMax(t *testing.T, below int64) *memStore {
+	t.Helper()
+	near, err := amount.FromBig(new(big.Int).Sub(amount.MaxStorable(), big.NewInt(below)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newMemStore()
+	s.putToken(TokenRecord{Txid: strings.Repeat("ee", 32), TokenID: acTokA, Amount: near, IdentityKey: mt.Holder.Identity})
+	return s
+}
+
+func TestIssueBeyondStorageRangeRefused(t *testing.T) {
+	authIn := acIn(0, acTokA, 0)
+	outs, env := acCommit(t, "issue")
+	_, err := acCase{outs: append(outs, acValue(1, acTokA, 2)), ins: []brc162.Input{authIn}, env: env, store: acNearMax(t, 1)}.run(t)
+	// ERR_SHAPE is a final verdict (HTTP 400, persisted and replayed by payload hash).
+	requireReject(t, err, CodeShape, "token "+acTokA+": amount aggregate exceeds storage range")
+	if _, err := (acCase{outs: append(outs, acValue(1, acTokA, 1)), ins: []brc162.Input{authIn}, env: env, store: acNearMax(t, 1)}).run(t); err != nil {
+		t.Fatalf("an issue up to exactly 10^34-1: %v", err)
+	}
+}
+
+func TestReissueMatchesFrozenAmountExactly(t *testing.T) {
+	target := strings.Repeat("ab", 32) + ".0"
+	reissue := acDetails(t, brc162.CborMap{"kind": "reissue", "outpoint": dtOutpoint36(0xab, 0), "recipient": dtKey(t, mt.Holder)})
+	env := acEnv(AdminEntry{Index: 0, Details: hex.EncodeToString(reissue)})
+	s := newMemStore()
+	st := DefaultAssetState(acTokA, nil)
+	st.FrozenOutpoints = []FrozenRef{{Outpoint: target, Amount: amount.FromUint64(math.MaxUint64), Owner: mt.Rogue.Identity}}
+	s.putState(st)
+	run := func(v uint64) error {
+		outs := []brc162.Output{acAuthority(0, acTokA, reissue), acValue(1, acTokA, v)}
+		owners := acOwnedBy(outs, mt.Issuer.Identity, mt.Issuer.Identity)
+		owners[1].IdentityKey = mt.Holder.Identity
+		_, err := acCase{outs: outs, owners: owners, ins: []brc162.Input{acIn(0, acTokA, 0)}, env: env, store: s}.run(t)
+		return err
+	}
+	if err := run(math.MaxUint64); err != nil {
+		t.Fatalf("a reissue of exactly 2^64-1: %v", err)
+	}
+	requireReject(t, run(math.MaxUint64-1), CodeShape, "token "+acTokA+": reissue amount does not match the frozen row")
 }
 
 func TestCheckAuthorityStep10Reissue(t *testing.T) {

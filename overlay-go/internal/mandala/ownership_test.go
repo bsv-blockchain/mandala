@@ -35,11 +35,14 @@ func TestRequireValidTokenOutputsIsRuleMajor(t *testing.T) {
 	// Codec refusals first (vector precedence-codec-before-satoshis).
 	err := RequireValidTokenOutputs([]brc162.InvalidOutput{{Index: 3, Detail: "truncated push"}}, []brc162.Output{twoSats})
 	requireReject(t, err, CodeShape, "output 3: token-shaped output is not a valid BRC-162 token output (truncated push)")
-	// Satoshis before the amount cap (vector precedence-satoshis-before-amount-cap).
+	// No amount cap (uint64 end to end): a 2^64-1 output passes; the satoshi rule still fires
+	// (vector precedence-satoshis-before-amount-cap).
 	huge := obOut(1)
-	huge.Amount = MaxSafeAmount + 1
+	huge.Amount = math.MaxUint64
 	requireReject(t, RequireValidTokenOutputs(nil, []brc162.Output{huge, twoSats}), CodeSatoshis, "output 0: token output must carry exactly 1 satoshi")
-	requireReject(t, RequireValidTokenOutputs(nil, []brc162.Output{huge}), CodeShape, "output 1: token amount exceeds 2^53-1")
+	if err := RequireValidTokenOutputs(nil, []brc162.Output{huge}); err != nil {
+		t.Fatalf("2^64-1 is a valid amount: %v", err)
+	}
 	// Rule-major: the deploy rule scans every output before the P2PKH rule looks at output 0.
 	noP2pkh := obOut(0)
 	noP2pkh.RestPubKeyHash = nil
@@ -48,10 +51,10 @@ func TestRequireValidTokenOutputsIsRuleMajor(t *testing.T) {
 	requireReject(t, RequireValidTokenOutputs(nil, []brc162.Output{noP2pkh, deployAt1}), CodeShape, "output 1: a deploy must be output 0")
 	requireReject(t, RequireValidTokenOutputs(nil, []brc162.Output{twoSats, func() brc162.Output { o := obOut(1); o.RestPubKeyHash = nil; return o }()}),
 		CodeShape, "output 1: token output remainder must be a P2PKH lock")
-	maxSafe := obOut(0)
-	maxSafe.Amount = MaxSafeAmount
-	if err := RequireValidTokenOutputs(nil, []brc162.Output{maxSafe}); err != nil {
-		t.Fatalf("2^53-1 itself is allowed: %v", err)
+	past53 := obOut(0)
+	past53.Amount = 1<<53 + 1
+	if err := RequireValidTokenOutputs(nil, []brc162.Output{past53}); err != nil {
+		t.Fatalf("2^53+1 is allowed: %v", err)
 	}
 }
 
@@ -564,7 +567,7 @@ func TestJournalAgrees(t *testing.T) {
 		t.Fatal("agreeing journal")
 	}
 	// Exact uint64 compare: amounts past 2^53 agree exactly; 2^64+5 never agrees with 5 (no wrap).
-	for _, u := range []uint64{MaxSafeAmount + 1, math.MaxUint64} {
+	for _, u := range []uint64{1<<53 + 1, math.MaxUint64} {
 		if !journalAgrees(&OwnerRecord{TokenID: "t_0", Role: brc162.RoleValue, Amount: amount.FromUint64(u), IdentityKey: mt.Holder.Identity}, "t_0", brc162.RoleValue, u) {
 			t.Fatalf("journal of %d must agree exactly", u)
 		}

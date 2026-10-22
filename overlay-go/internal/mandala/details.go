@@ -119,13 +119,14 @@ func detPublicKey(v any) (string, bool) {
 	return hex.EncodeToString(b), true
 }
 
-// detFeeRate: CBOR null -> (nil, true); a uint 1..2^53-1 -> its value.
+// detFeeRate: CBOR null -> (nil, true); a uint 1..2^53-1 -> its value. The fee rate is a sats/kB
+// rate (a JSON number, contract §0), not a token amount, so it keeps the JS safe-integer bound.
 func detFeeRate(v any) (*int64, bool) {
 	if v == nil {
 		return nil, true
 	}
 	n, ok := v.(uint64)
-	if !ok || n < 1 || n > MaxSafeAmount {
+	if !ok || n < 1 || n > maxSafeInteger {
 		return nil, false
 	}
 	x := int64(n)
