@@ -2,15 +2,12 @@ import { describe, it, expect } from 'vitest'
 import {
   Hash, PrivateKey, PublicKey, ProtoWallet, Utils
 } from '@bsv/sdk'
+import * as blinding from './blinding.js'
 import {
-  addBlind, blindedSharedSecret, changeCustomInstructions, childOffset,
-  invoiceNumber, outputPublicKey, prepareBlindedPayment,
-  recipientCustomInstructions, sampleBlindingFactor
+  addBlind, blindedSharedSecret, childOffset,
+  invoiceNumber, outputPublicKey, rootSharedSecret, sampleBlindingFactor
 } from './blinding.js'
-import { configureMandala, ADMIN_PROTOCOL } from './constants.js'
-import { colorProtocolID } from './naming.js'
-
-const HOLDER_PROTOCOL = colorProtocolID(`${'c7'.repeat(32)}_0`, 'AQ==', 'Ag==')
+import { ADMIN_PROTOCOL } from './constants.js'
 
 describe('sender identity blinding (A′ = A + rG)', () => {
   it('opens: A′ − rG equals A', () => {
@@ -80,42 +77,17 @@ describe('sender identity blinding (A′ = A + rG)', () => {
     expect(r.toHex().length).toBe(64)
   })
 
-  it('prepareBlindedPayment locks to the key Bob derives from A′', async () => {
+  it('rootSharedSecret equals a·B (ProtoWallet key deriver path)', async () => {
     const a = PrivateKey.fromRandom()
     const b = PrivateKey.fromRandom()
-    const overlay = PrivateKey.fromRandom()
-    configureMandala({ overlayIdentityKey: overlay.toPublicKey().toString() })
-    const sender = new ProtoWallet(a)
-    const recipient = new ProtoWallet(b)
-    const identityKey = (await sender.getPublicKey({ identityKey: true })).publicKey
-    const recipientKey = (await recipient.getPublicKey({ identityKey: true })).publicKey
-    const prepared = await prepareBlindedPayment(sender as any, {
-      identityKey,
-      recipientKey,
-      keyID: 'xfer-prep',
-      protocolID: HOLDER_PROTOCOL
-    })
-    const { publicKey: fromBob } = await recipient.getPublicKey({
-      protocolID: HOLDER_PROTOCOL,
-      keyID: 'xfer-prep',
-      counterparty: prepared.senderBlinded,
-      forSelf: true
-    })
-    expect(Hash.hash160(Utils.toArray(fromBob, 'hex'))).toEqual(prepared.pubKeyHash)
-    expect(prepared.linkage.counterparty).toBe(recipientKey)
-    expect(prepared.r).toHaveLength(64)
+    const S = await rootSharedSecret(new ProtoWallet(a) as any, b.toPublicKey().toString())
+    expect(S.toString()).toBe(a.deriveSharedSecret(b.toPublicKey()).toString())
   })
 
-  it('does not put r on the recipient output CI', () => {
-    const rec = JSON.parse(recipientCustomInstructions({
-      keyID: 'k', recipientKey: '02aa', senderBlinded: '02bb'
-    }))
-    const ch = JSON.parse(changeCustomInstructions({
-      keyID: 'c', identityKey: '02aa', recipientKey: '03cc',
-      sentAmount: 5, r: 'dd'.repeat(32), senderBlinded: '02bb'
-    }))
-    expect(rec.blindingR).toBeUndefined()
-    expect(ch.blindingR).toBe('dd'.repeat(32))
+  it('the holder-side CI/payment builders are gone (recipientLinkage replaces them)', () => {
+    for (const n of ['prepareBlindedPayment', 'recipientCustomInstructions', 'changeCustomInstructions']) {
+      expect(n in blinding).toBe(false)
+    }
   })
 })
 
