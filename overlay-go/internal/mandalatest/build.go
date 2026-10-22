@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -31,6 +32,40 @@ type Out struct {
 	Details    []byte // strict-CBOR admin details placed in env.admin at this index; nil = none
 	NoLinkage  bool   // omit this output's env.outputs entry
 	Satoshis   uint64 // 0 means 1
+	// Color set: the lock derives under ColorProtocol(TokenID, *Color) with keyID "color" (contract §5.1)
+	// and the linkage is revealed with that tuple; nil keeps the Mandala derivation (FTProtocol, "out-<n>").
+	Color *ColorRemittance
+}
+
+// ColorRemittance is one 1Color derivation's remittance strings (UTF-8; base64 of 16 bytes in production,
+// at most 48 bytes each, contract §0).
+type ColorRemittance struct{ Prefix, Suffix string }
+
+// ColorKeyID is the keyID of every p color derivation (contract §5.1).
+const ColorKeyID = "color"
+
+// AssetTag is the derivation/basket tag of a token id: "<64hex>_<vout>" -> "<64hex>v<vout>" (contract §0, 0207:540-546).
+func AssetTag(tokenID string) string {
+	i := strings.LastIndexByte(tokenID, '_')
+	if i < 0 {
+		panic("mandalatest: AssetTag of a token id without '_': " + tokenID)
+	}
+	return tokenID[:i] + "v" + tokenID[i+1:]
+}
+
+// ColorProtocol is [2, "p color <assetTag> <hex(utf8(prefix))> <hex(utf8(suffix))>"] (contract §5.1).
+func ColorProtocol(tokenID string, r ColorRemittance) wallet.Protocol {
+	return wallet.Protocol{
+		SecurityLevel: wallet.SecurityLevelEveryAppAndCounterparty,
+		Protocol:      "p color " + AssetTag(tokenID) + " " + hex.EncodeToString([]byte(r.Prefix)) + " " + hex.EncodeToString([]byte(r.Suffix)),
+	}
+}
+
+// BuildOptions changes how BuildWith shapes the envelope.
+type BuildOptions struct {
+	// OutputsOnlyEnvelope makes the envelope {"outputs":[…]} only, entries sorted by index: the holder
+	// shape the wallet module submits (contract §5.1, D3). No inputs, admin or deploySig keys.
+	OutputsOnlyEnvelope bool
 }
 
 // In is one token input: Src's output Vout.
@@ -46,7 +81,7 @@ type Built struct {
 	Txid     string
 	Beef     []byte // tx.AtomicBEEF(false): full ancestry, proven funding
 	OffChain []byte // envelope JSON, keys in order inputs, outputs, admin[, deploySig]
-	Outs     []Out  // per-output spec; keyID of output n is "out-<n>"
+	Outs     []Out  // per-output spec; derivation of output n is derivationOf(Outs[n], n)
 }
 
 // numBytes marshals as a JSON number array, the TS shape of SpecificLinkage byte fields.
@@ -90,12 +125,26 @@ type envelopeJSON struct {
 	DeploySig string        `json:"deploySig,omitempty"`
 }
 
+// outputsOnlyJSON is the holder envelope {"outputs":[…]} (contract §5.1, D3).
+type outputsOnlyJSON struct {
+	Outputs []linkedEntry `json:"outputs"`
+}
+
 func keyIDOf(vout uint32) string { return "out-" + strconv.FormatUint(uint64(vout), 10) }
 
-// lockPubKey is the BRC-42 child of owner that prover derives for keyID: the key the output locks to.
-func lockPubKey(t testing.TB, prover, owner Party, keyID string) []byte {
+// derivationOf is the (protocol, keyID) output vout of spec o locks under: the p color tuple when o.Color
+// is set, else the Mandala tuple (FTProtocol, "out-<vout>"). Spending and revealing use the same tuple.
+func derivationOf(o Out, vout uint32) (wallet.Protocol, string) {
+	if o.Color != nil {
+		return ColorProtocol(o.TokenID, *o.Color), ColorKeyID
+	}
+	return FTProtocol, keyIDOf(vout)
+}
+
+// lockPubKey is the BRC-42 child of owner that prover derives for (proto, keyID): the key the output locks to.
+func lockPubKey(t testing.TB, prover, owner Party, proto wallet.Protocol, keyID string) []byte {
 	t.Helper()
-	pub, err := wallet.NewKeyDeriver(prover.Priv).DerivePublicKey(FTProtocol, keyID, owner.other(), false)
+	pub, err := wallet.NewKeyDeriver(prover.Priv).DerivePublicKey(proto, keyID, owner.other(), false)
 	if err != nil {
 		t.Fatalf("mandalatest: derive %s's lock for %s (%s): %v", prover.Name, owner.Name, keyID, err)
 	}
@@ -103,9 +152,9 @@ func lockPubKey(t testing.TB, prover, owner Party, keyID string) []byte {
 }
 
 // spendKey is the owner's private child for the same derivation: it signs the spend.
-func spendKey(t testing.TB, owner, prover Party, keyID string) *p2pkh.P2PKH {
+func spendKey(t testing.TB, owner, prover Party, proto wallet.Protocol, keyID string) *p2pkh.P2PKH {
 	t.Helper()
-	priv, err := wallet.NewKeyDeriver(owner.Priv).DerivePrivateKey(FTProtocol, keyID, prover.other())
+	priv, err := wallet.NewKeyDeriver(owner.Priv).DerivePrivateKey(proto, keyID, prover.other())
 	if err != nil {
 		t.Fatalf("mandalatest: derive %s's spend key (%s): %v", owner.Name, keyID, err)
 	}
@@ -116,13 +165,13 @@ func spendKey(t testing.TB, owner, prover Party, keyID string) *p2pkh.P2PKH {
 	return unlock
 }
 
-// reveal is revealer's BRC-72 specific linkage for (FTProtocol, keyID) with counterparty, sealed for Overlay.
-func reveal(t testing.TB, revealer, counterparty Party, keyID string) linkageJSON {
+// reveal is revealer's BRC-72 specific linkage for (proto, keyID) with counterparty, sealed for Overlay.
+func reveal(t testing.TB, revealer, counterparty Party, proto wallet.Protocol, keyID string) linkageJSON {
 	t.Helper()
 	res, err := revealer.protoWallet().RevealSpecificKeyLinkage(context.Background(), wallet.RevealSpecificKeyLinkageArgs{
 		Counterparty: counterparty.other(),
 		Verifier:     Overlay.Priv.PubKey(),
-		ProtocolID:   FTProtocol,
+		ProtocolID:   proto,
 		KeyID:        keyID,
 	}, "")
 	if err != nil {
@@ -132,7 +181,7 @@ func reveal(t testing.TB, revealer, counterparty Party, keyID string) linkageJSO
 		Prover:                revealer.Identity,
 		Verifier:              Overlay.Identity,
 		Counterparty:          counterparty.Identity,
-		ProtocolID:            [2]any{int(FTProtocol.SecurityLevel), FTProtocol.Protocol},
+		ProtocolID:            [2]any{int(proto.SecurityLevel), proto.Protocol},
 		KeyID:                 keyID,
 		EncryptedLinkage:      res.EncryptedLinkage,
 		EncryptedLinkageProof: res.EncryptedLinkageProof,
@@ -179,9 +228,32 @@ func deploySig(t testing.TB, signer Party, txid string) string {
 
 // Build signs one transaction: token inputs first (in ins order), then one fresh proven funding
 // input; one output per outs entry, locked to the Owner's BRC-42 child derived by the Prover for
-// (FTProtocol, "out-<n>") and revealed to Overlay. deploySigBy != nil adds a deploySig over the txid.
+// derivationOf(out, n) ((FTProtocol, "out-<n>"), or the p color tuple when Out.Color is set) and
+// revealed to Overlay. deploySigBy != nil adds a deploySig over the txid.
 func Build(t testing.TB, ins []In, outs []Out, deploySigBy *Party) *Built {
 	t.Helper()
+	return BuildWith(t, ins, outs, deploySigBy, BuildOptions{})
+}
+
+// BuildWith is Build with envelope options. OutputsOnlyEnvelope refuses (t.Fatal) a build that would need
+// any other envelope member: an input linkage, admin details or a deploySig.
+func BuildWith(t testing.TB, ins []In, outs []Out, deploySigBy *Party, opts BuildOptions) *Built {
+	t.Helper()
+	if opts.OutputsOnlyEnvelope {
+		if deploySigBy != nil {
+			t.Fatal("mandalatest: an outputs-only envelope carries no deploySig")
+		}
+		for i, in := range ins {
+			if in.WithLinkage {
+				t.Fatalf("mandalatest: an outputs-only envelope carries no input linkage (input %d)", i)
+			}
+		}
+		for n, out := range outs {
+			if out.Details != nil {
+				t.Fatalf("mandalatest: an outputs-only envelope carries no admin details (output %d)", n)
+			}
+		}
+	}
 	tx := transaction.NewTransaction()
 	env := envelopeJSON{Inputs: []linkedEntry{}, Outputs: []linkedEntry{}, Admin: []adminEntry{}}
 	for i, in := range ins {
@@ -189,16 +261,16 @@ func Build(t testing.TB, ins []In, outs []Out, deploySigBy *Party) *Built {
 			t.Fatalf("mandalatest: input %d names no built output", i)
 		}
 		spec := in.Src.Outs[in.Vout]
-		keyID := keyIDOf(in.Vout)
+		proto, keyID := derivationOf(spec, in.Vout)
 		tx.AddInput(&transaction.TransactionInput{
 			SourceTXID:              in.Src.Tx.TxID(),
 			SourceTxOutIndex:        in.Vout,
 			SourceTransaction:       in.Src.Tx,
-			UnlockingScriptTemplate: spendKey(t, spec.Owner, spec.Prover, keyID),
+			UnlockingScriptTemplate: spendKey(t, spec.Owner, spec.Prover, proto, keyID),
 			SequenceNumber:          0xffffffff,
 		})
 		if in.WithLinkage {
-			env.Inputs = append(env.Inputs, linkedEntry{Index: uint32(i), Linkage: reveal(t, spec.Owner, spec.Prover, keyID)})
+			env.Inputs = append(env.Inputs, linkedEntry{Index: uint32(i), Linkage: reveal(t, spec.Owner, spec.Prover, proto, keyID)})
 		}
 	}
 	funding := fundingSource()
@@ -214,11 +286,14 @@ func Build(t testing.TB, ins []In, outs []Out, deploySigBy *Party) *Built {
 		SequenceNumber:          0xffffffff,
 	})
 	for n, o := range outs {
-		keyID := keyIDOf(uint32(n))
+		if o.Color != nil && o.TokenID == "" {
+			t.Fatalf("mandalatest: output %d: a p color derivation needs a token id (a deploy has none)", n)
+		}
+		proto, keyID := derivationOf(o, uint32(n))
 		lock, err := brc162.Lock(brc162.LockParams{
 			TokenID:    o.TokenID,
 			Amount:     o.Amount,
-			PubKeyHash: hash.Hash160(lockPubKey(t, o.Prover, o.Owner, keyID)),
+			PubKeyHash: hash.Hash160(lockPubKey(t, o.Prover, o.Owner, proto, keyID)),
 			Payload:    o.Payload,
 			HasPayload: o.HasPayload,
 		})
@@ -232,7 +307,7 @@ func Build(t testing.TB, ins []In, outs []Out, deploySigBy *Party) *Built {
 		s := script.Script(lock)
 		tx.AddOutput(&transaction.TransactionOutput{Satoshis: sats, LockingScript: &s})
 		if !o.NoLinkage {
-			env.Outputs = append(env.Outputs, linkedEntry{Index: uint32(n), Linkage: reveal(t, o.Prover, o.Owner, keyID)})
+			env.Outputs = append(env.Outputs, linkedEntry{Index: uint32(n), Linkage: reveal(t, o.Prover, o.Owner, proto, keyID)})
 		}
 		if o.Details != nil {
 			env.Admin = append(env.Admin, adminEntry{Index: uint32(n), Details: hex.EncodeToString(o.Details)})
@@ -249,7 +324,12 @@ func Build(t testing.TB, ins []In, outs []Out, deploySigBy *Party) *Built {
 	if err != nil {
 		t.Fatalf("mandalatest: atomic BEEF: %v", err)
 	}
-	offChain, err := json.Marshal(env)
+	var offChain []byte
+	if opts.OutputsOnlyEnvelope {
+		offChain, err = json.Marshal(outputsOnlyJSON{Outputs: env.Outputs}) // appended in index order
+	} else {
+		offChain, err = json.Marshal(env)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

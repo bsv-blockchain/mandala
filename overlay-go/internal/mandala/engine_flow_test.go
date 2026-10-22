@@ -1,6 +1,7 @@
 package mandala
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -537,4 +539,66 @@ func TestIssueTwoMaxOutputsAdmittedAndExact(t *testing.T) {
 	if sup, err := f.store.CirculatingSupply(f.ctx, id); err != nil || sup.String() != twoMax {
 		t.Fatalf("supply after the transfer = %v, %v", sup, err)
 	}
+}
+
+// colorHolderTransfer deploys, issues 1000 to Holder under a p color derivation (B4: issuer-proved payout) and
+// builds a holder transfer of that coin with an outputs-only envelope (contract §5.1, D3): output 0 pays 600 to
+// Receiver at the maximum remittance lengths (48 UTF-8 bytes each, contract §0), output 1 returns 400 to Holder.
+// noChangeLinkage drops output 1's envelope entry.
+func colorHolderTransfer(t *testing.T, f *engineFlow, noChangeLinkage bool) (string, string, *mandalatest.Built) {
+	t.Helper()
+	d := mandalatest.Deploy(t, mandalatest.Issuer, "TUSD")
+	id := mandalatest.TokenIDOf(d, 0)
+	topic := f.hostWithLookup(id)
+	f.mustSubmit(d, MandalaTopic, topic)
+	r1 := &mandalatest.ColorRemittance{Prefix: "AAAAAAAAAAAAAAAAAAAAAA==", Suffix: "BBBBBBBBBBBBBBBBBBBBBB=="}
+	is := mandalatest.IssueTo(t, d, 0, mandalatest.Issuer, mandalatest.Holder, 1000, r1)
+	flowEntry(t, f.mustSubmit(is, topic), topic, []uint32{0, 1}, []uint32{0})
+	r2 := &mandalatest.ColorRemittance{Prefix: strings.Repeat("p", 48), Suffix: strings.Repeat("s", 48)}
+	r3 := &mandalatest.ColorRemittance{Prefix: "CCCCCCCCCCCCCCCCCCCCCC==", Suffix: "DDDDDDDDDDDDDDDDDDDDDD=="}
+	tr := mandalatest.BuildWith(t, []mandalatest.In{{Src: is, Vout: 1}}, []mandalatest.Out{
+		{Owner: mandalatest.Receiver, Prover: mandalatest.Holder, TokenID: id, Amount: 600, Color: r2},
+		{Owner: mandalatest.Holder, Prover: mandalatest.Holder, TokenID: id, Amount: 400, Color: r3, NoLinkage: noChangeLinkage},
+	}, nil, mandalatest.BuildOptions{OutputsOnlyEnvelope: true})
+	if string(tr.OffChain[:12]) != `{"outputs":[` || bytes.Contains(tr.OffChain, []byte(`"inputs"`)) || bytes.Contains(tr.OffChain, []byte(`"admin"`)) {
+		t.Fatalf("not an outputs-only envelope: %s", tr.OffChain)
+	}
+	return id, topic, tr
+}
+
+// Task 10 (contract §5.1, design B4): holder outputs derived under [2,"p color <assetTag> <hex> <hex>"], keyID
+// "color", carried in an outputs-only envelope, are admitted with unchanged envelope semantics.
+func TestHolderColorTransferOutputsOnlyEnvelope(t *testing.T) {
+	f := newEngineFlow(t, "mandala3_test_flow_color")
+	id, topic, tr := colorHolderTransfer(t, f, false)
+	if !bytes.Contains(tr.OffChain, []byte(`"keyID":"color"`)) || !bytes.Contains(tr.OffChain, []byte(`"p color `+mandalatest.AssetTag(id)+` `)) {
+		t.Fatalf("envelope does not carry the p color tuple: %s", tr.OffChain)
+	}
+	flowEntry(t, f.mustSubmit(tr, topic), topic, []uint32{0, 1}, []uint32{0})
+	for vout, want := range map[uint32]struct {
+		owner  mandalatest.Party
+		amount int64
+	}{0: {mandalatest.Receiver, 600}, 1: {mandalatest.Holder, 400}} {
+		row, err := f.store.GetTokenRow(f.ctx, tr.Txid, vout)
+		if err != nil || row == nil || row.IdentityKey != want.owner.Identity || row.Amount.Cmp(amt(want.amount)) != 0 || row.TokenID != id {
+			t.Fatalf("row %d = %+v, %v; want %s owning %d", vout, row, err, want.owner.Name, want.amount)
+		}
+	}
+	for key, want := range map[string]int64{mandalatest.Receiver.Identity: 600, mandalatest.Holder.Identity: 400} {
+		if bal, err := f.store.GetBalance(f.ctx, key); err != nil || bal.Cmp(amt(want)) != 0 {
+			t.Fatalf("balance of %s = %v, %v; want %d", key, bal, err, want)
+		}
+	}
+	// a double-submit is accepted and moves nothing
+	f.mustSubmit(tr, topic)
+	if bal, _ := f.store.GetBalance(f.ctx, mandalatest.Receiver.Identity); bal.Cmp(amt(600)) != 0 {
+		t.Fatalf("receiver balance after the replay = %v, want 600", bal)
+	}
+}
+
+func TestHolderColorTransferMissingOutputLinkage(t *testing.T) {
+	f := newEngineFlow(t, "mandala3_test_flow_color")
+	_, topic, tr := colorHolderTransfer(t, f, true)
+	_, err := f.submit(tr, topic)
+	mgrRefusal(t, err, CodeLinkage, "output 1: token output with no verified linkage", topic)
 }

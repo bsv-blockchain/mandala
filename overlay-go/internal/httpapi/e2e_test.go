@@ -563,3 +563,48 @@ func TestE2EDeployWrongReqIsFinalAndPersisted(t *testing.T) {
 		t.Fatal("the admitted deploy has no registry row")
 	}
 }
+
+// Task 10 (contract §5.1, design B4) through /submit with x-includes-off-chain-values: an issuer payout under a
+// p color derivation, then a holder transfer whose envelope is {"outputs":[…]} only, both attested on tm_color_<id>.
+func TestE2EColorHolderFlow(t *testing.T) {
+	e2eDB(t, e2eNode)
+	o := e2eBoot(t, e2eNode, nil, false)
+	I, H, R := mandalatest.Issuer, mandalatest.Holder, mandalatest.Receiver
+
+	dep := mandalatest.Deploy(t, I, "TUSD")
+	id := mandalatest.TokenIDOf(dep, 0)
+	tm := mandala.TokenTopicOfTxid(dep.Txid)
+	steak := e2eAdmit(t, o, dep, mandala.MandalaTopic, tm)
+	e2eSigma(t, mandala.MandalaTopic, dep.Txid, steak[mandala.MandalaTopic], []uint32{0})
+	e2eSigma(t, tm, dep.Txid, steak[tm], []uint32{0})
+
+	r1 := &mandalatest.ColorRemittance{Prefix: "AAAAAAAAAAAAAAAAAAAAAA==", Suffix: "BBBBBBBBBBBBBBBBBBBBBB=="}
+	iss := mandalatest.IssueTo(t, dep, 0, I, H, 1000, r1)
+	e2eSigma(t, tm, iss.Txid, e2eAdmit(t, o, iss, tm)[tm], []uint32{0, 1})
+
+	r2 := &mandalatest.ColorRemittance{Prefix: "pppppppppppppppppppppppppppppppppppppppppppppppp", Suffix: "ssssssssssssssssssssssssssssssssssssssssssssssss"}
+	r3 := &mandalatest.ColorRemittance{Prefix: "CCCCCCCCCCCCCCCCCCCCCC==", Suffix: "DDDDDDDDDDDDDDDDDDDDDD=="}
+	tr := mandalatest.BuildWith(t, []mandalatest.In{{Src: iss, Vout: 1}}, []mandalatest.Out{
+		{Owner: R, Prover: H, TokenID: id, Amount: 600, Color: r2},
+		{Owner: H, Prover: H, TokenID: id, Amount: 400, Color: r3},
+	}, nil, mandalatest.BuildOptions{OutputsOnlyEnvelope: true})
+	if !bytes.HasPrefix(tr.OffChain, []byte(`{"outputs":[`)) || bytes.Contains(tr.OffChain, []byte(`"inputs"`)) {
+		t.Fatalf("not an outputs-only envelope: %s", tr.OffChain)
+	}
+	first := e2eAdmit(t, o, tr, tm)
+	if len(first) != 1 {
+		t.Fatalf("holder transfer STEAK = %+v, want only %s", first, tm)
+	}
+	e2eSigma(t, tm, tr.Txid, first[tm], []uint32{0, 1})
+	if h, r := e2eBalance(t, o, H), e2eBalance(t, o, R); h != 400 || r != 600 {
+		t.Fatalf("balances holder %d receiver %d, want 400 and 600", h, r)
+	}
+	// double-submit: the same attestation bytes, nothing moves
+	second := e2eAdmit(t, o, tr, tm)[tm]
+	if second.AdmissionSignature != first[tm].AdmissionSignature || !slices.Equal(second.OutputsToAdmit, first[tm].OutputsToAdmit) {
+		t.Fatalf("replay %+v differs from %+v", second, first[tm])
+	}
+	if h, r := e2eBalance(t, o, H), e2eBalance(t, o, R); h != 400 || r != 600 {
+		t.Fatalf("balances after the replay holder %d receiver %d, want 400 and 600", h, r)
+	}
+}

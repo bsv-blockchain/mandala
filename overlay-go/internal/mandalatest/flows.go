@@ -59,6 +59,21 @@ func Issue(t testing.TB, auth *Built, authVout uint32, issuer, to Party, amount 
 	}, nil)
 }
 
+// IssueTo is Issue with a 1Color payout (design B4): output 0 is the new authority under the Mandala
+// derivation; output 1 pays amount to `to` under ColorProtocol(tokenID, *r), keyID "color", proved by issuer.
+func IssueTo(t testing.TB, auth *Built, authVout uint32, issuer, to Party, amount uint64, r *ColorRemittance) *Built {
+	t.Helper()
+	if r == nil {
+		t.Fatal("mandalatest: IssueTo needs a remittance; use Issue for a Mandala payout")
+	}
+	tokenID := TokenIDOf(auth, authVout)
+	details := Details(brc162.CborMap{"kind": "issue"})
+	return Build(t, []In{{Src: auth, Vout: authVout}}, []Out{
+		{Owner: issuer, Prover: issuer, TokenID: tokenID, Payload: AdmPayload(sha256.Sum256(details)), HasPayload: true, Details: details},
+		{Owner: to, Prover: issuer, TokenID: tokenID, Amount: amount, Color: r},
+	}, nil)
+}
+
 // Transfer spends src:vout (owner = src.Outs[vout].Owner): output 0 pays amount to `to`; output 1
 // returns the change to the owner and is omitted when the change is 0.
 func Transfer(t testing.TB, src *Built, vout uint32, to Party, amount uint64) *Built {

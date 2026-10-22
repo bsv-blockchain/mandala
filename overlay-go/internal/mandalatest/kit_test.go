@@ -68,7 +68,8 @@ func requireOutputs(t *testing.T, b *Built, want []wantOut) {
 			t.Fatalf("output %d: token %q, want %q", n, gotID, w.tokenID)
 		}
 		spec := b.Outs[n]
-		wantPKH := hash.Hash160(lockPubKey(t, spec.Prover, spec.Owner, keyIDOf(uint32(n))))
+		proto, keyID := derivationOf(spec, uint32(n))
+		wantPKH := hash.Hash160(lockPubKey(t, spec.Prover, spec.Owner, proto, keyID))
 		if !bytes.Equal(d.RestPubKeyHash, wantPKH) {
 			t.Fatalf("output %d: pkh %x, want the BRC-42 child %x", n, d.RestPubKeyHash, wantPKH)
 		}
@@ -258,5 +259,52 @@ func TestEveryBuildHasItsOwnFunding(t *testing.T) {
 	a, b := Deploy(t, Issuer, "USD"), Deploy(t, Issuer, "USD")
 	if a.Txid == b.Txid {
 		t.Fatal("two identical deploy specs produced one txid")
+	}
+}
+
+// Task 10 (contract §0, §5.1): the p color tuple, IssueTo's payout and the outputs-only holder envelope.
+func TestColorDerivationAndOutputsOnlyEnvelope(t *testing.T) {
+	tid := strings.Repeat("ab", 32) + "_0"
+	if got := AssetTag(tid); got != strings.Repeat("ab", 32)+"v0" {
+		t.Fatalf("AssetTag = %q", got)
+	}
+	r := ColorRemittance{Prefix: "AAAAAAAAAAAAAAAAAAAAAA==", Suffix: "p"}
+	want := "p color " + strings.Repeat("ab", 32) + "v0 " + hex.EncodeToString([]byte(r.Prefix)) + " 70"
+	if p := ColorProtocol(tid, r); p.SecurityLevel != wallet.SecurityLevelEveryAppAndCounterparty || p.Protocol != want {
+		t.Fatalf("ColorProtocol = %+v, want [2 %q]", p, want)
+	}
+
+	d := Deploy(t, Issuer, "TUSD")
+	id := TokenIDOf(d, 0)
+	is := IssueTo(t, d, 0, Issuer, Holder, 1000, &r)
+	verifies(t, is)
+	p := probe(t, is)
+	var auth, pay linkageProbe
+	if len(p.Outputs) != 2 || json.Unmarshal(p.Outputs[0].Linkage, &auth) != nil || json.Unmarshal(p.Outputs[1].Linkage, &pay) != nil {
+		t.Fatalf("IssueTo envelope: %s", is.OffChain)
+	}
+	if auth.KeyID != "out-0" || auth.ProtocolID[1] != FTProtocol.Protocol {
+		t.Fatalf("authority output left the Mandala derivation: %+v", auth)
+	}
+	if pay.KeyID != ColorKeyID || pay.ProtocolID[1] != ColorProtocol(id, r).Protocol || pay.Prover != Issuer.Identity || pay.Counterparty != Holder.Identity {
+		t.Fatalf("payout linkage: %+v", pay)
+	}
+
+	long := ColorRemittance{Prefix: strings.Repeat("p", 48), Suffix: strings.Repeat("s", 48)}
+	tr := BuildWith(t, []In{{Src: is, Vout: 1}}, []Out{
+		{Owner: Receiver, Prover: Holder, TokenID: id, Amount: 600, Color: &long},
+		{Owner: Holder, Prover: Holder, TokenID: id, Amount: 400, Color: &r},
+	}, nil, BuildOptions{OutputsOnlyEnvelope: true})
+	verifies(t, tr) // the spend key derives with the coin's p color tuple
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(tr.OffChain, &keys); err != nil || len(keys) != 1 || keys["outputs"] == nil || !bytes.HasPrefix(tr.OffChain, []byte(`{"outputs":[{"index":0,`)) {
+		t.Fatalf("outputs-only envelope: %s", tr.OffChain)
+	}
+	if p := probe(t, tr); len(p.Outputs) != 2 || p.Outputs[0].Index != 0 || p.Outputs[1].Index != 1 {
+		t.Fatalf("outputs-only entries: %s", tr.OffChain)
+	}
+	// the default options keep the full envelope shape
+	if full := BuildWith(t, []In{{Src: tr, Vout: 1}}, []Out{{Owner: Receiver, Prover: Holder, TokenID: id, Amount: 400, Color: &r}}, nil, BuildOptions{}); !bytes.HasPrefix(full.OffChain, []byte(`{"inputs":[],"outputs":[`)) {
+		t.Fatalf("default envelope: %s", full.OffChain)
 	}
 }
