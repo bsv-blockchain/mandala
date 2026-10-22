@@ -22,7 +22,7 @@ import { MAX_UINT64 } from './amount.js'
 import { notifyClear, notifyList, reconcileNotifications } from './notifyJournal.js'
 import { blindingClear, blindingGet, blindingListReserved } from './blindingJournal.js'
 import { hasFreshIntent, journalClear, journalList } from './txJournal.js'
-import { adminAuthInFlightPrior, clearAdminAuthGates } from './adminAuthGate.js'
+import { adminAuthInFlightPrior, clearAdminAuthGates, StaleAdminAuthError } from './adminAuthGate.js'
 import { attestationFromSteak, verifyAttestation, type Attestation } from './attestation.js'
 import { handoverBody, issuerAttestedLeaf, newRemittance, ReceiptUnavailableError } from './receipt.js'
 import { OVERLAY_KEY, signedSteak } from './__fixtures__/overlaySigner.js'
@@ -481,6 +481,11 @@ describe('reissue through the payout path (submitAdminAction ftOutput)', () => {
     expect(adminAuthInFlightPrior(ID)).toBeUndefined()
     expect(mb.sendMessage).not.toHaveBeenCalled()
     expect(await notifyList()).toEqual([])
+    // A caller that retries anyway with its stale asset fails closed: the
+    // wallet no longer lists the spent authority.
+    wallet.listOutputs.mockImplementation(async () => ({ outputs: [], BEEF: [1] }) as any)
+    await expect(reissue()).rejects.toBeInstanceOf(StaleAdminAuthError)
+    expect(wallet.createAction).toHaveBeenCalledTimes(1)
   })
 
   it('a failed send keeps the journaled body and reports notified false; the action is not failed', async () => {
