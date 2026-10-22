@@ -1,12 +1,11 @@
 /**
  * Recovery-machinery regression tests for the robustness audit fixes:
  * per-entry journal atomicity, intent markers, abort retention,
- * already-broadcast detection, notification retry, receive verification,
- * and cross-tab lock semantics.
+ * already-broadcast detection, notification retry, and cross-tab lock
+ * semantics.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { PrivateKey, Hash, Transaction, P2PKH, LockingScript, UnlockingScript } from '@bsv/sdk'
-import { MandalaToken } from './__fixtures__/token.js'
 import type { MandalaActionDetails } from './brc162.js'
 import {
   journalPut,
@@ -26,7 +25,6 @@ import {
   reconcileNotifications,
   PendingNotification
 } from './notifyJournal.js'
-import { receiveTokens, InvalidTransferError } from './receive.js'
 import { tryWithLock } from './webLocks.js'
 import { isAlreadyBroadcast, submitAndBroadcast } from './overlay.js'
 import { submitAdminAction } from './assets.js'
@@ -143,75 +141,6 @@ describe('notification journal', () => {
     const delivered = await reconcileNotifications(mbc)
     expect(delivered).toEqual([])
     expect((await notifyList())[0]?.attempts).toBe(1)
-  })
-})
-
-describe('receive verification', () => {
-  const pkh = Hash.hash160(PrivateKey.fromRandom().toPublicKey().encode(true) as number[])
-  const assetId = `${'a'.repeat(64)}_0`
-
-  const mkMbc = (messages: Array<{ messageId: string, body: any }>) => ({
-    listMessages: vi.fn().mockResolvedValue(messages),
-    acknowledgeMessage: vi.fn().mockResolvedValue({})
-  })
-
-  it('acks and drops a message whose transaction does not parse (poisoned)', async () => {
-    const mbc = mkMbc([{
-      messageId: 'm1',
-      body: { assetId, amount: '25', sender: '02ab', keyID: 'k', protocolID: [2, 'p mandala token'], transaction: [1, 2, 3], outputIndex: 0 }
-    }])
-    const wallet = mkWallet()
-    const { accepted, failed } = await receiveTokens({ wallet: wallet as any, messageBoxClient: mbc })
-    expect(accepted).toEqual([])
-    expect(failed).toHaveLength(1)
-    expect(failed[0].error).toBeInstanceOf(InvalidTransferError)
-    // Poisoned message is acknowledged so it never replays.
-    expect(mbc.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m1'] })
-    // And the wallet was never touched.
-    expect(wallet.internalizeAction).not.toHaveBeenCalled()
-  })
-
-  it('treats an already-internalized output as success and acknowledges', async () => {
-    const { Transaction: Tx, P2PKH, UnlockingScript } = await import('@bsv/sdk')
-    const src = new Tx()
-    src.addOutput({ satoshis: 2, lockingScript: new P2PKH().lock(pkh) })
-    const tx = new Tx()
-    tx.addInput({ sourceTransaction: src, sourceOutputIndex: 0, unlockingScript: new UnlockingScript([]), sequence: 0xffffffff })
-    tx.addOutput({ satoshis: 1, lockingScript: new MandalaToken().lock(assetId, 25, pkh) })
-    const atomic = tx.toAtomicBEEF(true)
-
-    const mbc = mkMbc([{
-      messageId: 'm2',
-      body: { assetId, amount: '25', sender: '02ab', keyID: 'k', protocolID: [2, 'p mandala token'], transaction: atomic, outputIndex: 0 }
-    }])
-    const wallet = mkWallet({
-      internalizeAction: vi.fn().mockRejectedValue(new Error('output already exists in basket'))
-    })
-    const { accepted, failed } = await receiveTokens({ wallet: wallet as any, messageBoxClient: mbc })
-    expect(failed).toEqual([])
-    expect(accepted).toHaveLength(1)
-    expect(mbc.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m2'] })
-  })
-
-  it('rejects a body/output mismatch (wrong amount) without wallet work', async () => {
-    const { Transaction: Tx, P2PKH, UnlockingScript } = await import('@bsv/sdk')
-    const src = new Tx()
-    src.addOutput({ satoshis: 2, lockingScript: new P2PKH().lock(pkh) })
-    const tx = new Tx()
-    tx.addInput({ sourceTransaction: src, sourceOutputIndex: 0, unlockingScript: new UnlockingScript([]), sequence: 0xffffffff })
-    tx.addOutput({ satoshis: 1, lockingScript: new MandalaToken().lock(assetId, 25, pkh) })
-    const atomic = tx.toAtomicBEEF(true)
-
-    const mbc = mkMbc([{
-      messageId: 'm3',
-      body: { assetId, amount: '1000000', sender: '02ab', keyID: 'k', protocolID: [2, 'p mandala token'], transaction: atomic, outputIndex: 0 }
-    }])
-    const wallet = mkWallet()
-    const { accepted, failed } = await receiveTokens({ wallet: wallet as any, messageBoxClient: mbc })
-    expect(accepted).toEqual([])
-    expect(failed[0].error).toBeInstanceOf(InvalidTransferError)
-    expect(String(failed[0].error)).toMatch(/amount mismatch/)
-    expect(wallet.internalizeAction).not.toHaveBeenCalled()
   })
 })
 

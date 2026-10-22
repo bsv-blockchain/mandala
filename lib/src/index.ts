@@ -1,10 +1,11 @@
 /**
  * @bsv/mandala — token client for Mandala overlay assets.
  *
- * High-level facade: create a client once, then send / receive / admin any
- * asset. Every pipeline is overlay-first (noSend → overlay submit → sendWith
- * broadcast) with journaled recovery; see transfer.ts / overlay.ts /
- * reconcile.ts for the mechanics.
+ * High-level facade: create a client once, then admin any asset. Every
+ * pipeline is overlay-first (noSend → overlay submit → sendWith broadcast)
+ * with journaled recovery; see overlay.ts / reconcile.ts for the mechanics.
+ * Holder value moves only through BRC-207 receipts (send/receive return in
+ * the 1Color rewrite).
  *
  * Lower-level building blocks (coin selection, guards, journal, reconcile)
  * are exported via subpaths, e.g. `@bsv/mandala/ftSelect`.
@@ -12,9 +13,6 @@
 import { WalletClient, WalletInterface } from '@bsv/sdk'
 import { MessageBoxClient } from '@bsv/message-box-client'
 import { configureMandala, MandalaEndpoints, MESSAGEBOX_URL } from './constants.js'
-import { transferTokens, TransferResult } from './transfer.js'
-import { EvidenceSource } from './handover.js'
-import { receiveTokens, ReceiveResult, SettleFn } from './receive.js'
 import {
   AdminAsset,
   listAdminAssets,
@@ -30,38 +28,11 @@ export interface MandalaClientOptions extends MandalaEndpoints {
   wallet?: WalletInterface
 }
 
-export interface SendArgs {
-  assetId: string
-  /** Recipient identity key (hex compressed pubkey). */
-  counterparty: string
-  /** Base units (integer). */
-  amount: number
-  /**
-   * `'handover'` builds and signs the payment but contacts NOTHING — the
-   * recipient submits (offline settlement §0.1). Defaults to `'submit'`, the
-   * online rail.
-   */
-  mode?: 'submit' | 'handover'
-  /** Evidence source for `'handover'` mode; defaults to the lib's journals. */
-  evidence?: EvidenceSource
-}
-
-export interface ReceiveArgs {
-  /** Only accept transfers of this asset; others stay pending. */
-  assetId?: string
-  /** Override how a credited offline hand-over is settled with the overlay. */
-  settle?: SettleFn
-}
-
 export type AdminArgs = Omit<SubmitAdminActionParams, 'wallet' | 'messageBoxClient' | 'identityKey'>
 
 export interface MandalaClient {
   wallet: WalletInterface
   identityKey: () => Promise<string>
-  /** Transfer tokens to a counterparty (overlay-gated, journaled). */
-  send: (args: SendArgs) => Promise<TransferResult>
-  /** Internalize + acknowledge all pending incoming transfers. */
-  receive: (args?: ReceiveArgs) => Promise<ReceiveResult>
   /**
    * Submit a regulatory/treasury admin action (freeze, pause, reissue, …).
    * `notified` is false when a reissue committed but the recipient notify is
@@ -102,30 +73,9 @@ export function createMandalaClient (opts: MandalaClientOptions = {}): MandalaCl
     }))
     return messageBoxPromise
   }
-  const processed = new Set<string>()
-
   return {
     wallet,
     identityKey,
-    send: async ({ assetId, counterparty, amount, mode, evidence }) =>
-      transferTokens({
-        wallet: wallet as any,
-        messageBoxClient: await messageBox(),
-        identityKey: await identityKey(),
-        assetId,
-        amount,
-        recipientKey: counterparty,
-        ...(mode != null ? { mode } : {}),
-        ...(evidence != null ? { evidence } : {})
-      }),
-    receive: async (args = {}) =>
-      receiveTokens({
-        wallet,
-        messageBoxClient: await messageBox(),
-        assetId: args.assetId,
-        ...(args.settle != null ? { settle: args.settle } : {}),
-        processed
-      }),
     admin: async args =>
       submitAdminAction({
         ...args,
@@ -153,10 +103,6 @@ export * from './authority.js'
 export * from './txJournal.js'
 export * from './overlay.js'
 export * from './admission.js'
-export * from './bundle.js'
-export * from './transfer.js'
-export * from './handover.js'
-export * from './receive.js'
 export * from './assets.js'
 export * from './issuerOps.js'
 export * from './registry.js'
