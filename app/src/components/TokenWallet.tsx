@@ -4,7 +4,8 @@ import AssetAccount from './holder/AssetAccount'
 
 interface SelectedAsset {
   assetId: string
-  balance: number
+  /** Exact `p color balance` units (BRC-207 view). */
+  balance: bigint
 }
 
 interface Props {

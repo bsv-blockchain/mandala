@@ -141,4 +141,21 @@ describe('robustness wiring (shipped source)', () => {
     expect(mut).toMatch(/guardIssueSubmit\(\{[\s\S]*bankRef/)
     expect(mut).toMatch(/issueTokens\(\{[\s\S]*depositHash/)
   })
+
+  it('holder views read no basket and format bigint amounts', () => {
+    for (const f of ['components/holder/HolderHome.tsx', 'components/holder/AssetAccount.tsx', 'components/holder/TransactionHistory.tsx', 'components/holder/AlertBanners.tsx', 'components/TokenWallet.tsx']) {
+      const s = src(f)
+      expect(s).not.toMatch(/\bBASKET\b/)
+      expect(s).not.toContain('decodeValue')
+      expect(s).not.toContain("'@bsv/mandala/amount'")
+    }
+    const a = src('components/holder/AlertBanners.tsx')
+    expect(a).toContain('frozenUnitsFor(')
+    expect(a).not.toContain('listOutputs')
+    const h = src('components/holder/HolderHome.tsx')
+    expect(h).toContain('holderLines(')
+    // unsettled is already inside the balance and incoming is outside it: never summed
+    expect(h).not.toMatch(/balance\s*\+\s*(row\.|a\.|asset\.)?(incoming|unsettled)|(incoming|unsettled)\s*\+\s*(row\.|a\.|asset\.)?balance/)
+    expect(h).not.toMatch(/\.pending\b/)
+  })
 })

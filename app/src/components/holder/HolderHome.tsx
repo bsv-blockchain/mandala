@@ -20,7 +20,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { ArrowDownLeft, ArrowUpRight, Bell, Send, Download, Users, RefreshCw, ChevronDown } from 'lucide-react'
 import { HistoryRow } from '@bsv/mandala/history'
-import { currencySymbol, formatAmount } from '@bsv/mandala/amount'
+import { currencySymbol, displayAmount } from '../../lib/mandala/amountDisplay'
+import { holderLines } from '../../lib/mandala/holderLines'
 import { useHolderData } from '../../hooks/useHolderData'
 import { useWallet } from '../../context/WalletContext'
 import { CounterpartyDisplay } from '../CounterpartyDisplay'
@@ -124,7 +125,7 @@ function RecentRow({ row, decimals, ticker }: { row: HistoryRow; decimals: numbe
   // replaces them on the next refetch.
   const isPending = row.txid.startsWith('pending-')
   const symbol = currencySymbol(ticker)
-  const formatted = `${isCredit ? '+' : '−'}${symbol}${formatAmount(row.amount, decimals)}`
+  const formatted = `${isCredit ? '+' : '−'}${symbol}${displayAmount(row.amount, decimals)}`
   const cp = row.counterparty !== '' ? shortCounterparty(row.counterparty) : directionLabel(row.direction)
   const when = isPending ? 'Sending…' : relativeTime(row.when)
 
@@ -176,7 +177,7 @@ function RecentRow({ row, decimals, ticker }: { row: HistoryRow; decimals: numbe
 export type HolderAction = 'send' | 'contacts' | 'receive'
 
 interface Props {
-  onSelect: (assetId: string, balance: number) => void
+  onSelect: (assetId: string, balance: bigint) => void
   onAction?: (action: HolderAction, assetId?: string) => void
   identityKey?: string | null
 }
@@ -211,7 +212,7 @@ export default function HolderHome({ onSelect: _onSelect, onAction, identityKey 
     if (assets.length === 0) return
     const valid = currentAssetId !== '' && assets.some(a => a.assetId === currentAssetId)
     if (valid) return
-    const def = assets.find(a => a.balance > 0)?.assetId ?? assets[0]?.assetId
+    const def = assets.find(a => a.balance !== null && a.balance > 0n)?.assetId ?? assets[0]?.assetId
     if (def == null) return
     setSearchParams(prev => {
       const next = new URLSearchParams(prev)
@@ -391,20 +392,46 @@ export default function HolderHome({ onSelect: _onSelect, onAction, identityKey 
           <div className="mt-[7px] h-12 w-44 animate-pulse rounded-full bg-muted" />
         ) : currentAsset ? (
           (() => {
+            // hero is the `p color balance` view, which already contains the
+            // unsettled part; incoming (pending) is outside it. Each line is
+            // formatted on its own and never added to the hero (plan A6).
+            const lines = holderLines(currentAsset, currentAsset.meta.decimals)
+            if (currentAsset.balance === null) {
+              return (
+                <div className="mt-[7px]">
+                  <div className="flex items-baseline">
+                    <span className="text-[44px] font-semibold leading-none tracking-[-1.5px] text-subtle-foreground">
+                      {lines.hero}
+                    </span>
+                  </div>
+                  <p className="mt-[6px] text-[12px] leading-none text-subtle-foreground">Balance unavailable</p>
+                  {lines.incoming && (
+                    <p className="mt-[6px] tabular text-[12px] leading-none text-subtle-foreground">{lines.incoming}</p>
+                  )}
+                </div>
+              )
+            }
             const sym = currencySymbol(currentAsset.meta.ticker)
-            const full = formatAmount(currentAsset.balance, currentAsset.meta.decimals)
-            const dotIdx = full.indexOf('.')
-            const whole = dotIdx >= 0 ? full.slice(0, dotIdx) : full
-            const frac = dotIdx >= 0 ? full.slice(dotIdx) : ''
+            const dotIdx = lines.hero.indexOf('.')
+            const whole = dotIdx >= 0 ? lines.hero.slice(0, dotIdx) : lines.hero
+            const frac = dotIdx >= 0 ? lines.hero.slice(dotIdx) : ''
             return (
-              <div className="mt-[7px] flex items-baseline gap-[2px]">
-                <span className="tabular text-[44px] font-semibold leading-none tracking-[-1.5px]">
-                  {sym}{whole}
-                </span>
-                {frac && (
-                  <span className="tabular text-[24px] font-semibold leading-none tracking-[-0.3px] text-subtle-foreground">
-                    {frac}
+              <div className="mt-[7px]">
+                <div className="flex items-baseline gap-[2px]">
+                  <span className="tabular text-[44px] font-semibold leading-none tracking-[-1.5px]">
+                    {sym}{whole}
                   </span>
+                  {frac && (
+                    <span className="tabular text-[24px] font-semibold leading-none tracking-[-0.3px] text-subtle-foreground">
+                      {frac}
+                    </span>
+                  )}
+                </div>
+                {lines.unsettled && (
+                  <p className="mt-[6px] tabular text-[12px] leading-none text-subtle-foreground">{lines.unsettled}</p>
+                )}
+                {lines.incoming && (
+                  <p className="mt-[6px] tabular text-[12px] leading-none text-subtle-foreground">{lines.incoming}</p>
                 )}
               </div>
             )
