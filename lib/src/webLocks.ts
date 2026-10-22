@@ -14,6 +14,8 @@
  *                                registerFlight covers same-tab re-entry only
  *   'mandala.admin.<assetId>'  — per-asset admin-auth spend (adminAuthGate.ts)
  *   'mandala.reconcile'        — the recovery pass (reconcile.ts)
+ *   'mandala.notify'           — the notification retry/redelivery pass
+ *                                (notifyJournal.ts reconcileNotifications)
  */
 
 export interface TryLockResult<T> {

@@ -48,7 +48,8 @@ import {
 } from './overlay.js'
 import type { Attestation } from './attestation.js'
 import {
-  HandoverJournalEntry, JournalEntry, journalGet, journalIntentBegin, journalIntentEnd, journalPut, journalRemove
+  HandoverJournalEntry, JournalEntry, journalGet, journalIntentBegin, journalIntentEnd, journalPromoteSigned, journalPut,
+  journalRemove
 } from './txJournal.js'
 import { notifyPut, notifyRemove } from './notifyJournal.js'
 import { handoverBody, MessageBoxSender, newRemittance, ReceiptInstruction } from './receipt.js'
@@ -391,9 +392,7 @@ export async function deliverHandover (p: {
  * send) or any other stage it resolves without writing.
  */
 export async function markHandoverDelivered (txid: string): Promise<void> {
-  const entry = await journalGet(txid)
-  if (entry?.stage !== 'signed') return
-  await journalPut({ ...entry, stage: 'delivered' })
+  await journalPromoteSigned(txid)
 }
 
 // ---------------------------------------------------------------------------
@@ -427,12 +426,18 @@ function subjectTxid (tx: number[]): string | undefined {
  * - refused: a final verdict; the journaled reference is aborted (a failed
  *   abort leaves an 'abort' entry) and the entry is dropped.
  */
-export async function settleHandover (p: {
+export async function settleHandover (p: SettleParams): Promise<SettleResult> {
+  return await settleChecked(p, true)
+}
+
+interface SettleParams {
   wallet: WalletInterface
   handover: Pick<HandoverResult, 'txid' | 'tx' | 'offChainValues'>
   assetId: string
   overlayIdentityKey: string
-}): Promise<SettleResult> {
+}
+
+async function settleChecked (p: SettleParams, broadcast: boolean): Promise<SettleResult> {
   if (p?.overlayIdentityKey === '' || p?.overlayIdentityKey == null) throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
   if (OVERLAY_URL === '') throw new Error(OVERLAY_URL_UNSET)
   checkKey(p.overlayIdentityKey, 'overlayIdentityKey')
@@ -445,7 +450,7 @@ export async function settleHandover (p: {
   if (!Array.isArray(offChainValues) || offChainValues.length === 0) {
     throw new TypeError('@bsv/mandala: handover.offChainValues must be the non-empty envelope bytes')
   }
-  return await settleOnce(p.wallet, { txid, tx, offChainValues, assetId, overlayIdentityKey: p.overlayIdentityKey })
+  return await settleOnce(p.wallet, { txid, tx, offChainValues, assetId, overlayIdentityKey: p.overlayIdentityKey, broadcast })
 }
 
 /**
@@ -453,13 +458,21 @@ export async function settleHandover (p: {
  * journaled `submit.txHex` / `offChainHex` on `[colorTopic(assetId)]`,
  * verified against `overlayIdentityKey`, with the same verdict handling.
  * Reused by reconcile (Task 15).
+ *
+ * `opts.broadcast` (default true) starts the background `sendWith` after an
+ * admission, exactly as `settleHandover` does. Reconcile passes `false`: it
+ * broadcasts the 'accepted' entry itself, so its attempt counting, stranding
+ * and `ReconcileOptions.broadcast: false` (a host drain owns the broadcast)
+ * all hold. Throws exactly where `settleHandover` throws (S5, malformed or
+ * stale bytes).
  */
 export async function resubmitDelivered (
   wallet: WalletInterface,
   entry: HandoverJournalEntry,
-  overlayIdentityKey: string
+  overlayIdentityKey: string,
+  opts: { broadcast?: boolean } = {}
 ): Promise<SettleResult> {
-  return await settleHandover({
+  return await settleChecked({
     wallet,
     handover: {
       txid: entry.txid,
@@ -468,7 +481,7 @@ export async function resubmitDelivered (
     },
     assetId: entry.assetId,
     overlayIdentityKey
-  })
+  }, opts.broadcast !== false)
 }
 
 interface SettleArgs {
@@ -477,6 +490,8 @@ interface SettleArgs {
   offChainValues: number[]
   assetId: string
   overlayIdentityKey: string
+  /** Start the background sendWith after an admission (false: the caller broadcasts). */
+  broadcast: boolean
 }
 
 function settleOnce (wallet: WalletInterface, a: SettleArgs): Promise<SettleResult> {
@@ -524,6 +539,7 @@ async function settlePipeline (wallet: WalletInterface, a: SettleArgs): Promise<
     offChainHex: Utils.toHex(a.offChainValues),
     ...admissionReceipt(admitted)
   })
+  if (!a.broadcast) return { status: 'admitted', attestation }
   void broadcastAcceptedTx(wallet, a.txid)
     .then(async posted => {
       if (posted) {

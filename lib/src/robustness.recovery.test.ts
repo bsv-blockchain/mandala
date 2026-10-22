@@ -5,7 +5,7 @@
  * semantics.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { PrivateKey } from '@bsv/sdk'
+import { Beef, LockingScript, PrivateKey, Transaction, Utils } from '@bsv/sdk'
 import {
   journalPut,
   journalList,
@@ -27,7 +27,9 @@ import { tryWithLock } from './webLocks.js'
 import { isAlreadyBroadcast, submitAndBroadcast } from './overlay.js'
 import { registerAsset } from './issuerOps.js'
 import { BusyError } from './singleFlight.js'
-import { configureMandala } from './constants.js'
+import { configureMandala, MESSAGEBOX } from './constants.js'
+import { handoverBody } from './receipt.js'
+import { colorTopic } from './naming.js'
 
 // Label lookup only; an unconfigured overlay URL now throws (see overlayUrlGuard.test.ts),
 // and these tests are about journal/receive ordering, not metadata.
@@ -118,14 +120,14 @@ describe('reconcile abort retention', () => {
 
 describe('notification journal', () => {
   it('retries pending notifications and clears on delivery', async () => {
-    await notifyPut({ txid: 't1', recipient: '02ab', messageBox: 'mandala-payments', body: { assetId: 'a.0' }, at: 1 })
+    await notifyPut({ txid: 't1', recipient: '02ab', messageBox: MESSAGEBOX, body: { assetId: 'a.0' }, at: 1 })
     const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
     const delivered = await reconcileNotifications(mbc)
     expect(delivered).toEqual(['t1'])
     expect(await notifyList()).toEqual([])
     expect(mbc.sendMessage).toHaveBeenCalledWith({
       recipient: '02ab',
-      messageBox: 'mandala-payments',
+      messageBox: MESSAGEBOX,
       body: { assetId: 'a.0' }
     })
   })
@@ -136,6 +138,127 @@ describe('notification journal', () => {
     const delivered = await reconcileNotifications(mbc)
     expect(delivered).toEqual([])
     expect((await notifyList())[0]?.attempts).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 15: hand-over redelivery. A 'signed' entry (crash between sign and
+// deliver, or a deliver whose journal write was lost) is redelivered from the
+// journal; a successful resend promotes 'signed' to 'delivered'.
+// ---------------------------------------------------------------------------
+
+describe('reconcileNotifications — hand-over redelivery', () => {
+  const ASSET = `${'c7'.repeat(32)}_0`
+  const RECIPIENT = '02' + '7b'.repeat(32)
+  const tip = new Transaction()
+  tip.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
+  const tipBeef = new Beef(); tipBeef.mergeTransaction(tip)
+  const TXID = tip.id('hex')
+  const TX = tipBeef.toBinaryAtomic(TXID)
+  const RECEIPT = {
+    version: 1 as const,
+    assetId: ASSET,
+    derivationPrefix: 'cHJlZml4',
+    derivationSuffix: 'c3VmZml4',
+    senderIdentityKey: '02' + '11'.repeat(32),
+    profileData: { 'https://brc.dev/207/attested': { [ASSET]: { submissions: [] } } }
+  }
+  const signedEntry = (over: Record<string, unknown> = {}): any => ({
+    txid: TXID,
+    stage: 'signed',
+    at: Date.now() - 61_000,
+    reference: 'ref-s',
+    assetId: ASSET,
+    recipientKey: RECIPIENT,
+    outputIndex: 0,
+    note: 'for lunch',
+    receipt: JSON.stringify(RECEIPT),
+    submit: { txHex: Utils.toHex(TX), offChainHex: '0708', topics: [colorTopic(ASSET)] },
+    ...over
+  })
+  const stageOf = async (txid: string): Promise<string | undefined> => (await journalList()).find(e => e.txid === txid)?.stage
+
+  it('redelivers a signed entry older than 60 s that has no pending notification, rebuilt from the journal, and promotes it', async () => {
+    await journalPut(signedEntry())
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    const delivered = await reconcileNotifications(mbc)
+    expect(mbc.sendMessage).toHaveBeenCalledTimes(1)
+    const sent = mbc.sendMessage.mock.calls[0][0]
+    expect(sent.recipient).toBe(RECIPIENT)
+    expect(sent.messageBox).toBe(MESSAGEBOX)
+    expect(sent.body.v).toBe(3)
+    expect(sent.body).toEqual(handoverBody({ assetId: ASSET, outputIndex: 0, tx: TX, receipt: RECEIPT, note: 'for lunch' }))
+    expect(delivered).toEqual([TXID])
+    expect(await stageOf(TXID)).toBe('delivered')
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('leaves a signed entry aged 10 s alone (a live send is still delivering it)', async () => {
+    await journalPut(signedEntry({ at: Date.now() - 10_000 }))
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    expect(await reconcileNotifications(mbc)).toEqual([])
+    expect(mbc.sendMessage).not.toHaveBeenCalled()
+    expect(await stageOf(TXID)).toBe('signed')
+  })
+
+  it('a pending mandala-color notification for a signed entry is resent once (not rebuilt too) and promotes the entry', async () => {
+    await journalPut(signedEntry())
+    const body = handoverBody({ assetId: ASSET, outputIndex: 0, tx: TX, receipt: RECEIPT })
+    await notifyPut({ txid: TXID, recipient: RECIPIENT, messageBox: MESSAGEBOX, body, at: 1 })
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    expect(await reconcileNotifications(mbc)).toEqual([TXID])
+    expect(mbc.sendMessage).toHaveBeenCalledTimes(1)
+    expect(mbc.sendMessage.mock.calls[0][0].body).toEqual(body)
+    expect(await stageOf(TXID)).toBe('delivered')
+  })
+
+  it('a failed redelivery journals the notification (attempts 1) and keeps the entry signed; the next pass resends it once', async () => {
+    await journalPut(signedEntry())
+    const down = { sendMessage: vi.fn().mockRejectedValue(new Error('box down')) }
+    expect(await reconcileNotifications(down)).toEqual([])
+    expect(down.sendMessage).toHaveBeenCalledTimes(1)
+    expect(await notifyList()).toMatchObject([{ txid: TXID, recipient: RECIPIENT, messageBox: MESSAGEBOX, attempts: 1 }])
+    expect(await stageOf(TXID)).toBe('signed')
+
+    const up = { sendMessage: vi.fn().mockResolvedValue({}) }
+    expect(await reconcileNotifications(up)).toEqual([TXID])
+    expect(up.sendMessage).toHaveBeenCalledTimes(1)
+    expect(await stageOf(TXID)).toBe('delivered')
+    expect(await notifyList()).toEqual([])
+  })
+
+  it('a resend never touches a txid whose entry is not signed (payout notifications, accepted entries)', async () => {
+    await journalPut({ txid: TXID, stage: 'accepted', at: 1 })
+    await notifyPut({ txid: TXID, recipient: RECIPIENT, messageBox: MESSAGEBOX, body: {}, at: 1 })
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    expect(await reconcileNotifications(mbc)).toEqual([TXID])
+    expect(await stageOf(TXID)).toBe('accepted')
+  })
+
+  it('never redelivers a signed entry whose journaled bytes do not hash to its txid', async () => {
+    await journalPut(signedEntry({ txid: 'f'.repeat(64) }))
+    const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      expect(await reconcileNotifications(mbc)).toEqual([])
+    } finally {
+      warn.mockRestore()
+    }
+    expect(mbc.sendMessage).not.toHaveBeenCalled()
+    expect(await stageOf('f'.repeat(64))).toBe('signed')
+  })
+
+  it('two concurrent passes deliver once', async () => {
+    await journalPut(signedEntry())
+    let release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    const mbc = { sendMessage: vi.fn().mockImplementation(async () => { await gate; return {} }) }
+    const first = reconcileNotifications(mbc)
+    const second = reconcileNotifications(mbc)
+    release()
+    const [a, b] = await Promise.all([first, second])
+    expect(mbc.sendMessage).toHaveBeenCalledTimes(1)
+    expect([...a, ...b]).toEqual([TXID])
   })
 })
 

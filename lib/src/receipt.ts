@@ -79,25 +79,11 @@ export function issuerReceipt (p: {
   }
 }
 
-/** The MessageBox hand-over body (C§7.2). No amount: the recipient reads it from the script. */
-export function handoverBody (p: {
-  assetId: string
-  outputIndex: number
-  /** AtomicBEEF of the tip. */
-  tx: number[]
-  receipt: ReceiptInstruction
-  note?: string
-}): object {
-  return {
-    v: 3,
-    kind: 'handover',
-    assetId: p.assetId,
-    outputIndex: p.outputIndex,
-    tx: Utils.toHex(p.tx),
-    receipt: p.receipt,
-    ...(p.note != null ? { note: p.note } : {})
-  }
-}
+/**
+ * The MessageBox hand-over body (C§7.2). Defined in notifyJournal.ts, which
+ * rebuilds it for redelivery (Task 15) and must not import this module back.
+ */
+export { handoverBody } from './notifyJournal.js'
 
 /**
  * Deliver `body` for committed tx `txid` on MESSAGEBOX. The notification is

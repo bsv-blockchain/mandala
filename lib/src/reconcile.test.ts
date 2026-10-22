@@ -596,18 +596,28 @@ describe('reconcileWallet — bulk sweep guards', () => {
   })
 })
 
-describe('reconcileWallet — delivered entries (the sender’s post-ACK submit)', () => {
+describe('reconcileWallet — hand-over entries (signed / delivered, Task 15)', () => {
   const mockFetch = vi.fn()
   const OVERLAY = 'http://test-overlay'
+  const RECIPIENT = '02' + '7b'.repeat(32)
 
-  const handedOver = (over: Record<string, unknown> = {}): any => ({
-    txid: 'ho',
+  /** A well-formed HandoverJournalEntry over SUBJECT (its bytes hash to SUBJECT_TXID). */
+  const handover = (over: Record<string, unknown> = {}): any => ({
+    txid: SUBJECT_TXID,
     stage: 'delivered',
     at: 1,
     reference: 'ref-ho',
+    assetId: ASSET,
+    recipientKey: RECIPIENT,
+    outputIndex: 0,
+    receipt: JSON.stringify({ version: 1, assetId: ASSET }),
     submit: { txHex: BEEF_HEX, offChainHex: '0708', topics: [colorTopic(ASSET)] },
     ...over
   })
+
+  const respond = (status: number, body: unknown): void => {
+    mockFetch.mockResolvedValueOnce({ ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(body) })
+  }
 
   beforeEach(() => {
     mockFetch.mockReset()
@@ -616,58 +626,174 @@ describe('reconcileWallet — delivered entries (the sender’s post-ACK submit)
   })
   afterEach(() => { vi.unstubAllGlobals() })
 
-  it('never submits, aborts or sweeps a signed (unacknowledged) hand-over', async () => {
-    await journalPut(handedOver({ stage: 'signed' }))
-    const wallet = mkWallet()
+  it('a signed entry is never submitted, aborted or swept, and is counted as awaiting delivery', async () => {
+    await journalPut(handover({ stage: 'signed' }))
+    const wallet = mkWallet({ listActions: vi.fn().mockResolvedValue({ actions: [staleAction({ reference: 'ref-a' })] }) })
     const r = await reconcileWallet(wallet as any)
     expect(mockFetch).not.toHaveBeenCalled()
     expect(wallet.abortAction).not.toHaveBeenCalled()
     expect(wallet.listActions).not.toHaveBeenCalled()
     expect(r.swept).toBe(0)
-    expect(await journalList()).toMatchObject([{ txid: 'ho', stage: 'signed' }])
+    expect(r.handoversAwaitingDelivery).toBe(1)
+    expect(await journalList()).toMatchObject([{ txid: SUBJECT_TXID, stage: 'signed' }])
   })
 
-  it('re-POSTs the stored bytes when online and commits + broadcasts on acceptance', async () => {
-    await journalPut(handedOver())
-    const steak = await signedSteak(SUBJECT_TXID, { [colorTopic(ASSET)]: [0, 1] })
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify(steak)
+  it('an empty journal reports no hand-overs awaiting delivery', async () => {
+    const r = await reconcileWallet(mkWallet() as any)
+    expect(r.handoversAwaitingDelivery).toBe(0)
+  })
+
+  it('a delivered entry is re-POSTed with the exact journaled bytes on its color topic and, admitted, goes accepted then sendWith', async () => {
+    await journalPut(handover())
+    respond(200, await signedSteak(SUBJECT_TXID, { [colorTopic(ASSET)]: [0, 1] }))
+    const order: string[] = []
+    const wallet = mkWallet({
+      createAction: vi.fn().mockImplementation(async (args: any) => {
+        // THE COMMIT POINT precedes the broadcast: the entry is already 'accepted'.
+        order.push(`broadcast:${(await journalList())[0]?.stage}`)
+        return posted(args)
+      })
     })
-    const wallet = mkWallet()
     const r = await reconcileWallet(wallet as any)
-    expect(mockFetch.mock.calls[0][0]).toBe(`${OVERLAY}/submit`)
-    expect(mockFetch.mock.calls[0][1].headers['X-Topics']).toBe(JSON.stringify([colorTopic(ASSET)]))
-    expect(r.resubmitted).toEqual(['ho'])
-    expect(r.rebroadcast).toEqual(['ho'])
+    const [url, init] = mockFetch.mock.calls[0]
+    expect(url).toBe(`${OVERLAY}/submit`)
+    expect(init.headers['X-Topics']).toBe(JSON.stringify([colorTopic(ASSET)]))
+    expect([...init.body]).toEqual(framed([0x07, 0x08]))
+    expect(wallet.createAction).toHaveBeenCalledTimes(1)
+    expect(wallet.createAction).toHaveBeenCalledWith({
+      description: 'broadcast overlay-accepted tx',
+      options: { sendWith: [SUBJECT_TXID], acceptDelayedBroadcast: false }
+    })
+    expect(order).toEqual(['broadcast:accepted'])
+    expect(r.resubmitted).toEqual([SUBJECT_TXID])
+    expect(r.rebroadcast).toEqual([SUBJECT_TXID])
+    expect(wallet.abortAction).not.toHaveBeenCalled()
     expect(await journalList()).toEqual([])
   })
 
-  it('keeps the entry (and blocks the bulk sweep) while the overlay is unreachable', async () => {
-    await journalPut(handedOver())
+  it('an admitted delivered entry whose broadcast fails stays accepted with its attestation σ', async () => {
+    await journalPut(handover())
+    const steak = await signedSteak(SUBJECT_TXID, { [colorTopic(ASSET)]: [0] })
+    respond(200, steak)
+    const wallet = mkWallet({ createAction: vi.fn().mockRejectedValue(new Error('net down')) })
+    const r = await reconcileWallet(wallet as any)
+    expect(r.resubmitted).toEqual([SUBJECT_TXID])
+    expect(r.rebroadcast).toEqual([])
+    expect(await journalList()).toMatchObject([{
+      txid: SUBJECT_TXID,
+      stage: 'accepted',
+      reference: 'ref-ho',
+      attempts: 1,
+      admissionSignature: steak[colorTopic(ASSET)].admissionSignature,
+      admissionIdentityKey: OVERLAY_KEY
+    }])
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+  })
+
+  it('a retryable verdict (ERR_FROZEN) keeps the entry with attempts + 1, never aborts, and blocks the sweep', async () => {
+    await journalPut(handover())
+    respond(409, { status: 'error', code: 'ERR_FROZEN', retryable: true, description: 'frozen' })
+    const wallet = mkWallet({ listActions: vi.fn().mockResolvedValue({ actions: [staleAction({ reference: 'ref-a' })] }) })
+    const r = await reconcileWallet(wallet as any)
+    expect(await journalList()).toMatchObject([{ txid: SUBJECT_TXID, stage: 'delivered', attempts: 1, code: 'ERR_FROZEN' }])
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+    expect(wallet.listActions).not.toHaveBeenCalled()
+    expect(r.resubmitted).toEqual([])
+    expect(r.stranded).toEqual([])
+  })
+
+  it('at RETRY_CAP a still-retryable delivered entry is parked as stranded, never aborted', async () => {
+    await journalPut(handover({ attempts: RETRY_CAP - 1 }))
+    respond(409, { status: 'error', code: 'ERR_FROZEN', retryable: true, description: 'frozen' })
+    const wallet = mkWallet()
+    const r = await reconcileWallet(wallet as any)
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+    expect(r.stranded).toEqual([SUBJECT_TXID])
+    expect(await journalList()).toMatchObject([{ txid: SUBJECT_TXID, stage: 'stranded', attempts: RETRY_CAP, reference: 'ref-ho' }])
+    expect((await journalListStranded()).map(e => e.txid)).toEqual([SUBJECT_TXID])
+  })
+
+  it('a transport failure counts as a retry (attempts + 1), never aborts', async () => {
+    await journalPut(handover())
     mockFetch.mockRejectedValue(new Error('offline'))
     const wallet = mkWallet()
     const r = await reconcileWallet(wallet as any)
-    expect(await journalList()).toMatchObject([{ txid: 'ho', stage: 'delivered', attempts: 1 }])
+    expect(await journalList()).toMatchObject([{ txid: SUBJECT_TXID, stage: 'delivered', attempts: 1 }])
     expect(wallet.abortAction).not.toHaveBeenCalled()
-    // The noSend action behind a handed-over tx still holds its inputs on
-    // purpose — sweeping it would invalidate evidence the payee already has.
     expect(wallet.listActions).not.toHaveBeenCalled()
     expect(r.swept).toBe(0)
   })
 
-  it('aborts the reference and drops the entry on a FINAL refusal', async () => {
-    await journalPut(handedOver())
-    mockFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 400,
-      text: async () => JSON.stringify({ status: 'error', code: 'ERR_CONSERVATION', retryable: false })
-    })
+  it('a FINAL verdict (ERR_CONSERVATION) aborts the journaled reference and drops the entry', async () => {
+    await journalPut(handover())
+    respond(400, { status: 'error', code: 'ERR_CONSERVATION', retryable: false, description: 'nope' })
+    const wallet = mkWallet()
+    const r = await reconcileWallet(wallet as any)
+    expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-ho' })
+    expect(r.aborted).toEqual([SUBJECT_TXID])
+    expect(await journalList()).toEqual([])
+  })
+
+  it('S5: with no overlay identity key every delivered entry is left untouched, nothing is sent, one warning', async () => {
+    configureMandala({ overlayIdentityKey: '' })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await journalPut(handover({ attempts: RETRY_CAP - 1 }))
+      await journalPut(handover({ txid: 'e'.repeat(64), at: 2 }))
+      const wallet = mkWallet()
+      const r = await reconcileWallet(wallet as any)
+      expect(mockFetch).not.toHaveBeenCalled()
+      expect(wallet.abortAction).not.toHaveBeenCalled()
+      expect(wallet.listActions).not.toHaveBeenCalled()
+      expect(r.resubmitted).toEqual([])
+      expect(r.stranded).toEqual([])
+      expect(await journalList()).toMatchObject([
+        { txid: SUBJECT_TXID, stage: 'delivered', attempts: RETRY_CAP - 1 },
+        { txid: 'e'.repeat(64), stage: 'delivered' }
+      ])
+      expect((await journalList())[1].attempts).toBeUndefined()
+      expect(warn.mock.calls.filter(c => /overlay identity key/i.test(String(c[0])))).toHaveLength(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('a delivered entry whose journaled bytes do not hash to its txid is never submitted or aborted, and the pass goes on', async () => {
+    await journalPut(handover({ txid: 'f'.repeat(64), at: 1 }))
+    await journalPut({ txid: 'bb', stage: 'abort', reference: 'ref-b', at: 2 })
+    const wallet = mkWallet()
+    const r = await reconcileWallet(wallet as any)
+    expect(mockFetch).not.toHaveBeenCalled()
+    expect(wallet.abortAction).not.toHaveBeenCalledWith({ reference: 'ref-ho' })
+    expect(r.aborted).toEqual(['bb'])
+    expect(await journalList()).toMatchObject([{ txid: 'f'.repeat(64), stage: 'delivered', attempts: 1 }])
+  })
+
+  it('a malformed delivered entry (no assetId) is never submitted or aborted; it is stranded at RETRY_CAP', async () => {
+    await journalPut(handover({ assetId: undefined }))
     const wallet = mkWallet()
     await reconcileWallet(wallet as any)
-    expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-ho' })
-    expect(await journalList()).toEqual([])
+    expect(mockFetch).not.toHaveBeenCalled()
+    expect(await journalList()).toMatchObject([{ txid: SUBJECT_TXID, stage: 'delivered', attempts: 1 }])
+
+    await journalPut(handover({ assetId: undefined, attempts: RETRY_CAP - 1 }))
+    const r = await reconcileWallet(wallet as any)
+    expect(mockFetch).not.toHaveBeenCalled()
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+    expect(r.stranded).toEqual([SUBJECT_TXID])
+    expect(await journalList()).toMatchObject([{ txid: SUBJECT_TXID, stage: 'stranded' }])
+  })
+
+  it('broadcast: false journals the acceptance of a delivered entry and leaves the broadcast to the host', async () => {
+    await journalPut(handover())
+    respond(200, await signedSteak(SUBJECT_TXID, { [colorTopic(ASSET)]: [0] }))
+    const wallet = mkWallet()
+    const r = await reconcileWallet(wallet as any, { sweep: false, broadcast: false })
+    expect(r.resubmitted).toEqual([SUBJECT_TXID])
+    // Give any stray background broadcast a chance to run before asserting none happened.
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(wallet.createAction).not.toHaveBeenCalled()
+    expect(await journalList()).toMatchObject([{ txid: SUBJECT_TXID, stage: 'accepted', reference: 'ref-ho' }])
   })
 })
 
@@ -684,31 +810,5 @@ describe('reconcileWallet — broadcast: false leaves accepted entries to the ho
     expect(wallet.createAction).not.toHaveBeenCalled()
     expect(await journalList()).toMatchObject([{ txid: 'aa', stage: 'accepted' }])
     expect((await journalList())[0].attempts).toBeUndefined()
-  })
-
-  it('still re-submits a delivered entry and journals the acceptance', async () => {
-    const { PrivateKey, Beef, LockingScript, Transaction, Utils } = await import('@bsv/sdk')
-    const { admissionMessageV3 } = await import('./admission.js')
-    const overlayKey = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000f6')
-    const tx = new Transaction()
-    tx.addOutput({ satoshis: 1, lockingScript: LockingScript.fromHex('51') })
-    const beef = new Beef(); beef.mergeTransaction(tx)
-    const txid = tx.id('hex')
-    const sig = Utils.toHex(overlayKey.sign(Utils.toArray(admissionMessageV3('tm_mandala', txid, [0]), 'utf8')).toDER() as number[])
-    configureMandala({ overlayUrl: 'https://overlay.test', overlayIdentityKey: overlayKey.toPublicKey().toString(), messageBoxUrl: 'https://box.test' })
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
-      ok: true, status: 200,
-      text: async () => JSON.stringify({ tm_mandala: { outputsToAdmit: [0], admissionSignature: sig, admissionIdentityKey: overlayKey.toPublicKey().toString() } })
-    } as any)
-    try {
-      await journalPut({ txid, stage: 'delivered', at: 1, reference: 'ref', submit: { txHex: Utils.toHex(beef.toBinaryAtomic(txid)), topics: ['tm_mandala'] } })
-      const wallet = mkWallet()
-      const r = await reconcileWallet(wallet as any, { sweep: false, broadcast: false })
-      expect(r.resubmitted).toEqual([txid])
-      expect(wallet.createAction).not.toHaveBeenCalled()
-      expect(await journalList()).toMatchObject([{ txid, stage: 'accepted', reference: 'ref' }])
-    } finally {
-      fetchSpy.mockRestore()
-    }
   })
 })

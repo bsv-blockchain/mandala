@@ -28,7 +28,8 @@
  *                acknowledged delivery yet. NEVER submitted, aborted or swept
  *                automatically: the recipient may already hold these bytes,
  *                so releasing the inputs would invalidate a payment in
- *                flight. Recovery = redeliver the receipt (Task 15).
+ *                flight. Recovery = redeliver the receipt
+ *                (notifyJournal reconcileNotifications, after 60 s).
  *   'delivered'— the hand-over was acknowledged (MessageBox sendMessage
  *                resolved, or the host's own ACK). The sender may now submit
  *                the exact journaled bytes (settleHandover / reconcile):
@@ -165,7 +166,8 @@ export type HandoverJournalEntry = JournalEntry & {
   submit: { txHex: string, offChainHex: string, topics: string[] }
 }
 
-function isHandoverEntry (e: JournalEntry): e is HandoverJournalEntry {
+/** True for a well-formed 'signed' / 'delivered' hand-over entry (every field a redelivery or resubmit reads). */
+export function isHandoverEntry (e: JournalEntry): e is HandoverJournalEntry {
   return (e.stage === 'signed' || e.stage === 'delivered') &&
     typeof e.assetId === 'string' && typeof e.recipientKey === 'string' &&
     typeof e.outputIndex === 'number' && typeof e.receipt === 'string' &&
@@ -194,6 +196,19 @@ export async function journalGet (txid: string): Promise<JournalEntry | undefine
   } catch {
     return undefined
   }
+}
+
+/**
+ * 'signed' → 'delivered' for one txid (the body of `markHandoverDelivered`,
+ * here so notifyJournal's redelivery can promote without importing
+ * handover.ts). Idempotent. With no entry or any other stage it resolves
+ * without writing: a 'delivered', 'accepted' or 'abort' entry is never
+ * moved backwards, and a payout notification (no 'signed' entry) is a no-op.
+ */
+export async function journalPromoteSigned (txid: string): Promise<void> {
+  const entry = await journalGet(txid)
+  if (entry?.stage !== 'signed') return
+  await journalPut({ ...entry, stage: 'delivered' })
 }
 
 /**
