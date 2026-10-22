@@ -140,8 +140,26 @@ func detKeyLess(a, b string) int {
 	return bytes.Compare([]byte(a), []byte(b))
 }
 
-func detDecodeMap(b []byte, fail func(string) error) (brc162.CborMap, error) {
-	m, err := brc162.DecodeStrictCbor(b)
+// Mandala CBOR policy (contract §4.1, D14). The codec reads full strict DAG-CBOR with no size cap
+// and a 1024 depth bound (templates parity); Mandala reads a deploy payload of at most 65536 bytes,
+// admin details and authority payloads of at most 4096, each nested at most 64 deep.
+const (
+	MaxDeployPayloadBytes = 65536
+	MaxAdminDetailsBytes  = 4096
+	MandalaCborMaxDepth   = 64
+)
+
+// decodeMandalaCbor applies the Mandala size limit, then reads strict DAG-CBOR at depth <= 64.
+// Every error is a *brc162.StrictCborError.
+func decodeMandalaCbor(b []byte, maxBytes int) (brc162.CborMap, error) {
+	if len(b) > maxBytes {
+		return nil, &brc162.StrictCborError{Message: fmt.Sprintf("input exceeds %d bytes", maxBytes)}
+	}
+	return brc162.DecodeStrictCborLimit(b, MandalaCborMaxDepth)
+}
+
+func detDecodeMap(b []byte, maxBytes int, fail func(string) error) (brc162.CborMap, error) {
+	m, err := decodeMandalaCbor(b, maxBytes)
 	if err != nil {
 		var se *brc162.StrictCborError
 		if errors.As(err, &se) {
@@ -152,9 +170,9 @@ func detDecodeMap(b []byte, fail func(string) error) (brc162.CborMap, error) {
 	return m, nil
 }
 
-// DecodeAdminDetails reads admin details against D §3.3 in TS order: lowercase hex, strict CBOR,
-// kind, the first unknown key in CBOR key order, then each key of the kind (required, optional,
-// reason), then sha256 of the bytes. Every refusal is rDetailsSchema(outputIndex, detail).
+// DecodeAdminDetails reads admin details against D §3.3 in TS order: lowercase hex, strict CBOR
+// under the Mandala policy (4096 bytes, depth 64), kind, the first unknown key in CBOR key order,
+// then each key of the kind (required, optional, reason), then sha256 of the bytes. Every refusal is rDetailsSchema(outputIndex, detail).
 func DecodeAdminDetails(detailsHex string, allowed []string, outputIndex uint32) (AdminDetails, [32]byte, error) {
 	fail := func(detail string) error { return rDetailsSchema(outputIndex, detail) }
 	if !detHexPairs.MatchString(detailsHex) {
@@ -164,7 +182,7 @@ func DecodeAdminDetails(detailsHex string, allowed []string, outputIndex uint32)
 	if err != nil {
 		return AdminDetails{}, [32]byte{}, fail("details must be lowercase hex")
 	}
-	m, err := detDecodeMap(raw, fail)
+	m, err := detDecodeMap(raw, MaxAdminDetailsBytes, fail)
 	if err != nil {
 		return AdminDetails{}, [32]byte{}, err
 	}
@@ -296,8 +314,8 @@ func detLabel(v any, max int) (string, bool) {
 }
 
 // ParseDeployMetadata reads the deploy payload {sym, dec, label, feeRatePerKb?} (unknown keys
-// ignored) in TS order: missing payload, non-canonical push, strict CBOR, sym, dec, label, fee
-// rate. Every refusal is rDeployPayload(detail).
+// ignored) in TS order: missing payload, non-canonical push, strict CBOR under the Mandala policy
+// (65536 bytes, depth 64), sym, dec, label, fee rate. Every refusal is rDeployPayload(detail).
 func ParseDeployMetadata(payload []byte, hasPayload, canonical bool) (DeployMetadata, error) {
 	if !hasPayload {
 		return DeployMetadata{}, rDeployPayload("missing payload")
@@ -305,7 +323,7 @@ func ParseDeployMetadata(payload []byte, hasPayload, canonical bool) (DeployMeta
 	if !canonical {
 		return DeployMetadata{}, rDeployPayload("non-canonical payload push")
 	}
-	m, err := detDecodeMap(payload, func(detail string) error { return rDeployPayload(detail) })
+	m, err := detDecodeMap(payload, MaxDeployPayloadBytes, func(detail string) error { return rDeployPayload(detail) })
 	if err != nil {
 		return DeployMetadata{}, err
 	}
@@ -342,13 +360,14 @@ func ParseDeployMetadata(payload []byte, hasPayload, canonical bool) (DeployMeta
 }
 
 // CommitmentOf reads the authority payload {adm: bytes(32)} (other keys ignored). A missing,
-// non-canonical or non-strict payload is simply no commitment, never a refusal.
+// non-canonical or non-strict payload, or one outside the Mandala limits (4096 bytes, depth 64), is
+// simply no commitment, never a refusal.
 func CommitmentOf(payload []byte, hasPayload, canonical bool) ([32]byte, bool) {
 	if !hasPayload || !canonical {
 		return [32]byte{}, false
 	}
-	m, ok := brc162.TryDecodeStrictCbor(payload)
-	if !ok {
+	m, err := decodeMandalaCbor(payload, MaxAdminDetailsBytes)
+	if err != nil {
 		return [32]byte{}, false
 	}
 	adm, ok := m["adm"].([]byte)

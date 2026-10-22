@@ -3,17 +3,23 @@ package brc162
 import (
 	"bytes"
 	"fmt"
+	"math"
+	"math/big"
 	"sort"
 	"unicode/utf8"
 )
 
-// Strict DAG-CBOR subset (design §3.5), a line-for-line port of @bsv/templates
-// strictCbor.ts (ts-stack 37468f290). The messages and the order the checks run
-// in are a cross-engine contract (fact base ts-codec §6.3, §6.5).
-const (
-	StrictCborMaxBytes = 4096
-	StrictCborMaxDepth = 4
-)
+// Strict DAG-CBOR (the IPLD profile), which BRC-162 requires payloads to be read as (0162:148):
+// definite lengths, minimal integer arguments, text keys in canonical order (shorter first, then
+// bytewise) without duplicates, floats only as finite 64-bit values, no simple values beyond
+// false/true/null, and tag 42 (a CID link) as the only tag. A check-for-check port of @bsv/templates
+// strictCbor.ts at ts-stack cbdccfe5b: the messages and the order the checks run in are a
+// cross-engine contract, and every refusal reaches a Mandala reject reason byte for byte.
+//
+// The spec sets no size limit, and neither does the codec. StrictCborMaxDepth bounds container
+// nesting only, so hostile input cannot exhaust the stack. Size and depth limits that are Mandala
+// policy live in internal/mandala (contract §4.1, D14).
+const StrictCborMaxDepth = 1024
 
 // StrictCborError is TS StrictCborError; Message is the exact contract string.
 type StrictCborError struct{ Message string }
@@ -22,13 +28,33 @@ func (e *StrictCborError) Error() string { return e.Message }
 
 func cborFail(message string) error { return &StrictCborError{Message: message} }
 
-// CborMap values from DecodeStrictCbor are exactly: uint64 (major 0), []byte (2), string (3), nil (f6), bool (f4/f5),
-// CborMap (5). EncodeStrictCbor also accepts int, int64 and uint32 >= 0. Go-only encoder messages: a string that is not
-// valid UTF-8 -> "invalid UTF-8"; an unsupported Go type -> "unsupported value type"; a negative integer -> "integer
-// outside 0..2^64-1"; plus the TS "map nesting deeper than 4" (checked first) and "encoding exceeds 4096 bytes" (last).
+// CborMap is a strict-CBOR map. Values from DecodeStrictCbor are exactly: uint64 (major 0), *big.Int
+// (major 1; always negative, = -1-arg, down to -2^64), []byte (2), string (3), []any (4), CborMap
+// (5), CborLink (tag 42), float64 (finite, from 0xfb only), bool and nil.
+//
+// EncodeStrictCbor / EncodeStrictCborValue accept that set plus int, int64 and uint32, and any
+// *big.Int in -2^64..2^64-1. A float64 always encodes as 0xfb plus 8 bytes, so every decoded value
+// re-encodes to its input bytes. This differs from TS on purpose: TS encodes an integral number (1.0,
+// -0.0) as an integer, because JS cannot keep the distinction; Go keeps the float. Go-only encoder
+// messages: invalid UTF-8 text -> "invalid UTF-8" (TS: a lone surrogate), a NaN or infinite float ->
+// "number must be a safe integer or a finite float", any other Go type -> "unsupported value type".
 type CborMap map[string]any
 
-// cborHeader is the minimal definite-length header (strictCbor.ts:45-52).
+// CborLink is a tag 42 link: the CID bytes, which begin with the 0x00 identity multibase prefix.
+type CborLink struct{ CID []byte }
+
+const cidTag = 42
+
+var (
+	cborMinInteger = new(big.Int).Neg(new(big.Int).Lsh(big.NewInt(1), 64)) // -2^64
+	cborMaxInteger = new(big.Int).SetUint64(math.MaxUint64)                // 2^64-1
+)
+
+func tooDeep(maxDepth int) error { return cborFail(fmt.Sprintf("nesting deeper than %d", maxDepth)) }
+
+func isCid(b []byte) bool { return len(b) > 0 && b[0] == 0 }
+
+// cborHeader is the minimal definite-length header (strictCbor.ts header()).
 func cborHeader(major byte, v uint64) []byte {
 	m := major << 5
 	switch {
@@ -53,6 +79,42 @@ func encodeText(s string) ([]byte, error) {
 	return append(cborHeader(3, uint64(len(s))), s...), nil
 }
 
+// encodeSigned: a negative int64 is major 1 with argument -1-v, which is always in range.
+func encodeSigned(v int64) []byte {
+	if v >= 0 {
+		return cborHeader(0, uint64(v))
+	}
+	return cborHeader(1, uint64(-1-v))
+}
+
+// encodeBig ports encodeInteger (strictCbor.ts): -2^64..2^64-1.
+func encodeBig(v *big.Int) ([]byte, error) {
+	if v.Cmp(cborMinInteger) < 0 || v.Cmp(cborMaxInteger) > 0 {
+		return nil, cborFail("integer outside -2^64..2^64-1")
+	}
+	if v.Sign() >= 0 {
+		return cborHeader(0, v.Uint64()), nil
+	}
+	arg := new(big.Int).Neg(v)
+	arg.Sub(arg, big.NewInt(1))
+	return cborHeader(1, arg.Uint64()), nil
+}
+
+func encodeFloat(f float64) ([]byte, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil, cborFail("number must be a safe integer or a finite float")
+	}
+	bits := math.Float64bits(f)
+	return []byte{0xfb, byte(bits >> 56), byte(bits >> 48), byte(bits >> 40), byte(bits >> 32), byte(bits >> 24), byte(bits >> 16), byte(bits >> 8), byte(bits)}, nil
+}
+
+func encodeLink(l CborLink) ([]byte, error) {
+	if !isCid(l.CID) {
+		return nil, cborFail("invalid CID")
+	}
+	return append(append([]byte{0xd8, cidTag}, cborHeader(2, uint64(len(l.CID)))...), l.CID...), nil
+}
+
 func encodeValue(v any, depth int) ([]byte, error) {
 	switch x := v.(type) {
 	case uint64:
@@ -60,15 +122,16 @@ func encodeValue(v any, depth int) ([]byte, error) {
 	case uint32:
 		return cborHeader(0, uint64(x)), nil
 	case int:
-		if x < 0 {
-			return nil, cborFail("integer outside 0..2^64-1")
-		}
-		return cborHeader(0, uint64(x)), nil
+		return encodeSigned(int64(x)), nil
 	case int64:
-		if x < 0 {
-			return nil, cborFail("integer outside 0..2^64-1")
+		return encodeSigned(x), nil
+	case *big.Int:
+		if x == nil {
+			return nil, cborFail("unsupported value type")
 		}
-		return cborHeader(0, uint64(x)), nil
+		return encodeBig(x)
+	case float64:
+		return encodeFloat(x)
 	case string:
 		return encodeText(x)
 	case nil:
@@ -80,6 +143,10 @@ func encodeValue(v any, depth int) ([]byte, error) {
 		return []byte{0xf4}, nil
 	case []byte:
 		return append(cborHeader(2, uint64(len(x))), x...), nil
+	case CborLink:
+		return encodeLink(x)
+	case []any:
+		return encodeArray(x, depth+1)
 	case CborMap:
 		return encodeMap(x, depth+1)
 	default:
@@ -87,11 +154,27 @@ func encodeValue(v any, depth int) ([]byte, error) {
 	}
 }
 
-// encodeMap (strictCbor.ts:97-107): depth first, then every key, then the
-// entries sorted by encoded key bytes (equals DAG-CBOR length-first order).
+// encodeArray (strictCbor.ts encodeArray): depth first, then each item in order.
+func encodeArray(items []any, depth int) ([]byte, error) {
+	if depth > StrictCborMaxDepth {
+		return nil, tooDeep(StrictCborMaxDepth)
+	}
+	out := cborHeader(4, uint64(len(items)))
+	for _, item := range items {
+		b, err := encodeValue(item, depth)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b...)
+	}
+	return out, nil
+}
+
+// encodeMap (strictCbor.ts encodeMap): depth first, then every key, then the entries sorted by
+// encoded key bytes (equals DAG-CBOR length-first order).
 func encodeMap(m CborMap, depth int) ([]byte, error) {
 	if depth > StrictCborMaxDepth {
-		return nil, cborFail("map nesting deeper than 4")
+		return nil, tooDeep(StrictCborMaxDepth)
 	}
 	type entry struct {
 		key   []byte
@@ -117,25 +200,23 @@ func encodeMap(m CborMap, depth int) ([]byte, error) {
 	return out, nil
 }
 
-// EncodeStrictCbor ports encodeStrictCbor (strictCbor.ts:109-116); keys sorted
-// by encoded bytes (length-first); the 4096-byte limit is checked last.
+// EncodeStrictCbor ports encodeStrictCbor (strictCbor.ts): a map, keys sorted by encoded bytes
+// (length-first). There is no size limit.
 func EncodeStrictCbor(m CborMap) ([]byte, error) {
 	if m == nil {
 		return nil, cborFail("top level must be a map")
 	}
-	out, err := encodeMap(m, 1)
-	if err != nil {
-		return nil, err
-	}
-	if len(out) > StrictCborMaxBytes {
-		return nil, cborFail("encoding exceeds 4096 bytes")
-	}
-	return out, nil
+	return encodeMap(m, 1)
 }
 
+// EncodeStrictCborValue encodes any single value of the encodable set (see CborMap) at the top
+// level, where a map or an array counts as depth 1.
+func EncodeStrictCborValue(v any) ([]byte, error) { return encodeValue(v, 0) }
+
 type cborReader struct {
-	b   []byte
-	pos int
+	b        []byte
+	pos      int
+	maxDepth int
 }
 
 func (r *cborReader) next() (byte, error) {
@@ -156,40 +237,48 @@ func (r *cborReader) take(n int) ([]byte, error) {
 
 var cborMinimum = [4]uint64{24, 0x100, 0x10000, 0x100000000}
 
-// head returns [major, value]; refuses indefinite/reserved and non-minimal
-// headers for every major type, before the caller looks at the major type
-// (strictCbor.ts:139-150).
-func (r *cborReader) head() (byte, uint64, error) {
+// head returns (major, additional info, argument); it refuses indefinite/reserved and non-minimal
+// headers before the caller looks at the major type (strictCbor.ts Reader.head). A float's argument
+// is its IEEE 754 bits and is not subject to minimality; a one-byte simple value must be 32 or
+// more, as smaller ones have a one-byte form.
+func (r *cborReader) head() (byte, byte, uint64, error) {
 	b, err := r.next()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	major, info := b>>5, b&0x1f
 	if info < 24 {
-		return major, uint64(info), nil
+		return major, info, uint64(info), nil
 	}
 	if info > 27 {
 		if info == 31 {
-			return 0, 0, cborFail("indefinite length")
+			return 0, 0, 0, cborFail("indefinite length")
 		}
-		return 0, 0, cborFail("reserved additional info")
+		return 0, 0, 0, cborFail("reserved additional info")
 	}
 	raw, err := r.take(1 << (info - 24))
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	var v uint64
 	for _, x := range raw {
 		v = v<<8 | uint64(x)
 	}
-	if v < cborMinimum[info-24] {
-		return 0, 0, cborFail("non-minimal header")
+	if major == 7 {
+		if info == 24 && v < 32 {
+			return 0, 0, 0, cborFail("non-minimal header")
+		}
+		return major, info, v, nil
 	}
-	return major, v, nil
+	if v < cborMinimum[info-24] {
+		return 0, 0, 0, cborFail("non-minimal header")
+	}
+	return major, info, v, nil
 }
 
-// count compares with the TOTAL input length, not the remaining bytes
-// (strictCbor.ts:153-156): "length exceeds input" vs "truncated input".
+// count compares with the TOTAL input length, not the remaining bytes (strictCbor.ts
+// Reader.count): "length exceeds input" vs "truncated input". A count is never used as an
+// allocation hint: each of a chain of nested containers may claim up to the whole input length.
 func (r *cborReader) count(v uint64) (int, error) {
 	if v > uint64(len(r.b)) {
 		return 0, cborFail("length exceeds input")
@@ -197,8 +286,16 @@ func (r *cborReader) count(v uint64) (int, error) {
 	return int(v), nil
 }
 
-// decodeText: strict RFC 3629 UTF-8. utf8.Valid is exactly the TS hand
-// validator's accept set (fact base ts-codec §6.4, brute-force verified).
+func (r *cborReader) counted(v uint64) ([]byte, error) {
+	n, err := r.count(v)
+	if err != nil {
+		return nil, err
+	}
+	return r.take(n)
+}
+
+// decodeText: strict RFC 3629 UTF-8. utf8.Valid is exactly the TS hand validator's accept set (no
+// overlongs, no surrogates, max U+10FFFF; fact base ts-codec §6.4, brute-force verified).
 func decodeText(b []byte) (string, error) {
 	if !utf8.Valid(b) {
 		return "", cborFail("invalid UTF-8")
@@ -206,77 +303,123 @@ func decodeText(b []byte) (string, error) {
 	return string(b), nil
 }
 
+// simpleOrFloat ports decodeSimpleOrFloat (strictCbor.ts).
+func simpleOrFloat(info byte, v uint64) (any, error) {
+	if info == 27 {
+		f := math.Float64frombits(v)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, cborFail("non-finite float")
+		}
+		return f, nil
+	}
+	if info == 25 || info == 26 {
+		return nil, cborFail("float must be 64-bit")
+	}
+	switch v {
+	case 20:
+		return false, nil
+	case 21:
+		return true, nil
+	case 22:
+		return nil, nil
+	}
+	return nil, cborFail("simple value not allowed")
+}
+
+// link ports decodeLink (strictCbor.ts): the tag number first, then the content at the same depth,
+// then the CID check.
+func (r *cborReader) link(tag uint64, depth int) (any, error) {
+	if tag != cidTag {
+		return nil, cborFail("only tag 42 is allowed")
+	}
+	content, err := r.value(depth)
+	if err != nil {
+		return nil, err
+	}
+	cid, ok := content.([]byte)
+	if !ok || !isCid(cid) {
+		return nil, cborFail("invalid CID")
+	}
+	return CborLink{CID: cid}, nil
+}
+
+// value ports decodeValue (strictCbor.ts).
 func (r *cborReader) value(depth int) (any, error) {
-	major, v, err := r.head()
+	major, info, v, err := r.head()
 	if err != nil {
 		return nil, err
 	}
 	switch major {
 	case 0:
 		return v, nil
+	case 1:
+		n := new(big.Int).SetUint64(v)
+		return n.Sub(big.NewInt(-1), n), nil
 	case 2:
-		n, err := r.count(v)
-		if err != nil {
-			return nil, err
-		}
-		raw, err := r.take(n)
+		raw, err := r.counted(v)
 		if err != nil {
 			return nil, err
 		}
 		return append([]byte{}, raw...), nil
 	case 3:
-		n, err := r.count(v)
-		if err != nil {
-			return nil, err
-		}
-		raw, err := r.take(n)
+		raw, err := r.counted(v)
 		if err != nil {
 			return nil, err
 		}
 		return decodeText(raw)
+	case 4:
+		n, err := r.count(v)
+		if err != nil {
+			return nil, err
+		}
+		return r.arrayBody(n, depth+1)
 	case 5:
 		n, err := r.count(v)
 		if err != nil {
 			return nil, err
 		}
 		return r.mapBody(n, depth+1)
-	case 7:
-		switch v {
-		case 20:
-			return false, nil
-		case 21:
-			return true, nil
-		case 22:
-			return nil, nil
-		}
-		return nil, cborFail("simple value or float not allowed")
+	case 6:
+		return r.link(v, depth)
 	default:
-		return nil, cborFail(fmt.Sprintf("major type %d not allowed", major))
+		return simpleOrFloat(info, v)
 	}
 }
 
-// mapBody (strictCbor.ts:229-249): depth, then per entry key header, text key,
-// UTF-8, strict key order, value.
-func (r *cborReader) mapBody(count, depth int) (CborMap, error) {
-	if depth > StrictCborMaxDepth {
-		return nil, cborFail("map nesting deeper than 4")
+// arrayBody ports decodeArrayBody (strictCbor.ts): depth, then each item.
+func (r *cborReader) arrayBody(count, depth int) ([]any, error) {
+	if depth > r.maxDepth {
+		return nil, tooDeep(r.maxDepth)
 	}
-	out := make(CborMap, count)
+	out := []any{}
+	for i := 0; i < count; i++ {
+		item, err := r.value(depth)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+// mapBody ports decodeMapBody (strictCbor.ts): depth, then per entry key header, text key, UTF-8,
+// strict key order, value.
+func (r *cborReader) mapBody(count, depth int) (CborMap, error) {
+	if depth > r.maxDepth {
+		return nil, tooDeep(r.maxDepth)
+	}
+	out := CborMap{}
 	var previous []byte
 	for i := 0; i < count; i++ {
 		start := r.pos
-		major, n, err := r.head()
+		major, _, n, err := r.head()
 		if err != nil {
 			return nil, err
 		}
 		if major != 3 {
 			return nil, cborFail("map key must be text")
 		}
-		size, err := r.count(n)
-		if err != nil {
-			return nil, err
-		}
-		raw, err := r.take(size)
+		raw, err := r.counted(n)
 		if err != nil {
 			return nil, err
 		}
@@ -298,14 +441,18 @@ func (r *cborReader) mapBody(count, depth int) (CborMap, error) {
 	return out, nil
 }
 
-// DecodeStrictCbor ports decodeStrictCbor (strictCbor.ts:251-265), check order:
-// input size, top header, top major type, map body, trailing bytes, re-encode guard.
+// DecodeStrictCbor ports decodeStrictCbor (strictCbor.ts), check order: top header, top major
+// type, map body, trailing bytes. Canonical form is enforced inline; there is no re-encode guard and
+// no size limit. The depth bound is StrictCborMaxDepth.
 func DecodeStrictCbor(input []byte) (CborMap, error) {
-	if len(input) > StrictCborMaxBytes {
-		return nil, cborFail("input exceeds 4096 bytes")
-	}
-	r := &cborReader{b: input}
-	major, v, err := r.head()
+	return DecodeStrictCborLimit(input, StrictCborMaxDepth)
+}
+
+// DecodeStrictCborLimit is DecodeStrictCbor with the caller's container depth bound (the top map
+// is depth 1, each nested array or map adds 1); the refusal is "nesting deeper than <maxDepth>".
+func DecodeStrictCborLimit(input []byte, maxDepth int) (CborMap, error) {
+	r := &cborReader{b: input, maxDepth: maxDepth}
+	major, _, v, err := r.head()
 	if err != nil {
 		return nil, err
 	}
@@ -323,18 +470,11 @@ func DecodeStrictCbor(input []byte) (CborMap, error) {
 	if r.pos != len(input) {
 		return nil, cborFail("trailing bytes")
 	}
-	again, err := EncodeStrictCbor(m)
-	if err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(again, input) {
-		return nil, cborFail("non-canonical encoding")
-	}
 	return m, nil
 }
 
-// TryDecodeStrictCbor returns false only for a *StrictCborError (the only error
-// DecodeStrictCbor returns).
+// TryDecodeStrictCbor returns false only for a *StrictCborError (the only error DecodeStrictCbor
+// returns).
 func TryDecodeStrictCbor(input []byte) (CborMap, bool) {
 	m, err := DecodeStrictCbor(input)
 	if err != nil {

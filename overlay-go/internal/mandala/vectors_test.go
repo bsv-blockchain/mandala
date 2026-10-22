@@ -242,7 +242,20 @@ type vectorOverride struct {
 
 // vectorOverrides is keyed by case id. TestVectorOverridesAreLive keeps every entry pointed at a
 // real case, reasoned, and different from the file.
-var vectorOverrides = map[string]vectorOverride{}
+var vectorOverrides = map[string]vectorOverride{
+	// Task 2: the codec reads full strict DAG-CBOR (templates cbdccfe5b), so a float16 or a tag
+	// reaches its own check instead of the old blanket "not allowed" refusal.
+	"deploy-payload-float": {Why: fullDagCborWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: deploy payload is not a valid Mandala deploy map (float must be 64-bit)"}}, // sym: f93c00
+	"deploy-payload-tag": {Why: fullDagCborWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: deploy payload is not a valid Mandala deploy map (invalid CID)"}}, // sym: d82a + text "USD"
+	"details-tag": {Why: fullDagCborWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: admin details violate the schema (invalid CID)"}}, // kind: d82a + text "issue"
+	"details-float": {Why: fullDagCborWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 0: admin details violate the schema (float must be 64-bit)"}}, // feeRatePerKb: f93c00
+}
+
+const fullDagCborWhy = "full strict DAG-CBOR (0162:148); Mandala payload policy 65536 B / depth 64 (contract §4.1)"
 
 // replayCase is c as this overlay replays it: topics through vectorTopic and the expectation
 // through vectorOverrides. The state slices are cloned, so the loaded file is never mutated.

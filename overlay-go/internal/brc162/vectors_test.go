@@ -9,10 +9,10 @@ import (
 	"testing"
 )
 
-// brc162.json (ts-stack 37468f290 packages/helpers/ts-templates/test/vectors/brc162.json),
+// brc162.json (ts-stack cbdccfe5b packages/helpers/ts-templates/test/vectors/brc162.json),
 // row schemas per fact base ts-codec §8.
 const brc162VectorsPath = "../../testdata/brc162.json"
-const brc162VectorsSHA256 = "de5b898bee1a0f848f92e7082a9ca6b9026f9d2801ed7fcdda8ff6eb47e0afb1"
+const brc162VectorsSHA256 = "dec7003a7cf61a933574737228bc56d7fc902fedab0b21eddc28ab1042ef47f0"
 
 type brc162Vectors struct {
 	ID            string              `json:"id"`
@@ -97,7 +97,7 @@ func TestBRC162VectorsFileIsPinned(t *testing.T) {
 	}
 	sum := sha256.Sum256(b)
 	if got := hex.EncodeToString(sum[:]); got != brc162VectorsSHA256 {
-		t.Fatalf("testdata/brc162.json sha256 = %s, want %s (recopy it from ts-stack 37468f290)", got, brc162VectorsSHA256)
+		t.Fatalf("testdata/brc162.json sha256 = %s, want %s (recopy it from ts-stack cbdccfe5b)", got, brc162VectorsSHA256)
 	}
 	v := loadBRC162Vectors(t)
 	if v.ID != "mandala.brc162" || v.Version != 1 {
@@ -109,7 +109,7 @@ func TestBRC162VectorsFileIsPinned(t *testing.T) {
 	}{
 		{"scripts", len(v.Scripts), 34}, {"payloadPushes", len(v.PayloadPushes), 10},
 		{"amountChunks", len(v.AmountChunks), 40}, {"rejectScripts", len(v.RejectScripts), 33},
-		{"strictCbor", len(v.StrictCbor), 104}, {"commitments", len(v.Commitments), 19},
+		{"strictCbor", len(v.StrictCbor), 124}, {"commitments", len(v.Commitments), 19},
 	}
 	for _, c := range counts {
 		if c.got != c.want {
