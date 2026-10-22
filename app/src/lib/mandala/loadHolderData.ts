@@ -9,7 +9,8 @@
  * Never reads the old `'p mandala'` / `mandala-tokens` baskets.
  */
 import type { WalletInterface } from '@bsv/sdk'
-import type { HistoryRow, loadHistory, listAdminAssets, resolveAssetMetadata } from '@bsv/mandala'
+import type { HistoryRow, loadHistory, listAdminAssets } from '@bsv/mandala'
+import type { resolveAssetMetadata } from '@bsv/mandala/metadata'
 import {
   INVENTORY_SELECTOR,
   balanceSelector,

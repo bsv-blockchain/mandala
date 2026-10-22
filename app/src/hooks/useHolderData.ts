@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { listAdminAssets, loadHistory, resolveAssetMetadata } from '@bsv/mandala'
+import { listAdminAssets, loadHistory } from '@bsv/mandala'
+import { resolveAssetMetadata } from '@bsv/mandala/metadata'
 import { useWallet } from '../context/WalletContext'
 import { loadHolderData, type HolderData } from '../lib/mandala/loadHolderData'
 
