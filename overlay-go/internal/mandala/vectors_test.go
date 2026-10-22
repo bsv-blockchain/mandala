@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -224,6 +225,43 @@ func caseNamed(t *testing.T, v rejectVectors, id string) rejectCase {
 	return rejectCase{}
 }
 
+// The 1Color replay seam (design C9). mandala-rejects.json stays byte-for-byte pinned to the TS
+// parity reference, which 1Color deliberately makes stale in places. Every divergence is spelled
+// out here instead of in the file: vectorTopic maps the file's topic names to this overlay's, and
+// vectorOverrides replaces a case's expectation, each entry with a one-line reason.
+
+// vectorTopic maps a topic named in the vector file to the topic this overlay uses. It applies to
+// case.Topic and to every Topic in state.authorities and state.owners.
+func vectorTopic(topic string) string { return topic }
+
+// vectorOverride is a reviewed replacement for one case's file expectation.
+type vectorOverride struct {
+	Expected rejectExpected
+	Why      string
+}
+
+// vectorOverrides is keyed by case id. TestVectorOverridesAreLive keeps every entry pointed at a
+// real case, reasoned, and different from the file.
+var vectorOverrides = map[string]vectorOverride{}
+
+// replayCase is c as this overlay replays it: topics through vectorTopic and the expectation
+// through vectorOverrides. The state slices are cloned, so the loaded file is never mutated.
+func replayCase(c rejectCase) rejectCase {
+	c.Topic = vectorTopic(c.Topic)
+	c.State.Authorities = slices.Clone(c.State.Authorities)
+	for i := range c.State.Authorities {
+		c.State.Authorities[i].Topic = vectorTopic(c.State.Authorities[i].Topic)
+	}
+	c.State.Owners = slices.Clone(c.State.Owners)
+	for i := range c.State.Owners {
+		c.State.Owners[i].Topic = vectorTopic(c.State.Owners[i].Topic)
+	}
+	if o, ok := vectorOverrides[c.ID]; ok {
+		c.Expected = o.Expected
+	}
+	return c
+}
+
 func TestRejectVectorsHaveTheShapeGoReads(t *testing.T) {
 	v := loadRejectVectors(t)
 	if v.ID != "mandala.rejects" || v.Version != 2 {
@@ -244,15 +282,15 @@ func TestRejectVectorsHaveTheShapeGoReads(t *testing.T) {
 			t.Fatalf("duplicate case id %s", c.ID)
 		}
 		ids[c.ID] = true
-		switch {
-		case IsTokenTopic(c.Topic):
-			tokenTopics[c.Topic] = true
-		case c.Topic == MandalaTopic:
+		switch topic := vectorTopic(c.Topic); {
+		case IsTokenTopic(topic):
+			tokenTopics[topic] = true
+		case topic == MandalaTopic:
 			registry++
-		case c.Topic == KYCTopic:
+		case topic == KYCTopic:
 			kyc++
 		default:
-			t.Fatalf("%s: topic %q is neither a token topic, tm_mandala nor tm_mandala_kyc", c.ID, c.Topic)
+			t.Fatalf("%s: topic %q (file %q) is neither a token topic, tm_mandala nor tm_mandala_kyc", c.ID, topic, c.Topic)
 		}
 		e := c.Expected
 		admits := e.OutputsToAdmit != nil || e.CoinsToRetain != nil
@@ -285,7 +323,8 @@ func TestRejectVectorsHaveTheShapeGoReads(t *testing.T) {
 
 func TestRejectVectorsReplay(t *testing.T) {
 	v := loadRejectVectors(t)
-	for _, c := range v.Cases {
+	for _, fc := range v.Cases {
+		c := replayCase(fc)
 		t.Run(c.ID, func(t *testing.T) {
 			var repairs []string
 			got, err := runVector(t, v, c, c.State.memStore(), &repairs)
@@ -312,7 +351,8 @@ func TestRejectVectorsReplay(t *testing.T) {
 
 func TestRejectVectorsJournalEveryAdmittedOutput(t *testing.T) {
 	v := loadRejectVectors(t)
-	for _, c := range v.Cases {
+	for _, fc := range v.Cases {
+		c := replayCase(fc)
 		if c.Expected.OutputsToAdmit == nil {
 			continue
 		}
@@ -342,7 +382,7 @@ func TestRejectVectorsJournalEveryAdmittedOutput(t *testing.T) {
 
 func TestRejectVectorsRepairTheMissingOwnerRowInline(t *testing.T) {
 	v := loadRejectVectors(t)
-	c := caseNamed(t, v, "admit-transfer-repairing-the-owner-row")
+	c := replayCase(caseNamed(t, v, "admit-transfer-repairing-the-owner-row"))
 	var lost *OwnerRecord
 	for i := range c.State.Owners {
 		if c.State.Owners[i].Role == "value" {
@@ -367,5 +407,28 @@ func TestRejectVectorsRepairTheMissingOwnerRowInline(t *testing.T) {
 	r := st.tokens[0]
 	if r.Txid != lost.Txid || r.OutputIndex != lost.OutputIndex || r.TokenID != lost.TokenID || r.Amount != lost.Amount || r.IdentityKey != lost.IdentityKey {
 		t.Fatalf("repaired row = %+v, want the journal row %+v", r, *lost)
+	}
+}
+
+func TestVectorOverridesAreLive(t *testing.T) {
+	v := loadRejectVectors(t)
+	byID := map[string]rejectCase{}
+	for _, c := range v.Cases {
+		byID[c.ID] = c
+	}
+	for id, o := range vectorOverrides {
+		c, ok := byID[id]
+		if !ok {
+			t.Fatalf("override %q names no case", id)
+		}
+		if strings.TrimSpace(o.Why) == "" {
+			t.Fatalf("override %q has no reason", id)
+		}
+		if reflect.DeepEqual(c.Expected, o.Expected) {
+			t.Fatalf("override %q equals the file's expectation", id)
+		}
+	}
+	if vectorTopic("tm_mandala") != "tm_mandala" {
+		t.Fatal("registry topic must not be remapped")
 	}
 }
