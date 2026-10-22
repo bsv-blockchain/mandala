@@ -6,7 +6,7 @@
  * - holder-scope history and asset metadata.
  *
  * Pure over its injected dependencies so it is unit-tested without React.
- * Never reads the old `'p mandala'` / `mandala-tokens` baskets.
+ * Never reads a pre-1Color token basket: only the `p color` views.
  */
 import type { WalletInterface } from '@bsv/sdk'
 import type { HistoryRow, loadHistory, listAdminAssets } from '@bsv/mandala'

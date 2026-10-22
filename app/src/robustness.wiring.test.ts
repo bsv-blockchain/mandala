@@ -211,4 +211,16 @@ describe('robustness wiring (shipped source)', () => {
     const bank = src('components/issuer/BankingMock.tsx')
     expect(bank).toContain('safeParseAmount('); expect(bank).not.toMatch(/type="number"/)
   })
+
+  it('no old Mandala token residue remains in app source', () => {
+    const files = listSrc() // every .ts/.tsx under src except *.test.ts
+    for (const f of files) {
+      const s = src(f)
+      for (const banned of ["'p mandala'", 'mandala-tokens', 'decodeValue', 'transferTokens', 'receiveTokens',
+        "'@bsv/mandala/amount'", "'@bsv/mandala/transfer'", "'@bsv/mandala/receive'", "'@bsv/mandala/tokens'", 'formatAmountPlain', 'tm_mandala_registry',
+        'mandala.app.handover.' /* the old queue key prefix; the lock name 'mandala.app.handovers' has no trailing dot */, 'handoverQueue', 'localQueueStore'])
+        expect(s, `${f} contains ${banned}`).not.toContain(banned)
+      expect(s, `${f} uses the removed BASKET`).not.toMatch(/\bBASKET\b/) // TREASURY_BASKET is allowed (no word boundary after '_')
+    }
+  })
 })
