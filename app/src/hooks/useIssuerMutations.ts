@@ -66,7 +66,9 @@ export function useIssuerMutations() {
   const adjustTreasury = async (assetId: string, delta: bigint): Promise<{ prev?: TreasuryData }> => {
     await qc.cancelQueries({ queryKey: tKey })
     const prev = qc.getQueryData<TreasuryData>(tKey)
-    if (prev != null) {
+    // An absent row is "unknown", not zero: a decrement there (redeem with the
+    // cap skipped) would show a negative treasury until the refetch.
+    if (prev != null && (delta > 0n || prev[assetId] != null)) {
       qc.setQueryData<TreasuryData>(tKey, { ...prev, [assetId]: (prev[assetId] ?? 0n) + delta })
     }
     return { prev }
