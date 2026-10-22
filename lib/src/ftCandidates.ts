@@ -5,7 +5,7 @@
  */
 import { Beef, LockingScript, WalletInterface } from '@bsv/sdk'
 import { decodeValue } from './brc162.js'
-import { BASKET } from './constants.js'
+import { TREASURY_BASKET } from './constants.js'
 import { FtCandidate } from './ftSelect.js'
 import { resolveAssetState } from './adminState.js'
 import { assertSpendablePrior } from './adminAuthGate.js'
@@ -62,7 +62,7 @@ export async function loadFtCandidates(
   }
 ): Promise<{ candidates: FtCandidate[], beef: number[] }> {
   const scriptRes = await wallet.listOutputs({
-    basket: BASKET,
+    basket: TREASURY_BASKET,
     include: 'locking scripts',
     includeCustomInstructions: true,
     limit: 1000
@@ -71,7 +71,7 @@ export async function loadFtCandidates(
     assertSpendablePrior(opts.requireSpendable, scriptRes.outputs.map(o => o.outpoint as string))
   }
   const beefRes = await wallet.listOutputs({
-    basket: BASKET,
+    basket: TREASURY_BASKET,
     include: 'entire transactions',
     limit: 1000
   })
@@ -135,7 +135,7 @@ export async function loadFtCandidates(
 
   const usable = excludeFrozen(candidates, excluded)
   if (usable.length === 0) {
-    console.warn(`[mandala] no spendable ${assetId} outputs: listed ${scriptRes.outputs.length} in basket '${BASKET}', ${candidates.length} decoded for this asset, ${excluded.size} frozen/evicted`)
+    console.warn(`[mandala] no spendable ${assetId} outputs: listed ${scriptRes.outputs.length} in basket '${TREASURY_BASKET}', ${candidates.length} decoded for this asset, ${excluded.size} frozen/evicted`)
   }
   return { candidates: usable, beef: beefRes.BEEF as number[] }
 }

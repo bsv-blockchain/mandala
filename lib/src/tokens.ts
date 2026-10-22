@@ -1,6 +1,6 @@
 import { WalletInterface, WalletCounterparty } from '@bsv/sdk'
 import { decodeValue } from './brc162.js'
-import { FT_PROTOCOL, OVERLAY_IDENTITY_KEY } from './constants.js'
+import { ADMIN_PROTOCOL, OVERLAY_IDENTITY_KEY } from './constants.js'
 import { SpecificLinkage } from './encoding.js'
 
 export interface TokenBalance { assetId: string, amount: number }
@@ -50,7 +50,7 @@ export async function revealLinkage (
   const linkage = await wallet.revealSpecificKeyLinkage({
     counterparty: counterparty as string,
     verifier: OVERLAY_IDENTITY_KEY,
-    protocolID: FT_PROTOCOL,
+    protocolID: ADMIN_PROTOCOL,
     keyID
   })
   return linkage as unknown as SpecificLinkage

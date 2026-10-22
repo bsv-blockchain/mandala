@@ -5,21 +5,27 @@ export const TOPIC = 'tm_mandala'
 export const LOOKUP = 'ls_mandala'
 export const REGISTRY_TOPIC = 'tm_mandala_kyc'
 export const REGISTRY_LOOKUP = 'ls_mandala_kyc'
-export const FT_PROTOCOL: WalletProtocol = [2, 'p mandala token']
+/**
+ * Derivation for every Mandala-key output: treasury value, authority, deploy,
+ * registry and payout change (C§8.1, contract gap G1). Holder value uses the
+ * per-asset BRC-207 `p color` protocol (naming.ts), never this one.
+ */
 export const ADMIN_PROTOCOL: WalletProtocol = [2, 'mandala admin']
 export const REGISTRY_PROTOCOL: WalletProtocol = [2, 'mandala registry']
-export const MESSAGEBOX = 'mandala-payments'
+/** MessageBox box for BRC-207 hand-over and payout receipts (D11). */
+export const MESSAGEBOX = 'mandala-color'
+
+/** BRC-207 built-in attested profile id (C§4). */
+export const ATTESTED_PROFILE_ID = 'https://brc.dev/207/attested'
+/** Mandala issuer-v1 required-profile id (C§4); exactly 80 UTF-8 bytes. */
+export const MANDALA_PROFILE_ID = 'https://github.com/bsv-blockchain/mandala/blob/master/docs/profiles/issuer-v1.md'
 
 /**
- * Wallet basket every Mandala token output lives in. A live binding, not a
- * constant: a host that runs more than one Mandala deployment against one
- * wallet (a staging console beside production, an RN app beside the web
- * console) must be able to keep their outputs apart, and every lib reference
- * reads it at call time so `configureMandala({ basket })` takes effect
- * immediately. The default is unchanged, so an existing wallet keeps its
- * outputs without any migration.
+ * Wallet basket for the console's issuer/admin outputs (treasury value,
+ * authority, deploy, registry). A fixed non-P basket (D18): holder value
+ * lives only in the BRC-207 per-asset `p color` baskets.
  */
-export let BASKET = 'mandala-tokens'
+export const TREASURY_BASKET = 'mandala treasury'
 
 // Endpoints start empty and MUST be set via configureMandala. The library
 // deliberately reads no environment: a module-scope env read (the Vite
@@ -38,13 +44,6 @@ export interface MandalaEndpoints {
   messageBoxUrl?: string
   /** Sent as `Authorization: Bearer …` on /admin/registry and /admin/activity, never on the public audit routes. */
   adminApiToken?: string
-  /**
-   * Wallet basket for token outputs (default 'mandala-tokens'). Changing it
-   * points every listing, coin selection and output-tagging call at a
-   * different basket — the existing outputs are NOT moved, so only set this
-   * before a deployment's first use, or deliberately to isolate one.
-   */
-  basket?: string
   /**
    * Durable key/value store for the journals (D3c). Omit on the web — the
    * default adapter uses localStorage. React Native has no localStorage, so a
@@ -65,7 +64,6 @@ export function configureMandala (endpoints: MandalaEndpoints): void {
   if (endpoints.overlayIdentityKey != null) OVERLAY_IDENTITY_KEY = endpoints.overlayIdentityKey
   if (endpoints.messageBoxUrl != null) MESSAGEBOX_URL = endpoints.messageBoxUrl
   if (endpoints.adminApiToken != null) ADMIN_API_TOKEN = endpoints.adminApiToken
-  if (endpoints.basket != null && endpoints.basket !== '') BASKET = endpoints.basket
   if (endpoints.storage != null) configureStorage(endpoints.storage)
 }
 
@@ -76,6 +74,14 @@ export function configureMandala (endpoints: MandalaEndpoints): void {
  */
 export const OVERLAY_URL_UNSET =
   '@bsv/mandala: overlay URL is not configured — call configureMandala({ overlayUrl }) before any overlay request'
+
+/**
+ * Thrown before any wallet mutation or network call by every path that
+ * submits to, or verifies against, the overlay while OVERLAY_IDENTITY_KEY is
+ * '' (S5: fail closed).
+ */
+export const OVERLAY_IDENTITY_KEY_UNSET =
+  '@bsv/mandala: overlay identity key is not configured — call configureMandala({ overlayIdentityKey })'
 
 /** Headers for the identity-bearing /admin routes; empty until a token is configured. */
 export function adminAuthHeaders (): Record<string, string> {

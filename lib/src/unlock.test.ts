@@ -4,7 +4,7 @@ import {
 } from '@bsv/sdk'
 import { MandalaToken } from './__fixtures__/token.js'
 import { walletMandalaUnlock } from './unlock.js'
-import { FT_PROTOCOL } from './constants.js'
+import { ADMIN_PROTOCOL } from './constants.js'
 
 describe('walletMandalaUnlock', () => {
   it('produces an unlocking script that satisfies a MandalaToken output locked to a wallet-derived key', async () => {
@@ -13,7 +13,7 @@ describe('walletMandalaUnlock', () => {
     const counterparty = 'self'
     const assetId = `${'a'.repeat(64)}_0`
 
-    const lockingScript = await new MandalaToken(wallet as any).lockBRC29(assetId, 100, FT_PROTOCOL, keyID, counterparty)
+    const lockingScript = await new MandalaToken(wallet as any).lockBRC29(assetId, 100, ADMIN_PROTOCOL, keyID, counterparty)
 
     const sourceTx = new Transaction()
     sourceTx.addOutput({ lockingScript, satoshis: 1 })
@@ -50,7 +50,7 @@ describe('walletMandalaUnlock', () => {
     const assetId = `${'b'.repeat(64)}_0`
 
     // Sender locks the FT to the recipient (counterparty = recipient identity).
-    const lockingScript = await new MandalaToken(sender as any).lockBRC29(assetId, 100, FT_PROTOCOL, keyID, recipientId)
+    const lockingScript = await new MandalaToken(sender as any).lockBRC29(assetId, 100, ADMIN_PROTOCOL, keyID, recipientId)
 
     const sourceTx = new Transaction()
     sourceTx.addOutput({ lockingScript, satoshis: 1 })

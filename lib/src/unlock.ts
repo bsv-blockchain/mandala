@@ -2,7 +2,7 @@ import {
   Transaction, TransactionSignature, Signature, UnlockingScript,
   ScriptTemplateUnlock, WalletInterface, WalletCounterparty, Hash, Utils
 } from '@bsv/sdk'
-import { FT_PROTOCOL } from './constants.js'
+import { ADMIN_PROTOCOL } from './constants.js'
 
 type SignOutputs = 'all' | 'none' | 'single'
 
@@ -51,7 +51,7 @@ export function walletMandalaUnlock (
       const { preimage, scope } = buildSighashPreimage(tx, inputIndex, signOutputs, anyoneCanPay)
       const { signature: der } = await wallet.createSignature({
         hashToDirectlySign: Hash.hash256(preimage),
-        protocolID: FT_PROTOCOL, keyID, counterparty
+        protocolID: ADMIN_PROTOCOL, keyID, counterparty
       })
       const sig = Signature.fromDER([...der])
       const txSig = new TransactionSignature(sig.r, sig.s, scope)
@@ -60,7 +60,7 @@ export function walletMandalaUnlock (
       // key is the forSelf:true derivation (= the key the locker hashed, by BRC-42
       // symmetry). For self-held tokens forSelf is symmetric; for tokens locked TO us
       // by another party (counterparty = sender) only forSelf:true matches the pkh.
-      const { publicKey } = await wallet.getPublicKey({ protocolID: FT_PROTOCOL, keyID, counterparty, forSelf: true })
+      const { publicKey } = await wallet.getPublicKey({ protocolID: ADMIN_PROTOCOL, keyID, counterparty, forSelf: true })
       const pubkey = Utils.toArray(publicKey, 'hex')
       return new UnlockingScript([
         { op: sigForScript.length, data: sigForScript },

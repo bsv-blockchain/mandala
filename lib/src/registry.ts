@@ -4,7 +4,7 @@
  * The overlay database is a cache of this chain.
  */
 import { WalletInterface } from '@bsv/sdk'
-import { adminAuthHeaders, BASKET, OVERLAY_URL, OVERLAY_URL_UNSET, REGISTRY_TOPIC } from './constants.js'
+import { adminAuthHeaders, TREASURY_BASKET, OVERLAY_URL, OVERLAY_URL_UNSET, REGISTRY_TOPIC } from './constants.js'
 import { deployPayload } from './brc162.js'
 import { AdmissionReceipt, admissionReceipt } from './overlay.js'
 import { registryFlight } from './singleFlight.js'
@@ -57,7 +57,7 @@ const tokenIdOf = (ci: RegistryCI, op: string): string =>
   ci.tokenId !== '' ? ci.tokenId : `${op.slice(0, op.lastIndexOf('.'))}_0`
 
 export async function listRegistryAuth (wallet: WalletInterface): Promise<RegistryAuth | null> {
-  const res = await wallet.listOutputs({ basket: BASKET, includeCustomInstructions: true, limit: 1000 })
+  const res = await wallet.listOutputs({ basket: TREASURY_BASKET, includeCustomInstructions: true, limit: 1000 })
   const found: RegistryAuth[] = []
   for (const o of res.outputs) {
     const ci = parseRegistryCI(o.customInstructions)

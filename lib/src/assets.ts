@@ -1,5 +1,5 @@
 import { WalletInterface } from '@bsv/sdk'
-import { BASKET, MESSAGEBOX, FT_PROTOCOL } from './constants.js'
+import { TREASURY_BASKET, MESSAGEBOX, ADMIN_PROTOCOL } from './constants.js'
 import { MandalaActionDetails } from './brc162.js'
 import { outpoint } from './tokens.js'
 import { AdmissionReceipt, admissionReceipt } from './overlay.js'
@@ -20,7 +20,7 @@ export interface AdminAsset {
   assetId: string
   label: string
   authOutpoint: string
-  /** keyID of the live authority coin (FT_PROTOCOL, counterparty = issuer identity key). */
+  /** keyID of the live authority coin (ADMIN_PROTOCOL, counterparty = issuer identity key). */
   authKeyID: string
   metadata?: Record<string, unknown>
 }
@@ -80,7 +80,7 @@ export function adminAssetFromOutput (
 // List the issuer's live admin assets straight from the wallet basket.
 export async function listAdminAssets (wallet: WalletInterface): Promise<AdminAsset[]> {
   const res = await wallet.listOutputs({
-    basket: BASKET,
+    basket: TREASURY_BASKET,
     includeCustomInstructions: true,
     limit: 1000
   })
@@ -121,7 +121,7 @@ export interface SubmitAdminActionResult extends AdmissionReceipt {
 }
 
 async function spendableBeef (wallet: WalletInterface, priors: string[]): Promise<number[]> {
-  const list = await wallet.listOutputs({ basket: BASKET, include: 'entire transactions', limit: 1000 })
+  const list = await wallet.listOutputs({ basket: TREASURY_BASKET, include: 'entire transactions', limit: 1000 })
   if (list.BEEF == null) throw new Error('listOutputs returned no BEEF')
   // Fail fast on a stale auth reference (e.g. spent by a half-failed earlier
   // action) instead of building a doomed tx that dies with a cryptic wallet error.
@@ -173,7 +173,7 @@ export async function submitAdminAction (
           transaction: res.tx,
           keyID: ftKeyID,
           outputIndex: res.valueIndices[0],
-          protocolID: FT_PROTOCOL,
+          protocolID: ADMIN_PROTOCOL,
           // Issuer remittances are not blinded — the recipient derives
           // against the issuer identity key directly.
           sender: identityKey,

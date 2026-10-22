@@ -7,7 +7,10 @@ import {
   invoiceNumber, outputPublicKey, prepareBlindedPayment,
   recipientCustomInstructions, sampleBlindingFactor
 } from './blinding.js'
-import { configureMandala, FT_PROTOCOL } from './constants.js'
+import { configureMandala, ADMIN_PROTOCOL } from './constants.js'
+import { colorProtocolID } from './naming.js'
+
+const HOLDER_PROTOCOL = colorProtocolID(`${'c7'.repeat(32)}_0`, 'AQ==', 'Ag==')
 
 describe('sender identity blinding (A′ = A + rG)', () => {
   it('opens: A′ − rG equals A', () => {
@@ -47,11 +50,11 @@ describe('sender identity blinding (A′ = A + rG)', () => {
     const keyID = 'xfer-test'
     const S = a.deriveSharedSecret(PublicKey.fromString(B))
     const Sprime = blindedSharedSecret(S, r, PublicKey.fromString(B))
-    const k = childOffset(Sprime, FT_PROTOCOL, keyID)
+    const k = childOffset(Sprime, ADMIN_PROTOCOL, keyID)
     const Pout = outputPublicKey(PublicKey.fromString(B), k)
 
     const { publicKey: fromBob } = await recipient.getPublicKey({
-      protocolID: FT_PROTOCOL,
+      protocolID: ADMIN_PROTOCOL,
       keyID,
       counterparty: Aprime,
       forSelf: true
@@ -60,7 +63,7 @@ describe('sender identity blinding (A′ = A + rG)', () => {
 
     // Unblinded derivation against A must NOT match.
     const { publicKey: unblinded } = await recipient.getPublicKey({
-      protocolID: FT_PROTOCOL,
+      protocolID: ADMIN_PROTOCOL,
       keyID,
       counterparty: A,
       forSelf: true
@@ -69,7 +72,7 @@ describe('sender identity blinding (A′ = A + rG)', () => {
   })
 
   it('invoiceNumber matches BRC-43', () => {
-    expect(invoiceNumber(FT_PROTOCOL, 'k1')).toBe('2-p mandala token-k1')
+    expect(invoiceNumber(ADMIN_PROTOCOL, 'k1')).toBe('2-mandala admin-k1')
   })
 
   it('sampleBlindingFactor is a 32-byte scalar', () => {
@@ -89,10 +92,11 @@ describe('sender identity blinding (A′ = A + rG)', () => {
     const prepared = await prepareBlindedPayment(sender as any, {
       identityKey,
       recipientKey,
-      keyID: 'xfer-prep'
+      keyID: 'xfer-prep',
+      protocolID: HOLDER_PROTOCOL
     })
     const { publicKey: fromBob } = await recipient.getPublicKey({
-      protocolID: FT_PROTOCOL,
+      protocolID: HOLDER_PROTOCOL,
       keyID: 'xfer-prep',
       counterparty: prepared.senderBlinded,
       forSelf: true
@@ -118,7 +122,7 @@ describe('sender identity blinding (A′ = A + rG)', () => {
 describe('HMAC offset is 32 bytes', () => {
   it('childOffset length', () => {
     const S = PrivateKey.fromRandom().toPublicKey()
-    const k = childOffset(S, FT_PROTOCOL, 'abc')
+    const k = childOffset(S, ADMIN_PROTOCOL, 'abc')
     expect(k.length).toBe(32)
     expect(Hash.sha256hmac).toBeTypeOf('function')
     expect(Utils.toHex(k).length).toBe(64)

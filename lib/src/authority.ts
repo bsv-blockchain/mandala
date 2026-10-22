@@ -2,7 +2,7 @@
  * BRC-162 authority-chain transactions (overlay-go internal/mandala/authority.go).
  *
  * An authority coin is a 1-sat Bsv21Binary output of amount 0, locked to the
- * issuer's own wallet-derived key under FT_PROTOCOL and proven by
+ * issuer's own wallet-derived key under ADMIN_PROTOCOL and proven by
  * specificKeyLinkage like any token output. A deploy (output 0, no token id)
  * is the chain's first link; every admin action spends the token's live
  * authority and re-emits one committing `{adm: sha256(details)}`, with the
@@ -14,7 +14,7 @@
  * lost track of.
  */
 import { Transaction, WalletInterface } from '@bsv/sdk'
-import { BASKET, FT_PROTOCOL } from './constants.js'
+import { TREASURY_BASKET, ADMIN_PROTOCOL } from './constants.js'
 import {
   commitmentHex, commitmentPayload, DEPLOY_KEY_ID, encodeAdminDetails, lockToken,
   MandalaActionDetails, signDeploy, tokenIdOfDeploy, tokenTopic
@@ -97,7 +97,7 @@ export async function runAuthorityTx (p: {
 
   const outputs: any[] = []
   for (const v of valueOuts) {
-    const script = await lockToken(wallet, v.tokenId, v.amount, FT_PROTOCOL, v.keyID, v.owner)
+    const script = await lockToken(wallet, v.tokenId, v.amount, ADMIN_PROTOCOL, v.keyID, v.owner)
     outputs.push({
       satoshis: 1,
       lockingScript: script.toHex(),
@@ -107,12 +107,12 @@ export async function runAuthorityTx (p: {
     })
   }
   for (let i = 0; i < legs.length; i++) {
-    const script = await lockToken(wallet, legs[i].prior.tokenId, 0, FT_PROTOCOL, authKeyIDs[i], identityKey, commitmentPayload(detailsBytes[i]))
+    const script = await lockToken(wallet, legs[i].prior.tokenId, 0, ADMIN_PROTOCOL, authKeyIDs[i], identityKey, commitmentPayload(detailsBytes[i]))
     outputs.push({
       satoshis: 1,
       lockingScript: script.toHex(),
       outputDescription: `${legs[i].details.kind} authority`,
-      basket: BASKET,
+      basket: TREASURY_BASKET,
       customInstructions: legs[i].customInstructions(authKeyIDs[i]),
       ...(legs[i].tags != null ? { tags: legs[i].tags } : {})
     })
@@ -204,7 +204,7 @@ export async function runDeployTx (p: {
   labels: string[]
 }): Promise<{ txid: string, tokenId: string, admitted: OverlayAdmitResult }> {
   const { wallet, identityKey } = p
-  const script = await lockToken(wallet, null, 0, FT_PROTOCOL, DEPLOY_KEY_ID, identityKey, p.payload)
+  const script = await lockToken(wallet, null, 0, ADMIN_PROTOCOL, DEPLOY_KEY_ID, identityKey, p.payload)
   const created = await wallet.createAction({
     description: p.description,
     labels: p.labels,
@@ -212,7 +212,7 @@ export async function runDeployTx (p: {
       satoshis: 1,
       lockingScript: script.toHex(),
       outputDescription: 'token deploy + first authority',
-      basket: BASKET,
+      basket: TREASURY_BASKET,
       customInstructions: p.customInstructions,
       ...(p.tags != null ? { tags: p.tags } : {})
     }],

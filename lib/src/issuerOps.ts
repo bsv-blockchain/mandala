@@ -5,7 +5,7 @@
  * (see submitAndBroadcast). Each resolves at the overlay-accept commit point.
  */
 import { Beef, WalletInterface } from '@bsv/sdk'
-import { BASKET, FT_PROTOCOL } from './constants.js'
+import { TREASURY_BASKET, ADMIN_PROTOCOL } from './constants.js'
 import { deployPayload, deployTopics, MandalaActionDetails } from './brc162.js'
 import { assertFeeRate } from './feeRate.js'
 import { AdmissionReceipt, admissionReceipt } from './overlay.js'
@@ -139,7 +139,7 @@ export async function issueTokens (p: IssueParams): Promise<IssuerOpResult> {
     const counterparty = identityKey
     const issueDetails: MandalaActionDetails = withBankRef({ kind: 'issue' as const }, depositHash)
 
-    const listResult = await wallet.listOutputs({ basket: BASKET, include: 'entire transactions', limit: 1000 })
+    const listResult = await wallet.listOutputs({ basket: TREASURY_BASKET, include: 'entire transactions', limit: 1000 })
     if (listResult.BEEF == null) throw new Error('listOutputs returned no BEEF')
     assertSpendablePrior(asset.authOutpoint, listResult.outputs.map(o => o.outpoint))
 
@@ -156,8 +156,8 @@ export async function issueTokens (p: IssueParams): Promise<IssuerOpResult> {
         amount,
         owner: counterparty,
         keyID,
-        basket: BASKET,
-        customInstructions: JSON.stringify({ protocolID: FT_PROTOCOL, keyID, counterparty }),
+        basket: TREASURY_BASKET,
+        customInstructions: JSON.stringify({ protocolID: ADMIN_PROTOCOL, keyID, counterparty }),
         outputDescription: 'minted FT'
       }],
       inputBEEF: listResult.BEEF as number[],
@@ -231,8 +231,8 @@ export async function redeemTokens (p: RedeemParams): Promise<IssuerOpResult> {
             amount: change,
             owner: identityKey,
             keyID: keyIDChange,
-            basket: BASKET,
-            customInstructions: JSON.stringify({ protocolID: FT_PROTOCOL, keyID: keyIDChange, counterparty: identityKey }),
+            basket: TREASURY_BASKET,
+            customInstructions: JSON.stringify({ protocolID: ADMIN_PROTOCOL, keyID: keyIDChange, counterparty: identityKey }),
             outputDescription: 'FT change'
           }]
         : [],

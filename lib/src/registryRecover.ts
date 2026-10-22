@@ -3,7 +3,7 @@
  * wallet no longer lists (plain 1-sat P2PKH loses basket CI after refresh).
  */
 import { Beef, Transaction, Utils, WalletInterface } from '@bsv/sdk'
-import { BASKET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
+import { TREASURY_BASKET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 import { authorityKeyIdOf, decodeToken } from './brc162.js'
 import {
   fetchRegistry,
@@ -125,7 +125,7 @@ function parseOutpoint (authOutpoint: string): { txid: string, vout: number } {
 
 /**
  * BEEF for the live identity-admin tx ONLY (plus its parents).
- * Do not merge the mandala-tokens basket: that graph can include a previous
+ * Do not merge the treasury basket: that graph can include a previous
  * noSend that already spends this outpoint, and createAction then errors
  * "already consumed by this action batch".
  */
@@ -258,7 +258,7 @@ export async function recoverRegistryAuth (p: {
         outputIndex: row.outputIndex,
         protocol: 'basket insertion',
         insertionRemittance: {
-          basket: BASKET,
+          basket: TREASURY_BASKET,
           customInstructions: registryCustomInstructions(tokenId, authKeyID),
           tags: ['mandala-registry']
         }

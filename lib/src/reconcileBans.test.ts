@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-vi.mock('./constants', () => ({ BASKET: 'mandala-tokens' }))
+vi.mock('./constants', () => ({ TREASURY_BASKET: 'mandala treasury' }))
 const resolveAssetState = vi.fn()
 vi.mock('./adminState', () => ({ resolveAssetState: (...a: any[]) => resolveAssetState(...a) }))
 
@@ -23,7 +23,7 @@ describe('reconcileBans', () => {
     const done = await reconcileBans(w, ['asset.0'])
     expect(done).toEqual(['held.1'])
     expect(w.relinquishOutput).toHaveBeenCalledTimes(1)
-    expect(w.relinquishOutput).toHaveBeenCalledWith({ basket: 'mandala-tokens', output: 'held.1' })
+    expect(w.relinquishOutput).toHaveBeenCalledWith({ basket: 'mandala treasury', output: 'held.1' })
   })
 
   it('does nothing when state is unavailable (fail open)', async () => {

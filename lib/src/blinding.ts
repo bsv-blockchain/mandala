@@ -10,7 +10,7 @@
 import {
   Hash, PrivateKey, PublicKey, Point, WalletInterface, WalletProtocol, Utils
 } from '@bsv/sdk'
-import { FT_PROTOCOL, OVERLAY_IDENTITY_KEY } from './constants.js'
+import { ADMIN_PROTOCOL, OVERLAY_IDENTITY_KEY } from './constants.js'
 import type { SpecificLinkage } from './encoding.js'
 
 export function sampleBlindingFactor (): PrivateKey {
@@ -55,7 +55,7 @@ export function recipientCustomInstructions (args: {
   senderBlinded: string
 }): string {
   return JSON.stringify({
-    protocolID: FT_PROTOCOL,
+    protocolID: ADMIN_PROTOCOL,
     keyID: args.keyID,
     counterparty: args.recipientKey,
     direction: 'sent',
@@ -74,7 +74,7 @@ export function changeCustomInstructions (args: {
   senderBlinded: string
 }): string {
   return JSON.stringify({
-    protocolID: FT_PROTOCOL,
+    protocolID: ADMIN_PROTOCOL,
     keyID: args.keyID,
     counterparty: args.identityKey,
     direction: 'change',
@@ -130,9 +130,9 @@ export async function rootSharedSecret (
  */
 export async function prepareBlindedPayment (
   wallet: WalletInterface,
-  args: { identityKey: string, recipientKey: string, keyID: string, protocolID?: WalletProtocol }
+  args: { identityKey: string, recipientKey: string, keyID: string, protocolID: WalletProtocol }
 ): Promise<BlindedPayment> {
-  const protocolID = args.protocolID ?? FT_PROTOCOL
+  const protocolID = args.protocolID
   const r = sampleBlindingFactor()
   const A = PublicKey.fromString(args.identityKey)
   const B = PublicKey.fromString(args.recipientKey)

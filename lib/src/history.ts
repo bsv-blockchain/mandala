@@ -1,6 +1,6 @@
 import { WalletInterface } from '@bsv/sdk'
 import { decodeValue } from './brc162.js'
-import { BASKET } from './constants.js'
+import { TREASURY_BASKET } from './constants.js'
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -252,7 +252,7 @@ export async function loadHistory (
       limit: 1000
     } as any),
     wallet.listOutputs({
-      basket: BASKET,
+      basket: TREASURY_BASKET,
       includeCustomInstructions: true,
       limit: 1000
     } as any).catch(() => ({ outputs: [] }))

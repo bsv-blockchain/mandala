@@ -9,7 +9,7 @@
  * (state === null) relinquishes nothing.
  */
 import { WalletInterface } from '@bsv/sdk'
-import { BASKET } from './constants.js'
+import { TREASURY_BASKET } from './constants.js'
 import { resolveAssetState } from './adminState.js'
 
 export async function reconcileBans (
@@ -21,7 +21,7 @@ export async function reconcileBans (
   // What we currently hold, once — evicted matching is by outpoint string.
   const held = new Set<string>()
   try {
-    const res = await wallet.listOutputs({ basket: BASKET, limit: 1000 })
+    const res = await wallet.listOutputs({ basket: TREASURY_BASKET, limit: 1000 })
     for (const o of res.outputs) held.add(o.outpoint as string)
   } catch { return relinquished }
 
@@ -38,7 +38,7 @@ export async function reconcileBans (
     for (const op of state.evictedOutpoints) {
       if (!held.has(op)) continue
       try {
-        await wallet.relinquishOutput({ basket: BASKET, output: op })
+        await wallet.relinquishOutput({ basket: TREASURY_BASKET, output: op })
         relinquished.push(op)
       } catch { /* already gone / not ours — idempotent, ignore */ }
     }
