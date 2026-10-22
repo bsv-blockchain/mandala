@@ -3,30 +3,59 @@
 Go port of the Mandala BSV overlay service (replaces the TS `overlay/` service).
 Module path: `github.com/sirdeggen/mandala/overlay-go`.
 
-Status: BRC-162 with Mandala token topics on one overlay (Q3). `cmd/overlay/main.go` is the entrypoint
-(env config, `wiring.Build`, the boot via `App.Start`, graceful shutdown). The pinned `go-overlay-services`
-engine runs three kinds of topic behind a hand-written Fiber HTTP layer that keeps the TS overlay's wire shapes:
-`tm_mandala` (the token registry), one `tm_color_<deployTxid>_0` per token, and `tm_mandala_kyc` (the identity registry).
-GASP, SHIP/SLAP advertising and cross-operator sync are off (design A1.1); token topics are registered in memory
-by `wiring.TokenTopics` at boot and by the `/submit` deploy hook.
+Status: final BRC-162 (1Color) outputs under the unchanged Mandala issuer policy, on one overlay (1Color).
+`cmd/overlay/main.go` is the entrypoint (env config, `wiring.Build`, the boot via `App.Start`, graceful shutdown).
+The pinned `go-overlay-services` engine runs three kinds of topic behind a hand-written Fiber HTTP layer that keeps
+the TS overlay's wire shapes: `tm_mandala` (the token registry), one `tm_color_<assetId>` per token
+(`<assetId>` = `<deploy txid>_0`), and `tm_mandala_kyc` (the identity registry). GASP, SHIP/SLAP advertising and
+cross-operator sync are off (design A1.1); token topics are registered in memory by `wiring.TokenTopics` at boot and
+by the `/submit` deploy hook.
+
+This overlay is not a 1Color `color` service and does not advertise itself as one: it reads and writes BRC-162
+outputs and answers the `color-*` lookups for interface compatibility, but admits only what the Mandala issuer
+policy allows, and publishes no SHIP/SLAP record (design §3; BRC-207 lines 775-786).
 
 ## Topics, routes and environment
 
 | Topic | Lookup | Admits |
 |---|---|---|
 | `tm_mandala` | `ls_mandala` | Deploys only: vout 0 of a deploy by a trusted issuer with a valid deploySig. The registry record is permanent. |
-| `tm_color_<deployTxid>_0` | `ls_color_<deployTxid>_0` | One token's deploy, authority and value outputs under BRC-162 layers A–D, the owner journal and §4.2a repair. |
+| `tm_color_<assetId>` | `ls_color_<assetId>` | One token's deploy, authority and value outputs under the codec and the Mandala policy, the owner journal and §4.2a repair. `<assetId>` is `<deploy txid>_0`. |
 | `tm_mandala_kyc` | `ls_mandala_kyc` | The identity registry: one authority chain that admits and revokes identities. |
 
-A deploy is one submit naming `["tm_mandala", "tm_color_<own txid>_0"]`; any other submit naming `tm_mandala` is refused
-(400 `ERR_SHAPE`). A token transaction names one `tm_color_<assetId>` per token it touches; a KYC action names
-`["tm_mandala_kyc"]`. Each `tm_mandala` / `tm_color_<assetId>` STEAK entry with admitted outputs carries its own σI
-(digest v3 binds the topic).
+A deploy is one submit naming exactly `["tm_mandala", "tm_color_<own txid>_0"]`; any other submit naming `tm_mandala`
+is refused (400 `ERR_SHAPE`). A token transaction names one `tm_color_<assetId>` per token it touches; a KYC action
+names `["tm_mandala_kyc"]`.
+
+Admission signatures. Each `tm_color_<assetId>` STEAK entry with admitted outputs carries the BRC-207 attested
+admission signature: the statement `1color-admit:v1:tm_color_<assetId>:<txid>:<sorted outputs>`, hashed once with
+SHA-256, signed by the overlay's BRC-42 child key `[2,"color admission attestation"]`, keyID `1`, counterparty
+anyone (low-S on signing, RFC 6979; verifiers accept high-S and never normalize S). `admissionIdentityKey` is the
+root overlay identity key. `tm_mandala` entries keep σI v3 (`mandala-admit:v3:`, digest binds the topic) signed with
+the bare overlay key. `tm_mandala_kyc` entries are unsigned. A replayed submit returns the same signature bytes, and
+`/admin/admission/:txid` serves them.
+
+Mandala policy (unchanged issuer policy, read through the final codec). Token outputs carry 1 satoshi; a holder
+transfer's token inputs equal its outputs; token ids are 32-byte (`<txid>_0`) only, and a 36-byte OneColor id is
+refused (`ERR_SHAPE`); deploys need a trusted issuer and a valid deploySig, plus membership, sanctions,
+freeze/pause/access and the admin chain as before. A deploy's `req` must be exactly the two-member map
+{attested profile `https://brc.dev/207/attested` with `identityKey` K and `trustMode` `identity`, Mandala issuer-v1
+profile with `identityKey` K}, where K is this overlay's identity key; another key, a reordered or extra member, or
+any `ext` is a final `ERR_SHAPE` refusal, persisted and replayed by payload hash. A non-deploy output carrying `req`
+or `ext` is refused. A deploy payload is at most 65536 bytes and an admin details or authority payload at most 4096
+bytes, each nested at most 64 deep (the codec itself is strict DAG-CBOR with templates-parity depth 1024).
+
+Amounts. A token amount is `uint64` per output (`0..2^64-1`, 0 = authority). Sums, supply, deltas and balances are
+exact (`math/big`) with no 2^53 cap. Mongo stores every amount and aggregate as Decimal128 with exponent 0; an
+aggregate above `10^34-1` refuses the submit (`ERR_SHAPE`, `amount aggregate exceeds storage range`). Every JSON
+amount is a canonical decimal string (`"18446744073709551615"`); `delta` may start with `-`. An old-format
+database (BSON double/int amounts) fails closed: every such read is an error (`ERR_UNAVAILABLE` on submit), never a
+silent 0 or a truncated value.
 
 | Route | Access | Notes |
 |---|---|---|
 | `POST /submit` | public | Holds a maintenance-gate slot; pairing rule and deploy hook; typed verdicts; an unhosted topic answers 400 `unknown-topic: <name>`. |
-| `POST /lookup` | public | Outputs only. |
+| `POST /lookup` | public | Outputs only, each item with its `txid` (read from the AtomicBEEF header). `ls_color_<assetId>` takes the Mandala keys (`metadataTokenId`, `authoritiesTokenId`, `tokenId`, `txid` + `outputIndex`) and the `color-spendability` / `color-admission` queries (`version` 1, 1-1000 unique lowercase `<txid>.<vout>` outpoints). A lookup store fault answers 503 `ERR_UNAVAILABLE` (retryable). |
 | `GET /admin/tokens?limit&skip` | public | The registry list with a `hosted` flag (`limit` 1–100, `skip` 0–100000). |
 | `GET /admin/authorities/:tokenId`, `/admin/asset-state/:tokenId`, `/admin/admin-history/:tokenId`, `/admin/admin-history-page/:tokenId?limit&offset`, `/admin/admin-summary/:tokenId` | public | 400 `invalid tokenId`; 404 `token not hosted`. |
 | `GET /admin/authorities/beef/:txid?vout=` | public | Served only from a `tm_color_<assetId>` copy. |
@@ -37,8 +66,8 @@ A deploy is one submit naming `["tm_mandala", "tm_color_<own txid>_0"]`; any oth
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `NODE_NAME` | yes | Database `<NODE_NAME>_lookup_services`. Use a fresh name (e.g. `mandala_q3`); never `mandala` or `mandala162`. |
-| `SERVER_PRIVATE_KEY` | yes | The overlay key: decrypts linkage, signs σI. |
+| `NODE_NAME` | yes | Database `<NODE_NAME>_lookup_services`. Use a fresh name (e.g. `mandala_1color`); never reuse `mandala`, `mandala162` or `mandala_q3`, and never drop an existing database. An old-format database fails closed on every amount read. |
+| `SERVER_PRIVATE_KEY` | yes | The overlay key: decrypts linkage, signs the attested (`tm_color_*`) and σI v3 (`tm_mandala`) admission signatures; its identity key is the K every deploy `req` must name. |
 | `HOSTING_URL`, `MONGO_URL`, `NETWORK` | yes | `NETWORK` is `main` or `test`; the `MONGO_URL` path is ignored. |
 | `MANDALA_ISSUER_KEYS` | yes | JSON array of trusted issuer identity keys. |
 | `MANDALA_TOKEN_ALLOWLIST` | no | JSON array of deploy txids to host; unset follows every token, `[]` hosts none. |
@@ -367,9 +396,11 @@ strategy**, not the `sync.Map` fallback.
 overlay-go/
   go.mod
   cmd/overlay/main.go        — entrypoint: env config, wiring.Build, App.Start, graceful shutdown
-  internal/brc162/           — generic BRC-162: TS-parity chunker, binary codec, strict CBOR, token ledger
-  internal/mandala/          — Mandala policy: topics, envelope, layers B–D, managers, lookups, §6.6 store,
-                                σI v3 admission record, fold/refold, reconciler, KYC registry
+  internal/brc162/           — generic BRC-162 (1Color): TS-parity chunker, OneColor codec, strict DAG-CBOR, token ledger
+  internal/amount/           — exact token amounts: Decimal128 in Mongo, decimal string in JSON, big.Int inside
+  internal/colorprofile/     — the attested + issuer-v1 profile ids and the Mandala deploy req
+  internal/mandala/          — Mandala policy: topics, envelope, layers B–D, managers, lookups (incl. color-*),
+                                §6.6 store, attested v1 / σI v3 admission record, fold/refold, reconciler, KYC registry
   internal/mandalatest/      — importable test kit: parties, BEEF/envelope builders, deploy/issue/transfer flows
   internal/maintenance/      — the shared/exclusive maintenance gate
   internal/enginestore/      — in-repo engine.Storage Mongo implementation

@@ -14,4 +14,5 @@ the pinned hash here and in the test that checks it.
 
 - Source: ts-stack `packages/overlays/topics/test/vectors/mandala-rejects.json` at commit `ee9f56c92` on branch `feat/mandala-token-topics` (read with `git -C /Users/personal/git/ts-stack show`). Q2 Task 5, "KYC rename; 2.1.0 exports, vectors, docs", is `37468f290`; `ee9f56c92` appended ten cases (coinsToRetain narrowing, registry/token agreement, two-token admin entries).
 - sha256 `c13fb98532ea86fbddbb6a8023528ab8339b3aed308dd69f767cb3942727d8a1`, 615526 bytes, format version 2 (real topic names, explicit coinsToRetain).
-- Read by `internal/mandala/vectors_test.go`, which replays every case through the three v3 managers directly (no host rules).
+- Read by `internal/mandala/vectors_test.go`, which replays every case through the three managers directly (no host rules).
+- 1Color: replayed with a topic remap (`tm_<deploy txid>` → `tm_color_<deploy txid>_0`; the registry and KYC topics are not remapped) and a reviewed override table in `internal/mandala/vectors_test.go`, each override naming its case and its reason. The file is unchanged: same bytes, same sha256.
