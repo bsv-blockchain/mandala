@@ -386,8 +386,8 @@ func ParseDeployMetadata(payload []byte, hasPayload, canonical bool) (DeployMeta
 			return DeployMetadata{}, rDeployPayload("req must be a map")
 		}
 		b, err := brc162.EncodeStrictCborValue(req)
-		if err != nil { // a decoded strict map always re-encodes; anything else is a codec fault
-			return DeployMetadata{}, fmt.Errorf("deploy req re-encode: %w", err)
+		if err != nil { // a strictly decoded map re-encodes; if it ever did not, it cannot equal the expected req
+			return DeployMetadata{}, rDeployPayload("req does not match this overlay's Mandala profiles")
 		}
 		md.ReqBytes = b
 	}
