@@ -289,7 +289,7 @@ describe('the commit point is an awaited write (deferred adapter)', () => {
 
 describe('journalHas', () => {
   const stages: Array<JournalEntry['stage']> =
-    ['intent', 'accepted', 'abort', 'retryable', 'stranded', 'handed_over']
+    ['intent', 'accepted', 'abort', 'retryable', 'stranded', 'signed', 'delivered']
 
   beforeEach(async () => {
     configureStorage(null)

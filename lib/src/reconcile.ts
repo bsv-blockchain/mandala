@@ -22,11 +22,11 @@
  *      'accepted' and is broadcast exactly as the live path would. A final
  *      verdict on the retry, or RETRY_CAP fruitless passes, aborts the
  *      reference and drops the entry so the inputs are not held forever.
- *   2b. Journal 'handed_over' entries — an OFFLINE hand-over the payee owns
- *      the submission of (§0.1 rule 3). When this device is online it may
- *      submit too (rule 6, so its change becomes spendable promptly); the
- *      overlay's idempotent /submit makes the order between the two
- *      irrelevant. Treated exactly like 'retryable'.
+ *   2b. Journal 'delivered' entries — an acknowledged holder hand-over
+ *      (handover.ts). The sender may submit the exact journaled bytes (the
+ *      recipient may already have: /submit is idempotent). Treated like
+ *      'retryable' for now (Task 15 gives it its own branch). 'signed'
+ *      entries (not yet acknowledged) are never submitted, aborted or swept.
  *   3. Journal 'abort' entries — overlay rejected, abort pending: retry the
  *      abortAction that releases the held inputs. Kept (attempts++) on failure
  *      so a transient error never orphans the only durable record; handed to
@@ -253,10 +253,15 @@ async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast
       // never blocking anything — the host decides what happens next.
       continue
     }
-    if (entry.stage === 'retryable' || entry.stage === 'handed_over') {
-      // A 'handed_over' entry is the payer's OPTIONAL later submit (offline
-      // settlement §0.1 rule 6): the payee may already have submitted, which
-      // is fine — /submit is idempotent and re-admission returns the same σ_I.
+    if (entry.stage === 'signed') {
+      // A hand-over the recipient has not acknowledged yet: its bytes may
+      // already be in the recipient's hands, so it is never submitted (B5),
+      // never aborted and never swept. Redelivery is reconcileNotifications'.
+      continue
+    }
+    if (entry.stage === 'retryable' || entry.stage === 'delivered') {
+      // A 'delivered' entry is the sender's post-ACK submit: the recipient
+      // may already have submitted, which is fine — /submit is idempotent.
       // Mechanically identical to a retryable refusal: re-POST the stored
       // bytes, commit + broadcast on acceptance, abort at a final verdict or
       // at RETRY_CAP.
@@ -297,9 +302,10 @@ async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast
   const blocked = entries.some(e =>
     e.stage === 'accepted' ||
     e.stage === 'retryable' ||
-    // A handed-over tx's inputs are held ON PURPOSE — the payee holds evidence
-    // over these exact bytes, so sweeping the action would un-pay them.
-    e.stage === 'handed_over' ||
+    // A hand-over's inputs are held ON PURPOSE — the recipient holds (or is
+    // about to hold) these exact bytes, so sweeping the action would un-pay them.
+    e.stage === 'signed' ||
+    e.stage === 'delivered' ||
     (e.stage === 'intent' && Date.now() - e.at < INTENT_TTL_MS)
   )
   if (sweep && !blocked) {

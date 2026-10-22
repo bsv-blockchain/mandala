@@ -516,7 +516,7 @@ describe('reconcileWallet — bulk sweep guards', () => {
   })
 
   const stages: Array<JournalEntry['stage']> =
-    ['accepted', 'retryable', 'handed_over', 'stranded', 'abort', 'intent']
+    ['accepted', 'retryable', 'signed', 'delivered', 'stranded', 'abort', 'intent']
 
   it.each(stages)('never aborts an action whose txid has a %s journal entry', async stage => {
     // The incident: the 'accepted' entry cleared (the wallet "accepted" the
@@ -596,13 +596,13 @@ describe('reconcileWallet — bulk sweep guards', () => {
   })
 })
 
-describe('reconcileWallet — handed_over entries (the payer’s optional later submit)', () => {
+describe('reconcileWallet — delivered entries (the sender’s post-ACK submit)', () => {
   const mockFetch = vi.fn()
   const OVERLAY = 'http://test-overlay'
 
   const handedOver = (over: Record<string, unknown> = {}): any => ({
     txid: 'ho',
-    stage: 'handed_over',
+    stage: 'delivered',
     at: 1,
     reference: 'ref-ho',
     submit: { txHex: BEEF_HEX, offChainHex: '0708', topics: [colorTopic(ASSET)] },
@@ -615,6 +615,17 @@ describe('reconcileWallet — handed_over entries (the payer’s optional later 
     configureMandala({ overlayUrl: OVERLAY, overlayIdentityKey: OVERLAY_KEY })
   })
   afterEach(() => { vi.unstubAllGlobals() })
+
+  it('never submits, aborts or sweeps a signed (unacknowledged) hand-over', async () => {
+    await journalPut(handedOver({ stage: 'signed' }))
+    const wallet = mkWallet()
+    const r = await reconcileWallet(wallet as any)
+    expect(mockFetch).not.toHaveBeenCalled()
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+    expect(wallet.listActions).not.toHaveBeenCalled()
+    expect(r.swept).toBe(0)
+    expect(await journalList()).toMatchObject([{ txid: 'ho', stage: 'signed' }])
+  })
 
   it('re-POSTs the stored bytes when online and commits + broadcasts on acceptance', async () => {
     await journalPut(handedOver())
@@ -638,7 +649,7 @@ describe('reconcileWallet — handed_over entries (the payer’s optional later 
     mockFetch.mockRejectedValue(new Error('offline'))
     const wallet = mkWallet()
     const r = await reconcileWallet(wallet as any)
-    expect(await journalList()).toMatchObject([{ txid: 'ho', stage: 'handed_over', attempts: 1 }])
+    expect(await journalList()).toMatchObject([{ txid: 'ho', stage: 'delivered', attempts: 1 }])
     expect(wallet.abortAction).not.toHaveBeenCalled()
     // The noSend action behind a handed-over tx still holds its inputs on
     // purpose — sweeping it would invalidate evidence the payee already has.
@@ -675,7 +686,7 @@ describe('reconcileWallet — broadcast: false leaves accepted entries to the ho
     expect((await journalList())[0].attempts).toBeUndefined()
   })
 
-  it('still re-submits a handed_over entry and journals the acceptance', async () => {
+  it('still re-submits a delivered entry and journals the acceptance', async () => {
     const { PrivateKey, Beef, LockingScript, Transaction, Utils } = await import('@bsv/sdk')
     const { admissionMessageV3 } = await import('./admission.js')
     const overlayKey = PrivateKey.fromHex('00000000000000000000000000000000000000000000000000000000000000f6')
@@ -690,7 +701,7 @@ describe('reconcileWallet — broadcast: false leaves accepted entries to the ho
       text: async () => JSON.stringify({ tm_mandala: { outputsToAdmit: [0], admissionSignature: sig, admissionIdentityKey: overlayKey.toPublicKey().toString() } })
     } as any)
     try {
-      await journalPut({ txid, stage: 'handed_over', at: 1, reference: 'ref', submit: { txHex: Utils.toHex(beef.toBinaryAtomic(txid)), topics: ['tm_mandala'] } })
+      await journalPut({ txid, stage: 'delivered', at: 1, reference: 'ref', submit: { txHex: Utils.toHex(beef.toBinaryAtomic(txid)), topics: ['tm_mandala'] } })
       const wallet = mkWallet()
       const r = await reconcileWallet(wallet as any, { sweep: false, broadcast: false })
       expect(r.resubmitted).toEqual([txid])
