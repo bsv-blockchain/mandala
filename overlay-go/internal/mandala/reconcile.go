@@ -168,7 +168,11 @@ func reconcileScriptToken(script []byte, txid string, vout uint32) (reconcileTok
 		return reconcileToken{}, false
 	}
 	if dec.TokenID != nil {
-		return reconcileToken{tokenID: brc162.TokenIDToString(*dec.TokenID), role: dec.Role, amount: dec.Amount}, true
+		tokenID, err := brc162.TokenIDToString(dec.TokenID)
+		if err != nil {
+			return reconcileToken{}, false
+		}
+		return reconcileToken{tokenID: tokenID, role: dec.Role, amount: dec.Amount}, true
 	}
 	if vout == 0 {
 		return reconcileToken{tokenID: txid + "_0", role: dec.Role, amount: dec.Amount}, true

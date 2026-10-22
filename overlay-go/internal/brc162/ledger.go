@@ -18,7 +18,7 @@ type Output struct {
 	Index            uint32
 	Satoshis         uint64
 	Role             Role
-	TokenID          string // deploy: DeployTokenID(txid, Index); else TokenIDToString(*Decoded.TokenID)
+	TokenID          string // deploy: DeployTokenID(txid, Index); else TokenIDToString(Decoded.TokenID)
 	Amount           uint64
 	Payload          []byte
 	HasPayload       bool
@@ -136,7 +136,11 @@ func ClassifyOutputs(tx *transaction.Transaction) Classification {
 		}
 		tokenID := DeployTokenID(txid, index)
 		if d.TokenID != nil {
-			tokenID = TokenIDToString(*d.TokenID)
+			// cannot fail on codec-validated bytes; a failure is listed like a codec refusal
+			if tokenID, err = TokenIDToString(d.TokenID); err != nil {
+				c.Invalid = append(c.Invalid, InvalidOutput{Index: index, Detail: err.Error()})
+				continue
+			}
 		}
 		c.Outputs = append(c.Outputs, Output{
 			Index:            index,
@@ -190,7 +194,10 @@ func ClassifyAdmittedInputs(tx *transaction.Transaction, previousCoins []uint32)
 		var tokenID string
 		switch {
 		case d.TokenID != nil:
-			tokenID = TokenIDToString(*d.TokenID)
+			// cannot fail on codec-validated bytes; a failure is skipped like a codec refusal
+			if tokenID, err = TokenIDToString(d.TokenID); err != nil {
+				continue
+			}
 		case vout == 0:
 			tokenID = DeployTokenID(sourceTxid, 0)
 		default:

@@ -206,7 +206,11 @@ func decodeToken(script []byte, txid string) (tokenID string, amount int64, role
 	if d.TokenID == nil {
 		return "", 0, "", false
 	}
-	return brc162.TokenIDToString(*d.TokenID), int64(d.Amount), d.Role, true
+	tokenID, err = brc162.TokenIDToString(d.TokenID)
+	if err != nil {
+		return "", 0, "", false
+	}
+	return tokenID, int64(d.Amount), d.Role, true
 }
 
 func lockingScriptBytes(o *transaction.TransactionOutput) []byte {

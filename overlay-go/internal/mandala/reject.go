@@ -68,6 +68,12 @@ func rInvalidTokenOutput(i uint32, detail string) *RejectError {
 	return newReject(CodeShape, "output %d: token-shaped output is not a valid BRC-162 token output (%s)", i, detail)
 }
 
+// rLegacyTokenID is Mandala policy, not a codec failure: the OneColor codec parses a canonical
+// 36-byte id, and Mandala serves 32-byte ids only (design §3, §4.2; contract §4 step 0; 0162:113-115).
+func rLegacyTokenID(i uint32, tokenID string) *RejectError {
+	return newReject(CodeShape, "output %d: legacy 36-byte token id %s is refused by Mandala policy (32-byte ids only)", i, tokenID)
+}
+
 func rNonP2pkhRemainder(i uint32) *RejectError {
 	return newReject(CodeShape, "output %d: token output remainder must be a P2PKH lock", i)
 }

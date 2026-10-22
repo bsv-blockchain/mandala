@@ -60,7 +60,9 @@ func requireOutputs(t *testing.T, b *Built, want []wantOut) {
 		}
 		gotID := ""
 		if d.TokenID != nil {
-			gotID = brc162.TokenIDToString(*d.TokenID)
+			if gotID, err = brc162.TokenIDToString(d.TokenID); err != nil {
+				t.Fatalf("output %d: %v", n, err)
+			}
 		}
 		if gotID != w.tokenID {
 			t.Fatalf("output %d: token %q, want %q", n, gotID, w.tokenID)

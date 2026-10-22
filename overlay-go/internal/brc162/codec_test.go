@@ -2,6 +2,7 @@ package brc162
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"go/parser"
 	"go/token"
@@ -98,18 +99,86 @@ func TestDecodeAmountChunkRejects(t *testing.T) {
 
 func TestTokenIDStrings(t *testing.T) {
 	id, err := TokenIDFromString(testID)
-	if err != nil || hex.EncodeToString(id[:]) != testIDWire {
+	if err != nil || hex.EncodeToString(id) != testIDWire {
 		t.Fatalf("TokenIDFromString = %x, %v", id, err)
 	}
-	if TokenIDToString(id) != testID {
-		t.Fatalf("TokenIDToString = %s", TokenIDToString(id))
+	if s, err := TokenIDToString(id); err != nil || s != testID {
+		t.Fatalf("TokenIDToString = %s, %v", s, err)
 	}
-	for _, bad := range []string{"", testTxid, testTxid + "_1", testTxid + "_00", strings.ToUpper(testTxid) + "_0",
-		testTxid + ".0", "x" + testTxid + "_0", testTxid[2:] + "_0", "zz" + testTxid[2:] + "_0"} {
+	// OneColor.ts TOKEN_ID_RE: ^([0-9a-f]{64})_(0|[1-9]\d{0,9})$ (0162:113-120)
+	for _, bad := range []string{"", testTxid, testTxid + "_00", testTxid + "_01", testTxid + "_-1", testTxid + "_12345678901",
+		strings.ToUpper(testTxid) + "_0", testTxid + ".0", "x" + testTxid + "_0", testTxid[2:] + "_0", "zz" + testTxid[2:] + "_0",
+		testTxid + "_0\n", testTxid + "_\u0661"} {
 		_, err := TokenIDFromString(bad)
-		if got := codecErr(t, err); got != "token id must be <64 lowercase hex>_0" {
+		if got := codecErr(t, err); got != "token id must be <64 lowercase hex>_<vout>" {
 			t.Errorf("%q: %q", bad, got)
 		}
+	}
+	for _, c := range []struct {
+		s    string
+		vout uint32
+	}{{testTxid + "_1", 1}, {testTxid + "_256", 256}, {testTxid + "_4294967295", math.MaxUint32}} {
+		id, err := TokenIDFromString(c.s)
+		if err != nil || len(id) != 36 || hex.EncodeToString(id[:32]) != testIDWire || binary.LittleEndian.Uint32(id[32:]) != c.vout {
+			t.Errorf("%s: %x, %v", c.s, id, err)
+			continue
+		}
+		if s, err := TokenIDToString(id); err != nil || s != c.s {
+			t.Errorf("%s: round trip %s, %v", c.s, s, err)
+		}
+	}
+	for _, c := range []struct {
+		id   []byte
+		want string
+	}{
+		{nil, "token id must be 32 or 36 bytes"},
+		{make([]byte, 20), "token id must be 32 or 36 bytes"},
+		{make([]byte, 33), "token id must be 32 or 36 bytes"},
+		{make([]byte, 36), "a 36-byte token id with vout 0 is non-canonical"},
+	} {
+		_, err := TokenIDToString(c.id)
+		if got := codecErr(t, err); got != c.want {
+			t.Errorf("TokenIDToString(%d bytes): %q, want %q", len(c.id), got, c.want)
+		}
+	}
+}
+
+func TestOneColorLegacyIDs(t *testing.T) {
+	txid := strings.Repeat("ab", 32)
+	id, err := TokenIDFromString(txid + "_7")
+	if err != nil || len(id) != 36 || binary.LittleEndian.Uint32(id[32:]) != 7 {
+		t.Fatal(id, err)
+	}
+	if s, _ := TokenIDToString(id); s != txid+"_7" {
+		t.Fatal(s)
+	}
+	if _, err := TokenIDFromString(txid + "_4294967296"); err == nil || err.Error() != "token id vout exceeds uint32" {
+		t.Fatal(err)
+	}
+	if _, err := TokenIDFromString(txid + "_9999999999"); err == nil || err.Error() != "token id vout exceeds uint32" {
+		t.Fatal(err)
+	}
+	script, err := Lock(LockParams{TokenID: txid + "_7", Amount: 5, PubKeyHash: make([]byte, 20)})
+	if err != nil || script[0] != 36 {
+		t.Fatalf("lock: %x %v", script, err)
+	}
+	d, err := Decode(script)
+	if err != nil || len(d.TokenID) != 36 || !bytes.Equal(d.TokenID, id) || d.Role != RoleValue || d.Amount != 5 {
+		t.Fatal(d, err)
+	}
+	zero := append(append([]byte{}, id[:32]...), 0, 0, 0, 0)
+	bad := append([]byte{36}, zero...) // direct 36-byte push, vout 0
+	bad = append(bad, 0x55, 0x6d)      // OP_5 amount, OP_2DROP (token-shaped; the id check fails first)
+	if _, err := Decode(bad); err == nil || err.Error() != "a 36-byte token id with vout 0 is non-canonical" {
+		t.Fatal(err)
+	}
+	// op/length checked before vout: a PUSHDATA1 of 36 bytes is not a direct push
+	pd1 := append([]byte{0x4c, 36}, id...)
+	if _, err := Decode(append(pd1, 0x55, 0x6d)); err == nil || err.Error() != "token id must be a direct 32- or 36-byte push" {
+		t.Fatal(err)
+	}
+	if !IsLegacyTokenID(txid+"_7") || IsLegacyTokenID(txid+"_0") || IsLegacyTokenID(txid+"_07") || IsLegacyTokenID(txid+"_4294967296") {
+		t.Fatal("IsLegacyTokenID")
 	}
 }
 
@@ -166,7 +235,7 @@ func TestLockAndDecode(t *testing.T) {
 		t.Errorf("amount 0 role = %s", d.Role)
 	}
 	d, _ = Decode(mustHex(t, lockHex(t, LockParams{TokenID: testID, Amount: math.MaxUint64, PubKeyHash: pkh})))
-	if d.Amount != math.MaxUint64 || TokenIDToString(*d.TokenID) != testID {
+	if s, err := TokenIDToString(d.TokenID); d.Amount != math.MaxUint64 || err != nil || s != testID {
 		t.Errorf("max amount = %+v", d)
 	}
 }
@@ -250,16 +319,21 @@ func TestDecodePayloadsAndRest(t *testing.T) {
 func TestDecodeTokenShapedButInvalid(t *testing.T) {
 	ones := strings.Repeat("11", 32)
 	for _, c := range []struct{ hex, want string }{
-		{"24" + strings.Repeat("11", 36) + "01056d", "token id must be a direct 32-byte push"},
-		{"1f" + strings.Repeat("11", 31) + "01056d", "token id must be a direct 32-byte push"},
-		{"4f556d", "token id must be a direct 32-byte push"},
-		{"51556d", "token id must be a direct 32-byte push"},
+		// OneColor: a 36-byte id with vout != 0 is an id, so the amount check is reached (0162:113-115)
+		{"24" + strings.Repeat("11", 36) + "01056d", "amounts 0..16 must use OP_0/OP_1..OP_16"},
+		{"24" + ones + "00000000556d", "a 36-byte token id with vout 0 is non-canonical"},
+		{"24" + ones + "000000004f6d", "a 36-byte token id with vout 0 is non-canonical"}, // id checked before amount
+		{"25" + strings.Repeat("11", 37) + "556d", "token id must be a direct 32- or 36-byte push"},
+		{"1f" + strings.Repeat("11", 31) + "01056d", "token id must be a direct 32- or 36-byte push"},
+		{"4f556d", "token id must be a direct 32- or 36-byte push"},
+		{"51556d", "token id must be a direct 32- or 36-byte push"},
 		{"20" + ones + "0205006d", "amount is not minimally encoded"},
 		{"20" + ones + "01056d", "amounts 0..16 must use OP_0/OP_1..OP_16"},
 		{"20" + ones + "01006d", "amount is not minimally encoded"},
 		{"20" + ones + "4f6d", "amount must be OP_0, OP_1..OP_16 or a direct push of 1-9 bytes"},
 		{"20" + ones + "038813ff6d", "amount must not be negative"},
-		{"4c20" + ones + "556d", "token id must be a direct 32-byte push"},
+		{"4c20" + ones + "556d", "token id must be a direct 32- or 36-byte push"},
+		{"4c24" + ones + "01000000556d", "token id must be a direct 32- or 36-byte push"},
 		{"00006d4c050102", "truncated push"},
 		{"20" + testIDWire + "516d4c050102", "truncated push"},
 	} {
@@ -278,8 +352,9 @@ func TestLockInputValidation(t *testing.T) {
 	}{
 		{LockParams{TokenID: testID, Amount: 1, PubKeyHash: pkh[:19]}, "pubKeyHash must be 20 bytes"},
 		{LockParams{TokenID: testID, Amount: 1, PubKeyHash: append(append([]byte{}, pkh...), 0x15)}, "pubKeyHash must be 20 bytes"},
-		{LockParams{TokenID: testTxid + "_1", Amount: 1, PubKeyHash: pkh}, "token id must be <64 lowercase hex>_0"},
-		{LockParams{TokenID: testTxid + "_1", Amount: 1, PubKeyHash: pkh[:19]}, "pubKeyHash must be 20 bytes"},
+		{LockParams{TokenID: testTxid + "_01", Amount: 1, PubKeyHash: pkh}, "token id must be <64 lowercase hex>_<vout>"},
+		{LockParams{TokenID: testTxid + "_4294967296", Amount: 1, PubKeyHash: pkh}, "token id vout exceeds uint32"},
+		{LockParams{TokenID: testTxid + "_01", Amount: 1, PubKeyHash: pkh[:19]}, "pubKeyHash must be 20 bytes"},
 	} {
 		_, err := Lock(c.p)
 		if got := codecErr(t, err); got != c.want {

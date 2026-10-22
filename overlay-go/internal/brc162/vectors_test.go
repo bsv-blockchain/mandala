@@ -2,6 +2,7 @@ package brc162
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -131,10 +132,10 @@ func TestVectorScriptsDecodeAndLock(t *testing.T) {
 			}
 			if row.TokenID == nil {
 				if d.TokenID != nil {
-					t.Errorf("tokenId = %x, want none", *d.TokenID)
+					t.Errorf("tokenId = %x, want none", d.TokenID)
 				}
-			} else if d.TokenID == nil || TokenIDToString(*d.TokenID) != *row.TokenID {
-				t.Errorf("tokenId = %v, want %s", d.TokenID, *row.TokenID)
+			} else if got, err := TokenIDToString(d.TokenID); d.TokenID == nil || err != nil || got != *row.TokenID {
+				t.Errorf("tokenId = %x (%v), want %s", d.TokenID, err, *row.TokenID)
 			}
 			if want := mustUint(t, row.Amount); d.Amount != want {
 				t.Errorf("amount = %d, want %d", d.Amount, want)
@@ -206,6 +207,42 @@ func TestVectorAmountChunks(t *testing.T) {
 	}
 }
 
+// oneColorRejectMessages remaps the brc162.json rejectScripts rows whose file expectation is the
+// Bsv21Binary token-id message ("token id must be a direct 32-byte push"). The vectors are
+// Bsv21Binary's; Decode is the OneColor codec (OneColor.ts at cbdccfe5b), which accepts a direct
+// 32- or 36-byte id push and refuses a 36-byte id with vout 0 (0162:113-115). "" = the row now
+// decodes. The file is unchanged; every entry is asserted, never skipped (TestOneColorRemapIsLive).
+var oneColorRejectMessages = map[string]string{
+	// 0162:113-115: 36 x 0x11 is txid ‖ LE vout 0x11111111 != 0, a canonical legacy id
+	"id-36-bytes": "",
+	// 0162:113-115: only a direct push of exactly 32 or 36 bytes is a token id
+	"id-33-bytes":              "token id must be a direct 32- or 36-byte push",
+	"id-31-bytes":              "token id must be a direct 32- or 36-byte push",
+	"id-op-1negate":            "token id must be a direct 32- or 36-byte push",
+	"id-op-1":                  "token id must be a direct 32- or 36-byte push",
+	"id-pushdata1":             "token id must be a direct 32- or 36-byte push",
+	"id-pushdata2":             "token id must be a direct 32- or 36-byte push",
+	"id-checked-before-amount": "token id must be a direct 32- or 36-byte push",
+}
+
+const bsv21IDMessage = "token id must be a direct 32-byte push"
+
+func TestOneColorRemapIsLive(t *testing.T) {
+	seen := map[string]bool{}
+	for _, row := range loadBRC162Vectors(t).RejectScripts {
+		_, remapped := oneColorRejectMessages[row.ID]
+		if (row.Error == bsv21IDMessage) != remapped {
+			t.Errorf("%s: file error %q, remapped %v", row.ID, row.Error, remapped)
+		}
+		seen[row.ID] = remapped
+	}
+	for id := range oneColorRejectMessages {
+		if !seen[id] {
+			t.Errorf("remap %s names no Bsv21Binary token-id row", id)
+		}
+	}
+}
+
 func TestVectorRejectScripts(t *testing.T) {
 	for _, row := range loadBRC162Vectors(t).RejectScripts {
 		t.Run(row.ID, func(t *testing.T) {
@@ -213,10 +250,20 @@ func TestVectorRejectScripts(t *testing.T) {
 			if got := IsTokenShaped(script); got != row.TokenShaped {
 				t.Errorf("IsTokenShaped = %v, want %v", got, row.TokenShaped)
 			}
-			_, err := Decode(script)
+			want := row.Error
+			if m, ok := oneColorRejectMessages[row.ID]; ok {
+				want = m
+			}
+			d, err := Decode(script)
+			if want == "" {
+				if err != nil || len(d.TokenID) != 36 || binary.LittleEndian.Uint32(d.TokenID[32:]) == 0 {
+					t.Errorf("Decode = %+v, %v; want a 36-byte legacy id", d, err)
+				}
+				return
+			}
 			ce, ok := err.(*CodecError)
-			if !ok || ce.Message != row.Error {
-				t.Errorf("Decode error = %v, want %q", err, row.Error)
+			if !ok || ce.Message != want {
+				t.Errorf("Decode error = %v, want %q", err, want)
 			}
 		})
 	}

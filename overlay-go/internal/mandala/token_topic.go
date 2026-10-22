@@ -96,6 +96,10 @@ func (m *TokenTopicManager) identify(ctx context.Context, beef *transaction.Beef
 
 	// layer A, narrowed to this token (Q2/mandala/MandalaTopicManager.ts:185-205)
 	cls := brc162.ClassifyOutputs(tx)
+	// Mandala policy: a legacy 36-byte id refuses the whole tx before scoping (contract §4 step 0)
+	if err := RequireNoLegacyTokenIDs(cls.Outputs); err != nil {
+		return fail(err)
+	}
 	v := ScopeToToken(m.tokenID, TxView{Outputs: cls.Outputs, Invalid: cls.Invalid,
 		Inputs: brc162.ClassifyAdmittedInputs(tx, previousCoins), Env: env})
 	if len(v.Outputs) == 0 && len(v.Inputs) == 0 && len(v.Invalid) == 0 && len(v.Env.Admin) == 0 {

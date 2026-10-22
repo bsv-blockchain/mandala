@@ -1,8 +1,10 @@
 package brc162
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"regexp"
+	"strconv"
 )
 
 // Role is a BRC-162 output role (TS Bsv21Role).
@@ -15,9 +17,10 @@ const (
 )
 
 const (
-	TokenIDBytes    = 32
-	PubKeyHashBytes = 20
-	MaxAmountBytes  = 9
+	TokenIDBytes       = 32 // a txid; the id of a deploy at vout 0
+	LegacyTokenIDBytes = 36 // txid ‖ uint32 LE vout, vout != 0 (OneColor.ts LEGACY_ID_BYTES; 0162:113-115)
+	PubKeyHashBytes    = 20
+	MaxAmountBytes     = 9
 )
 
 // CodecError is TS Bsv21BinaryError. Message is the exact cross-engine string
@@ -32,10 +35,10 @@ func isSmallIntOp(op byte) bool { return op >= op1 && op <= op16 }
 
 func isPushOp(op byte) bool { return op <= opPushData4 || op == op1Negate || isSmallIntOp(op) }
 
-// Decoded is TS Bsv21BinaryDecoded.
+// Decoded is TS OneColorDecoded (= Bsv21BinaryDecoded with a 32- or 36-byte tokenId).
 type Decoded struct {
 	Role             Role
-	TokenID          *[32]byte // natural (internal) byte order; nil for a deploy
+	TokenID          []byte // nil for a deploy; else 32 bytes (txid, natural order) or 36 (txid ‖ uint32 LE vout, vout != 0)
 	Amount           uint64
 	Payload          []byte // meaningful only when HasPayload
 	HasPayload       bool   // a payload push + OP_DROP follows OP_2DROP (an empty OP_0 payload counts: present and empty)
@@ -52,7 +55,7 @@ func tokenShaped(c []Chunk) bool {
 // (Bsv21Binary.ts:118-121). A truncated push still counts as a push.
 func IsTokenShaped(script []byte) bool { return tokenShaped(ParseChunks(script)) }
 
-// Decode ports Bsv21Binary.decode (Bsv21Binary.ts:197-213), checks in this order:
+// Decode ports OneColor.decode (ts-templates OneColor.ts at cbdccfe5b), checks in this order:
 // shape, "truncated push" over EVERY chunk, token id, amount, payload split.
 func Decode(script []byte) (*Decoded, error) {
 	c := ParseChunks(script)
@@ -85,19 +88,29 @@ func Decode(script []byte) (*Decoded, error) {
 	}, nil
 }
 
-func decodeTokenID(c Chunk) (*[32]byte, error) {
+// decodeTokenID ports OneColor.ts readTokenId: OP_0 = deploy; else a direct push of exactly 32
+// or 36 bytes (op/length first), then a 36-byte id must not carry vout 0 (0162:113-115).
+func decodeTokenID(c Chunk) ([]byte, error) {
 	if c.Op == op0 {
 		return nil, nil
 	}
-	if c.Op != TokenIDBytes || len(c.Data) != TokenIDBytes {
-		return nil, fail("token id must be a direct 32-byte push")
+	n := len(c.Data)
+	if int(c.Op) != n || (n != TokenIDBytes && n != LegacyTokenIDBytes) {
+		return nil, fail("token id must be a direct 32- or 36-byte push")
 	}
-	var id [32]byte
-	copy(id[:], c.Data)
-	return &id, nil
+	id := append([]byte{}, c.Data...)
+	if n == LegacyTokenIDBytes && legacyVout(id) == 0 {
+		return nil, fail("a 36-byte token id with vout 0 is non-canonical")
+	}
+	return id, nil
 }
 
-func roleOf(id *[32]byte, amount uint64) Role {
+// legacyVout is the uint32 little-endian vout of a 36-byte id (OneColor.ts legacyVout).
+func legacyVout(id []byte) uint32 {
+	return binary.LittleEndian.Uint32(id[TokenIDBytes:LegacyTokenIDBytes])
+}
+
+func roleOf(id []byte, amount uint64) Role {
 	if id == nil {
 		return RoleDeploy
 	}
@@ -171,28 +184,57 @@ func isMinimalScriptNum(d []byte) bool {
 	return top&0x7f != 0 || (len(d) > 1 && d[len(d)-2]&0x80 != 0)
 }
 
-var tokenIDPattern = regexp.MustCompile(`^[0-9a-f]{64}_0$`)
+// tokenIDPattern is OneColor.ts TOKEN_ID_RE: at most 10 decimal digits, no leading zero.
+var tokenIDPattern = regexp.MustCompile(`^([0-9a-f]{64})_(0|[1-9][0-9]{0,9})$`)
 
-// TokenIDToString formats 32 wire bytes (natural order) as `<64 hex, display order>_0`.
-func TokenIDToString(id [32]byte) string {
-	var rev [32]byte
-	for i := range id {
-		rev[31-i] = id[i]
+// TokenIDToString ports OneColor.tokenIdToString: a canonical 32- or 36-byte wire id (txid in
+// natural order [‖ uint32 LE vout]) as `<64 hex, display order>_<vout>`.
+func TokenIDToString(id []byte) (string, error) {
+	if len(id) != TokenIDBytes && len(id) != LegacyTokenIDBytes {
+		return "", fail("token id must be 32 or 36 bytes")
 	}
-	return hex.EncodeToString(rev[:]) + "_0"
+	rev := make([]byte, TokenIDBytes)
+	for i := range rev {
+		rev[TokenIDBytes-1-i] = id[i]
+	}
+	txid := hex.EncodeToString(rev)
+	if len(id) == TokenIDBytes {
+		return txid + "_0", nil
+	}
+	vout := legacyVout(id)
+	if vout == 0 {
+		return "", fail("a 36-byte token id with vout 0 is non-canonical")
+	}
+	return txid + "_" + strconv.FormatUint(uint64(vout), 10), nil
 }
 
-// TokenIDFromString parses `<64 lowercase hex, display order>_0` into the 32 wire bytes.
-func TokenIDFromString(s string) ([32]byte, error) {
-	var id [32]byte
-	if !tokenIDPattern.MatchString(s) {
-		return id, fail("token id must be <64 lowercase hex>_0")
+// TokenIDFromString ports OneColor.tokenIdFromString: `<64 lowercase hex, display order>_<vout>`
+// into the canonical wire id, 32 bytes for vout 0 and 36 (txid ‖ uint32 LE vout) otherwise.
+func TokenIDFromString(s string) ([]byte, error) {
+	m := tokenIDPattern.FindStringSubmatch(s)
+	if m == nil {
+		return nil, fail("token id must be <64 lowercase hex>_<vout>")
 	}
-	raw, _ := hex.DecodeString(s[:64])
+	vout, err := strconv.ParseUint(m[2], 10, 64) // <= 10 digits: always fits
+	if err != nil || vout > 0xffffffff {
+		return nil, fail("token id vout exceeds uint32")
+	}
+	raw, _ := hex.DecodeString(m[1])
+	id := make([]byte, TokenIDBytes, LegacyTokenIDBytes)
 	for i := range raw {
-		id[31-i] = raw[i]
+		id[TokenIDBytes-1-i] = raw[i]
 	}
-	return id, nil
+	if vout == 0 {
+		return id, nil
+	}
+	return binary.LittleEndian.AppendUint32(id, uint32(vout)), nil
+}
+
+// IsLegacyTokenID reports whether s is a canonical token id string naming a non-zero deploy
+// vout, i.e. one whose wire form is the 36-byte legacy id (0162:113-115).
+func IsLegacyTokenID(s string) bool {
+	id, err := TokenIDFromString(s)
+	return err == nil && len(id) == LegacyTokenIDBytes
 }
 
 // canonicalPushOp is the minimal push opcode for raw bytes (Bsv21Binary.ts:124-132).
@@ -272,7 +314,7 @@ type LockParams struct {
 	HasPayload bool
 }
 
-// Lock ports Bsv21Binary.lock (Bsv21Binary.ts:216-237), order: pkh length, id,
+// Lock ports OneColor.lock (OneColor.ts at cbdccfe5b), order: pkh length, id,
 // amount chunk, OP_2DROP, [canonical payload push, OP_DROP], canonical P2PKH.
 func Lock(p LockParams) ([]byte, error) {
 	if len(p.PubKeyHash) != PubKeyHashBytes {
@@ -284,7 +326,7 @@ func Lock(p LockParams) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		idChunk = Chunk{Op: TokenIDBytes, Data: id[:]}
+		idChunk = Chunk{Op: byte(len(id)), Data: id}
 	}
 	chunks := []Chunk{idChunk, EncodeAmountChunk(p.Amount), {Op: op2Drop}}
 	if p.HasPayload {

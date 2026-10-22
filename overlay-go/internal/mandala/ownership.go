@@ -55,6 +55,21 @@ func ownFirstFailing(outputs []brc162.Output, fails func(brc162.Output) bool) (u
 	return 0, false
 }
 
+// RequireNoLegacyTokenIDs refuses the first output (index order) that carried a 36-byte legacy
+// wire id. It runs on every Mandala token topic right after layer A and before ScopeToToken, so a
+// legacy output is refused, never scoped out as a foreign asset (contract §4 step 0). A deploy
+// carries no wire id: its own <txid>_<index> name is not a legacy id (a deploy off vout 0 stays
+// rDeployNotAtZero / out of scope). Inputs need no check: previousCoins are the topic's admitted
+// coins, and no output with a legacy id is ever admitted.
+func RequireNoLegacyTokenIDs(outputs []brc162.Output) error {
+	for _, o := range outputs {
+		if o.Role != brc162.RoleDeploy && brc162.IsLegacyTokenID(o.TokenID) {
+			return rLegacyTokenID(o.Index, o.TokenID)
+		}
+	}
+	return nil
+}
+
 // RequireValidTokenOutputs is the shape policy, rule-major (each rule scans every output before
 // the next rule runs): codec refusals, deploy at vout 0, P2PKH remainder, 1 satoshi, amount cap.
 func RequireValidTokenOutputs(invalid []brc162.InvalidOutput, outputs []brc162.Output) error {

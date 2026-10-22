@@ -364,6 +364,55 @@ func TestTokenTopicDeployNotAtZeroIsNotItsToken(t *testing.T) {
 	mgrAdmit(t, got, err, []uint32{}, []uint32{})
 }
 
+// legacyIDFixture spends the issue's 100-unit value coin into output 0, a token-shaped output
+// carrying the legacy 36-byte id <deploy txid>_1, and output 1, all 100 units of the topic's own
+// token. Scoped to the token, output 0 is a foreign asset and the rest conserves, so only a
+// refusal that runs before ScopeToToken refuses it.
+func legacyIDFixture(t *testing.T, st *memStore) (mgrIssued, *mandalatest.Built, string) {
+	t.Helper()
+	a := mgrIssue(t, st, "USD")
+	legacyID := a.deploy.Txid + "_1"
+	b := mandalatest.Build(t, []mandalatest.In{{Src: a.issue, Vout: 1}}, []mandalatest.Out{
+		{Owner: mandalatest.Receiver, Prover: mandalatest.Holder, TokenID: legacyID, Amount: 5},
+		{Owner: mandalatest.Receiver, Prover: mandalatest.Holder, TokenID: a.tokenID, Amount: 100},
+	}, nil)
+	return a, b, legacyID
+}
+
+func TestTokenTopicRefusesLegacyTokenID(t *testing.T) {
+	st := newMemStore()
+	a, b, legacyID := legacyIDFixture(t, st)
+	if len(b.Tx.Outputs[0].LockingScript.Bytes()) == 0 || b.Tx.Outputs[0].LockingScript.Bytes()[0] != 36 {
+		t.Fatalf("fixture output 0 is not a 36-byte id push: %x", b.Tx.Outputs[0].LockingScript.Bytes())
+	}
+	reason := "output 0: legacy 36-byte token id " + legacyID + " is refused by Mandala policy (32-byte ids only)"
+	_, err := mgrRunToken(t, a.tokenID, b, st, []uint32{0}, nil)
+	mgrRefusal(t, err, CodeShape, reason, a.topic)
+	// a topic with nothing of this transaction refuses it too: the check runs before scoping
+	_, err = mgrRunToken(t, mgrUntouched, b, st, nil, nil)
+	mgrRefusal(t, err, CodeShape, reason, mgrTopic(t, mgrUntouched))
+	_, err = mgrRunRegistry(t, b, st, nil, nil)
+	mgrRefusal(t, err, CodeShape, reason, MandalaTopic)
+	if len(st.owners) != 3 { // mgrIssue's seed (deploy 1 row, issue 2 rows): the refusal journals nothing
+		t.Fatalf("journal grew to %d rows", len(st.owners))
+	}
+}
+
+func TestRequireNoLegacyTokenIDs(t *testing.T) {
+	txid := strings.Repeat("cd", 32)
+	outs := []brc162.Output{
+		{Index: 0, Role: brc162.RoleValue, TokenID: txid + "_0"},
+		{Index: 1, Role: brc162.RoleDeploy, TokenID: brc162.DeployTokenID(txid, 1)}, // a deploy names itself; not a wire id
+		{Index: 2, Role: brc162.RoleAuthority, TokenID: txid + "_9"},
+		{Index: 3, Role: brc162.RoleValue, TokenID: txid + "_4"},
+	}
+	if err := RequireNoLegacyTokenIDs(outs[:2]); err != nil {
+		t.Fatalf("no legacy wire id: %v", err)
+	}
+	requireReject(t, RequireNoLegacyTokenIDs(outs), CodeShape,
+		"output 2: legacy 36-byte token id "+txid+"_9 is refused by Mandala policy (32-byte ids only)")
+}
+
 func TestTokenTopicConflictingSpendGuard(t *testing.T) {
 	other := strings.Repeat("99", 32)
 	setup := func(t *testing.T) (*memStore, *mandalatest.Built, *mandalatest.Built, string) {

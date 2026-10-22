@@ -253,9 +253,22 @@ var vectorOverrides = map[string]vectorOverride{
 		Reason: "output 0: admin details violate the schema (invalid CID)"}}, // kind: d82a + text "issue"
 	"details-float": {Why: fullDagCborWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
 		Reason: "output 0: admin details violate the schema (float must be 64-bit)"}}, // feeRatePerKb: f93c00
+
+	// Task 3: the codec is OneColor (templates cbdccfe5b), so its token-id message names 32- or
+	// 36-byte pushes, and a canonical 36-byte id parses and is then refused as Mandala policy.
+	"token-id-pushdata1": {Why: oneColorIDWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 1: token-shaped output is not a valid BRC-162 token output (token id must be a direct 32- or 36-byte push)"}},
+	"token-id-31-bytes": {Why: oneColorIDWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 1: token-shaped output is not a valid BRC-162 token output (token id must be a direct 32- or 36-byte push)"}},
+	"token-shaped-garbage": {Why: oneColorIDWhy, Expected: rejectExpected{Code: "ERR_SHAPE",
+		Reason: "output 1: token-shaped output is not a valid BRC-162 token output (token id must be a direct 32- or 36-byte push)"}}, // 02dead: a 2-byte id push
+	"token-id-36-bytes": {Why: oneColorIDWhy, Expected: rejectExpected{Code: "ERR_SHAPE", // id ab..ab ‖ 01020304 = vout 0x04030201
+		Reason: "output 1: legacy 36-byte token id " + strings.Repeat("ab", 32) + "_67305985 is refused by Mandala policy (32-byte ids only)"}},
 }
 
 const fullDagCborWhy = "full strict DAG-CBOR (0162:148); Mandala payload policy 65536 B / depth 64 (contract §4.1)"
+
+const oneColorIDWhy = "OneColor 36-byte ids parse in the codec; Mandala refuses them as policy (0162:113-115, design §4.2)"
 
 // replayCase is c as this overlay replays it: topics through vectorTopic and the expectation
 // through vectorOverrides. The state slices are cloned, so the loaded file is never mutated.
