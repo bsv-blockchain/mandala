@@ -14,6 +14,11 @@ import { useHolderData } from '../hooks/useHolderData'
 import { useContactsData } from '../hooks/useContactsData'
 import { useAssetState } from '../hooks/useAssetState'
 import { useSendMutation } from '../hooks/useSendMutation'
+import { usePayoutMutation, payoutFlight } from '../hooks/usePayoutMutation'
+import { useTreasuryBalances } from '../hooks/useTreasuryBalances'
+import { useAdminAssets } from '../hooks/useAdminAssets'
+import { guardPayout, payoutOutcomeUnknown } from '../lib/mandala/payoutGuard'
+import { decimalsOf } from '../lib/mandala/loadHolderData'
 import { useDevMode } from '../lib/devMode'
 import { resolveAssetState } from '@bsv/mandala/adminState'
 import { guardSendSubmit } from '@bsv/mandala/submitGuards'
@@ -38,10 +43,14 @@ const CONTACT_LIMIT = 12
 
 /**
  * `mode` 'holder' (default): a BRC-207 hand-over through useSendMutation.
- * 'payout' (issuer treasury to a holder, B4) is wired in by the payout task.
+ * 'payout' (B4): issuer treasury units (TREASURY_BASKET) to a holder's
+ * `p color` output through usePayoutMutation; the balance, Max and the guard
+ * read the treasury, decimals come from the asset's admin record, and the
+ * holder-only frozen note is hidden.
  */
-export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string, mode?: 'holder' | 'payout' } = {}) {
+export default function SendTokens({ lockedAssetId, mode = 'holder' }: { lockedAssetId?: string, mode?: 'holder' | 'payout' } = {}) {
   const locked = lockedAssetId != null && lockedAssetId !== ''
+  const isPayout = mode === 'payout'
   const { wallet, identityKey } = useWallet()
   // Dev mode bypasses the frontend pause guard so a paused transfer actually
   // reaches the overlay, proving the overlay (not the client) enforces the pause.
@@ -66,11 +75,20 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string, 
 
   // Shared cached data — instant render, background refetch.
   const holder = useHolderData()
+  // Payout mode: the issuer treasury (exact bigint). An asset absent from the
+  // sums holds zero treasury units; `undefined` only while not yet loaded.
+  const treasury = useTreasuryBalances()
+  const adminAssets = useAdminAssets()
+  const treasuryFor = (id: string): bigint | undefined =>
+    treasury.data == null || id === '' ? undefined : treasury.data[id] ?? 0n
   // Exact bigint balances; a failed balance view (null) is not sendable.
-  const balances = (holder.data?.assets ?? [])
-    .flatMap(a => (a.balance != null && a.balance > 0n ? [{ assetId: a.assetId, amount: a.balance }] : []))
+  const balances = isPayout
+    ? Object.entries(treasury.data ?? {})
+      .flatMap(([id, amount]) => (amount > 0n ? [{ assetId: id, amount }] : []))
+    : (holder.data?.assets ?? [])
+        .flatMap(a => (a.balance != null && a.balance > 0n ? [{ assetId: a.assetId, amount: a.balance }] : []))
   const metas = holder.data?.metas ?? {}
-  const isLoadingBalances = holder.data == null
+  const isLoadingBalances = isPayout ? treasury.data == null : holder.data == null
   const contactsQuery = useContactsData()
   const contacts = contactsQuery.data?.derived ?? []
   const saved = contactsQuery.data?.saved ?? []
@@ -78,10 +96,21 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string, 
   const isPaused = assetState.data?.isPaused ?? false
 
   const sendMutation = useSendMutation()
+  const payoutMutation = usePayoutMutation()
+  const isPending = sendMutation.isPending || payoutMutation.isPending
+  // The admin record a payout spends against (treasury coins + the deploy).
+  const adminAsset = isPayout ? adminAssets.data?.find(a => a.assetId === assetId) : undefined
+  // A payout whose overlay outcome is unknown may have committed: block a
+  // re-run of the same review (it could pay twice) until the flow is reset.
+  const [payoutUnknown, setPayoutUnknown] = useState(false)
 
   // Helpers
-  const labelFor = (id: string): string => metas[id]?.label ?? `${id.slice(0, 20)}…`
-  const decimalsFor = (id: string): number => metas[id]?.decimals ?? 0
+  const labelFor = (id: string): string =>
+    metas[id]?.label ?? (adminAsset?.assetId === id ? adminAsset.label : undefined) ?? `${id.slice(0, 20)}…`
+  // Payout: the admin record's dec (validated 0..18), never a 0 default while
+  // holder metadata is still loading — a wrong dec would scale the amount.
+  const decimalsFor = (id: string): number =>
+    adminAsset?.assetId === id ? decimalsOf(adminAsset.metadata?.decimals) : metas[id]?.decimals ?? 0
 
   // Keep the asset locked to the account this Send tab belongs to.
   useEffect(() => {
@@ -169,7 +198,8 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string, 
   // Exact base units, or null when empty, malformed, over-precise or > MAX_UINT64.
   const sendAmount = safeParseAmount(amountStr, decimals)
   const amountOk = sendAmount != null && sendAmount > 0n &&
-    selectedBalance != null && selectedBalance.amount >= sendAmount
+    selectedBalance != null && selectedBalance.amount >= sendAmount &&
+    (!isPayout || adminAsset != null)
 
   // Recipient shortlist shown under the search field — tap to pick, no search
   // needed. History counterparties come first (most recently sent-to/received-from,
@@ -272,7 +302,60 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string, 
   // same tick still sees step === 'review'. This ref + sendFlight close that gap.
   const sendStartedRef = useRef(false)
 
+  const handleConfirmPayout = () => {
+    if (sendStartedRef.current || payoutMutation.isPending || payoutFlight.isHeld() || payoutUnknown) return
+    if (step === 'sending' || step === 'sent') return
+    // Gate on the treasury as read now (before the mutation's optimistic decrement).
+    const gate = guardPayout({
+      amount: sendAmount,
+      treasury: treasuryFor(assetId),
+      recipientKey: recipient,
+      isPaused,
+      pauseBypass: devMode
+    })
+    if (!gate.ok) {
+      setSendError(gate.reason)
+      return
+    }
+    if (wallet == null) {
+      setSendError('Wallet not ready')
+      return
+    }
+    if (adminAsset == null || sendAmount == null) {
+      setSendError('Asset admin record unavailable — refresh')
+      return
+    }
+
+    setSendError('')
+    sendStartedRef.current = true
+    setStep('sending')
+    payoutMutation.mutate(
+      { asset: adminAsset, amount: sendAmount, recipientKey: recipient, note: note.trim() === '' ? undefined : note },
+      {
+        onSuccess: res => {
+          // Committed; an undelivered receipt is journaled and retried by the drain.
+          setSentTxid(res.txid)
+          setStep('sent')
+        },
+        onError: e => {
+          if (payoutOutcomeUnknown(e)) {
+            // The overlay may have applied it: keep this review locked (no
+            // second payout); the drain settles or releases the held action.
+            setPayoutUnknown(true)
+            setSendError(e.message)
+            setStep('review')
+            return
+          }
+          sendStartedRef.current = false
+          setSendError(e instanceof BusyError ? e.message : (e.message !== '' ? e.message : 'Payout failed. Please try again.'))
+          setStep('review')
+        }
+      }
+    )
+  }
+
   const handleConfirmAndSend = () => {
+    if (isPayout) { handleConfirmPayout(); return }
     if (sendStartedRef.current || sendMutation.isPending || sendFlight.isHeld()) return
     if (step === 'sending' || step === 'sent') return
     if (sendAmount == null) {
@@ -338,6 +421,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string, 
 
   const resetFlow = () => {
     sendStartedRef.current = false
+    setPayoutUnknown(false)
     setStep('recipient')
     setAssetId(lockedAssetId ?? '')
     setAmountStr('')
@@ -635,7 +719,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string, 
       {/* Big amount display */}
       <div className="px-6 pt-9 text-center">
         <div className="text-[11px] font-medium uppercase tracking-[1.2px] text-subtle-foreground">
-          Sending · {assetId ? labelFor(assetId) : 'Select token'}
+          {isPayout ? 'Paying out' : 'Sending'} · {assetId ? labelFor(assetId) : 'Select token'}
         </div>
         <div className="mt-3.5 font-semibold text-[56px] leading-none tracking-[-2px] tabular">
           {amountDisplay}
@@ -659,7 +743,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string, 
 
       {/* Frozen holdings note — only the current identity's frozen outputs for
           this asset, so a send that needs one can be understood up front. */}
-      {frozenNote.length > 0 && (
+      {!isPayout && frozenNote.length > 0 && (
         <div className="mx-5 mt-[18px] rounded-md border border-warning/40 bg-warning/10 p-3 text-[12px] text-warning">
           {frozenNote.map((f, i) => (
             <div key={i}>
@@ -766,7 +850,7 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string, 
             </div>
             <div className="flex items-center justify-between py-3 border-t border-separator">
               <span className="text-[12.5px] text-subtle-foreground">From</span>
-              <span className="text-[13.5px] font-semibold">{labelFor(assetId)} account</span>
+              <span className="text-[13.5px] font-semibold">{labelFor(assetId)} {isPayout ? 'treasury' : 'account'}</span>
             </div>
             {note && (
               <div className="flex items-center justify-between py-3 border-t border-separator">
@@ -812,15 +896,17 @@ export default function SendTokens({ lockedAssetId }: { lockedAssetId?: string, 
             (isPaused && !devMode) ||
             wallet == null ||
             sendMutation.isPending ||
+            payoutMutation.isPending ||
+            payoutUnknown ||
             !amountOk
           }
-          loading={sendMutation.isPending}
-          loadingText="Sending…"
+          loading={isPending}
+          loadingText={isPayout ? 'Paying out…' : 'Sending…'}
           size="lg"
           className="w-full"
         >
           <Send className="h-[17px] w-[17px]" />
-          Send {displayAmount(sendAmount ?? 0n, decimals)} {labelFor(assetId)}
+          {isPayout ? 'Pay out' : 'Send'} {displayAmount(sendAmount ?? 0n, decimals)} {labelFor(assetId)}
         </Button>
       </div>
     </div>

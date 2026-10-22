@@ -162,6 +162,14 @@ describe('robustness wiring (shipped source)', () => {
     expect(w).toMatch(/drainNow\(\{\s*force:\s*true\s*\}\)/)
   })
 
+  it('payout path uses payoutTokens unblinded with the MessageBox client', () => {
+    const m = src('hooks/usePayoutMutation.ts'); expect(m).toMatch(/payoutTokens\(\{[\s\S]*blind:\s*false[\s\S]*messageBoxClient/); expect(m).toContain('payoutFlight')
+    expect(m).toMatch(/notified\s*===\s*false/); expect(m).toContain('drainNow')
+    // no authority is spent: nothing may read or advance the admin-auth cache from a payout
+    for (const banned of ['nextAuthOutpoint', 'nextAuthKeyID', 'advanceAdminAuth', 'useAdvanceAdminAuth', 'isAdminAuthInFlight', 'reconcileWallet(']) expect(m).not.toContain(banned)
+    const t = src('components/issuer/TreasurySection.tsx'); expect(t).toContain("mode=\"payout\""); expect(t).toContain('useTreasuryBalances'); expect(t).not.toContain('useHolderData')
+  })
+
   // Flipped to `it` by Task 12, once useIssuerMutations routes its recovery
   // through drainNow (it still calls reconcileWallet directly until then).
   it.skip('one recovery path: reconcileWallet/reconcileNotifications are called only from handoverDrain via drainNow', () => {
