@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { PrivateKey } from '@bsv/sdk'
+import { P2PKH, PrivateKey, Transaction, UnlockingScript } from '@bsv/sdk'
 import { createMandalaOverlayProvider } from './profileProvider.js'
 
 const TXID = 'c7d0f61946bc8bde6c01219c67bb99cbf2f89a39bcaea9c2ecf67c54224edb4f'
@@ -141,6 +141,35 @@ describe('createMandalaOverlayProvider: lookups (C§6)', () => {
     }
   })
 
+  it('a non-JSON non-OK answer, a 408 or an untyped non-400 JSON 4xx is transport (same rule as submit)', async () => {
+    const replies: Reply[] = [
+      { status: 404, raw: '404 page not found' },
+      { status: 408, body: { status: 'error', message: 'x' } },
+      { status: 400, raw: '<html>' },
+      { status: 302, raw: '' },
+      { status: 404, body: { status: 'error', message: 'not here' } },
+      { status: 413, body: { status: 'error', message: 'too big' } }
+    ]
+    for (const reply of replies) {
+      for (const call of ['spendability', 'admission'] as const) {
+        const e = await caught(provider(fakeFetch(reply))[call](ID, [`${TXID}.0`]))
+        expect(e, `${call} ${JSON.stringify(reply)}`).toMatchObject({ name: 'ColorProviderError', code: 'ERR_UNAVAILABLE', retryable: true, transport: true })
+        expect(e.message.startsWith('[ColorProviderError] mandala overlay refused (ERR_UNAVAILABLE, retryable)')).toBe(true)
+      }
+    }
+  })
+
+  it('an answer entry without txid is a bad answer even when its bytes are a readable AtomicBEEF', async () => {
+    const src = new Transaction()
+    src.addOutput({ satoshis: 5, lockingScript: new P2PKH().lock(new PrivateKey(7).toPublicKey().toHash() as number[]) })
+    const tx = new Transaction()
+    tx.addInput({ sourceTransaction: src, sourceOutputIndex: 0, unlockingScript: new UnlockingScript([]), sequence: 0xffffffff })
+    tx.addOutput({ satoshis: 1, lockingScript: new P2PKH().lock(new PrivateKey(8).toPublicKey().toHash() as number[]) })
+    const body = { type: 'output-list', outputs: [{ beef: tx.toAtomicBEEF(true), outputIndex: 0 }] }
+    expect(await caught(provider(fakeFetch({ status: 200, body })).admission(ID, [`${TXID}.0`])))
+      .toMatchObject({ name: 'ColorProviderError', code: 'ERR_INVALID_ANSWER', transport: false })
+  })
+
   it('a 200 with a non-JSON body is transport', async () => {
     expect(await caught(provider(fakeFetch({ status: 200, raw: '<html>' })).spendability(ID, [`${TXID}.0`])))
       .toMatchObject({ name: 'ColorProviderError', code: 'ERR_UNAVAILABLE', transport: true })
@@ -221,8 +250,8 @@ describe('createMandalaOverlayProvider: submit (C§6 framing and verdicts)', () 
     const e = await caught(provider(fakeFetch({ status: 400, body: { status: 'error', message: 'invalid X-Topics header' } })).submit([TOPIC], BEEF))
     expect(e).toMatchObject({ name: 'ColorProviderError', code: 'ERR_REQUEST', retryable: false, transport: false })
     expect(e.message).toBe('[ColorProviderError] mandala overlay refused (ERR_REQUEST): invalid X-Topics header')
-    // 408 and 429 are not verdicts
-    for (const status of [408, 429]) {
+    // 408 and 429 are not verdicts; an untyped JSON 4xx other than 400 is an intermediary's, not overlay-go's
+    for (const status of [408, 429, 404, 405, 409, 413]) {
       expect(await caught(provider(fakeFetch({ status, body: { status: 'error', message: 'slow down' } })).submit([TOPIC], BEEF)))
         .toMatchObject({ code: 'ERR_UNAVAILABLE', transport: true })
     }

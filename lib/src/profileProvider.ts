@@ -8,13 +8,19 @@
  * message)`. The classification decides whether a recipient may ever take the
  * offline path (D6), so it is deliberately narrow:
  *
+ * Lookups and submits share one rule:
+ *
  * - `transport: true` (`ERR_UNAVAILABLE`, retryable): the overlay could not be
  *   reached or gave no verdict: a fetch failure, a timeout, a 5xx, a 408/429,
- *   a non-JSON body, or a typed `ERR_UNAVAILABLE`.
- * - `transport: false`: a typed verdict (`(body.code, body.retryable)`), an
- *   untyped JSON 4xx (`ERR_REQUEST`/`ERR_LOOKUP`, final), or an answer that
- *   fails validation (`ERR_INVALID_ANSWER`). A bad or poisoned answer is never
- *   reported as an outage, so it can never open the offline path.
+ *   a non-OK status below 400, a non-OK answer whose body is empty or not
+ *   JSON, an untyped JSON 4xx other than 400 (an intermediary, never
+ *   overlay-go), a non-JSON 200, or a typed `ERR_UNAVAILABLE` at any status.
+ * - `transport: false`: a typed verdict (`(body.code, body.retryable)`),
+ *   overlay-go's untyped JSON 400 (`ERR_REQUEST` on submit, `ERR_LOOKUP` on
+ *   lookup, final), or an answer that fails validation
+ *   (`ERR_INVALID_ANSWER`, e.g. a lookup entry without `txid`). A bad or
+ *   poisoned answer is never reported as an outage, so it can never open the
+ *   offline path.
  *
  * Message: `[ColorProviderError] mandala overlay refused (<CODE>[, retryable]): <description>`.
  * The module's constructor adds the `[ColorProviderError] ` prefix (once);
@@ -205,7 +211,10 @@ async function postSubmit (
       if (parsed.code === 'ERR_UNAVAILABLE') throw unavailable(description)
       throw providerError(parsed.code, parsed.retryable === true, false, description)
     }
-    // A JSON 4xx without a typed verdict: the overlay refused the request itself (headers, framing). Final.
+    // overlay-go's untyped refusal is a 400 ({status, message}): it refused the
+    // request itself (headers, framing). Final. Any other untyped JSON 4xx is
+    // an intermediary's and says nothing about this tx.
+    if (status !== 400) throw unavailable(description)
     throw providerError('ERR_REQUEST', false, false, description)
   }
   if (!isJson) throw unavailable(`overlay returned ${status} with a non-JSON body`)

@@ -2,10 +2,14 @@
  * BRC-24 `POST /lookup` against the Mandala overlay (C§6) and the
  * hash-verified deploy fetch (C§8.1).
  *
- * Errors are `LookupError`s classified the way the Mandala provider
- * classifies submits (C§6, D22): a fetch failure, timeout, non-JSON body or
- * 5xx is `ERR_UNAVAILABLE` (retryable, `transport: true`); a typed 4xx keeps
- * its code and `retryable` (`transport: false`). Only `transport` may ever be
+ * Errors are `LookupError`s classified exactly as the Mandala provider
+ * classifies submits (C§6, D22). No verdict ⇒ `ERR_UNAVAILABLE` (retryable,
+ * `transport: true`): a fetch failure, a timeout, a 5xx, a 408/429, a
+ * non-OK status below 400, a non-OK answer whose body is empty or not JSON,
+ * or an untyped JSON 4xx other than 400 (an intermediary, never overlay-go).
+ * A verdict ⇒ `transport: false`: a typed JSON 4xx keeps its code and
+ * `retryable`; overlay-go's untyped JSON 400 (`{status, message}`) is a
+ * final `ERR_LOOKUP`. Only `transport` may ever be
  * read as "the overlay is unreachable": an answer that fails verification is
  * `ERR_INVALID_ANSWER` with `transport: false`, so a bad or poisoned answer
  * can never be mistaken for an outage. Callers match on `.name` and the
@@ -13,7 +17,7 @@
  *
  * Uses `fetch` only (RN-safe).
  */
-import { Beef, Transaction } from '@bsv/sdk'
+import { Transaction } from '@bsv/sdk'
 import { OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 import { decodeToken } from './brc162.js'
 import { colorLookup, colorTopic } from './naming.js'
@@ -68,17 +72,6 @@ function isByteArray (v: unknown): v is number[] {
   return Array.isArray(v) && v.length > 0 && v.every(b => Number.isInteger(b) && b >= 0 && b <= 255)
 }
 
-/** The AtomicBEEF subject (else the last tx) of `beef`, or undefined when unreadable. */
-function subjectTxid (beef: number[]): string | undefined {
-  try {
-    const parsed = Beef.fromBinary(beef)
-    const txid = parsed.atomicTxid ?? parsed.txs[parsed.txs.length - 1]?.txid
-    return typeof txid === 'string' && TXID_RE.test(txid) ? txid : undefined
-  } catch {
-    return undefined
-  }
-}
-
 function readOutputList (v: unknown): LookupOutputList {
   const a = v as { type?: unknown, outputs?: unknown }
   if (a == null || typeof a !== 'object' || a.type !== 'output-list' || !Array.isArray(a.outputs)) {
@@ -89,11 +82,11 @@ function readOutputList (v: unknown): LookupOutputList {
       !Number.isInteger(o.outputIndex) || o.outputIndex < 0 || o.outputIndex > 0xffffffff) {
       throw invalidAnswer(`output ${i} is malformed`)
     }
-    // overlay-go is to send the AtomicBEEF subject's txid (C§6); until every
-    // node does, derive it from the bytes. It is never trusted on its own:
-    // consumers re-hash what they parse (fetchDeployTx).
-    let txid: unknown = o.txid
-    if (txid == null) txid = subjectTxid(o.beef)
+    // C§6: overlay-go sends the AtomicBEEF subject's txid on every entry. It is
+    // required, never derived from the same bytes (that would make the
+    // consumer's fromBEEF(beef, txid) check circular), and never trusted on
+    // its own: consumers re-hash what they parse.
+    const txid: unknown = o.txid
     if (typeof txid !== 'string' || !TXID_RE.test(txid)) throw invalidAnswer(`output ${i} has no valid txid`)
     return { beef: o.beef as number[], outputIndex: o.outputIndex as number, txid }
   })
@@ -156,16 +149,19 @@ export async function postLookup (service: string, query: unknown, o: LookupOpti
   }
 
   if (!okStatus) {
-    if (status >= 500 || status === 429 || status === 0) {
-      throw unavailable(typeof body?.description === 'string' ? body.description : `overlay returned ${status}`)
-    }
     const description = typeof body?.description === 'string'
       ? body.description
       : typeof body?.message === 'string' ? body.message : `overlay returned ${status}`
-    if (body?.status === 'error' && typeof body.code === 'string' && /^ERR_[A-Z_]+$/.test(body.code)) {
+    // No verdict: the same rule as the provider's submit (C§6).
+    if (body === undefined || status >= 500 || status === 408 || status === 429 || status < 400) {
+      throw unavailable(description)
+    }
+    if (body?.status === 'error' && typeof body.code === 'string' && /^ERR_[A-Z0-9_]+$/.test(body.code)) {
       throw new LookupError({ code: body.code, retryable: body.retryable === true, transport: false, description })
     }
-    // overlay-go's untyped lookup error ({status, message}): a final refusal of the question.
+    // overlay-go's untyped lookup error is a 400 ({status, message}): a final
+    // refusal of the question. Any other untyped JSON 4xx is an intermediary's.
+    if (status !== 400) throw unavailable(description)
     throw new LookupError({ code: 'ERR_LOOKUP', retryable: false, transport: false, description })
   }
   if (body === undefined) throw unavailable(`overlay returned ${status} with a non-JSON body`)

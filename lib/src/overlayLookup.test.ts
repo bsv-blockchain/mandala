@@ -26,7 +26,7 @@ function deployTx (seed = 1): Transaction {
 
 const ok = (body: unknown) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) })
 const status = (s: number, body: unknown) => ({ ok: false, status: s, text: async () => typeof body === 'string' ? body : JSON.stringify(body) })
-const answer = (tx: Transaction, txid: string | undefined = tx.id('hex')) => ({
+const answer = (tx: Transaction, txid: string | null = tx.id('hex')) => ({
   type: 'output-list',
   outputs: [{ beef: tx.toAtomicBEEF(true), outputIndex: 0, ...(txid != null ? { txid } : {}) }]
 })
@@ -69,11 +69,10 @@ describe('postLookup', () => {
     expect((f.mock.calls[0] as unknown as [string])[0]).toBe('http://other/lookup')
   })
 
-  it('derives a missing answer txid from the AtomicBEEF subject', async () => {
+  it('an entry without txid is an invalid answer even when its AtomicBEEF names a subject (C§6: txid required)', async () => {
     const tx = deployTx()
-    const f = vi.fn(async () => ok(answer(tx, undefined)))
-    const res = await postLookup('s', {}, { fetch: f as any })
-    expect(res.outputs[0].txid).toBe(tx.id('hex'))
+    const f = vi.fn(async () => ok(answer(tx, null)))
+    expect(await lookupError(postLookup('s', {}, { fetch: f as any }))).toMatchObject({ code: 'ERR_INVALID_ANSWER', transport: false })
   })
 
   it('503 ⇒ LookupError ERR_UNAVAILABLE, retryable, transport', async () => {
@@ -101,6 +100,36 @@ describe('postLookup', () => {
     const e = await lookupError(postLookup('s', {}, { fetch: f as any }))
     expect(e).toMatchObject({ code: 'ERR_LOOKUP', retryable: false, transport: false })
     expect(e.message).toMatch(/Invalid lookup query: x/)
+  })
+
+  it('a non-JSON or empty non-OK answer, a 408 and a 3xx are transport failures, never a final ERR_LOOKUP', async () => {
+    const replies = [
+      status(404, '404 page not found'),
+      status(400, '<html>'),
+      status(403, ''),
+      status(408, { status: 'error', message: 'x' }),
+      status(302, ''),
+      status(304, { status: 'error', message: 'moved' })
+    ]
+    for (const r of replies) {
+      const f = vi.fn(async () => r)
+      expect(await lookupError(postLookup('s', {}, { fetch: f as any })), `status ${r.status}`)
+        .toMatchObject({ name: 'LookupError', code: 'ERR_UNAVAILABLE', retryable: true, transport: true })
+    }
+  })
+
+  it('an untyped JSON 4xx other than 400 is no verdict on the question (an intermediary), so transport', async () => {
+    for (const s of [404, 405, 409, 413]) {
+      const f = vi.fn(async () => status(s, { status: 'error', message: 'nope' }))
+      expect(await lookupError(postLookup('s', {}, { fetch: f as any })), `status ${s}`)
+        .toMatchObject({ code: 'ERR_UNAVAILABLE', retryable: true, transport: true })
+    }
+  })
+
+  it('a typed 4xx verdict keeps its code at any 4xx status (overlay-go route 404 included)', async () => {
+    const f = vi.fn(async () => status(404, { status: 'error', code: 'ERR_ROUTE_NOT_FOUND', description: 'Route not found.' }))
+    expect(await lookupError(postLookup('s', {}, { fetch: f as any })))
+      .toMatchObject({ code: 'ERR_ROUTE_NOT_FOUND', retryable: false, transport: false })
   })
 
   it('a network fault, a non-JSON 200 and a timeout are transport failures', async () => {
