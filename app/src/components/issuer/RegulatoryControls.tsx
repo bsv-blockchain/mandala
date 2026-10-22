@@ -17,7 +17,7 @@ import { isAdminAuthInFlight } from '@bsv/mandala/adminAuthGate'
 import { useAssetState, useInvalidateAssetState } from '../../hooks/useAssetState'
 import { useInvalidateAdminHistory } from '../../hooks/useAdminHistory'
 import { useAdvanceAdminAuth } from '../../hooks/useAdminAssets'
-import { parseFeeRateInput } from './RegisterAssetStrip'
+import { parseFeeRateInput } from '../../lib/mandala/feeRateInput'
 
 interface Props {
   assets: AdminAsset[]

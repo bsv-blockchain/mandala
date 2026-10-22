@@ -4,62 +4,43 @@ import { useWallet } from '../../context/WalletContext'
 import { useIssuerMutations } from '../../hooks/useIssuerMutations'
 import { guardRegisterSubmit } from '@bsv/mandala/submitGuards'
 import { registerFlight } from '@bsv/mandala/singleFlight'
+import { validateRegisterForm } from '../../lib/mandala/registerForm'
 import { Input } from '../ui/input'
 import { Spinner } from '../ui/spinner'
-
-export type FeeRateParse = { ok: true, value: number | undefined } | { ok: false, reason: string }
-
-/**
- * Blank = leave issuer-paid fees disabled; otherwise a whole number ≥ 1
- * (token units per KB). The input is type="text" (see below), so this is the
- * only gate against a mistyped rate — `/^\d+$/` refuses anything `Number()`
- * would otherwise silently coerce (`'1e3'`, `'0x10'`, `'25-'`) into a rate
- * that looks like "off" was never intended.
- */
-export function parseFeeRateInput (raw: string): FeeRateParse {
-  const s = raw.trim()
-  if (s === '') return { ok: true, value: undefined }
-  const n = Number(s)
-  if (!/^\d+$/.test(s) || !Number.isSafeInteger(n) || n < 1) {
-    return { ok: false, reason: 'Fee rate must be a whole number ≥ 1 (units per KB)' }
-  }
-  return { ok: true, value: n }
-}
 
 /**
  * "Register a new asset" — the rare genesis action, kept as a slim dashed
  * strip on the Overview page (most issuers run a single stablecoin).
+ *
+ * The deploy carries the Mandala `req` (built inside the lib's registerAsset
+ * from the configured overlay identity key), and no fee rate (B6): the admin
+ * setFeeRate control in RegulatoryControls stays for later.
  */
 export default function RegisterAssetStrip() {
   const { wallet } = useWallet()
   const [label, setLabel] = useState('')
   const [ticker, setTicker] = useState('')
   const [decimals, setDecimals] = useState('0')
-  const [feeRate, setFeeRate] = useState('')
   const { register } = useIssuerMutations()
   const startedRef = useRef(false)
 
   const handleRegister = () => {
     if (startedRef.current || register.isPending || registerFlight.isHeld()) return
-    const dec = Number(decimals)
-    const gate = guardRegisterSubmit({
-      label,
-      ticker,
-      decimals: dec,
-      walletReady: wallet != null
-    })
+    // Field limits first (dec 0..18, sym 1..32, label 1..64 code points;
+    // contract gap A11), then the lib's own register gate on the trimmed values.
+    const form = validateRegisterForm({ label, ticker, decimals })
+    if (!form.ok) {
+      toast.error(form.reason)
+      return
+    }
+    const gate = guardRegisterSubmit({ ...form.value, walletReady: wallet != null })
     if (!gate.ok) {
       toast.error(gate.reason)
       return
     }
-    const fee = parseFeeRateInput(feeRate)
-    if (!fee.ok) {
-      toast.error(fee.reason)
-      return
-    }
     startedRef.current = true
-    register.mutate({ label, ticker, decimals: dec, feeRatePerKb: fee.value }, {
-      onSuccess: () => { setLabel(''); setTicker(''); setDecimals('0'); setFeeRate('') },
+    register.mutate(form.value, {
+      onSuccess: () => { setLabel(''); setTicker(''); setDecimals('0') },
       onSettled: () => { startedRef.current = false }
     })
   }
@@ -103,23 +84,11 @@ export default function RegisterAssetStrip() {
               id="reg-decimals"
               type="number"
               min="0"
+              max="18"
               step="1"
               value={decimals}
               onChange={e => setDecimals(e.target.value)}
               placeholder="0"
-              className="h-[30px] bg-input border-input-border rounded-sm px-[10px] py-0 text-[12px] placeholder:text-subtle-foreground tabular-nums"
-            />
-          </div>
-          <div className="flex flex-col min-w-[96px]">
-            <label className={labelCls} htmlFor="reg-fee-rate">Fee rate (units/KB)</label>
-            <Input
-              id="reg-fee-rate"
-              type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
-              value={feeRate}
-              onChange={e => setFeeRate(e.target.value)}
-              placeholder="off"
               className="h-[30px] bg-input border-input-border rounded-sm px-[10px] py-0 text-[12px] placeholder:text-subtle-foreground tabular-nums"
             />
           </div>

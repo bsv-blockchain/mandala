@@ -1,8 +1,8 @@
 /**
- * Smoke test: RegisterAssetStrip module loads and exposes the fee-rate parser.
+ * parseFeeRateInput (moved from RegisterAssetStrip; used by the admin setFeeRate control).
  */
 import { describe, it, expect } from 'vitest'
-import { parseFeeRateInput } from './RegisterAssetStrip'
+import { parseFeeRateInput } from './feeRateInput'
 
 describe('parseFeeRateInput', () => {
   it('maps blank to undefined and whole numbers ≥ 1 to a number', () => {

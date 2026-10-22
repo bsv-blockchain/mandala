@@ -99,26 +99,14 @@ describe('robustness wiring (shipped source)', () => {
     expect(s).toContain('guardRegisterSubmit')
   })
 
-  it('useIssuerMutations redeem passes holder-cache balance into guard + redeemTokens', () => {
-    const s = src('hooks/useIssuerMutations.ts')
-    // Mutation boundary must not omit balance (skeptic gap)
-    expect(s).toMatch(/guardRedeemSubmit\(\{[\s\S]*balance/)
-    expect(s).toMatch(/redeemTokens\(\{[\s\S]*balance/)
-    expect(s).toContain('qc.getQueryData<HolderData>(holderKey)')
-  })
-
-  it('redeem gates on the PRE-decrement balance (react-query awaits onMutate before mutationFn)', () => {
-    const s = src('hooks/useIssuerMutations.ts')
-    const redeemBlock = s.slice(s.indexOf('const redeem = useMutation'))
-    // The optimistic decrement must not live in onMutate — that runs before
-    // mutationFn, so the balance gate would compare against balance-minus-amount
-    // and refuse any redeem above half (redeem-all impossible).
-    expect(redeemBlock).not.toMatch(/onMutate\s*:/)
-    const guardIdx = redeemBlock.indexOf('guardRedeemSubmit(')
-    const adjustIdx = redeemBlock.indexOf('adjustBalance(')
-    expect(guardIdx).toBeGreaterThan(-1)
-    expect(adjustIdx).toBeGreaterThan(-1)
-    expect(guardIdx).toBeLessThan(adjustIdx)
+  it('register writes no fee rate; redeem gates on the treasury balance and does not pass it on', () => {
+    const s = src('hooks/useIssuerMutations.ts'); const strip = src('components/issuer/RegisterAssetStrip.tsx')
+    expect(s).not.toContain('feeRatePerKb'); expect(strip).not.toMatch(/feeRate/); expect(strip).toContain('validateRegisterForm(')
+    expect(s).toContain('qc.getQueryData<TreasuryData>(treasuryKey'); expect(s).toMatch(/guardRedeemSubmit\(\{[\s\S]*balance/)
+    const call = s.slice(s.indexOf('redeemTokens({')); expect(call.slice(0, call.indexOf('})'))).not.toContain('balance')
+    const redeemBlock = s.slice(s.indexOf('const redeem = useMutation')); expect(redeemBlock).not.toMatch(/onMutate\s*:/)
+    expect(redeemBlock.indexOf('guardRedeemSubmit(')).toBeLessThan(redeemBlock.indexOf('adjustTreasury('))
+    expect(src('components/IssuerPanel.tsx')).toContain('safeParseAmount(')
   })
 
   it('A08: the console surfaces a pending reissue notify', () => {
@@ -170,9 +158,7 @@ describe('robustness wiring (shipped source)', () => {
     const t = src('components/issuer/TreasurySection.tsx'); expect(t).toContain("mode=\"payout\""); expect(t).toContain('useTreasuryBalances'); expect(t).not.toContain('useHolderData')
   })
 
-  // Flipped to `it` by Task 12, once useIssuerMutations routes its recovery
-  // through drainNow (it still calls reconcileWallet directly until then).
-  it.skip('one recovery path: reconcileWallet/reconcileNotifications are called only from handoverDrain via drainNow', () => {
+  it('one recovery path: reconcileWallet/reconcileNotifications are called only from handoverDrain via drainNow', () => {
     for (const f of listSrc().filter(f => f !== 'lib/mandala/handoverDrain.ts' && f !== 'context/WalletContext.tsx')) {
       expect(src(f), f).not.toMatch(/reconcileWallet\(|reconcileNotifications\(/)
     }
