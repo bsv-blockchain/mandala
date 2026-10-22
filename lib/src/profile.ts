@@ -33,6 +33,7 @@ import { ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID } from './constants.js'
 import { createMandalaOverlayProvider, type MandalaOverlayProvider } from './profileProvider.js'
 import { hasExactly, invalidProfile as invalid, isCborMap, issuerKey } from './profileDescriptor.js'
 import { checkPlanData, submissionData } from './profilePlanData.js'
+import { admitReceipt } from './profileReceipt.js'
 
 export { MANDALA_PROFILE_ID }
 export { createMandalaOverlayProvider }
@@ -92,6 +93,13 @@ export function createMandalaProfile (o: MandalaProfileOptions): RequiredProfile
     providers.set(provider.identityKey, provider)
   }
 
+  /** The memoized provider for K. S5: no configured endpoint for K ⇒ fail closed, never a fallback. */
+  const providerFor = (k: string): ColorOverlayProvider => {
+    const provider = providers.get(k)
+    if (provider === undefined) throw new ProfileParamsError(`no Mandala overlay configured for ${k}`)
+    return provider
+  }
+
   const handler: RequiredProfileHandler = {
     id: MANDALA_PROFILE_ID,
     versions: Object.freeze([1]),
@@ -99,18 +107,15 @@ export function createMandalaProfile (o: MandalaProfileOptions): RequiredProfile
     operations: Object.freeze(['transfer'] as const),
     maxReceiptBytes: MAX_RECEIPT_BYTES,
     checkDescriptor,
-    provider: (_assetId: string, descriptor: ProfileDescriptor): ColorOverlayProvider => {
-      const k = issuerKey(descriptor)
-      const provider = providers.get(k)
-      // S5: no configured endpoint for K ⇒ fail closed, never a fallback.
-      if (provider === undefined) throw new ProfileParamsError(`no Mandala overlay configured for ${k}`)
-      return provider
-    },
+    provider: (_assetId: string, descriptor: ProfileDescriptor): ColorOverlayProvider => providerFor(issuerKey(descriptor)),
     deployProviders: (): ColorOverlayProvider[] => [...providers.values()],
     // B1 (C§5.2): the plan leaf and the tx layout are checked at createAction
     // and again at signAction; submissionData gives the envelope bytes.
     checkPlanData,
-    submissionData
+    submissionData,
+    // Goal 4, D6, D7: own submit and a verified attestation by K, or (transport
+    // failure only, policy-clean hops) unavailable for attested offline acceptance.
+    admitReceipt: async (ctx, graph) => await admitReceipt(ctx, graph, providerFor)
   }
   return Object.freeze(handler)
 }
