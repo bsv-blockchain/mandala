@@ -48,11 +48,11 @@ func TestMandalaReqMatchesFREQ(t *testing.T) {
 		t.Fatal(f)
 	}
 	req, err := MandalaReqBytes(f.IdentityKey)
-	if err != nil || hex.EncodeToString(req) != f.ReqHex || len(req) != 328 {
+	if err != nil || hex.EncodeToString(req) != f.ReqHex || len(req) != 181 {
 		t.Fatalf("req: %d bytes, err %v\n got %x\nwant %s", len(req), err, req, f.ReqHex)
 	}
 	payload, err := brc162.EncodeStrictCbor(brc162.CborMap{"dec": f.Dec, "req": MandalaReq(f.IdentityKey), "sym": f.Sym, "label": f.Label})
-	if err != nil || hex.EncodeToString(payload) != f.PayloadHex || len(payload) != 365 {
+	if err != nil || hex.EncodeToString(payload) != f.PayloadHex || len(payload) != 218 {
 		t.Fatalf("payload: %d bytes, err %v", len(payload), err)
 	}
 	k, _ := hex.DecodeString(f.IdentityKey)
@@ -62,19 +62,27 @@ func TestMandalaReqMatchesFREQ(t *testing.T) {
 	}
 }
 
+// TestMandalaReqIsIssuerOnly: B7, the req names only issuer-v1 (no attested companion).
+func TestMandalaReqIsIssuerOnly(t *testing.T) {
+	m := MandalaReq("02798b81951a6a8c7ef8beda09b06a23031d7efaf37b663265e0188ab378124046")
+	if len(m) != 1 || m[MandalaProfileID] == nil {
+		t.Fatalf("req must be exactly {issuer-v1}: %v", m)
+	}
+}
+
 // TestMandalaReqIsFresh: each call returns an independent map, so a caller that edits one (a test
 // building a negative) never changes the next.
 func TestMandalaReqIsFresh(t *testing.T) {
 	k := "02798b81951a6a8c7ef8beda09b06a23031d7efaf37b663265e0188ab378124046"
 	a := MandalaReq(k)
-	a[AttestedProfileID].(brc162.CborMap)["params"].(brc162.CborMap)["trustMode"] = "any"
+	a[MandalaProfileID].(brc162.CborMap)["params"].(brc162.CborMap)["identityKey"] = "x"
 	a["x"] = nil
 	b, err := MandalaReqBytes(k)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want, _ := brc162.EncodeStrictCborValue(MandalaReq(k))
-	if !bytes.Equal(b, want) || len(b) != 328 {
+	if !bytes.Equal(b, want) || len(b) != 181 {
 		t.Fatal("MandalaReq shares state between calls")
 	}
 }

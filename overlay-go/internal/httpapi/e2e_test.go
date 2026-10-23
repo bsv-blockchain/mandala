@@ -508,6 +508,50 @@ func TestE2EReplayReturnsIdenticalAttestation(t *testing.T) {
 	}
 }
 
+// B7: the Mandala issuer-v1 handler's fallback for a receipt its host did not record re-submits the bare AtomicBEEF
+// (no x-includes-off-chain-values, no envelope). An admitted transaction must answer with the same verifiable
+// attestation (serveKnownVerdict replays without looking at the payload); an unadmitted one is refused.
+func TestE2EBareReplayOfAnAdmittedTxReturnsItsAttestation(t *testing.T) {
+	e2eDB(t, e2eNode)
+	o := e2eBoot(t, e2eNode, nil, false)
+	I, H := mandalatest.Issuer, mandalatest.Holder
+	dep := mandalatest.Deploy(t, I, "USD")
+	tm := mandala.TokenTopicOfTxid(dep.Txid)
+	e2eAdmit(t, o, dep, mandala.MandalaTopic, tm)
+	iss := mandalatest.Issue(t, dep, 0, I, H, 1000)
+	first := e2eAdmit(t, o, iss, tm)[tm]
+
+	bare := func(b *mandalatest.Built) (int, []byte) {
+		hdr, _ := json.Marshal([]string{tm})
+		req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(b.Beef))
+		req.Header.Set("X-Topics", string(hdr))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		return e2eDo(t, o, req)
+	}
+	code, body := bare(iss)
+	var steak map[string]e2eAdmittance
+	if err := json.Unmarshal(body, &steak); code != 200 || err != nil {
+		t.Fatalf("bare replay of an admitted tx: %d %s", code, body)
+	}
+	got := steak[tm]
+	if !slices.Equal(got.OutputsToAdmit, first.OutputsToAdmit) || got.AdmissionSignature != first.AdmissionSignature {
+		t.Fatalf("bare replay %+v differs from the admission %+v", got, first)
+	}
+	if !mandala.VerifyAttestation(tm, iss.Txid, got.OutputsToAdmit, got.AdmissionSignature, mandalatest.Overlay.Identity) {
+		t.Fatal("bare replay attestation does not verify")
+	}
+
+	// A transaction the overlay never admitted gets no admission from a bare submit.
+	other := mandalatest.Issue(t, dep, 0, I, H, 7)
+	if code, body := bare(other); code == 200 {
+		var st map[string]e2eAdmittance
+		_ = json.Unmarshal(body, &st)
+		if len(st[tm].OutputsToAdmit) > 0 {
+			t.Fatalf("a bare submit of an unadmitted tx was admitted: %s", body)
+		}
+	}
+}
+
 // Review Focus 4: a deploy whose req names another overlay's key is a final ERR_SHAPE. The refusal is persisted and
 // replayed by payload hash, nothing is applied and no registry row exists; the same deploy with this overlay's req is
 // a different transaction and is admitted on both topics.
