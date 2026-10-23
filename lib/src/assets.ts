@@ -7,7 +7,6 @@ import { withAdminAuthGate, withAdminAuthGates, assertSpendablePrior } from './a
 import { withIntent } from './txJournal.js'
 import { notifyPutIntent, notifyRemove } from './notifyJournal.js'
 import { runAuthorityTx } from './authority.js'
-import { fetchDeployTx } from './overlayLookup.js'
 import { guardPositiveAmount } from './submitGuards.js'
 import {
   checkRecipient, deliverIssuerReceipt, handoverBody, issuerReceipt, issuerRecipientOutput, MessageBoxSender,
@@ -222,8 +221,6 @@ export async function submitAdminAction (
   if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
 
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
-    // The verified deploy, before any coin is held (reissue receipts carry it).
-    const declarationTx = ftOutput != null ? (await fetchDeployTx(asset.assetId)).toBinary() : undefined
     const inputBEEF = await spendableBeef(wallet, [asset.authOutpoint])
     const foreign = ftOutput != null
       ? await issuerRecipientOutput(wallet, { identityKey, recipientKey: ftOutput.recipient, assetId: asset.assetId, amount: ftOutput.amount })
@@ -232,17 +229,18 @@ export async function submitAdminAction (
     // failure from there to admission that released the action removes it.
     // An unknown outcome (the action is held) keeps it.
     let intentTxid: string | undefined
-    const journalIntent = ftOutput != null && foreign != null && declarationTx != null
+    const journalIntent = ftOutput != null && foreign != null
       ? async (s: { txid: string, tx: number[], offChainValues: number[], topics: string[], foreignIndices: number[] }) => {
         intentTxid = s.txid
         await notifyPutIntent(s.txid, {
           assetId: asset.assetId,
           recipientKey: ftOutput.recipient,
           outputIndex: s.foreignIndices[0],
+          amount: ftOutput.amount.toString(),
           derivationPrefix: foreign.derivationPrefix,
           derivationSuffix: foreign.derivationSuffix,
           senderIdentityKey: foreign.senderIdentityKey,
-          declarationTxHex: Utils.toHex(declarationTx),
+          senderMode: 'identity',
           txHex: Utils.toHex(s.tx),
           offChainHex: Utils.toHex(s.offChainValues),
           topics: s.topics
@@ -275,22 +273,25 @@ export async function submitAdminAction (
     }
 
     let notified = true
-    if (ftOutput != null && foreign != null && declarationTx != null) {
+    if (ftOutput != null && foreign != null) {
       const outputIndex = res.foreignIndices[0]
-      const receipt = issuerReceipt({
-        assetId: asset.assetId,
-        derivationPrefix: foreign.derivationPrefix,
-        derivationSuffix: foreign.derivationSuffix,
-        senderIdentityKey: foreign.senderIdentityKey,
-        declarationTx,
-        attestation: requireAttestedOutput(res.admitted, outputIndex, res.txid),
-        offChainValues: res.offChainValues
-      })
+      const attestation = requireAttestedOutput(res.admitted, outputIndex, res.txid)
       notified = await deliverIssuerReceipt({
         messageBoxClient: p.messageBoxClient as MessageBoxSender,
         recipientKey: ftOutput.recipient,
         txid: res.txid,
-        body: handoverBody({ assetId: asset.assetId, outputIndex, tx: res.tx, receipt })
+        body: handoverBody({
+          assetId: asset.assetId,
+          amount: ftOutput.amount,
+          outputIndex,
+          tx: res.tx,
+          derivationPrefix: foreign.derivationPrefix,
+          derivationSuffix: foreign.derivationSuffix,
+          senderIdentityKey: foreign.senderIdentityKey,
+          senderMode: 'identity',
+          admission: attestation,
+          linkage: [{ txid: res.txid, offChainValues: res.offChainValues }]
+        })
       })
     }
     return {

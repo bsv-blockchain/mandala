@@ -18,6 +18,8 @@ import { OneColor } from '@bsv/templates'
 import type { ProfileAssetContext, ProfileTxView, JsonValue } from '@bsv/color-permission-module'
 import { checkPlanData, submissionData } from './profilePlanData.js'
 import { createMandalaProfile, MANDALA_PROFILE_ID } from './profile.js'
+import { createHostLedger } from './hostLedger.js'
+import { memoryStorage } from './storage.js'
 import { recipientLinkage } from './linkage.js'
 import { assetTag, colorProtocolID } from './naming.js'
 import { decodeEnvelope } from './encoding.js'
@@ -277,11 +279,13 @@ describe('submissionData (C§5.1, G9)', () => {
 
 describe('createMandalaProfile wires the B1 hooks', () => {
   it('checkPlanData and submissionData delegate to profilePlanData', async () => {
-    const h = createMandalaProfile({ overlays: [{ identityKey: k, url: 'https://o' }] })
+    const ledger = createHostLedger(memoryStorage())
+    const h = createMandalaProfile({ overlays: [{ identityKey: k, url: 'https://o' }], ledger })
     expect(typeof h.checkPlanData).toBe('function')
     expect(typeof h.submissionData).toBe('function')
     await expect(h.checkPlanData!(ctx, LEAF, viewAtSign)).resolves.toBeUndefined()
-    const env = decodeEnvelope(await h.submissionData!(ctx, viewAtSign))
+    const bytes = await h.submissionData!(ctx, viewAtSign)
+    const env = decodeEnvelope(bytes)
     expect(env.outputs!.map(o => o.index)).toEqual([0, 1])
     expect(await overlayDerivedHash(env.outputs![1].linkage)).toEqual(CHANGE_PKH)
   })

@@ -170,6 +170,20 @@ describe('parseActionsToHistory: treasury kinds', () => {
     expect(csv[2]).toContain(',payout,18446744073709551615,')
   })
 
+  it('deferred item 5: a reissue reports only the reissued output, never treasury value it keeps', () => {
+    const rows = parseActionsToHistory([{
+      txid: 'ri1',
+      description: 'reissue Test Dollar',
+      labels: ['mandala', 'reissue'],
+      outputs: [
+        { outputIndex: 0, satoshis: 1, lockingScript: lock(ID, 5n) },
+        { outputIndex: 1, satoshis: 1, lockingScript: authority(ID), basket: TREASURY_BASKET },
+        { outputIndex: 2, satoshis: 1, lockingScript: lock(ID, 995n), basket: TREASURY_BASKET }
+      ]
+    }] as any)
+    expect(rows).toEqual([expect.objectContaining({ txid: 'ri1', kind: 'reissue', amount: 5n })])
+  })
+
   it('skips a treasury action with no asset id', () => {
     const rows = parseActionsToHistory([{
       txid: 'bad',

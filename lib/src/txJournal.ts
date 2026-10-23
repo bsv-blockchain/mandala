@@ -91,6 +91,12 @@ export interface JournalEntry {
   attempts?: number
   /** The overlay verdict code that produced a 'retryable' entry (diagnostics). */
   code?: string
+  /**
+   * 'retryable' entries: 'unknown' when the last submit left open whether the
+   * overlay applied (and broadcast) these bytes. Such an entry is never
+   * aborted at RETRY_CAP (deferred-lib item 2); only a final verdict releases it.
+   */
+  outcome?: 'refused' | 'unknown'
   /** Present on 'retryable' / 'signed' / 'delivered' entries whose bytes were journaled (§9.11). */
   submit?: JournalSubmit
   /** The off-chain envelope for THIS txid, hex; written on 'accepted' entries. */
@@ -103,8 +109,8 @@ export interface JournalEntry {
   outputIndex?: number
   /** Hand-over entries: the sender's note, carried in the redelivered body. */
   note?: string
-  /** Hand-over entries: the BRC-207 receipt instruction, as a JSON string (C§7.1). */
-  receipt?: string
+  /** Hand-over entries: the v4 MessageBox body (B7), as a JSON string; redelivered verbatim. */
+  body?: string
   /**
    * σ_I, on 'accepted' entries only (A12). The overlay's acceptance proof is
    * written at the commit point, which it already reaches before the
@@ -176,7 +182,7 @@ export type HandoverJournalEntry = JournalEntry & {
   assetId: string
   recipientKey: string
   outputIndex: number
-  receipt: string
+  body: string
   reference: string
   submit: { txHex: string, offChainHex: string, topics: string[] }
 }
@@ -185,7 +191,7 @@ export type HandoverJournalEntry = JournalEntry & {
 export function isHandoverEntry (e: JournalEntry): e is HandoverJournalEntry {
   return (e.stage === 'signed' || e.stage === 'delivered') &&
     typeof e.assetId === 'string' && typeof e.recipientKey === 'string' &&
-    typeof e.outputIndex === 'number' && typeof e.receipt === 'string' &&
+    typeof e.outputIndex === 'number' && typeof e.body === 'string' &&
     typeof e.reference === 'string' && typeof e.submit?.txHex === 'string' &&
     typeof e.submit.offChainHex === 'string' && Array.isArray(e.submit.topics)
 }

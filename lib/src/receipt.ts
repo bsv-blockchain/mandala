@@ -2,10 +2,8 @@
  * BRC-207 receipt instructions and the MessageBox hand-over body (C§7.1,
  * C§7.2), shared by issuer payouts, reissues and holder hand-overs.
  *
- * Every Mandala receipt carries the attested leaf (0207:313-322): the deploy
- * raw tx, the unattested token ancestors (none for an issuer payout: its
- * inputs are treasury coins, and the tip itself is attested), the tip's
- * attestation, and one submission per unattested tx including the tip.
+ * B7: a receipt is plain BRC-207 custody JSON; the issuer's evidence (σ and
+ * envelopes) rides in the v4 MessageBox body beside it, never inside it.
  */
 import { Random, Utils, WalletInterface } from '@bsv/sdk'
 import { OneColor } from '@bsv/templates'
@@ -19,7 +17,11 @@ export interface MessageBoxSender {
   sendMessage: (a: { recipient: string, messageBox: string, body: object }) => Promise<unknown>
 }
 
-/** BRC-207 `internalizeAction` customInstructions for a `p color` output (C§7.1). */
+/**
+ * BRC-207 `internalizeAction` customInstructions for a `p color` output
+ * (0207:1431-1440): plain custody JSON, exactly these five members, well under
+ * 1000 bytes (design §9 B7). Evidence never travels here.
+ */
 export type ReceiptInstruction = {
   version: 1
   assetId: string
@@ -27,7 +29,6 @@ export type ReceiptInstruction = {
   derivationSuffix: string
   /** A, or A′ when the sender blinded (B3). */
   senderIdentityKey: string
-  profileData: Record<string, unknown>
 }
 
 /** A fresh remittance string: base64 of 16 random bytes (C§0). */
@@ -39,14 +40,15 @@ export function newRemittance (): string {
  * The issuer receipt builders. Defined in issuerIntent.ts, which rebuilds a
  * receipt after a crash (plan 04 R6) and must not import this module back.
  */
-export { issuerAttestedLeaf, issuerReceipt } from './issuerIntent.js'
+export { issuerReceipt } from './issuerIntent.js'
 export type { IssuerReceiptIntent } from './issuerIntent.js'
 
 /**
  * The MessageBox hand-over body (C§7.2). Defined in notifyJournal.ts, which
  * rebuilds it for redelivery (Task 15) and must not import this module back.
  */
-export { handoverBody } from './notifyJournal.js'
+export { handoverBody, receiptOfBody } from './notifyJournal.js'
+export type { HandoverBodyV4, WireAdmission, WireLinkage } from './notifyJournal.js'
 
 /**
  * Deliver `body` for committed tx `txid` on MESSAGEBOX. The notification is

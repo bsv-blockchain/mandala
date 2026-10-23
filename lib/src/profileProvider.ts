@@ -31,7 +31,8 @@
  * validated before any network call; a timeout aborts the request.
  */
 import { PublicKey, Utils } from '@bsv/sdk'
-import { ColorProviderError, type AttestedSTEAK, type ColorOverlayProvider } from '@bsv/color-permission-module'
+import type { ColorOverlayProvider } from '@bsv/color-permission-module'
+import { ColorProviderError } from './providerError.js'
 import { postLookup, type LookupFetchResponse, type LookupOutputList } from './overlayLookup.js'
 import { colorLookup, colorTopic } from './naming.js'
 
@@ -135,7 +136,7 @@ async function within<T> (p: Promise<T>, timedOut: Promise<never>): Promise<T> {
 async function postSubmit (
   url: string, doFetch: FetchLike, timeoutMs: number,
   topics: string[], beef: number[], offChainValues: number[] | undefined
-): Promise<AttestedSTEAK> {
+): Promise<Record<string, any>> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/octet-stream',
     'X-Topics': JSON.stringify(topics)
@@ -222,7 +223,7 @@ async function postSubmit (
     Object.values(parsed).some(v => v == null || typeof v !== 'object' || Array.isArray(v))) {
     throw providerError('ERR_INVALID_ANSWER', true, false, 'the submit answer is not a STEAK object')
   }
-  return parsed as AttestedSTEAK
+  return parsed as Record<string, any>
 }
 
 /**

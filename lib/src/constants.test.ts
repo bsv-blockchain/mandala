@@ -68,7 +68,7 @@ describe('1Color constants (C§8.1)', () => {
     expect(constants.TREASURY_BASKET).toBe('mandala treasury')
     expect(constants.ADMIN_PROTOCOL).toEqual([2, 'mandala admin'])
     expect(constants.REGISTRY_PROTOCOL).toEqual([2, 'mandala registry'])
-    expect(constants.ATTESTED_PROFILE_ID).toBe('https://brc.dev/207/attested')
+    expect('ATTESTED_PROFILE_ID' in constants).toBe(false) // B7: no attested companion
     expect(constants.MANDALA_PROFILE_ID)
       .toBe('https://github.com/bsv-blockchain/mandala/blob/master/docs/profiles/issuer-v1.md')
     expect(new TextEncoder().encode(constants.MANDALA_PROFILE_ID).length).toBe(80)

@@ -1,12 +1,13 @@
 /**
- * Holder hand-over through a BRC-100 wallet that hosts
- * `@bsv/color-permission-module` 0.2.0 with the Mandala issuer-v1 profile
- * (C§8.1, B2, B5, D4, D24, D27).
+ * Holder hand-over from a wallet HOST that runs `@bsv/color-permission-module`
+ * with the Mandala issuer-v1 profile (C§8.1, B2, B5, design §9 B7).
  *
- *   sendHandover    build + sign noSend (the module adds inputs, token change
- *                   and the envelope), read `colorHandoff`, journal 'signed'
+ *   sendHandover    build + sign plain noSend (the module adds inputs and
+ *                   token change), build the envelope from the host's own
+ *                   custody, walk the evidence (σ / envelopes), record the
+ *                   hand-over 'pending' in the host ledger, journal 'signed'
  *                   ('delivered' for a self-send: no delivery is owed)
- *   deliverHandover journal the notification, send the v3 body on MESSAGEBOX,
+ *   deliverHandover journal the notification, send the v4 body on MESSAGEBOX,
  *                   mark 'delivered'
  *   settleHandover  post-ACK: submit the exact bytes on `tm_color_<assetId>`,
  *                   verify the attestation, journal 'accepted', sendWith
@@ -37,7 +38,7 @@
 import { PublicKey, Transaction, Utils, WalletInterface } from '@bsv/sdk'
 import { OneColor } from '@bsv/templates'
 import {
-  ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID, MESSAGEBOX, OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET,
+  MANDALA_PROFILE_ID, MESSAGEBOX, OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET,
   OVERLAY_URL, OVERLAY_URL_UNSET
 } from './constants.js'
 import { assertRemittance, colorProtocolID, colorTopic } from './naming.js'
@@ -46,6 +47,7 @@ import { recipientLinkage } from './linkage.js'
 import { outputPubKeyHash } from './blinding.js'
 import { blindingCommit, blindingReserve } from './blindingJournal.js'
 import { guardPositiveAmount } from './submitGuards.js'
+import { decodeToken } from './brc162.js'
 import {
   admissionReceipt, broadcastAcceptedTx, isAlreadyBroadcast, OverlayRefusedError, submitToOverlay
 } from './overlay.js'
@@ -55,7 +57,11 @@ import {
   journalRemove
 } from './txJournal.js'
 import { notifyPut, notifyRemove } from './notifyJournal.js'
-import { handoverBody, MessageBoxSender, newRemittance, ReceiptInstruction } from './receipt.js'
+import { handoverBody, MessageBoxSender, newRemittance, ReceiptInstruction, receiptOfBody, type HandoverBodyV4 } from './receipt.js'
+import type { HostLedger } from './hostLedger.js'
+import { buildHandoverEnvelope } from './hostEnvelope.js'
+import type { SpecificLinkage } from './encoding.js'
+import { collectHandoverEvidence, defaultEvidenceSource, type EvidenceSource } from './evidence.js'
 import { tryWithLock } from './webLocks.js'
 import { BusyError } from './singleFlight.js'
 
@@ -66,8 +72,11 @@ export interface HandoverResult {
   /** The noSend action's reference (abort handle). */
   reference: string
   outputIndex: number
+  /** The plain BRC-207 receipt the recipient internalizes with. */
   receipt: ReceiptInstruction
-  /** The tip's submission data (the Mandala envelope bytes the module built). */
+  /** The v4 MessageBox body (receipt fields + σ / envelope evidence), as delivered. */
+  body: HandoverBodyV4
+  /** The tip's submission data (the Mandala envelope the issuer-v1 handler built). */
   offChainValues: number[]
 }
 
@@ -94,6 +103,22 @@ export interface SendHandoverParams {
    * blinding reservation under the same key (a retry of the same payment).
    */
   journal?: boolean
+  /**
+   * The host ledger shared with the Mandala issuer-v1 handler (B7). The
+   * hand-over is recorded there `pending` (its change becomes spendable
+   * offline through the Mandala provider), and the evidence walk reads σ and
+   * envelopes of received coins from it.
+   */
+  ledger: HostLedger
+  /**
+   * The host's UNDERLYING wallet (not the permissions manager): the change
+   * custody and its linkage come from it, because the B7 module neither calls
+   * `submissionData` for a plain hand-over nor returns the envelope. Only a
+   * wallet host runtime has it; a BRC-100 app cannot send a Mandala hand-over.
+   */
+  hostWallet: WalletInterface
+  /** Where the ancestry evidence comes from; default the ledger plus the lib journal. */
+  evidence?: EvidenceSource
 }
 
 export type SettleResult =
@@ -105,7 +130,6 @@ const MANDALA_ASSET_ID = /^[0-9a-f]{64}_0$/
 const TXID = /^[0-9a-f]{64}$/
 const COLOR_KEY_ID = 'color'
 const DEFAULT_DESCRIPTION = 'Send Mandala tokens'
-const MISSING_MODULE = 'the wallet lacks @bsv/color-permission-module 0.2.0 with the Mandala issuer-v1 profile'
 
 function checkKey (key: unknown, name: string): string {
   if (typeof key !== 'string' || !COMPRESSED_KEY.test(key)) {
@@ -143,6 +167,9 @@ interface CheckedSend {
   derivationSuffix: string
   journal: boolean
   overlayIdentityKey: string
+  ledger: HostLedger
+  hostWallet: WalletInterface
+  evidence?: EvidenceSource
 }
 
 /** Every argument check, synchronous, before the lock and any wallet call. */
@@ -157,6 +184,12 @@ function checkSend (p: SendHandoverParams): CheckedSend {
   if (p.blind != null && typeof p.blind !== 'boolean') throw new TypeError('@bsv/mandala: blind must be a boolean')
   if (p.journal != null && typeof p.journal !== 'boolean') throw new TypeError('@bsv/mandala: journal must be a boolean')
   if (p.note != null && typeof p.note !== 'string') throw new TypeError('@bsv/mandala: note must be a string')
+  if (p.ledger == null || typeof p.ledger.put !== 'function') {
+    throw new TypeError('@bsv/mandala: sendHandover needs the host ledger shared with the Mandala profile handler')
+  }
+  if (p.hostWallet == null || typeof p.hostWallet.revealSpecificKeyLinkage !== 'function') {
+    throw new TypeError('@bsv/mandala: sendHandover needs the host\'s underlying wallet (hostWallet)')
+  }
   const hasPrefix = p.derivationPrefix !== undefined
   const hasSuffix = p.derivationSuffix !== undefined
   if (hasPrefix !== hasSuffix) {
@@ -167,7 +200,7 @@ function checkSend (p: SendHandoverParams): CheckedSend {
   const self = recipientKey === identityKey
   // S5: a send to another key needs the overlay key for its linkage; refuse
   // before the lock, the journal and any wallet call.
-  if (!self && OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
+  if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
   return {
     wallet: p.wallet,
     identityKey,
@@ -180,7 +213,10 @@ function checkSend (p: SendHandoverParams): CheckedSend {
     derivationPrefix,
     derivationSuffix,
     journal: p.journal !== false,
-    overlayIdentityKey: OVERLAY_IDENTITY_KEY
+    overlayIdentityKey: OVERLAY_IDENTITY_KEY,
+    ledger: p.ledger,
+    hostWallet: p.hostWallet,
+    ...(p.evidence != null ? { evidence: p.evidence } : {})
   }
 }
 
@@ -191,8 +227,9 @@ function checkSend (p: SendHandoverParams): CheckedSend {
  *
  * Throws `TypeError` on invalid arguments and `Error(OVERLAY_IDENTITY_KEY_UNSET)`
  * (S5) before any wallet call, `BusyError` while another send holds the
- * `mandala.send` lock, and `Error('the wallet lacks …')` (after aborting the
- * action) when the wallet returns no usable `colorHandoff`.
+ * `mandala.send` lock, and (after aborting the action) any failure to build
+ * the envelope (no host custody for an owned output) or to record the
+ * hand-over in the host ledger.
  */
 export async function sendHandover (p: SendHandoverParams): Promise<HandoverResult> {
   const c = checkSend(p)
@@ -222,6 +259,7 @@ async function sendPipeline (c: CheckedSend): Promise<HandoverResult> {
   let senderIdentityKey = identityKey
   let r: string | undefined
   let plan: ColorPlanV1
+  let recipientEntry: { index: number, linkage: SpecificLinkage } | undefined
   const base = {
     version: 1 as const,
     assets: [assetId],
@@ -253,6 +291,7 @@ async function sendPipeline (c: CheckedSend): Promise<HandoverResult> {
       ownedOutputs: [],
       profileData: { [MANDALA_PROFILE_ID]: { [assetId]: { outputs: [{ index: 0, linkage: rl.linkage }] } } }
     }
+    recipientEntry = { index: 0, linkage: rl.linkage }
   }
   // r is reserved before the action exists: a failed write stops the send
   // before any side effect. Throws on failure (the only copy of r).
@@ -271,8 +310,7 @@ async function sendPipeline (c: CheckedSend): Promise<HandoverResult> {
     // signAndProcess false: a WalletPermissionsManager otherwise signs a
     // caller-input-free action inside createAction (BRC-100 isSignAction is
     // false) and returns no reference, so the held action could not be
-    // released on a later failure. Two-phase keeps the reference in hand and
-    // the module's colorHandoff on the signAction result.
+    // released on a later failure. Two-phase keeps the reference in hand.
     options: { noSend: true, randomizeOutputs: false, signAndProcess: false }
   })
   const reference = created.signableTransaction?.reference
@@ -282,26 +320,71 @@ async function sendPipeline (c: CheckedSend): Promise<HandoverResult> {
   let txid: string
   let tx: number[]
   let offChainValues: number[]
-  let receipt: ReceiptInstruction
+  let body: HandoverBodyV4
   try {
-    const signed = await wallet.signAction({ reference, spends: {} }) as Awaited<ReturnType<WalletInterface['signAction']>> & { colorHandoff?: unknown }
+    const signed = await wallet.signAction({ reference, spends: {} })
     if (signed?.tx == null || typeof signed.txid !== 'string' || !TXID.test(signed.txid)) {
       throw new Error('sendHandover: signAction returned no tx')
     }
     txid = signed.txid
     tx = Array.from(signed.tx)
-    const handoff = readHandoff(signed.colorHandoff, txid, assetId)
-    offChainValues = handoff.offChainValues
-    receipt = { version: 1, assetId, derivationPrefix, derivationSuffix, senderIdentityKey, profileData: handoff.profileData }
+    const tipTx = Transaction.fromAtomicBEEF(tx)
+    if (tipTx.id('hex') !== txid) throw new Error('sendHandover: signAction returned bytes that do not hash to its txid')
+    // B7: the module neither calls submissionData for a plain hand-over nor
+    // returns an envelope, so the host builds it from its own custody.
+    offChainValues = await buildHandoverEnvelope({
+      hostWallet: c.hostWallet,
+      identityKey,
+      overlayIdentityKey: c.overlayIdentityKey,
+      assetId,
+      tx: tipTx,
+      ...(recipientEntry != null ? { recipient: recipientEntry } : {})
+    })
+    // The ancestry evidence: σ per admitted ancestor, envelope per unadmitted one.
+    const { admissions, linkage } = await collectHandoverEvidence(tipTx, assetId, c.evidence ?? defaultEvidenceSource(assetId, c.ledger))
+    body = handoverBody({
+      assetId,
+      amount,
+      outputIndex: 0,
+      tx,
+      derivationPrefix,
+      derivationSuffix,
+      senderIdentityKey,
+      senderMode: senderIdentityKey === identityKey ? 'identity' : 'blinded',
+      admissions: [...admissions.values()],
+      linkage: [...[...linkage].map(([t, b]) => ({ txid: t, offChainValues: b })), { txid, offChainValues }],
+      ...(c.note != null ? { note: c.note } : {})
+    })
   } catch (e) {
     await releaseAction(wallet, reference)
     throw e
   }
+  const receipt = receiptOfBody(body)
 
   // Durable before resolving: r moves to the recipient outpoint, then the
   // 'signed' entry (bytes, envelope, receipt) lands. Never aborted, swept or
   // submitted from here until the recipient acknowledges.
   if (r != null) await blindingCommit(derivationSuffix, `${txid}.0`)
+  // B7: the host records its own hand-over pending (exact bytes, envelope and
+  // the outputs it keeps), so the Mandala provider can vouch for the change
+  // while the overlay has not admitted it, and the evidence walk can forward
+  // the envelope. Nobody has the bytes yet: a failed write releases and fails.
+  try {
+    const tipTx = Transaction.fromAtomicBEEF(tx)
+    const kept: number[] = []
+    tipTx.outputs.forEach((o, i) => {
+      const d = decodeToken(o.lockingScript, txid, i)
+      if (d != null && d.assetId === assetId && (c.self || i !== 0)) kept.push(i)
+    })
+    const beefHex = Utils.toHex(tx)
+    await c.ledger.put({
+      v: 1, txid, assetId, state: 'pending', own: true, outputs: kept, beefHex,
+      submits: [{ txid, beefHex, offChainHex: Utils.toHex(offChainValues) }], at: Date.now()
+    })
+  } catch (e) {
+    await releaseAction(wallet, reference)
+    throw e
+  }
   if (c.journal) {
     try {
       await writeSigned()
@@ -313,7 +396,7 @@ async function sendPipeline (c: CheckedSend): Promise<HandoverResult> {
       throw e
     }
   }
-  return { txid, tx, reference, outputIndex: 0, receipt, offChainValues }
+  return { txid, tx, reference, outputIndex: 0, receipt, body, offChainValues }
 
   async function writeSigned (): Promise<void> {
     // A self-send owes no delivery (and never goes through deliverHandover):
@@ -329,7 +412,7 @@ async function sendPipeline (c: CheckedSend): Promise<HandoverResult> {
       recipientKey,
       outputIndex: 0,
       ...(c.note != null ? { note: c.note } : {}),
-      receipt: JSON.stringify(receipt),
+      body: JSON.stringify(body),
       submit: { txHex: Utils.toHex(tx), offChainHex: Utils.toHex(offChainValues), topics: [colorTopic(assetId)] }
     })
     // Read back from the store: the entry must be durable before we resolve.
@@ -337,27 +420,6 @@ async function sendPipeline (c: CheckedSend): Promise<HandoverResult> {
       throw new Error(`sendHandover: the '${stage}' journal entry for ${txid} was not stored; the hand-over was released`)
     }
   }
-}
-
-/**
- * The module's `colorHandoff` (C§2.2 item 9, D4): `version 1`, the signed
- * txid, and an attested leaf for the asset whose `submissions` contain the
- * tip. Anything else means the wallet does not host the 0.2.0 module with
- * the Mandala profile.
- */
-function readHandoff (v: unknown, txid: string, assetId: string): { profileData: Record<string, unknown>, offChainValues: number[] } {
-  const h = v as { version?: unknown, txid?: unknown, profileData?: unknown } | undefined
-  if (h == null || typeof h !== 'object' || h.version !== 1 || h.txid !== txid) throw new Error(MISSING_MODULE)
-  const profileData = h.profileData as Record<string, any> | undefined
-  if (profileData == null || typeof profileData !== 'object' || Array.isArray(profileData)) throw new Error(MISSING_MODULE)
-  const leaf = profileData[ATTESTED_PROFILE_ID]?.[assetId]
-  const submissions = leaf?.submissions
-  if (!Array.isArray(submissions)) throw new Error(MISSING_MODULE)
-  const tip = submissions.find((s: any) => s?.txid === txid)
-  if (tip == null || typeof tip.offChainValues !== 'string' || !/^(?:[0-9a-f]{2})+$/.test(tip.offChainValues)) {
-    throw new Error(MISSING_MODULE)
-  }
-  return { profileData, offChainValues: Utils.toArray(tip.offChainValues, 'hex') }
 }
 
 /** Best-effort abort of a held noSend action; a failed abort is journaled for reconcile. */
@@ -379,20 +441,21 @@ async function releaseAction (wallet: WalletInterface, reference: string): Promi
 export async function deliverHandover (p: {
   messageBoxClient: MessageBoxSender
   recipientKey: string
-  handover: Pick<HandoverResult, 'txid' | 'tx' | 'outputIndex' | 'receipt'>
-  note?: string
+  handover: Pick<HandoverResult, 'txid' | 'body'>
 }): Promise<void> {
   if (p?.messageBoxClient == null || typeof p.messageBoxClient.sendMessage !== 'function') {
     throw new TypeError('@bsv/mandala: deliverHandover needs a messageBoxClient')
   }
   const recipientKey = checkKey(p.recipientKey, 'recipientKey')
-  const { txid, tx, outputIndex, receipt } = p.handover ?? ({} as any)
+  const { txid, body } = p.handover ?? ({} as any)
   if (typeof txid !== 'string' || !TXID.test(txid)) throw new TypeError('@bsv/mandala: handover.txid must be 64 lowercase hex')
-  if (!Array.isArray(tx) || tx.length === 0) throw new TypeError('@bsv/mandala: handover.tx must be the AtomicBEEF bytes')
-  if (!Number.isInteger(outputIndex) || outputIndex < 0) throw new TypeError('@bsv/mandala: handover.outputIndex must be an output index')
-  if (receipt == null || typeof receipt !== 'object') throw new TypeError('@bsv/mandala: handover.receipt is required')
-  const assetId = checkMandalaAsset(receipt.assetId)
-  const body = handoverBody({ assetId, outputIndex, tx, receipt, ...(p.note != null ? { note: p.note } : {}) })
+  if (body == null || typeof body !== 'object' || body.v !== 4 || body.kind !== 'handover') {
+    throw new TypeError('@bsv/mandala: handover.body must be the v4 hand-over body')
+  }
+  checkMandalaAsset(body.assetId)
+  if (subjectTxid(Utils.toArray(body.transaction, 'hex')) !== txid) {
+    throw new TypeError(`@bsv/mandala: handover.body does not carry the AtomicBEEF of ${txid}`)
+  }
   await notifyPut({ txid, recipient: recipientKey, messageBox: MESSAGEBOX, body, at: Date.now() })
   await p.messageBoxClient.sendMessage({ recipient: recipientKey, messageBox: MESSAGEBOX, body })
   await notifyRemove(txid)
@@ -442,11 +505,15 @@ export async function settleHandover (p: SettleParams): Promise<SettleResult> {
   return await settleChecked(p, true)
 }
 
-interface SettleParams {
+export interface SettleParams {
   wallet: WalletInterface
   handover: Pick<HandoverResult, 'txid' | 'tx' | 'offChainValues'>
   assetId: string
   overlayIdentityKey: string
+  /** Host ledger: records the verified σ (onward hand-overs walk to it). */
+  ledger?: HostLedger
+  /** Host-only `color.markSettled(txid)`: clears `color_offline` on the hand-over's own change once admitted. */
+  markSettled?: (txid: string) => Promise<void>
 }
 
 async function settleChecked (p: SettleParams, broadcast: boolean): Promise<SettleResult> {
@@ -462,7 +529,11 @@ async function settleChecked (p: SettleParams, broadcast: boolean): Promise<Sett
   if (!Array.isArray(offChainValues) || offChainValues.length === 0) {
     throw new TypeError('@bsv/mandala: handover.offChainValues must be the non-empty envelope bytes')
   }
-  return await settleOnce(p.wallet, { txid, tx, offChainValues, assetId, overlayIdentityKey: p.overlayIdentityKey, broadcast })
+  return await settleOnce(p.wallet, {
+    txid, tx, offChainValues, assetId, overlayIdentityKey: p.overlayIdentityKey, broadcast,
+    ...(p.ledger != null ? { ledger: p.ledger } : {}),
+    ...(p.markSettled != null ? { markSettled: p.markSettled } : {})
+  })
 }
 
 /**
@@ -482,7 +553,7 @@ export async function resubmitDelivered (
   wallet: WalletInterface,
   entry: HandoverJournalEntry,
   overlayIdentityKey: string,
-  opts: { broadcast?: boolean } = {}
+  opts: { broadcast?: boolean, ledger?: HostLedger, markSettled?: (txid: string) => Promise<void> } = {}
 ): Promise<SettleResult> {
   return await settleChecked({
     wallet,
@@ -492,7 +563,9 @@ export async function resubmitDelivered (
       offChainValues: Utils.toArray(entry.submit.offChainHex, 'hex')
     },
     assetId: entry.assetId,
-    overlayIdentityKey
+    overlayIdentityKey,
+    ...(opts.ledger != null ? { ledger: opts.ledger } : {}),
+    ...(opts.markSettled != null ? { markSettled: opts.markSettled } : {})
   }, opts.broadcast !== false)
 }
 
@@ -504,6 +577,8 @@ interface SettleArgs {
   overlayIdentityKey: string
   /** Start the background sendWith after an admission (false: the caller broadcasts). */
   broadcast: boolean
+  ledger?: HostLedger
+  markSettled?: (txid: string) => Promise<void>
 }
 
 function settleOnce (wallet: WalletInterface, a: SettleArgs): Promise<SettleResult> {
@@ -532,6 +607,14 @@ async function settlePipeline (wallet: WalletInterface, a: SettleArgs): Promise<
       return { status: 'retry', code }
     }
     await releaseRefused(wallet, a.txid, refusal.code)
+    if (a.ledger != null) {
+      try {
+        const rec = await a.ledger.get(a.txid)
+        if (rec != null) await a.ledger.put({ ...rec, state: 'refused', code: refusal.code, at: Date.now() })
+      } catch (e) {
+        console.warn(`[mandala] hand-over ${a.txid} was refused but the host ledger could not record it:`, e)
+      }
+    }
     return { status: 'refused', code: refusal.code }
   }
   const attestation = admitted.attestation
@@ -551,6 +634,7 @@ async function settlePipeline (wallet: WalletInterface, a: SettleArgs): Promise<
     offChainHex: Utils.toHex(a.offChainValues),
     ...admissionReceipt(admitted)
   })
+  await recordOwnSettled(a, attestation)
   if (!a.broadcast) return { status: 'admitted', attestation }
   void broadcastAcceptedTx(wallet, a.txid)
     .then(async posted => {
@@ -568,6 +652,27 @@ async function settlePipeline (wallet: WalletInterface, a: SettleArgs): Promise<
       console.warn(`[mandala] overlay admitted hand-over ${a.txid} but the broadcast failed; reconcile retries it:`, e)
     })
   return { status: 'admitted', attestation }
+}
+
+/**
+ * B7: after a verified admission of an own hand-over, the host ledger keeps
+ * its σ (so onward hand-overs of its change stop the walk here) and the host's
+ * `markSettled` clears `color_offline` on that change. Neither failure undoes
+ * the admission: the record is rewritten and `markSettled` re-run by the next
+ * settle of the same txid (idempotent), so both are warned, never thrown.
+ */
+async function recordOwnSettled (a: SettleArgs, attestation: Attestation): Promise<void> {
+  try {
+    if (a.ledger != null) {
+      await a.ledger.put({ v: 1, txid: a.txid, assetId: a.assetId, state: 'settled', outputs: [], attestation, marked: a.markSettled == null, at: Date.now() })
+    }
+    if (a.markSettled != null) {
+      await a.markSettled(a.txid)
+      if (a.ledger != null) await a.ledger.put({ v: 1, txid: a.txid, assetId: a.assetId, state: 'settled', outputs: [], attestation, marked: true, at: Date.now() })
+    }
+  } catch (e) {
+    console.warn(`[mandala] hand-over ${a.txid} is admitted but recording it as settled failed; the next settle retries:`, e)
+  }
 }
 
 /**

@@ -595,19 +595,26 @@ export async function submitAndBroadcast (
       //
       // Awaited: a crash between this write and the rethrow must leave the
       // entry behind, not the error.
-      await journalPut({
-        txid: signed.txid,
-        stage: 'retryable',
-        at: Date.now(),
-        code: (e as OverlayRefusedError).code,
-        attempts: 0,
-        ...(reference != null ? { reference } : {}),
-        submit: {
-          txHex: Utils.toHex(signed.tx),
-          ...(offChainValues != null ? { offChainHex: Utils.toHex(offChainValues) } : {}),
-          topics
-        }
-      })
+      // Deferred-lib item 3: a journal fault must never replace the refusal
+      // (callers branch on isOutcomeUnknown(e) to keep or drop receipt intents).
+      try {
+        await journalPut({
+          txid: signed.txid,
+          stage: 'retryable',
+          at: Date.now(),
+          code: (e as OverlayRefusedError).code,
+          outcome: unknown ? 'unknown' : 'refused',
+          attempts: 0,
+          ...(reference != null ? { reference } : {}),
+          submit: {
+            txHex: Utils.toHex(signed.tx),
+            ...(offChainValues != null ? { offChainHex: Utils.toHex(offChainValues) } : {}),
+            topics
+          }
+        })
+      } catch (je) {
+        console.warn(`[mandala] could not journal the held ${signed.txid}; the refusal stands:`, je)
+      }
     } else if (reference != null) {
       // A refusal that proves nothing was applied (or a failure before the
       // send) — release the held inputs.

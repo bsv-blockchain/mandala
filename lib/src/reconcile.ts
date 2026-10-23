@@ -61,7 +61,7 @@
  */
 import { Utils, WalletInterface } from '@bsv/sdk'
 import {
-  admissionReceipt, broadcastAcceptedTx, isAlreadyBroadcast, OverlayRefusedError, submitToOverlay
+  admissionReceipt, broadcastAcceptedTx, isAlreadyBroadcast, isOutcomeUnknown, OverlayRefusedError, submitToOverlay
 } from './overlay.js'
 import {
   isHandoverEntry, JournalEntry, journalGet, journalList, journalPut, journalRemove, INTENT_TTL_MS
@@ -605,8 +605,9 @@ async function retryRefused (
 
   if (entry.submit == null) {
     // No bytes to re-POST (an older entry, or a store that lost the field).
-    // All this pass can do is count — then release the inputs at the cap.
-    if (attempts >= RETRY_CAP) await giveUp()
+    // All this pass can do is count — then release the inputs at the cap,
+    // unless the overlay may already have applied it (item 2: never abort).
+    if (attempts >= RETRY_CAP && entry.outcome !== 'unknown') await giveUp()
     else await journalPut({ ...entry, attempts })
     return
   }
@@ -639,13 +640,23 @@ async function retryRefused (
     // A refusal the contract calls final means these bytes will never be
     // admitted — retrying is pointless, so release the inputs now.
     const final = e instanceof OverlayRefusedError && !e.retryable
-    if (final || attempts >= RETRY_CAP) {
+    // Deferred-lib item 2: an entry whose outcome is unknown (the overlay may
+    // have folded and broadcast it) is never aborted at the cap: aborting an
+    // applied tx desyncs the wallet from the chain and strands its receipt
+    // intent. It keeps retrying (idempotent) until a 200 replay or a final
+    // verdict settles it, and is surfaced once past the cap.
+    const unknown = e instanceof OverlayRefusedError && isOutcomeUnknown(e)
+    if (final || (attempts >= RETRY_CAP && !unknown)) {
       await giveUp()
       return
+    }
+    if (attempts === RETRY_CAP && unknown) {
+      console.warn(`[mandala] ${entry.txid}: ${RETRY_CAP} re-submits left its overlay outcome unknown; it is kept (never aborted) and retried`)
     }
     await journalPut({
       ...entry,
       attempts,
+      outcome: unknown ? 'unknown' : 'refused',
       ...(e instanceof OverlayRefusedError ? { code: e.code } : {})
     })
   }

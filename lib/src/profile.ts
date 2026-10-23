@@ -4,8 +4,15 @@
  * the Mandala overlay provider it routes to.
  *
  * Profile definition: `docs/profiles/issuer-v1.md` (the profile id resolves
- * to it). A Mandala deploy's `req` is exactly attested v1 in identity mode
- * plus issuer-v1, both naming the same overlay identity key K (C§4).
+ * to it). A Mandala deploy's `req` is exactly `{issuer-v1: {version: 1,
+ * params: {identityKey: K}}}` (design §9 B7: no attested companion).
+ *
+ * B7: the handler credits a receipt only from the host ledger (the
+ * in-process object the host passes here and to the lib's receive/settle
+ * paths; never reachable over BRC-100) or after its own submit returns a
+ * verified σ by K (profileReceipt.ts). Its provider answers `spendability`
+ * from the same ledger when the overlay is unreachable or has not admitted
+ * yet (profileSpendability.ts), so offline and chained hand-overs work.
  *
  * S5 (fail closed): the overlay URL is wallet configuration, keyed by K. An
  * asset whose K has no configured overlay gets no provider: `provider()`
@@ -26,47 +33,43 @@
 import {
   ProfileParamsError,
   type ColorOverlayProvider,
-  type ProfileDescriptor,
-  type RequiredProfileHandler
+  type ProfileDescriptor
 } from '@bsv/color-permission-module'
-import { ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID } from './constants.js'
+import { MANDALA_PROFILE_ID } from './constants.js'
 import { createMandalaOverlayProvider, type MandalaOverlayProvider } from './profileProvider.js'
-import { hasExactly, invalidProfile as invalid, isCborMap, issuerKey } from './profileDescriptor.js'
+import { invalidProfile as invalid, issuerKey } from './profileDescriptor.js'
 import { checkPlanData, submissionData } from './profilePlanData.js'
 import { admitReceipt } from './profileReceipt.js'
+import type { HostLedger } from './hostLedger.js'
+import { withLedgerSpendability } from './profileSpendability.js'
+import type { B7RequiredProfileHandler } from './profileTypes.js'
 
 export { MANDALA_PROFILE_ID }
 export { createMandalaOverlayProvider }
+export { ColorProviderError } from './providerError.js'
+export { withLedgerSpendability } from './profileSpendability.js'
 export type { MandalaOverlayProvider, MandalaOverlayProviderOptions } from './profileProvider.js'
+export type { B7RequiredProfileHandler, ProfileReceiptCredit, ProfileReceiptView } from './profileTypes.js'
 
 export interface MandalaProfileOptions {
   /** Wallet configuration: the Mandala overlays this wallet trusts, by identity key K. K absent ⇒ its assets fail closed (S5). */
   overlays: Array<{ identityKey: string, url: string }>
+  /** The host ledger (B7): in-process, host-owned, shared with the lib's receive/settle/send paths. */
+  ledger: HostLedger
   fetch?: typeof fetch
   /** Per request; default 15000. */
   timeoutMs?: number
 }
 
-/** Receipt customInstructions limit for Mandala assets (attested receipts, 16 MiB). */
-const MAX_RECEIPT_BYTES = 16_777_216
-
-/** C§4: issuer params exactly {identityKey: K}; req exactly {attested v1 identity K, issuer-v1}. */
+/** B7: issuer params exactly {identityKey: K}; req exactly {issuer-v1}. */
 function checkDescriptor (descriptor: ProfileDescriptor, req: ReadonlyMap<string, ProfileDescriptor>): void {
   const k = issuerKey(descriptor)
-  if (req == null || typeof req.get !== 'function' || req.size !== 2) {
-    throw invalid('req must contain exactly the attested and issuer-v1 profiles')
+  if (req == null || typeof req.get !== 'function' || req.size !== 1) {
+    throw invalid('req must contain exactly the issuer-v1 profile')
   }
   const own = req.get(MANDALA_PROFILE_ID)
   if (own === undefined) throw invalid('req does not contain issuer-v1')
   if (own !== descriptor && issuerKey(own) !== k) throw invalid('issuer-v1 descriptor differs from the req entry')
-  const attested = req.get(ATTESTED_PROFILE_ID)
-  if (attested === undefined) throw invalid('the attested profile (identity mode) is required in the same req')
-  if (attested.version !== 1) throw invalid('the attested profile version must be 1')
-  const ap = attested.params
-  if (!isCborMap(ap) || !hasExactly(ap, ['trustMode', 'identityKey']) || ap.trustMode !== 'identity') {
-    throw invalid('attested params must be exactly {trustMode: "identity", identityKey}')
-  }
-  if (ap.identityKey !== k) throw invalid('attested identityKey must equal the issuer-v1 identityKey')
 }
 
 /**
@@ -74,9 +77,13 @@ function checkDescriptor (descriptor: ProfileDescriptor, req: ReadonlyMap<string
  * on malformed options, an invalid overlay identity key, an empty or
  * non-http(s) url, or a duplicate identity key.
  */
-export function createMandalaProfile (o: MandalaProfileOptions): RequiredProfileHandler {
+export function createMandalaProfile (o: MandalaProfileOptions): B7RequiredProfileHandler {
   if (o == null || typeof o !== 'object') throw new TypeError('@bsv/mandala: createMandalaProfile options are required')
   if (!Array.isArray(o.overlays)) throw new TypeError('@bsv/mandala: overlays must be an array of {identityKey, url}')
+  const ledger = o.ledger
+  if (ledger == null || typeof ledger.get !== 'function' || typeof ledger.put !== 'function') {
+    throw new TypeError('@bsv/mandala: createMandalaProfile needs the host ledger (createHostLedger)')
+  }
   const providers = new Map<string, MandalaOverlayProvider>()
   for (const entry of o.overlays) {
     if (entry == null || typeof entry !== 'object') throw new TypeError('@bsv/mandala: each overlay must be {identityKey, url}')
@@ -90,7 +97,7 @@ export function createMandalaProfile (o: MandalaProfileOptions): RequiredProfile
       ...(o.fetch !== undefined ? { fetch: o.fetch } : {}),
       ...(o.timeoutMs !== undefined ? { timeoutMs: o.timeoutMs } : {})
     })
-    providers.set(provider.identityKey, provider)
+    providers.set(provider.identityKey, withLedgerSpendability(provider, ledger))
   }
 
   /** The memoized provider for K. S5: no configured endpoint for K ⇒ fail closed, never a fallback. */
@@ -100,12 +107,11 @@ export function createMandalaProfile (o: MandalaProfileOptions): RequiredProfile
     return provider
   }
 
-  const handler: RequiredProfileHandler = {
+  const handler: B7RequiredProfileHandler = {
     id: MANDALA_PROFILE_ID,
     versions: Object.freeze([1]),
     sendPolicy: 'plain-nosend',
     operations: Object.freeze(['transfer'] as const),
-    maxReceiptBytes: MAX_RECEIPT_BYTES,
     checkDescriptor,
     provider: (_assetId: string, descriptor: ProfileDescriptor): ColorOverlayProvider => providerFor(issuerKey(descriptor)),
     deployProviders: (): ColorOverlayProvider[] => [...providers.values()],
@@ -113,9 +119,8 @@ export function createMandalaProfile (o: MandalaProfileOptions): RequiredProfile
     // and again at signAction; submissionData gives the envelope bytes.
     checkPlanData,
     submissionData,
-    // Goal 4, D6, D7: own submit and a verified attestation by K, or (transport
-    // failure only, policy-clean hops) unavailable for attested offline acceptance.
-    admitReceipt: async (ctx, graph) => await admitReceipt(ctx, graph, providerFor)
+    // B7: credit only what the host ledger recorded, else own submit + verified σ.
+    admitReceipt: async (ctx, receipt) => await admitReceipt(ctx, receipt, providerFor, ledger)
   }
   return Object.freeze(handler)
 }

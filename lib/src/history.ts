@@ -187,6 +187,10 @@ function treasuryRow (a: RawAction, kind: string, ciByOutpoint: Record<string, s
       return { txid: a.txid, assetId, direction: 'redeemed', amount: redeemAmount(a.description), counterparty: '', when: 0, kind }
     case 'payout':
       return { txid: a.txid, assetId, direction: 'admin', amount: payoutAmount(own), counterparty: '', when: 0, kind }
+    case 'reissue':
+      // Deferred-lib item 5: a reissue mints only the recipient output today,
+      // but any value it keeps in the treasury (change) is not reissued value.
+      return { txid: a.txid, assetId, direction: 'admin', amount: sum(own.filter(v => v.o.basket !== TREASURY_BASKET)), counterparty: '', when: 0, kind }
     default:
       return { txid: a.txid, assetId, direction: kind === 'recover' ? 'received' : 'admin', amount: sum(own), counterparty: '', when: 0, kind }
   }
