@@ -391,8 +391,12 @@ async function sendPipeline (c: CheckedSend): Promise<HandoverResult> {
     } catch (e) {
       // journalPut only warns on a failed write. Without the entry, nothing
       // protects this action from the sweep once the intent ends, and nothing
-      // can redeliver it. Nobody has the bytes yet, so release and fail.
+      // can redeliver it. Nobody has the bytes yet, so release and fail; the
+      // ledger must stop vouching for the released change.
       await releaseAction(wallet, reference)
+      try {
+        await c.ledger.put({ v: 1, txid, assetId, state: 'refused', own: true, outputs: [], code: 'ERR_RELEASED', at: Date.now() })
+      } catch { /* the action is released; nothing spends its change */ }
       throw e
     }
   }
@@ -664,7 +668,8 @@ async function settlePipeline (wallet: WalletInterface, a: SettleArgs): Promise<
 async function recordOwnSettled (a: SettleArgs, attestation: Attestation): Promise<void> {
   try {
     if (a.ledger != null) {
-      await a.ledger.put({ v: 1, txid: a.txid, assetId: a.assetId, state: 'settled', outputs: [], attestation, marked: a.markSettled == null, at: Date.now() })
+      // marked stays false until a markSettled really ran: settleReceipts finishes it otherwise.
+      await a.ledger.put({ v: 1, txid: a.txid, assetId: a.assetId, state: 'settled', outputs: [], attestation, marked: false, at: Date.now() })
     }
     if (a.markSettled != null) {
       await a.markSettled(a.txid)

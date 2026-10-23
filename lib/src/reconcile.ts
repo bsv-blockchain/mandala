@@ -69,6 +69,7 @@ import {
 import { tryWithLock } from './webLocks.js'
 import { OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 import { resubmitDelivered } from './handover.js'
+import type { HostLedger } from './hostLedger.js'
 
 /**
  * wallet-toolbox listActions spec-op: intercepts this "label" to list actions
@@ -147,6 +148,10 @@ export interface ReconcileOptions {
    * (`journalRemove`) the moment its drain really broadcasts the transaction.
    */
   broadcast?: boolean
+  /** B7 host runtime: a delivered hand-over admitted here records σ in the host ledger ... */
+  ledger?: HostLedger
+  /** ... and clears `color_offline` on its change (host-only `color.markSettled`). */
+  markSettled?: (txid: string) => Promise<void>
 }
 
 export interface ReconcileResult {
@@ -180,7 +185,10 @@ export async function reconcileWallet (
   opts: ReconcileOptions = {}
 ): Promise<ReconcileResult> {
   const { acquired, result } = await tryWithLock('mandala.reconcile', async () =>
-    await reconcilePass(wallet, opts.sweep !== false, opts.broadcast !== false)
+    await reconcilePass(wallet, opts.sweep !== false, opts.broadcast !== false, {
+      ...(opts.ledger != null ? { ledger: opts.ledger } : {}),
+      ...(opts.markSettled != null ? { markSettled: opts.markSettled } : {})
+    })
   )
   if (!acquired || result == null) {
     return { rebroadcast: [], aborted: [], resubmitted: [], stranded: [], swept: 0, handoversAwaitingDelivery: 0, skipped: true }
@@ -196,7 +204,9 @@ async function releaseReference (wallet: WalletInterface, reference?: string): P
   } catch { /* already on-chain, or the wallet is offline — the sweep owns it now */ }
 }
 
-async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast: boolean): Promise<ReconcileResult> {
+type HostPieces = { ledger?: HostLedger, markSettled?: (txid: string) => Promise<void> }
+
+async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast: boolean, host: HostPieces = {}): Promise<ReconcileResult> {
   const rebroadcast: string[] = []
   const aborted: string[] = []
   const resubmitted: string[] = []
@@ -305,7 +315,7 @@ async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast
         }
         continue
       }
-      await settleDelivered(wallet, entry, { resubmitted, aborted, stranded }, broadcastAccepted)
+      await settleDelivered(wallet, entry, { resubmitted, aborted, stranded }, broadcastAccepted, host)
       continue
     }
     if (entry.stage === 'retryable') {
@@ -378,7 +388,8 @@ async function settleDelivered (
   wallet: WalletInterface,
   entry: JournalEntry,
   out: { resubmitted: string[], aborted: string[], stranded: string[] },
-  broadcastAccepted: (e: JournalEntry) => Promise<void>
+  broadcastAccepted: (e: JournalEntry) => Promise<void>,
+  host: HostPieces = {}
 ): Promise<void> {
   const countPass = async (code?: string): Promise<void> => {
     // resubmitDelivered already counted a retry on the stored entry; read it
@@ -409,7 +420,7 @@ async function settleDelivered (
 
   let result
   try {
-    result = await resubmitDelivered(wallet, entry, OVERLAY_IDENTITY_KEY, { broadcast: false })
+    result = await resubmitDelivered(wallet, entry, OVERLAY_IDENTITY_KEY, { broadcast: false, ...host })
   } catch (e) {
     const msg = (e as { message?: unknown })?.message
     // S5 raced a reconfiguration: not a verdict, not a pass.

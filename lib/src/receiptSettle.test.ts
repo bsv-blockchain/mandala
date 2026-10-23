@@ -111,6 +111,22 @@ describe('settleReceipts', () => {
     expect(submitToOverlay).not.toHaveBeenCalled()
   })
 
+  it('an own hand-over is never submitted here; a settled-but-unmarked one is only marked', async () => {
+    const own = 'f'.repeat(64)
+    await ledger.put({ v: 1, txid: own, assetId: ID, state: 'pending', own: true, outputs: [1], submits: pending.submits, at: 2 })
+    vi.mocked(submitToOverlay).mockClear()
+    const marked: string[] = []
+    let r = await settleReceipts({ ledger, markSettled: async t => { marked.push(t) }, txids: [own] })
+    expect(r).toEqual([])
+    expect(submitToOverlay).not.toHaveBeenCalled()
+    await ledger.put({ v: 1, txid: own, assetId: ID, state: 'settled', own: true, outputs: [], marked: false, at: 3 })
+    r = await settleReceipts({ ledger, markSettled: async t => { marked.push(t) }, txids: [own] })
+    expect(r).toEqual([{ txid: own, assetId: ID, status: 'admitted' }])
+    expect(submitToOverlay).not.toHaveBeenCalled()
+    expect(marked).toEqual([own])
+    expect(await ledger.get(own)).toMatchObject({ state: 'settled', marked: true })
+  })
+
   it('fails closed without an overlay identity key (S5)', async () => {
     configureMandala({ overlayIdentityKey: '' })
     try {

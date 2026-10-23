@@ -553,6 +553,20 @@ describe('settleHandover', () => {
     expect(await ledger.get(h.txid)).toMatchObject({ state: 'settled', marked: false })
   })
 
+  it('B7: a hand-over that reconcile settles records σ and runs markSettled when the host passes them', async () => {
+    vi.mocked(submitToOverlay).mockResolvedValue(await admittedFor(h.txid))
+    const marked: string[] = []
+    await reconcileWallet(wallet as any, { sweep: false, broadcast: false, ledger, markSettled: async (t: string) => { marked.push(t) } })
+    expect(marked).toEqual([h.txid])
+    expect(await ledger.get(h.txid)).toMatchObject({ state: 'settled', own: true, marked: true })
+  })
+
+  it('B7: without markSettled the settled record stays unmarked (settleReceipts finishes it later)', async () => {
+    vi.mocked(submitToOverlay).mockResolvedValue(await admittedFor(h.txid))
+    await settle({ ledger })
+    expect(await ledger.get(h.txid)).toMatchObject({ state: 'settled', marked: false })
+  })
+
   it('resubmitDelivered re-POSTs the journaled bytes', async () => {
     const admitted = await admittedFor(h.txid)
     vi.mocked(submitToOverlay).mockResolvedValue(admitted)

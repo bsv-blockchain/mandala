@@ -106,9 +106,12 @@ export async function settleReceipts (p: {
     const only = p.txids != null ? new Set(p.txids) : undefined
     for (const r of await p.ledger.list()) {
       if (only != null && !only.has(r.txid)) continue
-      // An own hand-over is submitted only after the recipient's ACK (settleHandover).
-      if (r.own === true) continue
-      const due = r.state === 'pending' || (r.state === 'settled' && r.marked === false)
+      // An own hand-over is never SUBMITTED here (only after the recipient's
+      // ACK, by settleHandover); an own record that is settled but unmarked
+      // (markSettled failed, or reconcile settled it without one) is marked.
+      const unmarked = r.state === 'settled' && r.marked === false
+      if (r.own === true && !unmarked) continue
+      const due = r.state === 'pending' || unmarked
       if (!due) continue
       try {
         out.push(await settleOne(p.ledger, r, K, p.markSettled))
