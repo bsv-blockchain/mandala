@@ -19,7 +19,8 @@ const H: HandoverResult = {
   tx: [1, 2, 3],
   reference: 'ref-1',
   outputIndex: 0,
-  receipt: { version: 1, assetId: ID, derivationPrefix: 'p', derivationSuffix: 's', senderIdentityKey: A, profileData: {} },
+  receipt: { version: 1, assetId: ID, derivationPrefix: 'p', derivationSuffix: 's', senderIdentityKey: A },
+  body: {} as HandoverResult['body'],
   offChainValues: [9, 9]
 }
 const V: SendVars = { assetId: ID, amount: 5n, recipientKey: B }
@@ -53,7 +54,7 @@ describe('sendAndDeliver (B5: sign → deliver → post-ACK settle)', () => {
     const out = await sendAndDeliver(d, { assetId: ID, amount: 2n ** 64n - 1n, recipientKey: B, note: 'rent' })
     expect(order).toEqual(['send', 'lock:true', 'deliver', 'settle'])
     expect(out).toEqual({ txid: H.txid, delivered: true, self: false, settle: { status: 'admitted', attestation: ATT } })
-    expect(d.deliver).toHaveBeenCalledWith({ messageBoxClient: d.messageBoxClient, recipientKey: B, handover: H, note: 'rent' })
+    expect(d.deliver).toHaveBeenCalledWith({ messageBoxClient: d.messageBoxClient, recipientKey: B, handover: H })
     expect(d.settle).toHaveBeenCalledWith({ wallet: d.wallet, handover: { txid: H.txid, tx: H.tx, offChainValues: H.offChainValues }, assetId: ID, overlayIdentityKey: K })
   })
 
@@ -126,6 +127,19 @@ describe('describeSettle', () => {
 })
 
 describe('explainSendError', () => {
+  it('B7: a console without a wallet host gets a clear reason, not the lib TypeError', () => {
+    const t = explainSendError(new TypeError('@bsv/mandala: sendHandover needs the host ledger shared with the Mandala profile handler'))
+    expect(t).toMatch(/host runtime/)
+  })
+
+  it('B7: sendAndDeliver forwards the host pieces to send and settle', async () => {
+    const host = { hostWallet: {} as unknown as WalletInterface, ledger: {} as any, markSettled: vi.fn(async () => {}) }
+    const d = deps({ host })
+    await sendAndDeliver(d, V)
+    expect(d.send).toHaveBeenCalledWith(expect.objectContaining({ ledger: host.ledger, hostWallet: host.hostWallet }))
+    expect(d.settle).toHaveBeenCalledWith(expect.objectContaining({ ledger: host.ledger, markSettled: host.markSettled }))
+  })
+
   it('explainSendError names a wallet without the Mandala profile', () => {
     const msg = 'Your wallet cannot send Mandala assets: it needs the 1Color module with the Mandala issuer profile.'
     expect(explainSendError(Object.assign(new Error('x'), { name: 'UnsupportedProfileError' }))).toBe(msg)

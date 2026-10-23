@@ -27,6 +27,7 @@ import type { WalletInterface } from '@bsv/sdk'
 import type {
   deliverHandover,
   HandoverResult,
+  HostLedger,
   markHandoverDelivered,
   sendHandover,
   settleHandover
@@ -63,6 +64,13 @@ export interface SendDeps {
   markDelivered: typeof markHandoverDelivered
   settle: typeof settleHandover
   withLock?: typeof withHandoverLock
+  /**
+   * Design §9 B7: a hand-over is built by a wallet HOST (underlying wallet,
+   * host ledger, the module's markSettled). The console talks BRC-100 to an
+   * external wallet and has none, so a send fails before any wallet call with
+   * the lib's TypeError (explainSendError says why).
+   */
+  host?: { hostWallet: WalletInterface, ledger: HostLedger, markSettled?: (txid: string) => Promise<void> }
 }
 
 function errText (e: unknown): string {
@@ -74,7 +82,11 @@ export async function sendAndDeliver (deps: SendDeps, vars: SendVars): Promise<S
   const { wallet, identityKey } = deps
   const { assetId, amount, recipientKey, note } = vars
   // 1. Sign. `blind` is left to the lib default (true; forced false for self).
-  const h = await deps.send({ wallet, identityKey, assetId, amount, recipientKey, note })
+  const h = await deps.send({
+    wallet, identityKey, assetId, amount, recipientKey, note,
+    ledger: deps.host?.ledger as HostLedger,
+    hostWallet: deps.host?.hostWallet as WalletInterface
+  })
 
   const self = recipientKey === identityKey
   const undelivered: SendOutcome = { txid: h.txid, delivered: false, self, settle: null }
@@ -97,7 +109,7 @@ async function deliverThenSettle (deps: SendDeps, vars: SendVars, h: HandoverRes
       // No MessageBox leg for a send to self (A13).
       await deps.markDelivered(h.txid)
     } else {
-      await deps.deliver({ messageBoxClient: deps.messageBoxClient, recipientKey: vars.recipientKey, handover: h, note: vars.note })
+      await deps.deliver({ messageBoxClient: deps.messageBoxClient, recipientKey: vars.recipientKey, handover: h })
     }
   } catch (e) {
     // Entry stays 'signed': reconcileNotifications redelivers it (or the
@@ -112,7 +124,9 @@ async function deliverThenSettle (deps: SendDeps, vars: SendVars, h: HandoverRes
       wallet: deps.wallet,
       handover: { txid: h.txid, tx: h.tx, offChainValues: h.offChainValues },
       assetId: vars.assetId,
-      overlayIdentityKey: deps.overlayIdentityKey
+      overlayIdentityKey: deps.overlayIdentityKey,
+      ...(deps.host != null ? { ledger: deps.host.ledger } : {}),
+      ...(deps.host?.markSettled != null ? { markSettled: deps.host.markSettled } : {})
     })
   } catch (e) {
     // Entry stays 'delivered': reconcileWallet settles it from the journal.
@@ -133,12 +147,14 @@ export function describeSettle (o: SendOutcome): { kind: 'success' | 'info' | 'w
 }
 
 const NO_PROFILE = 'Your wallet cannot send Mandala assets: it needs the 1Color module with the Mandala issuer profile.'
+const NO_HOST = 'Mandala hand-overs are sent from the wallet itself (its host runtime); this console cannot build one over the wallet connection.'
 
 /** User-facing text for a send that failed before or at signing. */
 export function explainSendError (e: unknown): string {
   if (e instanceof Error) {
     if (e.name === 'UnsupportedProfileError') return NO_PROFILE
     if (/color-permission-module|issuer-v1 profile/i.test(e.message)) return NO_PROFILE
+    if (/host ledger|underlying wallet|hostWallet|no custody/i.test(e.message)) return NO_HOST
     if (e.message !== '') return e.message
   }
   return 'Send failed. Please try again.'

@@ -31,7 +31,7 @@ it('exposes the contract §8.1 constants verbatim', () => {
   expect(M.TOPIC).toBe('tm_mandala'); expect(M.REGISTRY_TOPIC).toBe('tm_mandala_kyc')
   expect(M.MESSAGEBOX).toBe('mandala-color'); expect(M.TREASURY_BASKET).toBe('mandala treasury')
   expect(M.MANDALA_PROFILE_ID).toBe('https://github.com/bsv-blockchain/mandala/blob/master/docs/profiles/issuer-v1.md')
-  expect(M.ATTESTED_PROFILE_ID).toBe('https://brc.dev/207/attested')
+  expect((M as Record<string, unknown>).ATTESTED_PROFILE_ID).toBeUndefined() // B7: no attested companion
   expect(M.colorTopic(ID)).toBe('tm_color_' + ID); expect(M.colorLookup(ID)).toBe('ls_color_' + ID)
   expect(M.assetTag(ID)).toBe('a'.repeat(64) + 'v0'); expect(M.MAX_UINT64).toBe(2n ** 64n - 1n)
   expect(M.parseAmount('1234.56', 2)).toBe(123456n); expect(() => M.parseAmount('18446744073709551616', 0)).toThrow()
@@ -52,7 +52,7 @@ it('keeps the lib recovery entry points drainHandovers schedules', async () => {
   expect(typeof (await import('@bsv/mandala/notifyJournal')).reconcileNotifications).toBe('function')
 })
 it('no longer exports the removed names', () => {
-  for (const n of ['BASKET','FT_PROTOCOL','MAX_SAFE_AMOUNT','tokenTopic','decodeValue','transferTokens','receiveTokens','cover'])
+  for (const n of ['BASKET','FT_PROTOCOL','MAX_SAFE_AMOUNT','tokenTopic','decodeValue','transferTokens','receiveTokens','ATTESTED_PROFILE_ID'])
     expect((M as any)[n]).toBeUndefined()
 })
 it('keeps the non-contract subpaths the console uses, bigint-typed', async () => {
