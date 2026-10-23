@@ -464,7 +464,8 @@ export function handoverBody (…): HandoverBodyV4; export function receiptOfBod
 export function receiveHandovers (p: { wallet, messageBoxClient, assetId?, processed?, ledger?, markSettled? }): Promise<ReceiveResult>
 export function acceptHandover (h: ParsedHandover, o: { wallet, ledger?, markSettled?, overlayIdentityKey? }): Promise<AcceptedHandover>
 export function cover (e: { assetId, tip: Transaction, admissions: Map, linkage: Map }, o: { expectedSignerKey }): CoverResult  // + S1 checkHop on every unanchored hop
-export function settleReceipts (p: { ledger, markSettled?, overlayIdentityKey?, txids? }): Promise<ReceiptSettleResult[]>  // pending receipts only (never own hand-overs)
+export function settleReceipts (p: { ledger, markSettled?, overlayIdentityKey?, txids? }): Promise<ReceiptSettleResult[]>  // submits pending receipts; own hand-overs are never submitted, only marked once settled
+// ReconcileOptions add { ledger?, markSettled? }: a delivered hand-over reconcile admits records σ and runs markSettled
 export function dismissHandover (p: { messageBoxClient, messageId }): Promise<void>
 export const ERR_BODY_UNREADABLE, ERR_NOT_COVERED, UNREADABLE_BUDGET
 // createMandalaClient options add { ledger?, hostWallet?, markSettled? }
