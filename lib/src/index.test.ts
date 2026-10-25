@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import type { WalletInterface } from '@bsv/sdk'
+import { PrivateKey, type WalletInterface } from '@bsv/sdk'
 
 // The facade is wiring only: the pipelines it composes are mocked so these
 // tests pin the order, the arguments and what each failure does to `send`.
@@ -58,8 +58,8 @@ describe('index — metadata is reachable from the package root', () => {
   })
 })
 
-const ME = '02' + 'a1'.repeat(32)
-const BOB = '03' + 'b2'.repeat(32)
+const ME = PrivateKey.fromString('0a'.padStart(64, '0')).toPublicKey().toString()
+const BOB = PrivateKey.fromString('0b'.padStart(64, '0')).toPublicKey().toString()
 const OVERLAY_KEY = '02' + 'c3'.repeat(32)
 const ASSET = 'd4'.repeat(32) + '_0'
 const TXID = 'e5'.repeat(32)

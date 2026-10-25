@@ -1,8 +1,11 @@
 /**
  * Issuer payouts (B4): treasury value coins (Mandala keys, `mandala
  * treasury`) → one holder `p color` output plus treasury change, overlay-first
- * (noSend → /submit → sendWith), then the BRC-207 receipt (attested leaf:
- * attestations = [tip], submissions = [tip]) delivered on MESSAGEBOX (C§7).
+ * (noSend → /submit → sendWith), then the hand-over delivered on MESSAGEBOX
+ * (C§7). B7: the receipt is plain BRC-207 custody JSON (the five
+ * `customInstructions` members, no evidence inside it); the overlay's σ
+ * admission of the tip travels in the v4 hand-over body beside it, with the
+ * tx and its linkage envelope.
  *
  * Stability:
  * - S5: refuses before any wallet call while the overlay key is unset.
@@ -41,7 +44,7 @@ import { ADMIN_PROTOCOL, OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, TREAS
 import { lockIssuerToken } from './brc162.js'
 import { colorTopic } from './naming.js'
 import { encodeEnvelope } from './encoding.js'
-import { AdmissionReceipt, admissionReceipt, isOutcomeUnknown, submitAndBroadcast } from './overlay.js'
+import { AdmissionReceipt, admissionReceipt, mayHaveCommitted, submitAndBroadcast } from './overlay.js'
 import { loadTreasuryCandidates } from './treasury/candidates.js'
 import { selectTreasuryInputs } from './treasury/select.js'
 import { revealIssuerLinkage } from './treasury/linkage.js'
@@ -87,11 +90,11 @@ export async function payoutTokens (p: PayoutParams): Promise<PayoutResult> {
   if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
   const gate = guardPositiveAmount(p.amount)
   if (!gate.ok) throw new Error(gate.reason)
-  checkRecipient(p)
+  const recipientKey = checkRecipient(p)
   if (p.blind != null && typeof p.blind !== 'boolean') throw new TypeError('@bsv/mandala: blind must be a boolean')
 
   const { acquired, result } = await tryWithLock('mandala.payout', async () =>
-    await withIntent(async () => await payoutPipeline(p))
+    await withIntent(async () => await payoutPipeline({ ...p, recipientKey }))
   )
   if (!acquired || result == null) throw new BusyError('Payout already in progress in another tab')
   return result
@@ -212,7 +215,7 @@ async function payoutPipeline (p: PayoutParams): Promise<PayoutResult> {
   try {
     admitted = await submitAndBroadcast(wallet, signed, env, reference, undefined, topics, { holdRetryable: false })
   } catch (e) {
-    if (!isOutcomeUnknown(e)) await notifyRemove(signed.txid)
+    if (!mayHaveCommitted(e)) await notifyRemove(signed.txid)
     throw e
   }
 

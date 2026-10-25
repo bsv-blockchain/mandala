@@ -242,6 +242,14 @@ describe('payoutTokens (B4)', () => {
     expect(fetchDeployTx).not.toHaveBeenCalled()
   })
 
+  it('an uppercase-hex recipient key pays out exactly like the lowercase key (lowercase linkage, address and intent)', async () => {
+    await payoutTokens(P({ recipientKey: RECIPIENT.toUpperCase() }))
+    const env = decodeEnvelope(vi.mocked(submitAndBroadcast).mock.calls[0][2]!)
+    expect(env.outputs![0].linkage.counterparty).toBe(RECIPIENT)
+    expect(mb.sendMessage.mock.calls[0][0].recipient).toBe(RECIPIENT)
+    await expect(payoutTokens(P({ recipientKey: '02' + '00'.repeat(32) }))).rejects.toThrow(TypeError)
+  })
+
   it('builds the recipient p color output, treasury change, envelope, plain receipt and v4 body', async () => {
     const seenAtSend: string[] = []
     mb.sendMessage.mockImplementation(async () => { seenAtSend.push(...(await notifyList()).map(n => n.txid)); return {} })
@@ -457,6 +465,16 @@ describe('reissue through the payout path (submitAdminAction ftOutput)', () => {
 
   beforeEach(() => {
     wallet.listOutputs.mockImplementation(async () => ({ outputs: [{ outpoint: asset.authOutpoint }], BEEF: [1] }) as any)
+  })
+
+  it('an uppercase-hex recipient is lowercased for the linkage, the admin details and the address', async () => {
+    await reissue({
+      details: { kind: 'reissue', outpoint: FROZEN, recipient: RECIPIENT.toUpperCase() },
+      ftOutput: { recipient: RECIPIENT.toUpperCase(), amount: 5n }
+    })
+    const call = vi.mocked(submitAndBroadcast).mock.calls[0]
+    expect(decodeEnvelope(call[2]!).outputs![0].linkage.counterparty).toBe(RECIPIENT)
+    expect(mb.sendMessage.mock.calls[0][0]).toMatchObject({ recipient: RECIPIENT })
   })
 
   it('outputs[0] is the recipient p color output, the authority follows, and a v4 body is sent', async () => {

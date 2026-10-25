@@ -11,6 +11,7 @@ import { MESSAGEBOX, OVERLAY_IDENTITY_KEY } from './constants.js'
 import type { Attestation } from './attestation.js'
 import { notifyPut, notifyRemove } from './notifyJournal.js'
 import { recipientLinkage } from './linkage.js'
+import { normalizeKey } from './keys.js'
 
 /** The MessageBox slice payouts and hand-overs send through (structural; `MessageBoxClient` fits). */
 export interface MessageBoxSender {
@@ -100,17 +101,20 @@ export function requireAttestedOutput (admitted: { attestation?: Attestation }, 
   return a
 }
 
-/** Arguments every issuer-built recipient output shares (payout and reissue); TypeError before any wallet call. */
-export function checkRecipient (p: { identityKey: string, recipientKey: string, messageBoxClient?: MessageBoxSender }): void {
-  if (typeof p.recipientKey !== 'string' || !/^0[23][0-9a-f]{64}$/.test(p.recipientKey)) {
-    throw new TypeError('@bsv/mandala: recipientKey must be a 66-hex compressed lowercase public key')
-  }
-  if (p.recipientKey === p.identityKey) {
+/**
+ * Arguments every issuer-built recipient output shares (payout and reissue);
+ * TypeError before any wallet call. Returns the recipient key normalised to
+ * lowercase: callers must use it, not the raw argument.
+ */
+export function checkRecipient (p: { identityKey: string, recipientKey: string, messageBoxClient?: MessageBoxSender }): string {
+  const recipientKey = normalizeKey(p.recipientKey, 'recipientKey')
+  if (recipientKey === p.identityKey) {
     throw new TypeError('@bsv/mandala: a payout needs a recipient other than the issuer (self uses owned outputs)')
   }
   if (p.messageBoxClient == null || typeof p.messageBoxClient.sendMessage !== 'function') {
     throw new TypeError('@bsv/mandala: a payout needs a messageBoxClient to deliver the receipt')
   }
+  return recipientKey
 }
 
 /**

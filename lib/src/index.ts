@@ -31,6 +31,7 @@ import { reconcileWallet, ReconcileOptions, ReconcileResult } from './reconcile.
 import { deliverHandover, HandoverResult, sendHandover, settleHandover, SettleResult } from './handover.js'
 import { receiveHandovers, ReceiveResult } from './receive.js'
 import type { HostLedger } from './hostLedger.js'
+import { normalizeKey } from './keys.js'
 import { payoutTokens, PayoutParams, PayoutResult } from './payout.js'
 
 export interface MandalaClientOptions extends MandalaEndpoints {
@@ -148,24 +149,25 @@ export function createMandalaClient (opts: MandalaClientOptions = {}): MandalaCl
 
   const send = async (a: SendArgs): Promise<SendOutcome> => {
     const me = await identityKey()
+    const counterparty = normalizeKey(a.counterparty, 'counterparty')
     const handover = await sendHandover({
       wallet,
       identityKey: me,
       assetId: a.assetId,
       amount: a.amount,
-      recipientKey: a.counterparty,
+      recipientKey: counterparty,
       ...(a.blind != null ? { blind: a.blind } : {}),
       ...(a.note != null ? { note: a.note } : {}),
       ledger: opts.ledger as HostLedger,
       hostWallet: opts.hostWallet as WalletInterface
     })
-    const self = a.counterparty === me
+    const self = counterparty === me
     let notified = self
     if (!self) {
       try {
         await deliverHandover({
           messageBoxClient: await messageBox(),
-          recipientKey: a.counterparty,
+          recipientKey: counterparty,
           handover
         })
         notified = true

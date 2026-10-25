@@ -62,6 +62,7 @@ import type { HostLedger } from './hostLedger.js'
 import { buildHandoverEnvelope } from './hostEnvelope.js'
 import type { SpecificLinkage } from './encoding.js'
 import { collectHandoverEvidence, defaultEvidenceSource, type EvidenceSource } from './evidence.js'
+import { normalizeKey } from './keys.js'
 import { tryWithLock } from './webLocks.js'
 import { BusyError } from './singleFlight.js'
 
@@ -125,17 +126,13 @@ export type SettleResult =
   | { status: 'admitted', attestation: Attestation }
   | { status: 'retry' | 'refused', code: string }
 
-const COMPRESSED_KEY = /^0[23][0-9a-f]{64}$/
 const MANDALA_ASSET_ID = /^[0-9a-f]{64}_0$/
 const TXID = /^[0-9a-f]{64}$/
 const COLOR_KEY_ID = 'color'
 const DEFAULT_DESCRIPTION = 'Send Mandala tokens'
 
 function checkKey (key: unknown, name: string): string {
-  if (typeof key !== 'string' || !COMPRESSED_KEY.test(key)) {
-    throw new TypeError(`@bsv/mandala: ${name} must be a 66-hex compressed lowercase public key`)
-  }
-  return key
+  return normalizeKey(key, name)
 }
 
 function checkMandalaAsset (assetId: unknown): string {

@@ -180,6 +180,18 @@ export function isOutcomeUnknown (e: unknown): boolean {
 }
 
 /**
+ * True when re-running the operation could pay twice: the overlay may have
+ * applied the tx (an unknown-outcome refusal) or it is known committed
+ * (ReceiptUnavailableError, or any error carrying `committed === true`).
+ * The one check callers use to decide an intent/action must be kept, never
+ * dropped or re-run. isOutcomeUnknown stays the narrower refusal-only check.
+ */
+export function mayHaveCommitted (e: unknown): boolean {
+  if (isOutcomeUnknown(e)) return true
+  return typeof e === 'object' && e !== null && (e as { committed?: unknown }).committed === true
+}
+
+/**
  * Map an HTTP status + raw body to a refusal. Only a body that actually
  * carries the contract's `{status:'error', code}` shape is trusted for its
  * code; a non-JSON body, an empty body, or an unexpected shape is

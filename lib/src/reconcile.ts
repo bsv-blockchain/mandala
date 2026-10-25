@@ -656,7 +656,7 @@ async function retryRefused (
     // applied tx desyncs the wallet from the chain and strands its receipt
     // intent. It keeps retrying (idempotent) until a 200 replay or a final
     // verdict settles it, and is surfaced once past the cap.
-    const unknown = e instanceof OverlayRefusedError && isOutcomeUnknown(e)
+    const unknown = isOutcomeUnknown(e)
     if (final || (attempts >= RETRY_CAP && !unknown)) {
       await giveUp()
       return
