@@ -15,7 +15,7 @@ const ID = 'a'.repeat(64) + '_0'
 it('resolves the vendored stack', () => {
   expect(sdkPkg.version).toBe('4.0.0'); expect(tplPkg.version).toMatch(/^2\.2\./); expect(libPkg.version).toBe('0.5.0')
 })
-it('locks exactly one @bsv/sdk and one @bsv/templates, both the vendored tarballs (contract §9)', () => {
+it('locks exactly one @bsv/sdk (npm ^4.0.0) and one @bsv/templates (vendored 993c98b) (contract §9)', () => {
   const read = (rel: string) => JSON.parse(readFileSync(new URL(rel, import.meta.url), 'utf8'))
   const lock: { packages: Record<string, { version?: string, resolved?: string }> } = read('../package-lock.json')
   const manifest: { overrides?: Record<string, string> } = read('../package.json')
@@ -23,9 +23,17 @@ it('locks exactly one @bsv/sdk and one @bsv/templates, both the vendored tarball
     // Any nested copy (e.g. under message-box-client) would be a second sdk in the bundle.
     const copies = Object.keys(lock.packages).filter(k => k === `node_modules/${name}` || k.endsWith(`/node_modules/${name}`))
     expect(copies).toEqual([`node_modules/${name}`])
-    expect(lock.packages[`node_modules/${name}`].resolved).toMatch(/^file:\.\.\/vendor-ts-stack\/bsv-(sdk|templates)-[0-9.]+-[0-9a-f]{7}\.tgz$/)
     expect(manifest.overrides?.[name]).toBe(`$${name}`)
   }
+  const deps = (manifest as { dependencies: Record<string, string> }).dependencies
+  expect(deps['@bsv/sdk']).toBe('^4.0.0')
+  expect(lock.packages['node_modules/@bsv/sdk'].resolved).toBe('https://registry.npmjs.org/@bsv/sdk/-/sdk-4.0.0.tgz')
+  expect(deps['@bsv/templates']).toBe('file:../vendor-ts-stack/bsv-templates-2.2.0-993c98b.tgz')
+  expect(lock.packages['node_modules/@bsv/templates'].resolved).toBe('file:../vendor-ts-stack/bsv-templates-2.2.0-993c98b.tgz')
+  // The console never reaches lib/profile.js (wallet hosts register the module), and no 4fa68e7 build remains.
+  expect(deps['@bsv/color-permission-module']).toBeUndefined()
+  expect(JSON.stringify(manifest) + JSON.stringify(lock)).not.toContain('4fa68e7')
+  expect(deps['@bsv/mandala']).toBe('file:../lib')
 })
 it('exposes the contract §8.1 constants verbatim', () => {
   expect(M.TOPIC).toBe('tm_mandala'); expect(M.REGISTRY_TOPIC).toBe('tm_mandala_kyc')
