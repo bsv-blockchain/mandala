@@ -144,3 +144,7 @@ Reference behaviour: bsv-wallet e85bf7d3 + `@bsv/mandala` 0.4.1. Parties exchang
 - Recipient (host runtime/lib): online → submit to the Mandala overlay with the body's linkage as offChainValues, verify σ, record "verified-admitted" in a host-side store, then `internalizeAction` with the plain receipt; offline → COVER over `admissions[]` with S1 protection (local BRC-162 conservation/authority validation of every unanchored hop, authority inputs walked, no duplicate spends), record "verified-offline", internalize, later submit and `markSettled`.
 - Mandala issuer-v1 `admitReceipt` credits only what the host-side store recorded (settled or pending); anything else → submit to the overlay itself and require admission, else refuse. An app cannot write that store.
 - Sender keeps the plain-noSend hand-over; after the recipient's ACK it submits (idempotent) so its change is admitted, then `markSettled`.
+
+## 10. Amendment B8 (user, 2026-10-24): console scope
+
+The app console is the issuer/admin tool only. It keeps a **Treasury page that sends from the issuer's treasury to users** (`payoutTokens`: issuer keys, lib-built, overlay-first, recipient output under the holder's BRC-207 `p color` derivation with a BRC-207 receipt delivered in the v4 hand-over body). Holder-to-holder sends are not offered in the console (they require the host ledger and underlying wallet, which only bsv-desktop and bsv-wallet host). Receiving in the console is not required.
