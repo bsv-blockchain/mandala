@@ -2,7 +2,7 @@
  * End to end against a live overlay-go (plan 04 Task 23, C§10 optional E2E):
  * register → issue MAX_UINT64 → payout MAX_UINT64 - 1 → the holder host's
  * receive (own submit, ledger, then the issuer-v1 `admitReceipt` through the
- * B7 module stand-in, fakeB7Color.ts) → holder `sendHandover` (host-built
+ * real color module on a WalletPermissionsManager, profileHolder.ts) → holder `sendHandover` (host-built
  * envelope) → recipient host receive → sender `settleHandover` + markSettled.
  *
  * Live run (skipped unless the URL is set; never wipes overlay state):
@@ -36,7 +36,7 @@ import { colorTopic } from './naming.js'
 import type { AdmissionReceipt } from './overlay.js'
 import { FakeWallet } from './__fixtures__/fakeWallet.js'
 import { fakeMandalaOverlay } from './__fixtures__/fakeMandalaOverlay.js'
-import { heldAmount, makeB7Holder, messageBus } from './__fixtures__/b7Holder.js'
+import { heldAmount, makeProfileHolder, messageBus } from './__fixtures__/profileHolder.js'
 
 const LIVE_URL = process.env.MANDALA_E2E_OVERLAY_URL ?? ''
 const LIVE_KEY = process.env.MANDALA_E2E_OVERLAY_KEY ?? ''
@@ -61,7 +61,7 @@ async function e2eFlow (env: FlowEnv): Promise<void> {
   const K = env.overlayKey
   expect(K, 'MANDALA_E2E_OVERLAY_KEY must be the overlay\'s 66-hex compressed identity key').toMatch(/^0[23][0-9a-f]{64}$/)
   configureMandala({ overlayUrl: env.url, overlayIdentityKey: K })
-  const holderOf = () => makeB7Holder({ K, url: env.url, ...(env.fetch != null ? { fetch: env.fetch } : {}) })
+  const holderOf = () => makeProfileHolder({ K, url: env.url, ...(env.fetch != null ? { fetch: env.fetch } : {}) })
   const bus = messageBus()
   const issuer = new FakeWallet(PrivateKey.fromRandom())
   const holder = holderOf()

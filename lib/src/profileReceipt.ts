@@ -24,12 +24,17 @@
  * Errors cross the module boundary by `.name` and the `[ClassName] ` prefix.
  */
 import { Utils } from '@bsv/sdk'
-import { ProfileDataError, type ColorOverlayProvider, type ProfileAssetContext } from '@bsv/color-permission-module'
+import {
+  ProfileDataError,
+  type ColorOverlayProvider,
+  type ProfileAssetContext,
+  type ProfileReceipt,
+  type ReceiptAdmission
+} from '@bsv/color-permission-module'
 import { attestationFromSteak, verifyAttestation } from './attestation.js'
 import type { HostLedger } from './hostLedger.js'
 import { colorTopic } from './naming.js'
 import { issuerKey } from './profileDescriptor.js'
-import type { ProfileReceiptCredit, ProfileReceiptView } from './profileTypes.js'
 
 const dataError = (reason: string): ProfileDataError =>
   new ProfileDataError(`BRC-207: Mandala issuer-v1 receipt: ${reason}`)
@@ -38,10 +43,10 @@ const TXID = /^[0-9a-f]{64}$/
 
 export async function admitReceipt (
   ctx: ProfileAssetContext,
-  receipt: ProfileReceiptView,
+  receipt: ProfileReceipt,
   provider: (k: string) => ColorOverlayProvider,
   ledger: HostLedger
-): Promise<ProfileReceiptCredit> {
+): Promise<ReceiptAdmission> {
   const K = issuerKey(ctx.descriptor)
   // S5: no endpoint for K ⇒ ProfileParamsError, before anything else.
   const overlay = provider(K)

@@ -33,7 +33,8 @@
 import {
   ProfileParamsError,
   type ColorOverlayProvider,
-  type ProfileDescriptor
+  type ProfileDescriptor,
+  type RequiredProfileHandler
 } from '@bsv/color-permission-module'
 import { MANDALA_PROFILE_ID } from './constants.js'
 import { createMandalaOverlayProvider, type MandalaOverlayProvider } from './profileProvider.js'
@@ -42,14 +43,13 @@ import { checkPlanData, submissionData } from './profilePlanData.js'
 import { admitReceipt } from './profileReceipt.js'
 import type { HostLedger } from './hostLedger.js'
 import { withLedgerSpendability } from './profileSpendability.js'
-import type { B7RequiredProfileHandler } from './profileTypes.js'
 
 export { MANDALA_PROFILE_ID }
 export { createMandalaOverlayProvider }
 export { ColorProviderError } from './providerError.js'
 export { withLedgerSpendability } from './profileSpendability.js'
 export type { MandalaOverlayProvider, MandalaOverlayProviderOptions } from './profileProvider.js'
-export type { B7RequiredProfileHandler, ProfileReceiptCredit, ProfileReceiptView } from './profileTypes.js'
+export type { ProfileReceipt, ReceiptAdmission, RequiredProfileHandler } from '@bsv/color-permission-module'
 
 export interface MandalaProfileOptions {
   /** Wallet configuration: the Mandala overlays this wallet trusts, by identity key K. K absent ⇒ its assets fail closed (S5). */
@@ -77,7 +77,7 @@ function checkDescriptor (descriptor: ProfileDescriptor, req: ReadonlyMap<string
  * on malformed options, an invalid overlay identity key, an empty or
  * non-http(s) url, or a duplicate identity key.
  */
-export function createMandalaProfile (o: MandalaProfileOptions): B7RequiredProfileHandler {
+export function createMandalaProfile (o: MandalaProfileOptions): RequiredProfileHandler {
   if (o == null || typeof o !== 'object') throw new TypeError('@bsv/mandala: createMandalaProfile options are required')
   if (!Array.isArray(o.overlays)) throw new TypeError('@bsv/mandala: overlays must be an array of {identityKey, url}')
   const ledger = o.ledger
@@ -107,7 +107,7 @@ export function createMandalaProfile (o: MandalaProfileOptions): B7RequiredProfi
     return provider
   }
 
-  const handler: B7RequiredProfileHandler = {
+  const handler: RequiredProfileHandler = {
     id: MANDALA_PROFILE_ID,
     versions: Object.freeze([1]),
     sendPolicy: 'plain-nosend',

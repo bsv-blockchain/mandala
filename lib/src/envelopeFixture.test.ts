@@ -3,8 +3,9 @@
  *
  * `__fixtures__/1color-envelope.json` freezes four lib-built transactions that
  * link by txid: deploy → issue → payout (issuer FakeWallet, overlay-first,
- * attested) → a holder hand-over built through the B7 module stand-in
- * (fakeB7Color.ts) with the issuer-v1 handler and the host-built envelope
+ * attested) → a holder hand-over built through the B7 module stand-in of
+ * the time (regeneration now runs the real color module, profileHolder.ts)
+ * with the issuer-v1 handler and the host-built envelope
  * (blinded recipient output 0, owned change output 1). Regenerated for B7
  * (the deploy `req` names issuer-v1 only). Plan 03 copies the file byte for byte to
  * `overlay-go/internal/mandala/testdata/1color-envelope.json` and replays it
@@ -39,7 +40,7 @@ import { sendHandover } from './handover.js'
 import { receiveHandovers } from './receive.js'
 import { FakeWallet } from './__fixtures__/fakeWallet.js'
 import { fakeMandalaOverlay } from './__fixtures__/fakeMandalaOverlay.js'
-import { makeB7Holder, messageBus } from './__fixtures__/b7Holder.js'
+import { makeProfileHolder, messageBus } from './__fixtures__/profileHolder.js'
 import { MAX_UINT64 } from './amount.js'
 
 interface FixtureTx {
@@ -212,8 +213,8 @@ describe.skipIf(process.env.MANDALA_REGEN_ENVELOPE == null || process.env.MANDAL
     configureMandala({ overlayUrl: 'https://mandala.test', overlayIdentityKey: K })
     const bus = messageBus()
     const issuer = new FakeWallet(new PrivateKey(1111))
-    const holder = makeB7Holder({ K, url: 'https://mandala.test', fetch: overlay.fetch, priv: new PrivateKey(2222) })
-    const recipient = makeB7Holder({ K, url: 'https://mandala.test', fetch: overlay.fetch, priv: new PrivateKey(3333) })
+    const holder = makeProfileHolder({ K, url: 'https://mandala.test', fetch: overlay.fetch, priv: new PrivateKey(2222) })
+    const recipient = makeProfileHolder({ K, url: 'https://mandala.test', fetch: overlay.fetch, priv: new PrivateKey(3333) })
     const wallet = issuer.asWallet()
     const { assetId } = await registerAsset({ wallet, identityKey: issuer.identityKey, label: 'Test Dollar', ticker: 'TUSD', decimals: 2 })
     await issueTokens({ wallet, identityKey: issuer.identityKey, asset: (await listAdminAssets(wallet)).find(a => a.assetId === assetId)!, amount: 1500n })

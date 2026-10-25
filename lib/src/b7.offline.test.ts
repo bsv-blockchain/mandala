@@ -6,8 +6,9 @@
  * on COVER evidence, and everything settles once online. An output the host
  * never recorded is refused offline (fail closed).
  *
- * Holders are FakeWallets behind the B7 module stand-in (fakeB7Color.ts) with
- * the real issuer-v1 handler; the overlay is the in-process fake (linkage,
+ * Holders are FakeWallets behind a WalletPermissionsManager running the real
+ * @bsv/color-permission-module (profileHolder.ts) with the real issuer-v1
+ * handler; the overlay is the in-process fake (linkage,
  * conservation and spend rules, σ by the C.0 key).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -24,7 +25,7 @@ import { receiveHandovers } from './receive.js'
 import { settleReceipts } from './receiptSettle.js'
 import { FakeWallet } from './__fixtures__/fakeWallet.js'
 import { fakeMandalaOverlay, type FakeMandalaOverlay } from './__fixtures__/fakeMandalaOverlay.js'
-import { heldAmount, makeB7Holder, messageBus, type B7Holder } from './__fixtures__/b7Holder.js'
+import { heldAmount, makeProfileHolder, messageBus, type ProfileHolder } from './__fixtures__/profileHolder.js'
 
 const URL_ = 'https://mandala.test'
 const PRIV = new PrivateKey(5555)
@@ -45,16 +46,16 @@ beforeEach(() => {
 
 afterEach(() => { vi.unstubAllGlobals() })
 
-const holder = (storage = memoryStorage()): B7Holder => makeB7Holder({ K, url: URL_, fetch: overlay.fetch, storage })
-const receive = async (h: B7Holder) => await receiveHandovers({ wallet: h.wallet, messageBoxClient: bus(h.identityKey), ledger: h.ledger, markSettled: h.markSettled })
-const send = async (from: B7Holder, to: B7Holder, assetId: string, amount: bigint) => {
+const holder = (storage = memoryStorage()): ProfileHolder => makeProfileHolder({ K, url: URL_, fetch: overlay.fetch, storage })
+const receive = async (h: ProfileHolder) => await receiveHandovers({ wallet: h.wallet, messageBoxClient: bus(h.identityKey), ledger: h.ledger, markSettled: h.markSettled })
+const send = async (from: ProfileHolder, to: ProfileHolder, assetId: string, amount: bigint) => {
   const h = await sendHandover({ wallet: from.wallet, hostWallet: from.hostWallet, ledger: from.ledger, identityKey: from.identityKey, assetId, amount, recipientKey: to.identityKey })
   await deliverHandover({ messageBoxClient: bus(from.identityKey), recipientKey: to.identityKey, handover: h })
   return h
 }
 
 /** register → issue 1500 → pay 1000 to `to`, received online (settled). */
-async function funded (to: B7Holder): Promise<string> {
+async function funded (to: ProfileHolder): Promise<string> {
   const issuer = new FakeWallet(new PrivateKey(1111))
   const wallet = issuer.asWallet()
   const { assetId } = await registerAsset({ wallet, identityKey: issuer.identityKey, label: 'Test Dollar', ticker: 'TUSD', decimals: 2 })
@@ -125,7 +126,7 @@ describe('B7 offline hand-overs through the host ledger', () => {
     for (const k of await storage.keys('')) await storage.removeItem(k)
     overlay.offline = true
     await expect(sendHandover({ wallet: a.wallet, hostWallet: a.hostWallet, ledger: a.ledger, identityKey: a.identityKey, assetId, amount: 400n, recipientKey: b.identityKey }))
-      .rejects.toThrow(/not spendable/)
+      .rejects.toThrow(/insufficient spendable balance/)
     expect(await a.coins(assetId)).toEqual([expect.objectContaining({ amount: 1000n })]) // still selectable later
     // Online, the overlay lists it and the same send works.
     overlay.offline = false
