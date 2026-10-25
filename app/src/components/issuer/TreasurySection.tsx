@@ -3,6 +3,7 @@ import type { AdminAsset } from '@bsv/mandala/assets'
 import { formatCurrency } from '../../lib/mandala/amountDisplay'
 import { decimalsOf } from '../../lib/mandala/decimals'
 import { useTreasuryBalances } from '../../hooks/useTreasuryBalances'
+import PayoutForm from './PayoutForm'
 import { cn } from '@/lib/utils'
 
 // ── Props ─────────────────────────────────────────────────────────────────────
@@ -88,11 +89,19 @@ export default function TreasurySection({ assetId, asset }: Props) {
       {!loading && isEmpty && (
         <div className="rounded-md border border-dashed border-separator bg-muted/50 px-[20px] py-[18px] text-center">
           <div className="text-[14px] font-medium text-muted-foreground">
-            No units held — issue some in Operations.
+            No units held — issue some in Operations before paying out.
           </div>
         </div>
       )}
 
+      {/* Treasury → user payout (B8). Holder sends and receiving live in the user's BRC-207 wallet. */}
+      <PayoutForm
+        assetId={assetId}
+        asset={asset}
+        treasury={balance}
+        decimals={decimals}
+        ticker={ticker}
+      />
     </div>
   )
 }

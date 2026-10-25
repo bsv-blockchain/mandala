@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { guardPayout, payoutOutcomeUnknown } from './payoutGuard'
+import { guardPayout } from './payoutGuard'
 
 const B = '03' + '11'.repeat(32), MAX = 2n ** 64n - 1n
 
@@ -28,17 +28,12 @@ describe('guardPayout (issuer treasury → holder, B4)', () => {
       .toEqual({ ok: false, reason: 'Recipient must be a compressed identity key' })
   })
 
+  it('guardPayout refuses the issuer as recipient, case-insensitively', () => {
+    expect(guardPayout({ amount: 1n, treasury: 5n, recipientKey: '02' + 'AB'.repeat(32), issuerKey: '02' + 'ab'.repeat(32), isPaused: false, pauseBypass: false }))
+      .toEqual({ ok: false, reason: 'Recipient is the issuer — pay out to a holder' })
+  })
+
   it('guardPayout lets dev mode bypass the pause (the overlay enforces it)', () => {
     expect(guardPayout({ amount: 1n, treasury: 5n, recipientKey: B, isPaused: true, pauseBypass: true })).toEqual({ ok: true })
-  })
-})
-
-describe('payoutOutcomeUnknown', () => {
-  it('is true only for a refusal whose overlay outcome is unknown (never re-run that payout)', async () => {
-    const { OverlayRefusedError } = await import('@bsv/mandala')
-    expect(payoutOutcomeUnknown(new OverlayRefusedError({ code: 'ERR_UNAVAILABLE', retryable: true, outcome: 'unknown' }))).toBe(true)
-    expect(payoutOutcomeUnknown(new OverlayRefusedError({ code: 'ERR_PAUSED', retryable: true, httpStatus: 409 }))).toBe(false)
-    expect(payoutOutcomeUnknown(new Error('boom'))).toBe(false)
-    expect(payoutOutcomeUnknown(undefined)).toBe(false)
   })
 })

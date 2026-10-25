@@ -112,10 +112,20 @@ describe('robustness wiring (shipped source)', () => {
 
   it('payout path uses payoutTokens unblinded with the MessageBox client', () => {
     const m = src('hooks/usePayoutMutation.ts'); expect(m).toMatch(/payoutTokens\(\{[\s\S]*blind:\s*false[\s\S]*messageBoxClient/); expect(m).toContain('payoutFlight')
-    expect(m).toMatch(/notified\s*===\s*false/); expect(m).toContain('drainNow')
+    expect(m).toContain('runPayout('); expect(m).toContain('drainNow'); expect(m).toContain('.toLowerCase()')
     // no authority is spent: nothing may read or advance the admin-auth cache from a payout
     for (const banned of ['nextAuthOutpoint', 'nextAuthKeyID', 'advanceAdminAuth', 'useAdvanceAdminAuth', 'isAdminAuthInFlight', 'reconcileWallet(']) expect(m).not.toContain(banned)
-    const t = src('components/issuer/TreasurySection.tsx'); expect(t).toContain('useTreasuryBalances'); expect(t).not.toContain('useHolderData')
+    const t = src('components/issuer/TreasurySection.tsx'); expect(t).toContain('<PayoutForm'); expect(t).toContain('useTreasuryBalances')
+  })
+
+  it('B8: the Treasury send form is double-click safe and states outcomes honestly', () => {
+    const f = src('components/issuer/PayoutForm.tsx')
+    expect(f).toContain('startedRef'); expect(f).toContain('payoutFlight.isHeld()'); expect(f).toContain('payout.isPending')
+    expect(f).toMatch(/if \(startedRef\.current \|\| payout\.isPending \|\| payoutFlight\.isHeld\(\) \|\| locked\) return/)
+    expect(f).toMatch(/disabled=\{busy \|\| locked/)
+    expect(f).toContain('guardPayout('); expect(f).toContain('safeParseAmount('); expect(f).toContain('outcomeLocksForm(')
+    expect(f).toContain('describePayoutOutcome('); expect(f).not.toMatch(/Number\(/)
+    expect(f).not.toMatch(/nothing (was )?committed/i) // only payoutFlow's refused branch may say it
   })
 
   it('one recovery path: reconcileWallet/reconcileNotifications are called only from handoverDrain via drainNow', () => {
