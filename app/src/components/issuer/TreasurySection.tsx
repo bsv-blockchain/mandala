@@ -1,12 +1,8 @@
-import { useState } from 'react'
-import { ArrowUpRight, ArrowDownLeft } from 'lucide-react'
 import { useWallet } from '../../context/WalletContext'
 import type { AdminAsset } from '@bsv/mandala/assets'
 import { formatCurrency } from '../../lib/mandala/amountDisplay'
-import { decimalsOf } from '../../lib/mandala/loadHolderData'
+import { decimalsOf } from '../../lib/mandala/decimals'
 import { useTreasuryBalances } from '../../hooks/useTreasuryBalances'
-import SendTokens from '../SendTokens'
-import ReceivePanel from '../holder/ReceivePanel'
 import { cn } from '@/lib/utils'
 
 // ── Props ─────────────────────────────────────────────────────────────────────
@@ -18,11 +14,8 @@ interface Props {
 
 // ── TreasurySection ───────────────────────────────────────────────────────────
 
-type Tab = 'send' | 'receive'
-
 export default function TreasurySection({ assetId, asset }: Props) {
   const { identityKey } = useWallet()
-  const [tab, setTab] = useState<Tab>('send')
 
   const ticker = typeof asset?.metadata?.ticker === 'string' ? asset.metadata.ticker : undefined
   const decimals = decimalsOf(asset?.metadata?.decimals)
@@ -100,46 +93,6 @@ export default function TreasurySection({ assetId, asset }: Props) {
         </div>
       )}
 
-      {/* Payout / Receive toggle — always accessible even with zero treasury (issuer might receive) */}
-      <div>
-        <div className="text-[11px] font-medium uppercase tracking-[1.2px] text-subtle-foreground mb-[14px]">
-          Actions
-        </div>
-        {/* Tab bar */}
-        <div className="inline-flex rounded border border-separator bg-muted p-[3px] gap-[3px] mb-[22px]">
-          {(['send', 'receive'] as const).map(t => (
-            <button
-              key={t}
-              type="button"
-              onClick={() => setTab(t)}
-              className={cn(
-                'flex items-center gap-[7px] rounded px-[14px] py-[7px] text-[13px] font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                tab === t
-                  ? 'bg-card text-foreground font-semibold shadow-[0_1px_2px_var(--separator)]'
-                  : 'text-muted-foreground hover:text-foreground'
-              )}
-            >
-              {t === 'send'
-                ? <ArrowUpRight className="h-[15px] w-[15px] shrink-0" strokeWidth={2} />
-                : <ArrowDownLeft className="h-[15px] w-[15px] shrink-0" strokeWidth={2} />}
-              {t === 'send' ? 'Pay out' : 'Receive'}
-            </button>
-          ))}
-        </div>
-
-        {/* Tab content */}
-        {tab === 'send' && (
-          <SendTokens lockedAssetId={assetId} mode="payout" />
-        )}
-        {tab === 'receive' && (
-          <div className="rounded-lg border border-separator bg-card px-[24px] py-[20px] shadow-[var(--shadow-card)]">
-            <p className="mb-[14px] text-[12px] text-subtle-foreground">
-              Tokens sent to this identity arrive in the wallet's 1Color balance, not the treasury.
-            </p>
-            <ReceivePanel />
-          </div>
-        )}
-      </div>
     </div>
   )
 }

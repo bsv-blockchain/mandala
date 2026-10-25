@@ -6,7 +6,6 @@ import { createSingleFlight, BusyError } from '@bsv/mandala/singleFlight'
 import { guardPositiveAmount } from '@bsv/mandala/submitGuards'
 import { useWallet } from '../context/WalletContext'
 import { treasuryKey, type TreasuryData } from './useTreasuryBalances'
-import { holderDataKey } from './useHolderData'
 
 export interface PayoutVars { asset: AdminAsset; amount: bigint; recipientKey: string; note?: string }
 
@@ -29,7 +28,7 @@ interface PayoutContext { prev?: TreasuryData, acquired?: boolean }
  *   reads or writes the admin-auth cache and cannot race an admin action over
  *   the authority output.
  * - Stale cache: the treasury is decremented optimistically, restored from
- *   the snapshot on error, and refetched (with holder data) once settled.
+ *   the snapshot on error, and refetched once settled.
  * - Crash / undelivered receipt: the lib journals the receipt before the
  *   submit. `drainNow` (notification redelivery plus wallet reconcile) is the
  *   only recovery path; this hook never reconciles directly.
@@ -41,7 +40,6 @@ export function usePayoutMutation() {
 
   const refresh = (): void => {
     void qc.invalidateQueries({ queryKey: tKey })
-    void qc.invalidateQueries({ queryKey: holderDataKey(identityKey) })
   }
 
   return useMutation<PayoutResult, Error, PayoutVars, PayoutContext>({

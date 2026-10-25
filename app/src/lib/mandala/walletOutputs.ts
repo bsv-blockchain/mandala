@@ -1,31 +1,10 @@
 /**
- * BRC-207 holder views (0207:606-697): the `p color assets` inventory and the
- * `p color balance <assetTag>` exact-balance selectors, built from the lib's
- * `assetTag` (contract §8.1:572 — no lib helper). Pure, bigint throughout.
- *
- * Balance semantics (0207:396-404, C40):
- * - `p color balance` already counts `color_offline` available outputs, so
- *   `unsettled` is a SUBSET of the balance ("of which awaiting settlement").
- * - `color_state_pending` records are excluded from the balance, so
- *   `incoming` is OUTSIDE it. Neither is ever summed into the balance or into
- *   the other.
+ * BRC-100 output paging and 1Color record decoding for the issuer treasury
+ * (TREASURY_BASKET, an ordinary basket of Mandala-key outputs). Pure, bigint
+ * throughout. Holder `p color` views are not the console's concern (B8).
  */
 import type { ListOutputsArgs, WalletInterface, WalletOutput } from '@bsv/sdk'
-import { assetTag, decodeToken } from '@bsv/mandala'
-import type { AssetAdminStateView } from '@bsv/mandala/adminState'
-
-/** Cross-basket inventory view (0207:608-612). */
-export const INVENTORY_SELECTOR = 'p color assets'
-/** Wallet-authored: accepted but overlay admission not yet verified (0207:396-404). */
-export const OFFLINE_TAG = 'color_offline'
-/** Wallet-authored state tags (0207:649). */
-export const AVAILABLE_TAG = 'color_state_available'
-export const PENDING_TAG = 'color_state_pending'
-
-/** `p color balance <assetTag>` (0207:611): available token units of one asset. */
-export function balanceSelector (assetId: string): string {
-  return `p color balance ${assetTag(assetId)}`
-}
+import { decodeToken } from '@bsv/mandala'
 
 const DECIMAL = /^(0|[1-9][0-9]*)$/
 
@@ -49,13 +28,6 @@ export interface InventoryRecord {
   outpoint: string
   lockingScript?: string
   tags?: string[]
-}
-
-export interface InventorySummary {
-  /** `color_offline` ∧ `color_state_available`: already inside `p color balance`. */
-  unsettled: bigint
-  /** `color_state_pending`: not in `p color balance`. */
-  incoming: bigint
 }
 
 type Decode = typeof decodeToken
@@ -92,43 +64,6 @@ export function * uniqueRecords (records: InventoryRecord[]): Generator<Inventor
     seen.add(r.outpoint)
     yield r
   }
-}
-
-/**
- * Per-asset `unsettled` / `incoming` from a `p color assets` page set fetched
- * with `includeTags` and `include: 'locking scripts'`. Every decodable asset
- * appears (deploy- and authority-only assets with zero figures). A value record
- * tagged pending counts only toward `incoming` (whether or not it is also
- * offline); otherwise one tagged both offline and available counts toward
- * `unsettled`; reserved, restricted and settled-available records add nothing.
- */
-export function summarizeInventory (records: InventoryRecord[], decode: Decode = decodeToken): Map<string, InventorySummary> {
-  const out = new Map<string, InventorySummary>()
-  for (const r of uniqueRecords(records)) {
-    const d = decodeRecord(r, decode)
-    if (d === null || typeof d.assetId !== 'string') continue
-    let s = out.get(d.assetId)
-    if (s === undefined) {
-      s = { unsettled: 0n, incoming: 0n }
-      out.set(d.assetId, s)
-    }
-    if (d.role !== 'value') continue
-    const tags = new Set(r.tags ?? [])
-    if (tags.has(PENDING_TAG)) s.incoming += d.amount
-    else if (tags.has(OFFLINE_TAG) && tags.has(AVAILABLE_TAG)) s.unsettled += d.amount
-  }
-  return out
-}
-
-/** Units of this identity's outputs the issuer has frozen (sum, no ceiling). */
-export function frozenUnitsFor (
-  state: Pick<AssetAdminStateView, 'frozenOutpoints'> | null | undefined,
-  identityKey: string | null
-): bigint {
-  if (state == null || identityKey === null || identityKey === '') return 0n
-  let sum = 0n
-  for (const f of state.frozenOutpoints) if (f.owner === identityKey) sum += f.amount
-  return sum
 }
 
 const MAX_PAGES = 100

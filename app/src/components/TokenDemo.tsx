@@ -1,104 +1,16 @@
 import { AlertTriangle } from 'lucide-react'
-import { Routes, Route, Navigate, useNavigate, useSearchParams } from 'react-router-dom'
+import { Routes, Route, Navigate } from 'react-router-dom'
 import { useWallet } from '../context/WalletContext'
 import { Spinner } from './ui/spinner'
 import IssuerDashboard from './issuer/IssuerDashboard'
-import TokenWallet from './TokenWallet'
-import SendTokens from './SendTokens'
-import ReceiveTokens from './ReceiveTokens'
-import ContactsPage from './holder/ContactsPage'
-import type { HolderAction } from './holder/HolderHome'
+import { BrandMark } from './ui/BrandMark'
 
 // ─── Routing model ──────────────────────────────────────────────────────────
-// The full app state lives in the URL so a browser reload restores it:
-//   Holder:  /              home (selected token in ?asset=<id>)
-//            /send          send flow      (?asset locks the source account)
-//            /receive       receive
-//            /contacts      contacts manager
-//   Issuer:  /issuer/:section   (?asset=<id> selects the asset)
-// Switching the token dropdown updates ?asset via the History API — no reload.
-
-// ─── Shared bits ──────────────────────────────────────────────────────────────
-
-/** Read the currently-selected asset id from the URL (?asset=…). */
-function useAssetParam(): string {
-  const [params] = useSearchParams()
-  return params.get('asset') ?? ''
-}
-
-/** A "/" link that carries the current ?asset so the switcher survives round-trips. */
-function homePath(asset: string): string {
-  return asset ? `/?asset=${encodeURIComponent(asset)}` : '/'
-}
-
-/** Back-arrow header used by the Send / Receive drill-ins. */
-function DrillHeader({ title, onBack }: { title: string; onBack: () => void }) {
-  return (
-    <div className="mb-6 flex items-center gap-3">
-      <button
-        type="button"
-        onClick={onBack}
-        className="flex h-8 w-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        aria-label="Back to home"
-      >
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M19 12H5M12 19l-7-7 7-7" />
-        </svg>
-      </button>
-      <h2 className="text-[17px] font-semibold tracking-[-0.01em]">{title}</h2>
-    </div>
-  )
-}
-
-// ─── Holder views (route targets) ──────────────────────────────────────────────
-
-function HolderShell({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="relative mx-auto flex min-h-screen max-w-[430px] flex-col bg-background">
-      {/* No bottom bar — nav lives in the home quick actions; drill-ins carry a back arrow */}
-      <div className="flex-1 overflow-y-auto">{children}</div>
-    </div>
-  )
-}
-
-function HomeView() {
-  const { identityKey } = useWallet()
-  const navigate = useNavigate()
-  // Quick actions navigate to a route, carrying the current account as ?asset.
-  const handleAction = (action: HolderAction, assetId?: string) => {
-    const search = assetId ? `?asset=${encodeURIComponent(assetId)}` : ''
-    navigate(`/${action}${search}`)
-  }
-  return <TokenWallet identityKey={identityKey} onAction={handleAction} />
-}
-
-function SendView() {
-  const navigate = useNavigate()
-  const asset = useAssetParam()
-  return (
-    <div className="flex min-h-screen flex-col px-5 pt-8">
-      <DrillHeader title="Send" onBack={() => navigate(homePath(asset))} />
-      <SendTokens lockedAssetId={asset || undefined} />
-    </div>
-  )
-}
-
-function ReceiveView() {
-  const navigate = useNavigate()
-  const asset = useAssetParam()
-  return (
-    <div className="px-5 pt-8">
-      <DrillHeader title="Receive" onBack={() => navigate(homePath(asset))} />
-      <ReceiveTokens />
-    </div>
-  )
-}
-
-function ContactsView() {
-  const navigate = useNavigate()
-  const asset = useAssetParam()
-  return <ContactsPage onBack={() => navigate(homePath(asset))} />
-}
+// The console is the issuer/admin tool only (B8). The section lives in the
+// path and the asset in ?asset=<id>, so a reload restores the view:
+//   /issuer/:section   (?asset=<id> selects the asset)
+// Holders send and receive in their BRC-207 wallet (bsv-desktop, bsv-wallet),
+// which hosts the color module and ledger the console does not have.
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
@@ -142,16 +54,31 @@ export default function TokenDemo() {
     )
   }
 
-  // ── Holder: Meridian single-account home + drill-in routes ──
+  // ── Not the issuer: the console has nothing for this identity ──
+  return <NotIssuer />
+}
+
+/** Shown to any identity other than the configured issuer (no holder views, B8). */
+function NotIssuer() {
+  const { identityKey, overlayIdentityKey } = useWallet()
+  const abbr = (k: string | null): string => k == null ? '—' : `${k.slice(0, 10)}…${k.slice(-6)}`
   return (
-    <HolderShell>
-      <Routes>
-        <Route path="/" element={<HomeView />} />
-        <Route path="/send" element={<SendView />} />
-        <Route path="/receive" element={<ReceiveView />} />
-        <Route path="/contacts" element={<ContactsView />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </HolderShell>
+    <div className="grid min-h-screen place-items-center px-6">
+      <div className="flex max-w-md flex-col items-center gap-3 text-center animate-in">
+        <BrandMark />
+        <h2 className="text-[17px] font-semibold tracking-[-0.01em]">Issuer console</h2>
+        <p className="text-[13px] leading-relaxed text-muted-foreground">
+          This console is for the asset issuer only. Connect the wallet that holds the issuer identity to
+          manage assets and pay out from the treasury. To send or receive tokens, use a BRC-207 wallet
+          (BSV Desktop or the BSV wallet app).
+        </p>
+        <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-left text-[12px]">
+          <dt className="text-subtle-foreground">Connected</dt>
+          <dd className="tabular font-mono">{abbr(identityKey)}</dd>
+          <dt className="text-subtle-foreground">Issuer</dt>
+          <dd className="tabular font-mono">{abbr(overlayIdentityKey)}</dd>
+        </dl>
+      </div>
+    </div>
   )
 }

@@ -4,7 +4,7 @@
  * Reads source as the verifier's static CTA bar.
  */
 import { describe, it, expect } from 'vitest'
-import { readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -35,25 +35,6 @@ describe('robustness wiring (shipped source)', () => {
     expect(m).toContain('readMandalaConfig(')
     expect(src('context/WalletContext.tsx')).toContain('configError')
     expect(src('components/issuer/IdentityRegistry.tsx')).not.toContain('tm_mandala_registry')
-  })
-
-  it('SendTokens blocks re-entry with sync ref, sendFlight, and pending disable', () => {
-    const s = src('components/SendTokens.tsx')
-    expect(s).toContain('sendStartedRef')
-    expect(s).toContain('sendFlight')
-    expect(s).toContain('guardSendSubmit')
-    expect(s).toContain('sendMutation.isPending')
-    expect(s).toContain('BusyError')
-    // Confirm CTA must not rely only on setStep('sending') for double-click.
-    expect(s).toMatch(/disabled=\{[\s\S]*sendMutation\.isPending/)
-  })
-
-  it('useSendMutation acquires sendFlight before optimistic write', () => {
-    const s = src('hooks/useSendMutation.ts')
-    expect(s).toContain('sendFlight.tryAcquire')
-    expect(s).toContain('BusyError')
-    expect(s).toContain('guardPositiveAmount')
-    expect(s).toContain('sendFlight.release')
   })
 
   it('IssuerPanel and RegisterAssetStrip use sync re-entry refs + guards', () => {
@@ -120,34 +101,13 @@ describe('robustness wiring (shipped source)', () => {
     expect(s).toMatch(/resolveAssetState\([^)]*\{\s*force:\s*true\s*\}/)
   })
 
-  it('sendFlight is acquired before sendAndDeliver; the note reaches sendHandover', () => {
-    const m = src('hooks/useSendMutation.ts')
-    expect(m.indexOf('sendFlight.tryAcquire')).toBeGreaterThan(-1)
-    expect(m).toContain('sendAndDeliver(')
-    expect(m).not.toContain('transferTokens')
-    expect(m).toMatch(/interface SendVars|SendVars/)
-    expect(m).toContain('drainNow')
-    expect(m).not.toMatch(/reconcileBans/)
-    const ui = src('components/SendTokens.tsx')
-    expect(ui).toContain('sendStartedRef')
-    expect(ui).toContain('safeParseAmount(')
-    expect(ui).toMatch(/sendMutation\.mutate\(\s*\{[\s\S]*?note[\s\S]*?\}/)
-    expect(ui).not.toMatch(/Number\(/)
-    // The note is forwarded by the pipeline to sendHandover and deliverHandover.
-    const p = src('lib/mandala/sendPipeline.ts')
-    expect(p).toMatch(/send\(\{[\s\S]*?note[\s\S]*?\}\)/)
-    expect(src('context/WalletContext.tsx')).toMatch(/addEventListener\('online'/)
-  })
-
-  it('deliver and settle run inside the handover lock; the app never aborts a hand-over', () => {
-    const p = src('lib/mandala/sendPipeline.ts')
-    expect(p).toMatch(/withLock[\s\S]*wait:\s*true[\s\S]*settle\(/)
-    expect(p).not.toContain('abortAction')
+  it('the drain never delivers, settles or aborts itself; triggers stay wired', () => {
     const dr = src('lib/mandala/handoverDrain.ts')
     for (const banned of ['abortAction', 'deliverHandover', 'settleHandover', 'resubmitDelivered', 'localStorage']) expect(dr).not.toContain(banned)
     const w = src('context/WalletContext.tsx')
     expect(w).toMatch(/setInterval\([\s\S]*drainNow\(\)/)
     expect(w).toMatch(/drainNow\(\{\s*force:\s*true\s*\}\)/)
+    expect(w).toMatch(/addEventListener\('online'/)
   })
 
   it('payout path uses payoutTokens unblinded with the MessageBox client', () => {
@@ -155,7 +115,7 @@ describe('robustness wiring (shipped source)', () => {
     expect(m).toMatch(/notified\s*===\s*false/); expect(m).toContain('drainNow')
     // no authority is spent: nothing may read or advance the admin-auth cache from a payout
     for (const banned of ['nextAuthOutpoint', 'nextAuthKeyID', 'advanceAdminAuth', 'useAdvanceAdminAuth', 'isAdminAuthInFlight', 'reconcileWallet(']) expect(m).not.toContain(banned)
-    const t = src('components/issuer/TreasurySection.tsx'); expect(t).toContain("mode=\"payout\""); expect(t).toContain('useTreasuryBalances'); expect(t).not.toContain('useHolderData')
+    const t = src('components/issuer/TreasurySection.tsx'); expect(t).toContain('useTreasuryBalances'); expect(t).not.toContain('useHolderData')
   })
 
   it('one recovery path: reconcileWallet/reconcileNotifications are called only from handoverDrain via drainNow', () => {
@@ -178,30 +138,6 @@ describe('robustness wiring (shipped source)', () => {
     expect(mut).toMatch(/issueTokens\(\{[\s\S]*depositHash/)
   })
 
-  it('ReceiveTokens uses receiveHandovers', () => {
-    const s = src('components/ReceiveTokens.tsx')
-    expect(s).toContain('receiveHandovers(')
-    expect(s).not.toContain('receiveTokens')
-    expect(s).not.toMatch(/Number\(/)
-  })
-
-  it('holder views read no basket and format bigint amounts', () => {
-    for (const f of ['components/holder/HolderHome.tsx', 'components/holder/AssetAccount.tsx', 'components/holder/TransactionHistory.tsx', 'components/holder/AlertBanners.tsx', 'components/TokenWallet.tsx']) {
-      const s = src(f)
-      expect(s).not.toMatch(/\bBASKET\b/)
-      expect(s).not.toContain('decodeValue')
-      expect(s).not.toContain("'@bsv/mandala/amount'")
-    }
-    const a = src('components/holder/AlertBanners.tsx')
-    expect(a).toContain('frozenUnitsFor(')
-    expect(a).not.toContain('listOutputs')
-    const h = src('components/holder/HolderHome.tsx')
-    expect(h).toContain('holderLines(')
-    // unsettled is already inside the balance and incoming is outside it: never summed
-    expect(h).not.toMatch(/balance\s*\+\s*(row\.|a\.|asset\.)?(incoming|unsettled)|(incoming|unsettled)\s*\+\s*(row\.|a\.|asset\.)?balance/)
-    expect(h).not.toMatch(/\.pending\b/)
-  })
-
   it('admin views carry no Number() on amounts; reissue takes the frozen row amount', () => {
     const rc = src('components/issuer/RegulatoryControls.tsx'); expect(rc).not.toMatch(/Number\(reissueAmount\)/)
     expect(rc).toMatch(/ftOutput:\s*\{\s*recipient,\s*amount:\s*row\.amount\s*\}/); expect(rc).toContain('notified')
@@ -210,6 +146,25 @@ describe('robustness wiring (shipped source)', () => {
       expect(src(`components/issuer/${f}.tsx`)).not.toContain("'@bsv/mandala/amount'")
     const bank = src('components/issuer/BankingMock.tsx')
     expect(bank).toContain('safeParseAmount('); expect(bank).not.toMatch(/type="number"/)
+  })
+
+  it('B8: the console offers no holder send, receive or holder wallet view', () => {
+    for (const gone of ['components/SendTokens.tsx', 'components/ReceiveTokens.tsx', 'components/TokenWallet.tsx',
+      'components/QrScanModal.tsx', 'components/holder', 'hooks/useSendMutation.ts', 'hooks/useHolderData.ts',
+      'hooks/useContactsData.ts', 'lib/mandala/sendPipeline.ts', 'lib/mandala/receiveView.ts',
+      'lib/mandala/loadHolderData.ts', 'lib/mandala/holderLines.ts', 'lib/mandala/holderBalances.ts'])
+      expect(existsSync(resolve(appSrc, gone)), gone).toBe(false)
+    for (const f of listSrc()) {
+      const s = src(f)
+      // Holder hand-overs and BRC-207 holder views need the wallet host's ledger (bsv-desktop / bsv-wallet).
+      for (const banned of ['sendHandover', 'deliverHandover', 'settleHandover', 'receiveHandovers', 'internalizeAction',
+        "'p color balance", 'p color assets', 'sendFlight'])
+        expect(s, `${f} contains ${banned}`).not.toContain(banned)
+    }
+    const demo = src('components/TokenDemo.tsx')
+    expect(demo).not.toMatch(/path="\/(send|receive|contacts)?"/)
+    expect(demo).toContain('<NotIssuer />')
+    expect(demo).toContain('path="/issuer/:section"')
   })
 
   it('no old Mandala token residue remains in app source', () => {

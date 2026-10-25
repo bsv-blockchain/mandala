@@ -18,7 +18,7 @@ import { useInvalidateAdminHistory } from '../../hooks/useAdminHistory'
 import { useAdvanceAdminAuth } from '../../hooks/useAdminAssets'
 import { parseFeeRateInput } from '../../lib/mandala/feeRateInput'
 import { displayAmount } from '../../lib/mandala/amountDisplay'
-import { decimalsOf } from '../../lib/mandala/loadHolderData'
+import { decimalsOf } from '../../lib/mandala/decimals'
 
 interface Props {
   assets: AdminAsset[]

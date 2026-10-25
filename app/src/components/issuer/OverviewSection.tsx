@@ -7,7 +7,7 @@ import { useAssetState, useInvalidateAssetState } from '../../hooks/useAssetStat
 import { useAdminSummary, useInvalidateAdminHistory } from '../../hooks/useAdminHistory'
 import { useMockTransfers } from '../../lib/mandala/mockBankStore'
 import { displayAmount, reserveRatioPct } from '../../lib/mandala/amountDisplay'
-import { decimalsOf } from '../../lib/mandala/loadHolderData'
+import { decimalsOf } from '../../lib/mandala/decimals'
 import { cn } from '@/lib/utils'
 import AuditLog from './AuditLog'
 
