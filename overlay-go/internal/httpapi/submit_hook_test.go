@@ -181,11 +181,26 @@ type hookFailingGate struct{}
 
 func (hookFailingGate) Enter(context.Context) (func(), error) { return nil, errors.New("gate closed") }
 
+// hookCountingGate counts Enter calls. release is a no-op.
+type hookCountingGate struct {
+	n atomic.Int32
+}
+
+func (g *hookCountingGate) Enter(context.Context) (func(), error) {
+	g.n.Add(1)
+	return func() {}, nil
+}
+
 // ---- request and body helpers ---------------------------------------------------------------------------------
 
 // hookDo POSTs body to /submit with the off-chain framing header. It never calls t (safe in goroutines).
 func hookDo(f *fiber.App, topicsHeader string, body []byte) (int, []byte, error) {
-	req := httptest.NewRequest(http.MethodPost, "/submit", bytes.NewReader(body))
+	return hookDoPath(f, "/submit", topicsHeader, body)
+}
+
+// hookDoPath is hookDo for an explicit request path.
+func hookDoPath(f *fiber.App, path, topicsHeader string, body []byte) (int, []byte, error) {
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
 	if topicsHeader != "" {
 		req.Header.Set("X-Topics", topicsHeader)
 	}
@@ -952,4 +967,123 @@ func TestSubmitPairingRuleNamesColorTopic(t *testing.T) {
 	if n := sub.calls.Load(); n != 0 {
 		t.Fatalf("Submit called %d times", n)
 	}
+}
+
+// hookRequireRouteNotFound is the unmatched-route body notFoundMiddleware writes, with no verdict fields.
+func hookRequireRouteNotFound(t *testing.T, code int, body []byte) {
+	t.Helper()
+	if code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body %s", code, body)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("body %s: %v", body, err)
+	}
+	want := map[string]any{
+		"status":      "error",
+		"code":        "ERR_ROUTE_NOT_FOUND",
+		"description": "Route not found.",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("body = %s, want the plain route 404", body)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("body[%q] = %v, want %v (body %s)", k, got[k], v, body)
+		}
+	}
+}
+
+func newSubmitPathProbe(t *testing.T, pre *hookStubPrecheck) (*fiber.App, *hookStubSubmitter, *hookStubRegistrar, *hookStubRecorder, *hookCountingGate) {
+	t.Helper()
+	sub := newHookStubSubmitter(mandala.MandalaTopic)
+	reg := &hookStubRegistrar{result: true, sub: sub}
+	rec := &hookStubRecorder{}
+	gate := &hookCountingGate{}
+	f := newServer(sub, nil, nil, nil, WithSubmitGate(gate), WithDeployHook(reg, pre.run), WithAdmissionStore(rec, nil))
+	return f, sub, reg, rec, gate
+}
+
+func hookRequireNoHostRuleSideEffects(t *testing.T, sub *hookStubSubmitter, reg *hookStubRegistrar, pre *hookStubPrecheck, rec *hookStubRecorder, gate *hookCountingGate) {
+	t.Helper()
+	if got := reg.ensured(); len(got) != 0 {
+		t.Fatalf("Ensure called: %v", got)
+	}
+	if n := pre.count(); n != 0 {
+		t.Fatalf("precheck called %d times", n)
+	}
+	if gets, records, refusals := rec.snapshot(); gets+records+len(refusals) != 0 {
+		t.Fatalf("admission store touched: gets=%d records=%d refusals=%v", gets, records, refusals)
+	}
+	if n := sub.calls.Load(); n != 0 {
+		t.Fatalf("Submit called %d times", n)
+	}
+	if n := gate.n.Load(); n != 0 {
+		t.Fatalf("submit gate entered %d times", n)
+	}
+}
+
+// TestPostSubmitXIsPlain404WithoutHostRuleSideEffects: Use("/submit") prefix-matches, but POST /submitX is the
+// plain route 404. A body that would pass pairing and reach Ensure or MarkRefused on POST /submit does neither,
+// and Fiber's case-insensitive and trailing-slash forms of /submit still run the host rules.
+func TestPostSubmitXIsPlain404WithoutHostRuleSideEffects(t *testing.T) {
+	dep := mandalatest.Deploy(t, mandalatest.Issuer, "USD")
+	tm := mandala.TokenTopicOfTxid(dep.Txid)
+	body := mandalatest.SubmitBody(dep)
+	both := hookTopics(t, mandala.MandalaTopic, tm)
+
+	t.Run("deploy that would Ensure", func(t *testing.T) {
+		pre := &hookStubPrecheck{admit: []uint32{0}}
+		f, sub, reg, rec, gate := newSubmitPathProbe(t, pre)
+		for _, path := range []string{"/submitX", "/SubmitX", "/submit/extra"} {
+			code, resp, err := hookDoPath(f, path, both, body)
+			if err != nil {
+				t.Fatalf("POST %s: %v", path, err)
+			}
+			hookRequireRouteNotFound(t, code, resp)
+		}
+		hookRequireNoHostRuleSideEffects(t, sub, reg, pre, rec, gate)
+	})
+
+	t.Run("precheck refusal that would MarkRefused", func(t *testing.T) {
+		pre := &hookStubPrecheck{err: &mandala.RejectError{
+			Code: mandala.CodeShape, Reason: "deploy dry run refused", Topic: mandala.MandalaTopic,
+		}}
+		f, sub, reg, rec, gate := newSubmitPathProbe(t, pre)
+		code, resp, err := hookDoPath(f, "/submitX", both, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hookRequireRouteNotFound(t, code, resp)
+		hookRequireNoHostRuleSideEffects(t, sub, reg, pre, rec, gate)
+	})
+
+	t.Run("case and trailing slash still run the host rules", func(t *testing.T) {
+		pre := &hookStubPrecheck{admit: []uint32{0}}
+		f, sub, reg, rec, gate := newSubmitPathProbe(t, pre)
+		onlyRegistry := hookTopics(t, mandala.MandalaTopic)
+		for _, path := range []string{"/submit", "/Submit", "/submit/", "/SUBMIT/"} {
+			before := gate.n.Load()
+			code, resp, err := hookDoPath(f, path, onlyRegistry, body)
+			if err != nil {
+				t.Fatalf("POST %s: %v", path, err)
+			}
+			hookRequireError(t, code, resp, 400, "ERR_SHAPE", hookPairing(dep.Txid))
+			if got := gate.n.Load(); got != before+1 {
+				t.Fatalf("POST %s: gate entered %d times, want 1", path, got-before)
+			}
+		}
+		if got := reg.ensured(); len(got) != 0 {
+			t.Fatalf("Ensure called: %v", got)
+		}
+		if n := pre.count(); n != 0 {
+			t.Fatalf("precheck called %d times", n)
+		}
+		if _, _, refusals := rec.snapshot(); len(refusals) != 0 {
+			t.Fatalf("MarkRefused called: %+v", refusals)
+		}
+		if n := sub.calls.Load(); n != 0 {
+			t.Fatalf("Submit called %d times", n)
+		}
+	})
 }
