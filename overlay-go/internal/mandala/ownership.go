@@ -37,7 +37,7 @@ type InputOwnerDeps struct {
 	Verifier LinkageVerifier
 	Topic    string                               // the journal/engine topic of the coins (tm_color_<id> or tm_mandala_kyc)
 	Txid     string                               // the transaction under validation: its own spend mark on Topic reads admitted (V-16)
-	OnRepair func(outpoint string, inserted bool) // never nil here; managers default it to LogOwnerRepair(<topic>); nil falls back to that too
+	OnRepair func(outpoint string, inserted bool) // nil falls back to LogOwnerRepair(Topic); managers pass LogOwnerRepair of their topic
 }
 
 // sameAmount: a stored amount equals a script amount only when it is a uint64 equal to it

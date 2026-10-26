@@ -385,8 +385,9 @@ func TestAdminHistoryRoutesReadTheToken(t *testing.T) {
 		return out
 	}
 	if code, _, body := tokGet(t, f, "/admin/admin-history/"+tokA, nil); code != 200 || strings.Join(kinds(body), ",") != "issue,redeem,pause" ||
-		!strings.Contains(string(body), `"delta":"-200"`) || !strings.Contains(string(body), `"delta":"500"`) {
-		t.Fatalf("history (fold order, string deltas): %d %s", code, body)
+		!strings.Contains(string(body), `"delta":"-200"`) || !strings.Contains(string(body), `"delta":"500"`) ||
+		!strings.Contains(string(body), `"createdAt":"2026-10-05T12:00:00.000Z"`) {
+		t.Fatalf("history (fold order, string deltas, IsoStamp createdAt): %d %s", code, body)
 	}
 	if code, _, body := tokGet(t, f, "/admin/admin-history-page/"+tokA+"?limit=2", nil); code != 200 || strings.Join(kinds(body), ",") != "pause,redeem" {
 		t.Fatalf("history page (newest first): %d %s", code, body)
@@ -398,6 +399,35 @@ func TestAdminHistoryRoutesReadTheToken(t *testing.T) {
 	tokRequireJSON(t, code, body, 200, `{"totalIssued":"500","totalRedeemed":"200","actionCount":3}`)
 	code, _, body = tokGet(t, f, "/admin/admin-history/"+tokC, nil)
 	tokRequireJSON(t, code, body, 200, `[]`)
+}
+
+func TestAdminHistoryCreatedAtIsIsoStamp(t *testing.T) {
+	at := time.Date(2026, 10, 5, 12, 3, 4, 123456789, time.FixedZone("X", 3600))
+	frozen := amt(5)
+	owner := tokKey
+	body, err := json.Marshal(adminHistoryWires([]mandala.AdminHistoryEntry{{
+		TokenID: tokA, Txid: strings.Repeat("aa", 32), OutputIndex: 1, Kind: "freezeOutput",
+		Delta: amt(0), CreatedAt: at, FrozenAmount: &frozen, FrozenOwner: &owner,
+	}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []struct {
+		CreatedAt    string  `json:"createdAt"`
+		FrozenAmount *string `json:"frozenAmount"`
+		FrozenOwner  *string `json:"frozenOwner"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].CreatedAt != "2026-10-05T11:03:04.123Z" ||
+		rows[0].FrozenAmount == nil || *rows[0].FrozenAmount != "5" ||
+		rows[0].FrozenOwner == nil || *rows[0].FrozenOwner != tokKey {
+		t.Fatalf("wire = %s", body)
+	}
+	if empty, err := json.Marshal(adminHistoryWires(nil)); err != nil || string(empty) != "[]" {
+		t.Fatalf("empty history = %s, %v", empty, err)
+	}
 }
 
 func TestAdminHistoryPageClampsLikeTS(t *testing.T) {
