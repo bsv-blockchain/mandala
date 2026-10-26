@@ -153,6 +153,8 @@ func newServer(submitter Submitter, lookuper Lookuper, store AdminStore, ping Pi
 
 	f := fiber.New(fiber.Config{BodyLimit: bodyLimit})
 	f.Use(corsMiddleware(o.adminCORSOrigins))
+	// Use("/submit") prefix-matches. submitPath inside each handler limits it to the path POST /submit matches,
+	// including Fiber's case-insensitive and trailing-slash forms.
 	if o.submitGate != nil {
 		f.Use("/submit", submitGateMiddleware(o.submitGate))
 	}
