@@ -11,27 +11,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type vectors struct {
-	TokenScripts []struct {
-		AssetID    string `json:"assetId"`
-		Amount     int64  `json:"amount"`
-		PubKeyHash []byte `json:"pubKeyHash"`
-		ScriptHex  string `json:"scriptHex"`
-	} `json:"tokenScripts"`
+// tokenScript is one golden Mandala v2 locking script. Vendored from
+// overlay-go/testdata/vectors.json at 22e5b2a (`jq .tokenScripts`); that file
+// was deleted with the v2 quarantine, and fuelkeeper still locks this script.
+type tokenScript struct {
+	AssetID    string `json:"assetId"`
+	Amount     int64  `json:"amount"`
+	PubKeyHash []byte `json:"pubKeyHash"`
+	ScriptHex  string `json:"scriptHex"`
 }
 
-func loadVectors(t *testing.T) vectors {
+func loadTokenScripts(t *testing.T) []tokenScript {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "overlay-go", "testdata", "vectors.json"))
-	require.NoError(t, err, "overlay-go/testdata/vectors.json must exist (shared golden fixtures)")
-	var v vectors
-	require.NoError(t, json.Unmarshal(raw, &v))
-	require.NotEmpty(t, v.TokenScripts)
-	return v
+	raw, err := os.ReadFile(filepath.Join("..", "..", "testdata", "token_scripts.json"))
+	require.NoError(t, err, "fuelkeeper/testdata/token_scripts.json must exist (vendored golden fixtures)")
+	var scripts []tokenScript
+	require.NoError(t, json.Unmarshal(raw, &scripts))
+	require.NotEmpty(t, scripts)
+	return scripts
 }
 
 func TestLockToken_ParityWithOverlayVectors(t *testing.T) {
-	for _, tc := range loadVectors(t).TokenScripts {
+	for _, tc := range loadTokenScripts(t) {
 		s, err := LockToken(tc.AssetID, tc.Amount, tc.PubKeyHash)
 		require.NoError(t, err, tc.AssetID)
 		require.Equal(t, tc.ScriptHex, hex.EncodeToString(*s), "amount %d", tc.Amount)

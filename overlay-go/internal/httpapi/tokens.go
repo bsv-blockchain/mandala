@@ -249,7 +249,7 @@ func tokenAdminHistoryHandler(c *fiber.Ctx, store AdminStore, tokenID string) er
 	if rows == nil {
 		rows = []mandala.AdminHistoryEntry{}
 	}
-	return c.Status(fiber.StatusOK).JSON(rows)
+	return c.Status(fiber.StatusOK).JSON(adminHistoryWires(rows))
 }
 
 // tokenAdminHistoryPageHandler pages newest first by admitSeq with TS's clamps (tokenRoutes.ts:100-109).
@@ -263,7 +263,41 @@ func tokenAdminHistoryPageHandler(c *fiber.Ctx, store AdminStore, tokenID string
 	if rows == nil {
 		rows = []mandala.AdminHistoryEntry{}
 	}
-	return c.Status(fiber.StatusOK).JSON(rows)
+	return c.Status(fiber.StatusOK).JSON(adminHistoryWires(rows))
+}
+
+// adminHistoryWire is one admin-history row on the wire. createdAt is mandala.IsoStamp
+// (JavaScript Date#toISOString: UTC, milliseconds, trailing Z). encoding/json would
+// otherwise render time.Time as RFC3339Nano, which drops ".000" and can keep
+// sub-millisecond digits. The TS overlay JSON.stringifies a Date, so the two stacks match.
+type adminHistoryWire struct {
+	TokenID      string          `json:"tokenId"`
+	Txid         string          `json:"txid"`
+	OutputIndex  uint32          `json:"outputIndex"`
+	Kind         string          `json:"kind"`
+	DetailsHex   string          `json:"detailsHex"`
+	Commitment   string          `json:"commitment"`
+	Delta        mandala.Amount  `json:"delta"`
+	Height       int64           `json:"height"`
+	Offset       int64           `json:"offset"`
+	AdmitSeq     int64           `json:"admitSeq"`
+	CreatedAt    string          `json:"createdAt"`
+	FrozenAmount *mandala.Amount `json:"frozenAmount,omitempty"`
+	FrozenOwner  *string         `json:"frozenOwner,omitempty"`
+}
+
+func adminHistoryWires(rows []mandala.AdminHistoryEntry) []adminHistoryWire {
+	out := make([]adminHistoryWire, len(rows))
+	for i, r := range rows {
+		out[i] = adminHistoryWire{
+			TokenID: r.TokenID, Txid: r.Txid, OutputIndex: r.OutputIndex, Kind: r.Kind,
+			DetailsHex: r.DetailsHex, Commitment: r.Commitment, Delta: r.Delta,
+			Height: r.Height, Offset: r.Offset, AdmitSeq: r.AdmitSeq,
+			CreatedAt:    mandala.IsoStamp(r.CreatedAt),
+			FrozenAmount: r.FrozenAmount, FrozenOwner: r.FrozenOwner,
+		}
+	}
+	return out
 }
 
 // jsClampedInt is TS `Number(raw === "" ? def : raw ?? def)`, then non-finite -> def, else
