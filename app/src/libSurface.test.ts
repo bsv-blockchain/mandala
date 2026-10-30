@@ -12,10 +12,10 @@ const pkgOf = (name: string): { version: string } =>
   JSON.parse(readFileSync(new URL(`../node_modules/${name}/package.json`, import.meta.url), 'utf8'))
 const sdkPkg = pkgOf('@bsv/sdk'), tplPkg = pkgOf('@bsv/templates'), libPkg = pkgOf('@bsv/mandala')
 const ID = 'a'.repeat(64) + '_0'
-it('resolves the vendored stack', () => {
-  expect(sdkPkg.version).toBe('4.0.0'); expect(tplPkg.version).toMatch(/^2\.2\./); expect(libPkg.version).toBe('0.5.0')
+it('resolves the published stack', () => {
+  expect(sdkPkg.version).toBe('4.0.1'); expect(tplPkg.version).toMatch(/^2\.2\./); expect(libPkg.version).toBe('0.5.0')
 })
-it('locks exactly one @bsv/sdk (npm ^4.0.0) and one @bsv/templates (vendored 993c98b) (contract §9)', () => {
+it('locks exactly one @bsv/sdk (npm ^4.0.0) and one @bsv/templates (npm ^2.2.0) (contract §9)', () => {
   const read = (rel: string) => JSON.parse(readFileSync(new URL(rel, import.meta.url), 'utf8'))
   const lock: { packages: Record<string, { version?: string, resolved?: string }> } = read('../package-lock.json')
   const manifest: { overrides?: Record<string, string> } = read('../package.json')
@@ -27,12 +27,12 @@ it('locks exactly one @bsv/sdk (npm ^4.0.0) and one @bsv/templates (vendored 993
   }
   const deps = (manifest as { dependencies: Record<string, string> }).dependencies
   expect(deps['@bsv/sdk']).toBe('^4.0.0')
-  expect(lock.packages['node_modules/@bsv/sdk'].resolved).toBe('https://registry.npmjs.org/@bsv/sdk/-/sdk-4.0.0.tgz')
-  expect(deps['@bsv/templates']).toBe('file:../vendor-ts-stack/bsv-templates-2.2.0-993c98b.tgz')
-  expect(lock.packages['node_modules/@bsv/templates'].resolved).toBe('file:../vendor-ts-stack/bsv-templates-2.2.0-993c98b.tgz')
-  // The console never reaches lib/profile.js (wallet hosts register the module), and no 4fa68e7 build remains.
+  expect(lock.packages['node_modules/@bsv/sdk'].resolved).toBe('https://registry.npmjs.org/@bsv/sdk/-/sdk-4.0.1.tgz')
+  expect(deps['@bsv/templates']).toBe('^2.2.0')
+  expect(lock.packages['node_modules/@bsv/templates'].resolved).toBe('https://registry.npmjs.org/@bsv/templates/-/templates-2.2.0.tgz')
+  // The console never reaches lib/profile.js (wallet hosts register the module), and no vendored ts-stack build remains.
   expect(deps['@bsv/color-permission-module']).toBeUndefined()
-  expect(JSON.stringify(manifest) + JSON.stringify(lock)).not.toContain('4fa68e7')
+  for (const build of ['4fa68e7', '993c98b']) expect(JSON.stringify(manifest) + JSON.stringify(lock)).not.toContain(build)
   expect(deps['@bsv/mandala']).toBe('file:../lib')
 })
 it('exposes the contract §8.1 constants verbatim', () => {

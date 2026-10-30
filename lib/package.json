@@ -41,10 +41,10 @@
     }
   },
   "devDependencies": {
-    "@bsv/color-permission-module": "file:../vendor-ts-stack/bsv-color-permission-module-0.2.0-993c98b.tgz",
+    "@bsv/color-permission-module": "^0.2.0",
     "@bsv/message-box-client": "^2.5.4",
     "@bsv/sdk": "^4.0.0",
-    "@bsv/templates": "file:../vendor-ts-stack/bsv-templates-2.2.0-993c98b.tgz",
+    "@bsv/templates": "^2.2.0",
     "@bsv/wallet-toolbox-client": "^2.15.0",
     "typescript": "~5.9.3",
     "vitest": "^4.1.9"
