@@ -5,9 +5,10 @@
  *
  * The wallet is a real ProtoWallet for every key operation (recipient
  * linkage, self-send derivation) with createAction/signAction/abortAction
- * stubbed; `signAction` answers like @bsv/color-permission-module 0.2.0 with a
- * `colorHandoff` member over a real transaction. The overlay submit is
- * mocked; refusals are real `OverlayRefusedError`s.
+ * stubbed; `signAction` answers with a real transaction (B7: no envelope from
+ * the module). The host builds the envelope: the recipient entry from the
+ * lib's linkage, owned outputs from the host wallet's custody. The overlay
+ * submit is mocked; refusals are real `OverlayRefusedError`s.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Hash, LockingScript, P2PKH, PrivateKey, ProtoWallet, Random, Transaction, UnlockingScript, Utils } from '@bsv/sdk'
@@ -17,7 +18,9 @@ import {
   type HandoverResult
 } from './handover.js'
 import { OverlayRefusedError, submitToOverlay } from './overlay.js'
-import { configureMandala, ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID, MESSAGEBOX } from './constants.js'
+import { configureMandala, MANDALA_PROFILE_ID, MESSAGEBOX } from './constants.js'
+import { createHostLedger, type HostLedger } from './hostLedger.js'
+import { decodeEnvelope } from './encoding.js'
 import { colorProtocolID, colorTopic } from './naming.js'
 import { PLAN_LABEL_PREFIX } from './plan.js'
 import { configureStorage, getStorage, memoryStorage } from './storage.js'
@@ -37,10 +40,8 @@ const A_PRIV = new PrivateKey(31)
 const A = A_PRIV.toPublicKey().toString()
 const B = new PrivateKey(77).toPublicKey().toString()
 const ID = `${'c7'.repeat(32)}_0`
-const SUBMISSION_HEX = Utils.toHex(Utils.toArray('{"outputs":[]}', 'utf8'))
 const pkh = new PrivateKey(11).toPublicKey().toHash() as number[]
 
-type HandoffMode = 'ok' | 'none' | 'wrongTxid' | 'noTip'
 
 /** The tip a signAction call produces: a real tx carrying the requested output 0. */
 function buildTip (lockingScriptHex: string): { tx: number[], txid: string } {
@@ -54,8 +55,7 @@ function buildTip (lockingScriptHex: string): { tx: number[], txid: string } {
 
 function mkWallet () {
   const proto = new ProtoWallet(A_PRIV)
-  const state: { handoff: HandoffMode, lastTip?: { tx: number[], txid: string }, broadcast: () => Promise<any> } = {
-    handoff: 'ok',
+  const state: { lastTip?: { tx: number[], txid: string }, custody?: Record<string, string>, dropCustody?: boolean, broadcast: () => Promise<any> } = {
     broadcast: async () => ({ sendWithResults: [{ txid: state.lastTip?.txid, status: 'unproven' }] })
   }
   let lastScript = ''
@@ -68,23 +68,27 @@ function mkWallet () {
     createAction: vi.fn(async (args: any) => {
       if (args.options?.sendWith != null) return await state.broadcast()
       lastScript = args.outputs[0].lockingScript
+      // The module stores an owned output's custody (here: plain JSON) in the host wallet.
+      const owned = decodePlan(args.labels).ownedOutputs?.[0]
+      state.custody = owned != null && state.dropCustody !== true
+        ? { assetId: owned.assetId, derivationPrefix: owned.derivationPrefix, derivationSuffix: owned.derivationSuffix, senderIdentityKey: owned.senderIdentityKey }
+        : undefined
       return { signableTransaction: { tx: [0], reference: 'ref-h' } }
     }),
     signAction: vi.fn(async (_a: any) => {
       const tip = buildTip(lastScript)
       state.lastTip = tip
-      const leaf = {
-        declarationTx: 'ab',
-        transactions: [],
-        attestations: [],
-        submissions: state.handoff === 'noTip' ? [] : [{ txid: tip.txid, offChainValues: SUBMISSION_HEX }]
-      }
-      const colorHandoff = state.handoff === 'none'
-        ? undefined
-        : { version: 1, txid: state.handoff === 'wrongTxid' ? 'f'.repeat(64) : tip.txid, profileData: { [ATTESTED_PROFILE_ID]: { [ID]: leaf } } }
-      return { tx: tip.tx, txid: tip.txid, ...(colorHandoff != null ? { colorHandoff } : {}) }
+      return { tx: tip.tx, txid: tip.txid }
     }),
-    abortAction: vi.fn(async (_a: any) => ({ aborted: true }))
+    abortAction: vi.fn(async (_a: any) => ({ aborted: true })),
+    revealSpecificKeyLinkage: vi.fn(async (a: any) => await proto.revealSpecificKeyLinkage(a)),
+    // The host wallet's p color basket: custody of a self-send's owned output (plain JSON).
+    listOutputs: vi.fn(async (_a: any) => ({
+      totalOutputs: 1,
+      outputs: state.lastTip != null && state.custody != null
+        ? [{ outpoint: `${state.lastTip.txid}.0`, satoshis: 1, spendable: true, customInstructions: JSON.stringify(state.custody) }]
+        : []
+    }))
   }
   return w
 }
@@ -103,8 +107,11 @@ const mkMb = () => ({ sendMessage: vi.fn(async (_a: { recipient: string, message
 const nonce = (): string => Utils.toBase64(Random(32)) // 44 chars, like createNonce output
 
 let wallet: ReturnType<typeof mkWallet>
+let ledger: HostLedger
 const S = (over: Record<string, unknown> = {}) => ({
   wallet: wallet as any,
+  hostWallet: wallet as any,
+  ledger,
   identityKey: A,
   assetId: ID,
   amount: 5n,
@@ -135,6 +142,7 @@ beforeEach(async () => {
   await notifyClear()
   await blindingClear()
   configureMandala({ overlayUrl: 'http://o', overlayIdentityKey: OVERLAY_KEY })
+  ledger = createHostLedger(memoryStorage())
   wallet = mkWallet()
   vi.mocked(submitToOverlay).mockReset()
 })
@@ -166,11 +174,31 @@ describe('sendHandover', () => {
     expect(h.reference).toBe('ref-h')
     expect(h.outputIndex).toBe(0)
     expect(h.receipt.senderIdentityKey).not.toBe(A) // blinded by default
-    expect(Object.keys(h.receipt)).toEqual(['version', 'assetId', 'derivationPrefix', 'derivationSuffix', 'senderIdentityKey', 'profileData'])
+    expect(Object.keys(h.receipt)).toEqual(['version', 'assetId', 'derivationPrefix', 'derivationSuffix', 'senderIdentityKey'])
     expect(h.receipt.version).toBe(1)
     expect(h.receipt.assetId).toBe(ID)
-    expect(Object.keys(h.receipt.profileData)).toEqual([ATTESTED_PROFILE_ID])
-    expect(h.offChainValues).toEqual(Utils.toArray(SUBMISSION_HEX, 'hex'))
+    expect(JSON.stringify(h.receipt).length).toBeLessThan(1000)
+    // The host-built envelope: exactly the recipient output, verifier K.
+    const envelope = decodeEnvelope(h.offChainValues)
+    expect(envelope.outputs!.map(o => o.index)).toEqual([0])
+    expect(envelope.outputs![0].linkage).toEqual(leaf.outputs[0].linkage)
+    // The v4 body: receipt fields, amount as a decimal string, the tip's envelope.
+    expect(h.body).toEqual({
+      v: 4,
+      kind: 'handover',
+      assetId: ID,
+      amount: '5',
+      derivationPrefix: h.receipt.derivationPrefix,
+      derivationSuffix: h.receipt.derivationSuffix,
+      senderIdentityKey: h.receipt.senderIdentityKey,
+      senderMode: 'blinded',
+      transaction: Utils.toHex(h.tx),
+      outputIndex: 0,
+      admissions: [],
+      linkage: [{ txid: h.txid, offChainValues: Utils.toHex(h.offChainValues) }]
+    })
+    // B7: recorded pending in the host ledger as an own hand-over.
+    expect(await ledger.get(h.txid)).toMatchObject({ state: 'pending', own: true, outputs: [] })
 
     // journal entry is durable before sendHandover resolves
     const e = (await journalList()).find(x => x.txid === h.txid)
@@ -180,8 +208,8 @@ describe('sendHandover', () => {
       assetId: ID,
       recipientKey: B,
       outputIndex: 0,
-      receipt: JSON.stringify(h.receipt),
-      submit: { txHex: Utils.toHex(h.tx), offChainHex: SUBMISSION_HEX, topics: [colorTopic(ID)] }
+      body: JSON.stringify(h.body),
+      submit: { txHex: Utils.toHex(h.tx), offChainHex: Utils.toHex(h.offChainValues), topics: [colorTopic(ID)] }
     })
     expect(await hasFreshIntent()).toBe(false)
     expect((await journalListHandovers()).map(x => x.txid)).toEqual([h.txid])
@@ -195,6 +223,7 @@ describe('sendHandover', () => {
   it('blind: false shows the real sender key', async () => {
     const h = await sendHandover(S({ blind: false }))
     expect(h.receipt.senderIdentityKey).toBe(A)
+    expect(h.body.senderMode).toBe('identity')
     expect(await blindingGet(`${h.txid}.0`)).toBeUndefined()
   })
 
@@ -243,20 +272,17 @@ describe('sendHandover', () => {
     expect(wallet.abortAction).not.toHaveBeenCalled()
   })
 
-  it('no colorHandoff ⇒ rejects, aborts the action, journals nothing', async () => {
-    wallet.state.handoff = 'none'
-    await expect(sendHandover(S())).rejects.toThrow(/color-permission-module/)
+  it('an owned token output without host custody ⇒ rejects, aborts the action, journals nothing', async () => {
+    wallet.state.dropCustody = true
+    await expect(sendHandover(S({ recipientKey: A }))).rejects.toThrow(/no custody/)
     expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-h' })
     expect(await journalList()).toEqual([])
   })
 
-  it('a colorHandoff for another txid or without the tip submission ⇒ rejects and aborts', async () => {
-    wallet.state.handoff = 'wrongTxid'
-    await expect(sendHandover(S())).rejects.toThrow(/color-permission-module/)
-    wallet.state.handoff = 'noTip'
-    await expect(sendHandover(S())).rejects.toThrow(/color-permission-module/)
-    expect(wallet.abortAction).toHaveBeenCalledTimes(2)
-    expect(await journalList()).toEqual([])
+  it('needs the host ledger before any wallet call (an app over BRC-100 cannot send)', async () => {
+    await expect(sendHandover(S({ ledger: undefined }))).rejects.toThrow(/host ledger/)
+    await expect(sendHandover(S({ hostWallet: undefined }))).rejects.toThrow(/underlying wallet/)
+    expect(wallet.createAction).not.toHaveBeenCalled()
   })
 
   it('a signed entry that does not land rejects and aborts (nobody has the bytes yet)', async () => {
@@ -333,14 +359,14 @@ describe('sendHandover', () => {
   })
 
   it('journal: false failure writes no key either', async () => {
-    wallet.state.handoff = 'none'
-    await expect(sendHandover(S({ journal: false }))).rejects.toThrow(/color-permission-module/)
+    wallet.state.dropCustody = true
+    await expect(sendHandover(S({ journal: false, recipientKey: A }))).rejects.toThrow(/no custody/)
     expect(await journalKeys()).toEqual([])
   })
 })
 
 describe('deliverHandover / markHandoverDelivered', () => {
-  it('journals the notification, sends the v3 body, then marks delivered', async () => {
+  it('journals the notification, sends the v4 body, then marks delivered', async () => {
     const h = await sendHandover(S())
     const mb = mkMb()
     mb.sendMessage.mockImplementation(async () => {
@@ -352,15 +378,15 @@ describe('deliverHandover / markHandoverDelivered', () => {
     const sent = mb.sendMessage.mock.calls[0][0]
     expect(sent.recipient).toBe(B)
     expect(sent.messageBox).toBe(MESSAGEBOX)
-    expect(sent.body).toEqual({ v: 3, kind: 'handover', assetId: ID, outputIndex: 0, tx: Utils.toHex(h.tx), receipt: h.receipt })
+    expect(sent.body).toEqual(h.body)
     expect((await journalList()).find(e => e.txid === h.txid)?.stage).toBe('delivered')
     expect(await notifyList()).toEqual([])
   })
 
   it('carries the note when given', async () => {
-    const h = await sendHandover(S())
+    const h = await sendHandover(S({ note: 'thanks' }))
     const mb = mkMb()
-    await deliverHandover({ messageBoxClient: mb, recipientKey: B, handover: h, note: 'thanks' })
+    await deliverHandover({ messageBoxClient: mb, recipientKey: B, handover: h })
     expect((mb.sendMessage.mock.calls[0][0].body as any).note).toBe('thanks')
   })
 
@@ -376,8 +402,8 @@ describe('deliverHandover / markHandoverDelivered', () => {
   it('delivers after a journal: false send without writing a journal entry', async () => {
     const h = await sendHandover(S({ journal: false }))
     const mb = mkMb()
-    const { txid, tx, outputIndex, receipt } = h
-    await deliverHandover({ messageBoxClient: mb, recipientKey: B, handover: { txid, tx, outputIndex, receipt } })
+    const { txid, body } = h
+    await deliverHandover({ messageBoxClient: mb, recipientKey: B, handover: { txid, body } })
     expect(mb.sendMessage).toHaveBeenCalledTimes(1)
     expect(await journalList()).toEqual([])
   })
@@ -460,7 +486,7 @@ describe('settleHandover', () => {
     expect(await journalGet(h.txid)).toMatchObject({
       stage: 'accepted',
       reference: 'ref-h',
-      offChainHex: SUBMISSION_HEX,
+      offChainHex: Utils.toHex(h.offChainValues),
       admissionSignature: admitted.admissionSignature,
       admissionIdentityKey: OVERLAY_KEY,
       outputsToAdmit: [0]
@@ -508,6 +534,37 @@ describe('settleHandover', () => {
     const r = await settleHandover({ wallet: wallet as any, handover: h2, assetId: ID, overlayIdentityKey: OVERLAY_KEY })
     expect(r).toEqual({ status: 'refused', code: 'ERR_CONSERVATION' })
     expect(wallet.abortAction).not.toHaveBeenCalled()
+  })
+
+  it('B7: an admitted settle records σ in the host ledger, then the host markSettled', async () => {
+    const admitted = await admittedFor(h.txid)
+    vi.mocked(submitToOverlay).mockResolvedValue(admitted)
+    const marked: string[] = []
+    const r = await settle({ ledger, markSettled: async (t: string) => { marked.push(t) } })
+    expect(r.status).toBe('admitted')
+    expect(marked).toEqual([h.txid])
+    expect(await ledger.get(h.txid)).toMatchObject({ state: 'settled', assetId: ID, outputs: [], attestation: admitted.attestation, marked: true })
+  })
+
+  it('B7: a markSettled failure never undoes the admission; the record stays unmarked for the next settle', async () => {
+    vi.mocked(submitToOverlay).mockResolvedValue(await admittedFor(h.txid))
+    const r = await settle({ ledger, markSettled: async () => { throw new Error('module disposed') } })
+    expect(r.status).toBe('admitted')
+    expect(await ledger.get(h.txid)).toMatchObject({ state: 'settled', marked: false })
+  })
+
+  it('B7: a hand-over that reconcile settles records σ and runs markSettled when the host passes them', async () => {
+    vi.mocked(submitToOverlay).mockResolvedValue(await admittedFor(h.txid))
+    const marked: string[] = []
+    await reconcileWallet(wallet as any, { sweep: false, broadcast: false, ledger, markSettled: async (t: string) => { marked.push(t) } })
+    expect(marked).toEqual([h.txid])
+    expect(await ledger.get(h.txid)).toMatchObject({ state: 'settled', own: true, marked: true })
+  })
+
+  it('B7: without markSettled the settled record stays unmarked (settleReceipts finishes it later)', async () => {
+    vi.mocked(submitToOverlay).mockResolvedValue(await admittedFor(h.txid))
+    await settle({ ledger })
+    expect(await ledger.get(h.txid)).toMatchObject({ state: 'settled', marked: false })
   })
 
   it('resubmitDelivered re-POSTs the journaled bytes', async () => {

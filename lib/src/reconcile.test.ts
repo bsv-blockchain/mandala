@@ -349,13 +349,24 @@ describe('reconcileWallet — retryable entries (§9.11)', () => {
     expect(r.resubmitted).toEqual([])
   })
 
-  it('aborts the reference and drops the entry after RETRY_CAP fruitless passes', async () => {
+  it('aborts the reference and drops the entry after RETRY_CAP fruitless passes of a proven refusal', async () => {
     await journalPut(retryableEntry({ attempts: RETRY_CAP - 1 }))
-    respond(503, { status: 'error', code: 'ERR_UNAVAILABLE', retryable: true, description: 'down' })
+    respond(409, { status: 'error', code: 'ERR_PAUSED', retryable: true, description: 'paused' })
     const wallet = mkWallet()
     await reconcileWallet(wallet as any)
     expect(wallet.abortAction).toHaveBeenCalledWith({ reference: 'ref-h' })
     expect(await journalList()).toEqual([])
+  })
+
+  it('deferred item 2: an unknown-outcome entry (5xx) is never aborted at RETRY_CAP; it keeps retrying', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await journalPut(retryableEntry({ attempts: RETRY_CAP - 1 }))
+    respond(503, { status: 'error', code: 'ERR_UNAVAILABLE', retryable: true, description: 'down' })
+    const wallet = mkWallet()
+    await reconcileWallet(wallet as any)
+    await reconcileWallet(wallet as any)
+    expect(wallet.abortAction).not.toHaveBeenCalled()
+    expect(await journalList()).toMatchObject([{ txid: 'held', stage: 'retryable', attempts: RETRY_CAP + 1, outcome: 'unknown' }])
   })
 
   it('S5: with no overlay identity key the retry never sends, never counts a pass and never releases the inputs', async () => {
@@ -610,7 +621,7 @@ describe('reconcileWallet — hand-over entries (signed / delivered, Task 15)', 
     assetId: ASSET,
     recipientKey: RECIPIENT,
     outputIndex: 0,
-    receipt: JSON.stringify({ version: 1, assetId: ASSET }),
+    body: JSON.stringify({ v: 4, kind: 'handover', assetId: ASSET }),
     submit: { txHex: BEEF_HEX, offChainHex: '0708', topics: [colorTopic(ASSET)] },
     ...over
   })

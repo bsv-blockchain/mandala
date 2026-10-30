@@ -3,9 +3,15 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { PrivateKey, Utils } from '@bsv/sdk'
 import { decodeStrictCbor, type StrictCborValue } from '@bsv/templates'
-import { createAttestedProfile, createColorModule, type ProfileDescriptor } from '@bsv/color-permission-module'
-import { createMandalaProfile, createMandalaOverlayProvider, MANDALA_PROFILE_ID } from './profile.js'
-import { ATTESTED_PROFILE_ID } from './constants.js'
+import type { ProfileDescriptor } from '@bsv/color-permission-module'
+import { createMandalaProfile as create, createMandalaOverlayProvider, MANDALA_PROFILE_ID, type MandalaProfileOptions } from './profile.js'
+import { createHostLedger } from './hostLedger.js'
+import { memoryStorage } from './storage.js'
+
+const ATTESTED_PROFILE_ID = 'https://brc.dev/207/attested'
+/** Every handler is built with an in-process host ledger (B7). */
+const createMandalaProfile = (o: Omit<MandalaProfileOptions, 'ledger'> & { ledger?: MandalaProfileOptions['ledger'] }) =>
+  create({ ledger: createHostLedger(memoryStorage()), ...o } as MandalaProfileOptions)
 
 const F = JSON.parse(readFileSync(fileURLToPath(new URL('./__fixtures__/1color-deploy.json', import.meta.url)), 'utf8')) as { identityKey: string, reqHex: string }
 const K = new PrivateKey(5555).toPublicKey().toString()
@@ -44,32 +50,22 @@ describe('createMandalaProfile: identity and shape (C§8.2)', () => {
     expect(F.identityKey).toBe(K)
   })
 
-  it('declares id, versions, send policy, operations and the receipt limit', () => {
+  it('declares id, versions, send policy and operations; no receipt size override (B7: plain receipts)', () => {
     expect(h.id).toBe(MANDALA_PROFILE_ID)
     expect(new TextEncoder().encode(h.id).length).toBe(80)
     expect(h.versions).toEqual([1])
     expect(h.sendPolicy).toBe('plain-nosend')
     expect(h.operations).toEqual(['transfer'])
-    expect(h.maxReceiptBytes).toBe(16777216)
+    expect((h as any).maxReceiptBytes).toBeUndefined()
   })
 
-  it('defines no ext state and no receipt leaf hook (G7)', () => {
+  it('defines no ext state and no receipt leaf hook (G7, B7)', () => {
     expect((h as any).checkExt).toBeUndefined()
     expect((h as any).checkReceiptData).toBeUndefined()
   })
-})
 
-describe('createMandalaProfile: registration with the color module', () => {
-  it('passes the module\'s handler validation next to the attested profile', () => {
-    const h = createMandalaProfile({ overlays: [{ identityKey: K, url: 'https://o' }] })
-    const store = { get: async () => undefined, set: async () => {}, delete: async () => {}, keys: async () => [] }
-    expect(() => createColorModule({
-      wallet: {} as any,
-      provider: h.deployProviders!()[0],
-      requestTokenAccess: async () => false,
-      store,
-      profiles: { [ATTESTED_PROFILE_ID]: createAttestedProfile(), [MANDALA_PROFILE_ID]: h }
-    })).not.toThrow()
+  it('needs the host ledger (B7)', () => {
+    expect(() => create({ overlays: [] } as any)).toThrow(/host ledger/)
   })
 })
 
@@ -92,8 +88,9 @@ describe('createMandalaProfile: constructor', () => {
 describe('createMandalaProfile: checkDescriptor (C§4)', () => {
   const h = createMandalaProfile({ overlays: [{ identityKey: K, url: 'https://o' }] })
 
-  it('accepts the F-REQ req', () => {
-    expect(REQ.size).toBe(2)
+  it('accepts the F-REQ req (issuer-v1 only, B7)', () => {
+    expect(REQ.size).toBe(1)
+    expect(REQ.has(ATTESTED_PROFILE_ID)).toBe(false)
     expect(() => h.checkDescriptor(REQ.get(MANDALA_PROFILE_ID)!, REQ)).not.toThrow()
   })
 
@@ -103,22 +100,12 @@ describe('createMandalaProfile: checkDescriptor (C§4)', () => {
   })
 
   const cases: Array<[string, Req]> = [
-    ["attested trustMode 'any'", mutateReq(r => { r.get(ATTESTED_PROFILE_ID)!.params.trustMode = 'any' })],
-    ['attested identityKey ≠ K', mutateReq(r => { r.get(ATTESTED_PROFILE_ID)!.params.identityKey = K2 })],
-    ['attested params with an extra member', mutateReq(r => { r.get(ATTESTED_PROFILE_ID)!.params.evidenceProfile = MANDALA_PROFILE_ID })],
-    ['attested version 2', mutateReq(r => { r.get(ATTESTED_PROFILE_ID)!.version = 2 })],
+    ['a req that still names the attested profile', mutateReq(r => { r.set(ATTESTED_PROFILE_ID, { version: 1, params: { trustMode: 'identity', identityKey: K } }) })],
     ['issuer params with an extra member', mutateReq(r => { r.get(MANDALA_PROFILE_ID)!.params.url = 'https://o' })],
     ['issuer params without identityKey', mutateReq(r => { delete r.get(MANDALA_PROFILE_ID)!.params.identityKey })],
-    ['req with a third profile', mutateReq(r => { r.set('https://example.com/other', { version: 1, params: {} }) })],
-    ['attested entry missing', mutateReq(r => { r.delete(ATTESTED_PROFILE_ID) })],
-    ['issuer identityKey uppercase', mutateReq(r => {
-      r.get(MANDALA_PROFILE_ID)!.params.identityKey = K.toUpperCase()
-      r.get(ATTESTED_PROFILE_ID)!.params.identityKey = K.toUpperCase()
-    })],
-    ['issuer identityKey off the curve', mutateReq(r => {
-      r.get(MANDALA_PROFILE_ID)!.params.identityKey = '02' + 'f'.repeat(64)
-      r.get(ATTESTED_PROFILE_ID)!.params.identityKey = '02' + 'f'.repeat(64)
-    })],
+    ['req with a second profile', mutateReq(r => { r.set('https://example.com/other', { version: 1, params: {} }) })],
+    ['issuer identityKey uppercase', mutateReq(r => { r.get(MANDALA_PROFILE_ID)!.params.identityKey = K.toUpperCase() })],
+    ['issuer identityKey off the curve', mutateReq(r => { r.get(MANDALA_PROFILE_ID)!.params.identityKey = '02' + 'f'.repeat(64) })],
     ['issuer identityKey as bytes', mutateReq(r => { r.get(MANDALA_PROFILE_ID)!.params.identityKey = Uint8Array.from(Utils.toArray(K, 'hex')) })]
   ]
   it.each(cases)('%s ⇒ ProfileParamsError', (_name, req) => {
@@ -140,7 +127,7 @@ describe('createMandalaProfile: checkDescriptor (C§4)', () => {
     }
   })
 
-  it('a req that names attested but not issuer-v1 ⇒ ProfileParamsError', () => {
+  it('a req that does not name issuer-v1 ⇒ ProfileParamsError', () => {
     const req = mutateReq(r => {
       const own = r.get(MANDALA_PROFILE_ID)!
       r.delete(MANDALA_PROFILE_ID)
@@ -200,15 +187,19 @@ describe('createMandalaProfile: provider routing (S5)', () => {
 describe('docs/profiles/issuer-v1.md', () => {
   const doc = readFileSync(fileURLToPath(new URL('../../docs/profiles/issuer-v1.md', import.meta.url)), 'utf8')
 
+  it('names no attested companion and no BRC-207 evidence carrier (B7)', () => {
+    expect(doc).not.toMatch(/https:\/\/brc\.dev\/207\/attested/)
+  })
+
   it('cites the id, the replaced procedure and the required sections', () => {
-    for (const s of [MANDALA_PROFILE_ID, '0207:126-141', '0207:1476-1481', '## Parameters', '## Credit rule', '## Submission data', '## Failure behaviour']) {
+    for (const s of [MANDALA_PROFILE_ID, '0207:126-141', '0207:1476-1481', '## Parameters', '## Credit rule', '## Hand-over evidence', '## Submission data', '## Failure behaviour']) {
       expect(doc).toContain(s)
     }
   })
 
   it('has the sections in order', () => {
-    const order = ['## Identifier and version', '## Parameters', '## Companion requirement', '## Replaced procedure',
-      '## Credit rule', '## Operations and transaction shape', '## Send policy', '## Submission data', '## ext state',
+    const order = ['## Identifier and version', '## Parameters', '## Required profiles', '## Replaced procedure',
+      '## Credit rule', '## Hand-over evidence', '## Operations and transaction shape', '## Send policy', '## Submission data', '## ext state',
       '## Service configuration', '## Failure behaviour', '## Security notes']
     const at = order.map(s => doc.indexOf(s))
     expect(at.every(i => i >= 0)).toBe(true)

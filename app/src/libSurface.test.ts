@@ -12,10 +12,10 @@ const pkgOf = (name: string): { version: string } =>
   JSON.parse(readFileSync(new URL(`../node_modules/${name}/package.json`, import.meta.url), 'utf8'))
 const sdkPkg = pkgOf('@bsv/sdk'), tplPkg = pkgOf('@bsv/templates'), libPkg = pkgOf('@bsv/mandala')
 const ID = 'a'.repeat(64) + '_0'
-it('resolves the vendored stack', () => {
-  expect(sdkPkg.version).toBe('4.0.0'); expect(tplPkg.version).toMatch(/^2\.2\./); expect(libPkg.version).toBe('0.5.0')
+it('resolves the published stack', () => {
+  expect(sdkPkg.version).toBe('4.0.1'); expect(tplPkg.version).toMatch(/^2\.2\./); expect(libPkg.version).toBe('0.5.0')
 })
-it('locks exactly one @bsv/sdk and one @bsv/templates, both the vendored tarballs (contract §9)', () => {
+it('locks exactly one @bsv/sdk (npm ^4.0.0) and one @bsv/templates (npm ^2.2.0) (contract §9)', () => {
   const read = (rel: string) => JSON.parse(readFileSync(new URL(rel, import.meta.url), 'utf8'))
   const lock: { packages: Record<string, { version?: string, resolved?: string }> } = read('../package-lock.json')
   const manifest: { overrides?: Record<string, string> } = read('../package.json')
@@ -23,15 +23,23 @@ it('locks exactly one @bsv/sdk and one @bsv/templates, both the vendored tarball
     // Any nested copy (e.g. under message-box-client) would be a second sdk in the bundle.
     const copies = Object.keys(lock.packages).filter(k => k === `node_modules/${name}` || k.endsWith(`/node_modules/${name}`))
     expect(copies).toEqual([`node_modules/${name}`])
-    expect(lock.packages[`node_modules/${name}`].resolved).toMatch(/^file:\.\.\/vendor-ts-stack\/bsv-(sdk|templates)-[0-9.]+-[0-9a-f]{7}\.tgz$/)
     expect(manifest.overrides?.[name]).toBe(`$${name}`)
   }
+  const deps = (manifest as { dependencies: Record<string, string> }).dependencies
+  expect(deps['@bsv/sdk']).toBe('^4.0.0')
+  expect(lock.packages['node_modules/@bsv/sdk'].resolved).toBe('https://registry.npmjs.org/@bsv/sdk/-/sdk-4.0.1.tgz')
+  expect(deps['@bsv/templates']).toBe('^2.2.0')
+  expect(lock.packages['node_modules/@bsv/templates'].resolved).toBe('https://registry.npmjs.org/@bsv/templates/-/templates-2.2.0.tgz')
+  // The console never reaches lib/profile.js (wallet hosts register the module), and no vendored ts-stack build remains.
+  expect(deps['@bsv/color-permission-module']).toBeUndefined()
+  for (const build of ['4fa68e7', '993c98b']) expect(JSON.stringify(manifest) + JSON.stringify(lock)).not.toContain(build)
+  expect(deps['@bsv/mandala']).toBe('file:../lib')
 })
 it('exposes the contract §8.1 constants verbatim', () => {
   expect(M.TOPIC).toBe('tm_mandala'); expect(M.REGISTRY_TOPIC).toBe('tm_mandala_kyc')
   expect(M.MESSAGEBOX).toBe('mandala-color'); expect(M.TREASURY_BASKET).toBe('mandala treasury')
   expect(M.MANDALA_PROFILE_ID).toBe('https://github.com/bsv-blockchain/mandala/blob/master/docs/profiles/issuer-v1.md')
-  expect(M.ATTESTED_PROFILE_ID).toBe('https://brc.dev/207/attested')
+  expect((M as Record<string, unknown>).ATTESTED_PROFILE_ID).toBeUndefined() // B7: no attested companion
   expect(M.colorTopic(ID)).toBe('tm_color_' + ID); expect(M.colorLookup(ID)).toBe('ls_color_' + ID)
   expect(M.assetTag(ID)).toBe('a'.repeat(64) + 'v0'); expect(M.MAX_UINT64).toBe(2n ** 64n - 1n)
   expect(M.parseAmount('1234.56', 2)).toBe(123456n); expect(() => M.parseAmount('18446744073709551616', 0)).toThrow()
@@ -40,7 +48,7 @@ it('exposes the contract §8.1 constants verbatim', () => {
   expect(() => M.formatAmount(1n, 19)).toThrow(RangeError)
 })
 it('exposes the functions the app calls', () => {
-  for (const f of ['configureMandala','decodeToken','sendHandover','deliverHandover','settleHandover','receiveHandovers',
+  for (const f of ['configureMandala','decodeToken',
     'journalListHandovers','markHandoverDelivered',
     'registerAsset','issueTokens','payoutTokens','redeemTokens','submitAdminAction','listAdminAssets','formatAmount',
     // amountDisplay delegates to these (contract §8.1: formatAmountGrouped / formatCurrency stay)
@@ -52,7 +60,7 @@ it('keeps the lib recovery entry points drainHandovers schedules', async () => {
   expect(typeof (await import('@bsv/mandala/notifyJournal')).reconcileNotifications).toBe('function')
 })
 it('no longer exports the removed names', () => {
-  for (const n of ['BASKET','FT_PROTOCOL','MAX_SAFE_AMOUNT','tokenTopic','decodeValue','transferTokens','receiveTokens','cover'])
+  for (const n of ['BASKET','FT_PROTOCOL','MAX_SAFE_AMOUNT','tokenTopic','decodeValue','transferTokens','receiveTokens','ATTESTED_PROFILE_ID'])
     expect((M as any)[n]).toBeUndefined()
 })
 it('keeps the non-contract subpaths the console uses, bigint-typed', async () => {

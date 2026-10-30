@@ -3,10 +3,8 @@ import { PrivateKey, ProtoWallet, Utils } from '@bsv/sdk'
 import {
   ColorPlan,
   assetBasket,
-  attestationMessage as moduleAttestationMessage,
   colorProtocolID as moduleColorProtocolID,
-  colorTopic as moduleColorTopic,
-  verifyAttestation as moduleVerifyAttestation
+  colorTopic as moduleColorTopic
 } from '@bsv/color-permission-module'
 import { planLabels, type ColorPlanV1 } from './plan.js'
 import { colorBasket, colorProtocolID, colorTopic } from './naming.js'
@@ -14,10 +12,11 @@ import { attestationMessage, verifyAttestation } from './attestation.js'
 import { MANDALA_PROFILE_ID } from './constants.js'
 
 /**
- * D8: the lib implements plan labels, naming and attestation verification
- * itself so the core never loads the color module. These must agree with the
- * module exactly: the module parses the lib's labels and verifies the same
- * attestations.
+ * D8: the lib implements plan labels and naming itself so the core never
+ * loads the color module. These must agree with the module exactly: the
+ * module parses the lib's labels. Since B7 (module 0.2.0 at ts-stack 993c98b)
+ * the module no longer verifies attestations at all; the lib's verifier is
+ * pinned here against the C.0 vectors the two once shared.
  */
 const ID = 'c7d0f61946bc8bde6c01219c67bb99cbf2f89a39bcaea9c2ecf67c54224edb4f_0'
 const ID_TXID = ID.slice(0, 64)
@@ -114,23 +113,21 @@ describe('lib ⇔ color module parity (D8)', () => {
     expect(colorTopic(`${ID_TXID}_7`)).toBe(moduleColorTopic(`${ID_TXID}_7`))
   })
 
-  it('attestationMessage equals the module\'s (C§3)', () => {
+  it('attestationMessage is the C§3 message', () => {
     expect(attestationMessage(ID, TX, [0, 2])).toBe(MESSAGE)
-    expect(moduleAttestationMessage(ID, TX, [0, 2])).toBe(MESSAGE)
   })
 
-  it('lib and module verifyAttestation agree on the C.0 LOW/HIGH and the six negatives', async () => {
-    const both = (a: ReturnType<typeof att>, assetId = ID): [boolean, boolean] =>
-      [verifyAttestation(a, assetId, SIGNER), moduleVerifyAttestation(a, assetId)]
-    expect(both(att(LOW))).toEqual([true, true])
-    expect(both(att(HIGH))).toEqual([true, true])
+  it('verifyAttestation accepts the C.0 LOW/HIGH and rejects the six negatives', async () => {
+    const lib = (a: ReturnType<typeof att>, assetId = ID): boolean => verifyAttestation(a, assetId, SIGNER)
+    expect(lib(att(LOW))).toBe(true)
+    expect(lib(att(HIGH))).toBe(true)
     // reordered outputs, missing index 2, other topic
-    expect(both(att(LOW, { outputs: [2, 0] }))).toEqual([false, false])
-    expect(both(att(LOW, { outputs: [0] }))).toEqual([false, false])
-    expect(both(att(LOW), `${ID_TXID}_1`)).toEqual([false, false])
+    expect(lib(att(LOW, { outputs: [2, 0] }))).toBe(false)
+    expect(lib(att(LOW, { outputs: [0] }))).toBe(false)
+    expect(lib(att(LOW), `${ID_TXID}_1`)).toBe(false)
     // keyID '2', trailing newline, bare-key signature
-    expect(both(att(await signWith(utf8(MESSAGE), '2')))).toEqual([false, false])
-    expect(both(att(await signWith(utf8(MESSAGE + '\n'), '1')))).toEqual([false, false])
-    expect(both(att(PRIV.sign(utf8(MESSAGE)).toDER('hex') as string))).toEqual([false, false])
+    expect(lib(att(await signWith(utf8(MESSAGE), '2')))).toBe(false)
+    expect(lib(att(await signWith(utf8(MESSAGE + '\n'), '1')))).toBe(false)
+    expect(lib(att(PRIV.sign(utf8(MESSAGE)).toDER('hex') as string))).toBe(false)
   })
 })

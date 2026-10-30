@@ -5,6 +5,8 @@ Date: 2026-10-22. Author: integration architect (overnight run, user unavailable
 **Revision 2** (builder-check gaps 01-07, 04-G*, 05-A*): §0 remittance input rule; §1 `readOneColorAttributes` never-throw table, `reqMatchesDeploy` fail-closed order, `reqBytes` wire span; §2.1 store layout internal + `isSettled`, internals list; §2.2 `checkExt`/`checkReceiptData`, `ReceiptGraph.tip` object, admitReceipt on every receipt, handler cardinality, 0.2.0 limits (non-empty module-built req, attested `ISSUE`, `lifecycles`), exact per-tx AtomicBEEF; §2.3 `dispose()`/`isSettled()`, D24 sendWith semantics; §2.4 `[ClassName]` message prefix, `ColorConsentDeclinedError`, runtime exports, A.143 message; §2.5 `seekPermission`, `signers[]`, `handoff:true`, display metadata; §3 HMAC tweak in every C.0 suite, `IsTokenTopic` alias; §4 F-REQ schema, deploy reason strings, KYC/non-deploy req rule, 36-byte id, limits, issuer-v1 local hop checks; §5.1 owned-output envelope rule; §6 lookup txid/AtomicBEEF, spendability/admission semantics, 503 faults, query errors; §7.2/§7.3 decline handling, SESSION_VERSION 2; §8.1 ADMIN_PROTOCOL, journal stages, PayoutResult, signAttestation, formatAmount, submitToOverlay/postLookup/fetchDeployTx, actionDescription, sendHandover/deliverHandover, loadHistory, retained subpaths, exports; §8.2 default provider, host broadcast guard, store location, HTTP bridge errors; §9 tarball commit ownership, host peerDeps; §10 step 0, V2/V3 owners, worktree discipline, envelope fixture; D13/D14/D22/D24 amended.
 
 **Revision 2a** (post-review amendments from the plan 02 whole-plan review, 2026-10-22, for morning review): §2.2-2 non-required `ext` entries always ignored (D32); §2.3 descendants of a finally refused parent are persisted `refused`/`ERR_PARENT_REFUSED` (D31); §2.4 `UnsupportedProfileError` exempt from the message prefix (D33); §7.1 a leaf-attested tip settles on `unavailable` (D34). Each records what T2 0.2.0 ships; no seam bytes change.
+
+**Revision 3 (B7)** (design §9 Amendment B7, 2026-10-23; supersedes Revisions 2/2a where they differ): the BRC-207 attested profile and every history carrier are gone from the seams. §2.2-§2.5 handler = `admitReceipt(ctx, {assetId, txid, outputIndex, tx, beef}) → {credit}` + host-only `markSettled(txid)`, no `settle`/`isSettled`/`handoffEvidence`/`colorHandoff`, no `checkReceiptData`/`maxReceiptBytes`, `submissionData` not called for plain-noSend hand-overs (T2 API: `2026-10-23-color-module-b7-api.md`); §4 deploy `req` = issuer-v1 only (F-REQ 181-byte req, 218-byte payload; overlay policy refuses an attested entry); §5.2 envelopes travel only in the hand-over body; §7 receipt = plain 5-member custody JSON, MessageBox body `v: 4` = the 0.4.1 body adapted (decimal amount, receipt fields, `admission`/`admissions[]` σ, `linkage[]`), localpay `FRAME_VERSION = 7` carries the same members; §8 host ledger (`createHostLedger`), host-built envelope (`sendHandover({hostWallet, ledger})`), host receive (online submit / offline COVER with S1 hop checks), `settleReceipts`, `createMandalaProfile({overlays, ledger})` with ledger-backed provider spendability. σ statement (§3) unchanged.
 Authority: the design `docs/superpowers/specs/2026-10-21-1color-brc207-conformance-design.md` (incl. §8 B1-B6) wins over this file; this file wins over any per-repo plan on every seam below. A planner who finds this contract impossible to implement records the conflict in its plan and implements the closest shape that keeps the seam byte-compatible. It does not invent a new seam.
 
 Specs cited by line: **0162** = `docs/design/brc-0162-1color.pinned.md`, **0207** = `docs/design/brc-0207-1color-wallet-module.pinned.md`, **0175** = bitcoin-sv/BRCs `payments/0175.md` (local copy `/Users/personal/git/docs/BRCs/payments/0175.md`, BRCs 5119a9b).
@@ -171,162 +173,44 @@ export interface ColorPermissionModuleOptions {
 ```
 Additive internals (`ListedOutput.transaction`, optional read params, `TokenOutput.attributes`, protected `resolveAsset`/`ResolvedAsset`, `TrustMode`/`AttestedParams`, the `actionConsent` handoff param) are T2-internal. Of these only `readProfiledTokenOutput` and `TokenReader` are exported; hosts must not depend on the rest.
 
-### 2.2 Required-profile handler interface
+### 2.2 Required-profile handler interface (Revision 3, B7)
+
+Authoritative T2 shape: `docs/superpowers/plans/2026-10-23-color-module-b7-api.md`.
 
 ```ts
-export interface ProfileDescriptor { version: number, params: StrictCborValue }   // = OneColorProfileDescriptor
+interface ProfileReceipt { assetId: string, txid: string, outputIndex: number, tx: Transaction, beef: number[] /* the internalize AtomicBEEF */ }
+interface ReceiptAdmission { credit: 'settled' | 'pending' }
 
-export interface ProfileAssetContext {
-  assetId: string                                    // resolved id (never 'ISSUE' except in checkDescriptor for a new deploy)
-  profileId: string
-  descriptor: ProfileDescriptor                      // this handler's own entry
-  req: ReadonlyMap<string, ProfileDescriptor>        // the authenticated deploy req (canonical order)
-  declarationTx: Transaction                         // authenticated deploy tx, id === assetId txid
-  wallet: WalletInterface                            // the UNDERLYING wallet (privileged: not the manager)
-  identityKey: string                                // this wallet's identity key
-  originator: string
-}
-
-export interface ProfileTxView {
-  /** undefined at createAction (only args exist then); set at signAction (final layout, every input has
-   *  sourceTransaction, still unsigned for submissionData) and at receipt. `inputs`/`outputs` are always populated. */
-  tx?: Transaction
-  assetId: string
-  inputs: Array<{ inputIndex: number, outpoint: string, role: 'value' | 'authority', amount: bigint, custody?: Custody /* set iff a managed p color input */ }>
-  outputs: Array<{ outputIndex: number, role: 'value' | 'authority', amount: bigint, custody?: Custody /* set iff wallet-owned: token change or plan.ownedOutputs */ }>
-  planLeaf?: JsonValue                               // plan.profileData[profileId][assetId] if present
-}
-
-export interface ColorAttestation { txid: string, outputs: number[], signer: string, signature: string } // 0207:257-261, exact members
-
-export interface ReceiptGraph {
-  assetId: string
-  /** Always present, also when the tip is already attested (D7). */
-  tip: { txid: string, atomicBEEF: number[], offChainValues: number[] }
-  outputIndexes: number[]                            // receipt outputs of this asset in the tip
-  /** Txs not yet covered by a verified attestation, parents first, tip last, each with exact submit bytes. */
-  pending: Array<{ txid: string, atomicBEEF: number[], offChainValues: number[] }>
-  attestations: ColorAttestation[]                  // verified, deduplicated by (signer, txid, output)
-}
-
-export type ReceiptAdmission =
-  | { status: 'admitted', attestations: ColorAttestation[] }  // verified, cover graph.outputIndexes of the tip
-  | { status: 'unavailable' }                                 // transport failure only; module may then apply offline acceptance
-
-export interface RequiredProfileHandler {
-  readonly id: string                                // profile URI
-  readonly versions: readonly number[]               // exact versions supported (0207:95-106)
-  /** Validates this descriptor against the full req (cross-profile rules). Throws ProfileParamsError. Pure, sync. */
+interface RequiredProfileHandler {
+  readonly id: string
+  readonly versions: readonly number[]
   checkDescriptor: (descriptor: ProfileDescriptor, req: ReadonlyMap<string, ProfileDescriptor>) => void
-  /** (d) provider routing: the provider for every query/submit of assets requiring this profile. */
-  provider?: (assetId: string, descriptor: ProfileDescriptor) => ColorOverlayProvider
-  /** (d) providers asked, in order, for an unknown asset's deploy (color-admission of `<txid>.0`). */
+  provider?: (assetId: string, descriptor: ProfileDescriptor) => ColorOverlayProvider   // submit(topics, beef, offChainValues?) → STEAK
   deployProviders?: () => ColorOverlayProvider[]
-  /** (b) B2: 'plain-nosend' ⇒ every token createAction moving this asset MUST have options.noSend === true and
-   *  MUST NOT carry a BRC-177 'p nosend expiry ' label; module keeps token change inside the tx (no split),
-   *  tags that change `color_offline`, and never submits the action in onResponse. */
   readonly sendPolicy?: 'plain-nosend'
-  /** Operations a holder may declare for this asset through the module; absent = all. Mandala: ['transfer']. */
   readonly operations?: readonly ColorOperationName[]
-  /** B1-i / A.157 / A.159: checks the caller's plan leaf (undefined = absent). Called in createAction AND again in signAction. Throws ProfileDataError. */
   checkPlanData?: (ctx: ProfileAssetContext, leaf: JsonValue | undefined, view: ProfileTxView) => Promise<void>
-  /** B1-ii: offChainValues bytes for tm_color_<assetId>; called in signAction BEFORE signing. Non-empty result required when present. */
-  submissionData?: (ctx: ProfileAssetContext, view: ProfileTxView) => Promise<number[]>
-  /** (a) receipt: called for EVERY receipt (incl. attested tips) before crediting, after base receipt checks and
-   *  attested-leaf parsing. Throw ⇒ no credit. Honoured only if the asset also declares attested v1 (else ProfileParamsError at resolution). */
-  admitReceipt?: (ctx: ProfileAssetContext, graph: ReceiptGraph) => Promise<ReceiptAdmission>
-  /** Validates this profile's own `ext` value (undefined = absent). Absent hook ⇒ the profile's ext entry must be absent (ProfileParamsError). */
+  submissionData?: (ctx: ProfileAssetContext, view: ProfileTxView) => Promise<number[]>   // NOT called for a plain hand-over
+  admitReceipt?: (ctx: ProfileAssetContext, receipt: ProfileReceipt) => Promise<ReceiptAdmission>
   checkExt?: (value: StrictCborValue | undefined) => void
-  /** Validates a receipt profileData leaf for this profile. Absent hook ⇒ any receipt leaf for this profile is rejected (ProfileDataError). */
-  checkReceiptData?: (ctx: ProfileAssetContext, leaf: JsonValue) => Promise<void>
-  /** Receipt customInstructions limit for assets requiring this profile (default 1000; attested: 16 MiB). */
-  readonly maxReceiptBytes?: number
 }
 ```
 
-Module obligations (P-T2):
-1. **Deploy resolution** (0207:68-80), memoized by assetId, verified by `hash256(rawTx) == txid`: (i) `profileData[ATTESTED_PROFILE_ID][assetId].declarationTx` of the current request, (ii) `color.v1.` store cache, (iii) default `provider.admission`, (iv) each handler's `deployProviders()` in registration order. All fail ⇒ error, no fallback.
-2. **Support check**: read `req` with T1 `readOneColorAttributes`; malformed `req`/`ext` in a valid map ⇒ fail (0207:88-91); every id registered and `versions.includes(version)` else `UnsupportedProfileError` (A.142/A.143/A.148); then `checkDescriptor` per entry. Non-deploy outputs with `!reqMatchesDeploy` ⇒ fail. `ext` naming a non-required profile ⇒ always ignored (advisory): no handler's `checkExt` runs for it, since such entries cannot change token validity or required checks (0162:195-197, D32). A required profile's own `ext` entry goes to `checkExt` (absent hook ⇒ entry must be absent).
-3. **Routing**: distinct `provider()` results across an asset's handlers: 0 ⇒ default provider; 1 ⇒ that provider for spendability, admission, submit, resubmit, settle; ≥2 distinct objects ⇒ `ProfileParamsError`. Cardinality: at most one handler per asset defines `submissionData`, and at most one `admitReceipt` (else `ProfileParamsError`).
-3a. **0.2.0 limits**: module-built deploys with a non-empty `req`, and attested `'ISSUE'` leaves in plans and receipts, are refused (Mandala deploys are lib-built, B4). An attested leaf carrying `lifecycles` ⇒ `AttestationEvidenceError` 'lifecycles are not supported' (D28).
-4. **Plan profileData**: every profile id in `plan.profileData` must be in the asset's `req` and every asset key must be in `plan.assets` (A.154 `ProfileDataError`), then `checkPlanData`. The 0.1.0 "profileData is not supported" refusal is removed only for declared profiles.
-5. **Receipts**: `parseCustody` becomes two-stage (0207:1442-1448): structural parse bounded at 16 MiB; after the asset is authenticated, enforce `max(handler.maxReceiptBytes)` over the asset's handlers (default 1000). `profileData` members validated as in 4. **The underlying wallet never sees the large string.** In `onRequest(internalizeAction)` the module parses the full receipt, durably stores the receipt tx, the attested leaf and the submissions under `color.v1.` **before** calling the wallet, then forwards `insertionRemittance.customInstructions` = the 5-member custody JSON only (`{version, assetId, derivationPrefix, derivationSuffix, senderIdentityKey}`, ≤ 1000 bytes; toolbox validation and storage unchanged), plus the module-authored tags.
-5a. **SDK validator exception (part of the T2 PR set, @bsv/sdk 4.0.0 is unpublished):** `validateBasketInsertion` in `packages/sdk/src/wallet/validationHelpers.ts` allows `customInstructions` up to 16 MiB (16 777 216 UTF-8 bytes) when `basket` starts with `p color ` (1000 otherwise, unchanged). Reason: `WalletClient.internalizeAction` validates client-side, so an attested receipt cannot leave the app without it (0207:1444 "apply that exception before ordinary string-length rejection"). The wallet-side limit is then enforced by the module (5). No wallet-toolbox change (T3 stays empty). P-T2 also adds a test that a `colorHandoff` member on a `signAction` result survives `validateWalletResult` (JSON substrate). Both the sdk exception and that test live in plan 02 Task 16 (T2 PR set).
-6. **Offline state**: stored tag `color_offline` is written by the module on (a) receipts credited without verified current admission (internalize `insertionRemittance.tags`), (b) token change of a `plain-nosend` hand-over (createAction output tags). Caller-supplied `color_*` tags on outputs/insertions are stripped. The view tag `color_offline` (inventory, tag filters, balances) = stored tag AND no `color.v1.settled.<txid>` record. A settled record is written ONLY after a verified attestation (identity K for Mandala) covering that output was obtained. Store loss ⇒ coins re-show as offline (fail-safe), `settle()` restores. A final refusal writes `color.v1.refused.<txid>`: affected outputs show `color_state_restricted`, contribute no balance (C55).
-7. **Spending attested assets** (advisor note 4): a `color_offline` output of an attested asset is selectable and signable with no overlay contact, using stored frontier evidence. A settled output: live spendability via the routed provider; transport failure ⇒ proceed on stored attestation; reachable and not listed ⇒ resubmit through the settle path (stored exact bytes and stored offChainValues, never empty bytes when a handler supplied `submissionData`), recheck, else exclude.
-8. **Durability**: before `signAction` returns a signed `plain-nosend` hand-over, and before the underlying `internalizeAction` of a receipt, the module has durably stored everything `settle()` and onward hand-overs need: raw tx, unattested ancestors, per-asset offChainValues and attestations. The TxRecord keeps the **exact AtomicBEEF** per tx (receipt-time or signAction-time bytes); settle/resubmit send those bytes verbatim. Store loss on an unsettled receipt loses the bytes needed to settle it. Recovery is the sender's resend (`handoffEvidence`, lib journal) or the sender's own post-ACK settle. The coin stays `color_offline` and never shows as settled.
-9. **signAction result extension** (D4): for an action whose assets include any profile asset, the result is `SignActionResult & { colorHandoff?: ColorHandoffResult }`:
+Module behaviour Mandala relies on: fail-closed registry (every `req` profile registered, else `UnsupportedProfileError`); `admitReceipt` runs once per receipt output after custody/deploy conformance and replaces the spendability check; a throw credits nothing; `pending` ⇒ the output is tagged `color_offline` (pending balance) until the host calls the in-process `color.markSettled(txid)`; any non-empty receipt `profileData` is rejected; receipts are ≤ 1000-byte custody JSON. `plain-nosend`: noSend required, change kept in the tx tagged `color_offline`, the module never submits and returns the wallet result unchanged; every token input is checked with the asset provider's `spendability()` at createAction and signAction, and outputs of plain-noSend assets are never resubmitted by the module.
 
-```ts
-export interface ColorHandoffResult {
-  version: 1
-  txid: string
-  /** Receipt-ready profileData for the transaction's recipients: per attested asset, the full attested leaf (§7.1). No issuer-v1 leaf. */
-  profileData: ProfileData
-}
-```
-   The same object is returned by the in-process method `handoffEvidence(txid): Promise<ColorHandoffResult | undefined>` (resend after a lost ACK, C51).
+Mandala issuer-v1 handler (P-LIB): `admitReceipt` credits only what the host ledger (§8) records for that output (`settled` / `pending`; `refused` ⇒ throw); anything else ⇒ its own bare submit of `beef` must return σ by K covering the output, recorded `settled`, else throw. Its provider's `spendability` adds host-ledger outputs: `pending` records always, `settled` records too when the overlay is unreachable (transport failure only); `refused` never. `submissionData` stays (plan B1) but the host builds hand-over envelopes itself (§8.1).
 
-### 2.3 Settle API (c)
+### 2.3 Settle API — removed (Revision 3)
 
-```ts
-export interface ColorSettleResult {
-  txid: string
-  assetId: string
-  status: 'admitted' | 'retry' | 'refused'
-  outputs?: number[]        // attested outputs when admitted
-  code?: string             // overlay verdict / 'ERR_UNAVAILABLE'
-  description?: string
-}
-export interface ColorSettleReport { results: ColorSettleResult[] }
+`settle()`, `isSettled()`, `handoffEvidence()`, `ColorSettleReport/Result`, `ColorHandoffResult` are gone. Settlement of held hand-overs is the host's job (§8.1 `settleHandover`, `settleReceipts`), ending in `color.markSettled(txid)`.
 
-class ColorPermissionModule {
-  settle (request?: { txids?: string[], assetIds?: string[] }, originator?: string): Promise<ColorSettleReport>
-  handoffEvidence (txid: string): Promise<ColorHandoffResult | undefined>
-  /** true iff color.v1.settled.<txid> exists. Host broadcast guards use this (§8.2). */
-  isSettled (txid: string): Promise<boolean>
-  /** Sync, idempotent. Clears selections, asset memo, per-txid latches, pendingHandoffs. In-flight settle() promises
-   *  resolve, but no new submit starts after dispose. */
-  dispose (): void
-}
-```
-Semantics: single-flight per module instance, plus a per-txid in-flight latch. Submit order: parents first, exact stored bytes, `provider.submit([tm_color_<assetId>], atomicBEEF, offChainValues)`. Each attestation is verified (§3); `settled.<txid>` is recorded only then. A parent that is not admitted stops its descendants (D31): a parent reported `retry` (or not reached) ⇒ its descendants `retry`, nothing persisted; a parent finally refused, in this run or by an earlier `refused.<txid>` record ⇒ its descendants `refused` with code `ERR_PARENT_REFUSED`, persisted as `refused.<txid>` (they show `color_state_restricted` and leave balances, C55). Overlay refusals never throw; they are reported. Already published members stay published (0207:420-423).
-- No `txids`: (1) every offline-credited **receipt** is submitted (the recipient's duty); (2) every own `plain-nosend` hand-over: query `color-admission` for its token outputs; only if they are admitted, replay-submit to fetch the attestation and clear `color_offline`. **Never submit an own hand-over without host intent.**
-- `txids` named: also submits named own hand-overs (post-ACK intent; the intent is persisted, so a later bare `settle()` retries it).
-- After a verified admission of a tx that is an own `nosend` action, the module calls `wallet.createAction({ description: 'Settle token hand-over', options: { sendWith: [txid] } })` on the underlying wallet. A `createAction` that resolves is success regardless of `sendWithResults`, except an entry for this txid with status `'failed'` (⇒ `unsent` marker). Thrown errors of the form already broadcast / known / mined count as success; any other thrown error ⇒ `unsent` marker (D24). Host guards may hold the broadcast.
+### 2.4 Built-in attested profile — removed (Revision 3)
 
-### 2.4 Built-in attested profile, exports, errors
+`ATTESTED_PROFILE_ID`, `createAttestedProfile`, attestation helpers, `AttestationEvidenceError` and `ColorProviderError` are no longer exported by the module (the lib owns its `ColorProviderError`, same name/shape and `[ColorProviderError]` prefix). Error classes still exported: `UnsupportedProfileError`, `ProfileParamsError`, `ProfileDataError`, `ColorConsentDeclinedError`.
 
-```ts
-export const ATTESTED_PROFILE_ID = 'https://brc.dev/207/attested'
-export const ATTESTATION_PROTOCOL_ID: [2, 'color admission attestation']
-export const ATTESTATION_KEY_ID = '1'
-export const COLOR_OFFLINE_TAG = 'color_offline'
-export function attestationMessage (assetId: string, txid: string, outputs: readonly number[]): string   // §3, throws on non-canonical outputs
-export function attestationSigningKey (signer: string): PublicKey                                     // derived child (§3)
-export function parseAttestation (value: JsonValue): ColorAttestation                                 // exact members, canonical; throws AttestationEvidenceError
-export function verifyAttestation (att: ColorAttestation, assetId: string): boolean                   // never throws
-export function attestationFromSteak (txid: string, topic: string, entry: AttestedAdmittance): ColorAttestation | undefined
-export function createAttestedProfile (options?: {
-  /** BRC-189 snapshot for any/same/all; absent ⇒ those modes fail closed. `identity` mode never calls it. */
-  trustedIdentities?: () => Promise<{ snapshot: string, identityKeys: string[] }>
-}): RequiredProfileHandler   // id ATTESTED_PROFILE_ID, versions [1], maxReceiptBytes 16 MiB
-export function createColorModule (options: ColorPermissionModuleOptions): ColorPermissionModule  // unchanged name
-```
-Attested `checkDescriptor`: params exactly a map with optional `trustMode` ∈ {any, same, all, identity} (default any), `identityKey` (present iff identity), `evidenceProfile` (URI; when present, trustMode/identityKey absent and req contains it, 0207:435-445). `null` params invalid. Its own `ext` entry must be absent. It cannot be combined with BRC-209 in one asset. Capabilities: the module adds `brc207-color-attested: '1'` iff this handler is registered.
+### 2.5 Consent message — removed (Revision 3)
 
-Error classes (all `extends Error`, `name` = class name, every message starts with `'[<ClassName>] '` except `UnsupportedProfileError`'s (D33); all exported as runtime values; hosts and lib match on `.name`, then the `[ClassName]` prefix, never `instanceof` across bundles):
-`UnsupportedProfileError(message?)` (existing; keeps its default message; A.143 version mismatch uses 'BRC-207: the required processing profile version is unsupported'), `ProfileParamsError`, `ProfileDataError` (A.154 description "Profile data names an undeclared profile"), `AttestationEvidenceError` (`reason: string`; frontier/graph/signature failure), `ColorProviderError` (above), **`ColorConsentDeclinedError`** (thrown whenever `requestTokenAccess` returns false).
-
-### 2.5 Consent message added
-
-`requestTokenAccess(originator, JSON)` gets one new `type`. It is shown before an offline credit, and the host may answer from a continuing grant:
-```json
-{"type":"color_receive_offline","assetId":"<id>","outputs":[{"outputIndex":0,"amount":"1500"}],
- "unsettledTransactions":2,"signer":"<66hex K>","profiles":["https://brc.dev/207/attested","<issuer-v1 uri>"],"seekPermission":true}
-```
-`signer` is present in `identity` mode; `any`/`same`/`all` modes carry `signers: string[]` (sorted, deduplicated) instead. Declined ⇒ `ColorConsentDeclinedError`, internalize fails (no credit). Hosts may prompt every time (desktop D-DESK-3) or use a continuing grant (D19).
-Every consent message type (new and existing) carries `seekPermission: boolean` (= originating `args.seekPermission !== false`). `color_send` carries `handoff: true` for plain-nosend assets (plan 02 Task 12; pin only). Otherwise `color_send`, `color_signature`, `color_access`, `color_relinquish` are unchanged. Display metadata (sym/label/icon) stays host-resolved (`color-admission` + `readDeploy`, untrusted, full asset id always shown); no T2 field in 0.2.0.
+No `color_receive_offline` message: the module transports and validates no history.
 
 ### 2.6 RN
 
@@ -351,36 +235,24 @@ The module is ESM-only and imports `@bsv/wallet-toolbox-client` values (`encrypt
 
 ---
 
-## 4. Profiles and the Mandala deploy (P-T2, P-LIB, P-GO, P-APP)
+## 4. Profiles and the Mandala deploy (P-LIB, P-GO, P-APP) — Revision 3
 
 | Profile | Id | version | params (DAG-CBOR) |
 |---|---|---|---|
-| attested | `https://brc.dev/207/attested` | `1` | `{"trustMode":"identity","identityKey":K}` (exactly these 2 members for Mandala) |
 | Mandala issuer | `https://github.com/bsv-blockchain/mandala/blob/master/docs/profiles/issuer-v1.md` (80 bytes) | `1` | `{"identityKey":K}` (exactly) |
 
-K = the Mandala overlay's identity key (`SERVER_PRIVATE_KEY` pub), lowercase compressed hex, DAG-CBOR **text**.
+K = the Mandala overlay's identity key (`SERVER_PRIVATE_KEY` pub), lowercase compressed hex, DAG-CBOR **text**. There is no attested companion (B7).
 
-**Issuer-v1 semantics** (P-LIB writes `docs/profiles/issuer-v1.md`): replaces the baseline "receipt admission" procedure (receipt submit-then-verify, 0207:126-141, 0207:1479 named as replaced). A wallet credits only (a) after its own submit to the configured overlay for K returns a verified attestation covering the output, or (b) under attested offline evidence. This requires attested v1 in `identity` mode with the same K in the same `req`, otherwise `ProfileParamsError`. Every holder token action is a plain-noSend hand-over (`sendPolicy`). `operations: ['transfer']` only (holder I==O; no holder burn/mint/authority through the module). 1-sat token outputs. One Mandala asset per tx. Each tx's submission data (§5) is required and non-empty for every unattested tx (C42). The overlay URL is wallet configuration; params carry only K (0207 A.21). Fail closed when no overlay endpoint is configured for K (S5). Issuer-v1 defines **no `ext` state** (own `ext` entry must be absent). Its **profileData leaf exists only in action plans** (§5.2). In receipts and hand-overs the leaf MUST be absent (no `checkReceiptData`).
-Local hop checks: before offline acceptance (transport-only `unavailable`), `admitReceipt` checks every unanchored hop locally for Mandala policy — per-asset I==O unless an authority input is present, 1-sat token outputs, single asset, no non-deploy `req`/`ext`, envelope covers exactly the token outputs with verifier K and keyID `'color'` — and throws `ProfileDataError` otherwise.
+**Issuer-v1 semantics**: `docs/profiles/issuer-v1.md`. Credit only from the host ledger or the handler's own verified submit (§2.2); evidence travels only in the issuer's hand-over body (§7); `plain-nosend`; `operations: ['transfer']`; 1-sat token outputs; one Mandala asset per tx; no `ext` state; the plan leaf exists only in action plans. Fail closed when no overlay endpoint is configured for K (S5).
 
-**Mandala deploy payload** (DAG-CBOR map; canonical key order is length-first, then bytewise): `dec` (uint 0..18), `req` (above), `sym` (text 1..32 chars), `icon` (optional `[text, bytes]`), `label` (text 1..64 chars), `feeRatePerKb` (optional, the console no longer writes it by default, B6). `ext` MUST be absent. Diagnostic: `{"dec":2,"req":{…},"sym":"TUSD","label":"Test Dollar"}`.
+**Mandala deploy payload** (DAG-CBOR map): `dec`, `req` = `{issuer-v1: {version: 1, params: {identityKey: K}}}`, `sym`, `icon?`, `label`, `feeRatePerKb?`; `ext` absent.
 
-**Fixture F-REQ** (K = C.0 signer `02798b81…124046`). Generated with @bsv/templates `encodeStrictCbor` at ts-stack cbdccfe. P-LIB checks it in at `lib/src/__fixtures__/1color-deploy.json` with the fixed schema `{identityKey, sym, dec, label, reqHex, payloadHex, lockingScriptHex}`; P-GO copies the file byte-for-byte to `overlay-go/internal/mandala/testdata/1color-deploy.json`. Both suites compare against the hex below.
-- `req` VALUE (328 bytes):
-`a2781c68747470733a2f2f6272632e6465762f3230372f6174746573746564a266706172616d73a26974727573744d6f6465686964656e746974796b6964656e746974794b657978423032373938623831393531613661386337656638626564613039623036613233303331643765666166333762363633323635653031383861623337383132343034366776657273696f6e01785068747470733a2f2f6769746875622e636f6d2f6273762d626c6f636b636861696e2f6d616e64616c612f626c6f622f6d61737465722f646f63732f70726f66696c65732f6973737565722d76312e6d64a266706172616d73a16b6964656e746974794b657978423032373938623831393531613661386337656638626564613039623036613233303331643765666166333762363633323635653031383861623337383132343034366776657273696f6e01`
-- Whole payload `{"dec":2,"req":…,"sym":"TUSD","label":"Test Dollar"}` (365 bytes) = `a4636465630263726571` + req value + `6373796d6454555344656c6162656c6b5465737420446f6c6c6172`.
-- Deploy locking script with pkh = hash160(K) (test only): `00006d4d6d01` + payload + `7576a914a1d8edf2f9ebd6d2fe4728e0eb3bd369ab78d76a88ac`.
+**Fixture F-REQ** (K = C.0 signer `02798b81…124046`), `lib/src/__fixtures__/1color-deploy.json`, copied byte for byte to `overlay-go/internal/mandala/testdata/1color-deploy.json`:
+- `req` VALUE (181 bytes): `a1785068747470733a2f2f6769746875622e636f6d2f6273762d626c6f636b636861696e2f6d616e64616c612f626c6f622f6d61737465722f646f63732f70726f66696c65732f6973737565722d76312e6d64a266706172616d73a16b6964656e746974794b657978423032373938623831393531613661386337656638626564613039623036613233303331643765666166333762363633323635653031383861623337383132343034366776657273696f6e01`
+- Whole payload `{"dec":2,"req":…,"sym":"TUSD","label":"Test Dollar"}` (218 bytes) = `a4636465630263726571` + req value + `6373796d6454555344656c6162656c6b5465737420446f6c6c6172`.
+- Deploy locking script with pkh = hash160(K) (test only): `00006d4cda` + payload + `7576a914a1d8edf2f9ebd6d2fe4728e0eb3bd369ab78d76a88ac`.
 
-**Overlay deploy policy** (P-GO, on `tm_mandala` + `tm_color_<txid>_0` deploy submits; all failures are ERR_SHAPE, final):
-0. A 36-byte id ⇒ ERR_SHAPE `output N: legacy 36-byte token id <id> is refused by Mandala policy (32-byte ids only)`, checked before token scoping.
-1. The payload is a canonical push of a strictly valid DAG-CBOR map (full DAG-CBOR reader, D14). Size ≤ 65536 bytes; depth ≤ 64.
-2. Existing sym/dec/label/feeRatePerKb/deploySig/trusted-issuer rules are unchanged and run first. Then `req` is present and, decoded, is exactly the 2-entry map above with K == this overlay's identity key. Equality is checked by re-encoding the expected map and comparing bytes with the decoded `req` re-encoded (no normalization of the input: a non-canonical input already fails step 1).
-3. `ext` is absent. `icon`, if present, is exactly `[text, bytes]`.
-4. Pinned reason strings (after sym/dec/label/feeRate): `missing key req`, `req does not match this overlay's Mandala profiles`, `req must be a map`, `ext is not allowed on a Mandala deploy`, `icon must be [mediaType, bytes]`. KYC deploys (`tm_mandala_kyc`) do not require `req`. Admin details/authority keep the 4096-byte policy limit; `feeRatePerKb` keeps the JS safe-integer bound (not a token amount).
-5. Non-deploy outputs on every Mandala token topic (`tm_color_*` and `tm_mandala_kyc`): a payload that is a valid map containing `req` or `ext` ⇒ ERR_SHAPE `output N: req and ext are deploy-only under Mandala policy` (D14). Authority `{adm}` payloads are unchanged.
-6. Vector replays: the brc162.json `id-*` rejectScripts rows are remapped to OneColor messages in a documented table (vector file unchanged). `mandala-rejects.json` stays byte-pinned; its replay remaps `tm_<hex>`→`tm_color_<hex>_0` plus a reviewed override table.
-
----
+**Overlay deploy policy** (P-GO; all failures ERR_SHAPE, final): unchanged steps 0-6 of Revision 2 except step 2: `req` decoded and re-encoded must equal `MandalaReq(K)` = the one-entry map above for this overlay's K. A `req` that still names `https://brc.dev/207/attested` (or any second entry) ⇒ `req does not match this overlay's Mandala profiles`. Pinned reason strings unchanged.
 
 ## 5. Mandala envelope (owner linkage) as submission data (P-T2 hook, P-LIB, P-GO)
 
@@ -413,14 +285,12 @@ Who produces what:
 
 Receipt `senderIdentityKey` = A′ when blinded (B3) while the envelope `prover` = A. **This mismatch is intended.** Do not "fix" it.
 
-### 5.2 Carriage
+### 5.2 Carriage (Revision 3)
 
-- **Action plan (sender app → wallet module)**: `plan.profileData["<issuer-v1 uri>"]["<assetId>"] = {"outputs":[{"index":n,"linkage":{…}}]}`, exactly covering the plan's **non-owned** token outputs of that asset (indices = requested-output indices; `randomizeOutputs:false`). `checkPlanData` rejects: an extra or missing index, an index that is not a token output of the asset, `verifier ≠ K`, `prover ≠ ctx.identityKey`, `keyID ≠ 'color'`, a protocolID that is not a valid `p color <assetTag of this asset> …` name (0207:540-548), `proofType ≠ 0`, byte arrays empty or > 1024 entries, unknown members. Absent leaf with ≥1 non-owned token output ⇒ `ProfileDataError`.
-- **Handler output**: `submissionData` = plan leaf entries ∪ owned-output entries ⇒ `{"outputs":[…sorted]}` UTF-8 bytes.
-- **Receipts / hand-over / settle**: inside the attested leaf `submissions: [{txid, offChainValues: <lowercase hex of those bytes>}]` (0207:313-322), one entry per unattested tx incl. the tip. **Required and non-empty** for Mandala.
-- **Submit**: `ColorOverlayProvider.submit([tm_color_<assetId>], atomicBEEF, offChainValues)`. The Mandala provider frames the body as below.
-
----
+- **Action plan (sender app → wallet module)**: unchanged (`plan.profileData[issuer-v1][assetId] = {"outputs":[…]}` for non-owned outputs, checked by `checkPlanData`).
+- **Hand-over envelope**: built by the sending HOST (`buildHandoverEnvelope`): the recipient entry from the lib's `recipientLinkage`, every other token output of the asset (module change, self-send output) from the host wallet's stored custody (toolbox metadata encryption) and `revealSpecificKeyLinkage` through the underlying wallet; each owned entry is checked to derive its output key.
+- **Hand-over / settle**: envelopes travel only in the v4 body's `linkage[]` (§7.2), one per unadmitted tx incl. the tip. Never in receipts.
+- **Submit**: `POST /submit` framing unchanged; a bare AtomicBEEF replay of an admitted tx returns its σ (overlay-go `serveKnownVerdict`; pinned by `TestE2EBareReplayOfAnAdmittedTxReturnsItsAttestation`).
 
 ## 6. Overlay HTTP / BRC-22 / BRC-24 after the change (P-GO serves; P-LIB and P-T2 consume)
 
@@ -443,34 +313,34 @@ Receipt `senderIdentityKey` = A′ when blinded (B3) while the envelope `prover`
 
 ---
 
-## 7. Hand-over carriers (P-LIB builds/parses; P-WAL, P-DESK, P-APP transport)
+## 7. Hand-over carriers (Revision 3, B7)
 
 ### 7.1 Receipt instruction (BRC-207 internalize, 0207:1431-1440)
 
 ```json
-{"version":1,"assetId":"<id>","derivationPrefix":"<b64>","derivationSuffix":"<b64>","senderIdentityKey":"<A or A′>",
- "profileData":{"https://brc.dev/207/attested":{"<id>":{
-    "declarationTx":"<deploy raw tx hex>",
-    "transactions":["<raw hex of each unattested token ancestor, parents first; excludes the tip>"],
-    "attestations":[{"txid":"…","outputs":[0],"signer":"<K>","signature":"<der hex>"}],
-    "submissions":[{"txid":"<each unattested ancestor and the tip>","offChainValues":"<envelope hex>"}]}}}}
+{"version":1,"assetId":"<txid>_0","derivationPrefix":"<b64>","derivationSuffix":"<b64>","senderIdentityKey":"<A or A′>"}
 ```
-- Exactly these members (no `lifecycles`: Mandala uses no BRC-177). The attested leaf is **required** on every Mandala receipt, including issuer payouts. For an already-admitted tip, the tip's attestation is in `attestations` and its submission is still in `submissions`. Custominstructions limit: 16 MiB (attested). `internalizeAction` args: `outputs[i] = {outputIndex, protocol: 'basket insertion', insertionRemittance: {basket: 'p color <assetTag>', customInstructions: JSON.stringify(receipt)}}`. The tx is AtomicBEEF.
-- Mandala `admitReceipt` (recipient wallet): always submits online (idempotent), in `graph.pending` order, or `graph.tip` when `pending` is empty (attested tip, D7). A typed verdict (any code, retryable or not) ⇒ throw ⇒ no credit. Transport failure ⇒ `unavailable` ⇒ attested offline acceptance + `color_receive_offline` consent ⇒ credit `color_offline` (D6/D7). Exception (D34): when the receipt leaf already carries a verified, qualifying attestation of the tip covering every received output, `unavailable` credits the receipt as settled (`settled.<tip>` written, no `color_offline` tag, no consent prompt); §2.2-6 applies unchanged, because a verified attestation was obtained.
+Exactly these five members, < 1000 bytes; any `profileData` is rejected by the module. `internalizeAction` args: `outputs[i] = {outputIndex, protocol: 'basket insertion', insertionRemittance: {basket: 'p color <assetTag>', customInstructions: JSON.stringify(receipt)}}`, labels `['mandala','receive']`. The recipient HOST internalizes only after it recorded the output in its host ledger (§8.1 receive).
 
-### 7.2 MessageBox body (box name `mandala-color`, D11)
+### 7.2 MessageBox body `v: 4` (box `mandala-color`)
 
 ```json
-{"v":3,"kind":"handover","assetId":"<id>","outputIndex":0,"tx":"<AtomicBEEF hex>","receipt":{…§7.1 object…},"note":"optional"}
+{"v":4,"kind":"handover","assetId":"<txid>_0","amount":"<decimal>",
+ "derivationPrefix":"<b64>","derivationSuffix":"<b64>","senderIdentityKey":"<A or A′>","senderMode":"blinded"|"identity",
+ "transaction":"<AtomicBEEF hex of the tip, every unconfirmed ancestor inside>","outputIndex":0,
+ "admission":{"txid":"…","outputs":[0,1],"signer":"<K>","signature":"<der hex>"},
+ "admissions":[{"txid":"<admitted ancestor>","outputs":[…],"signer":"<K>","signature":"…"}],
+ "linkage":[{"txid":"<each unadmitted tx, the tip included>","offChainValues":"<envelope hex>"}],
+ "note":"optional"}
 ```
-No amount field: the amount is read from the script (0175:129). The recipient passes `receipt` to `internalizeAction` verbatim (`JSON.stringify`) and acknowledges the message only after the internalize resolves (credited or definitively refused). A v1/v2 body ⇒ refused and acknowledged (no back-compat). A `ColorConsentDeclinedError` receipt is **not** acknowledged; the receiver records it in `processed` and does not re-prompt it in the same session. Nearby (localpay) treats a decline as final (no retry channel). "ACK" for sender post-ACK settlement = MessageBox `sendMessage` success, or the localpay `settlementAck` frame.
+- Exact members (`admission`, `note` optional). Strict parse; the amount must equal the script amount of the named 1-sat value output. σ rows = §3 statement, BRC-207 JSON attestation shape, verified only under the recipient's own configured K.
+- `admission` = σ of the tip when the sender holds it (issuer payouts / reissues, which submit overlay-first). Holder hand-overs carry `admissions[]` collected by the evidence walk (host ledger σ of received or own settled txs, lib journal `accepted` σ) and `linkage[]` for every unadmitted ancestor plus the tip.
+- Recipient host: online ⇒ submit unadmitted chain (parents first, tip last) with each envelope, verify σ, tip σ covers the output ⇒ ledger `settled` ⇒ internalize ⇒ ack. Transport failure only ⇒ tip σ in body ⇒ `settled`; else COVER over `admissions[]` with S1 hop checks ⇒ ledger `pending` (+ exact submit chain, + the ancestor σ for onward hand-overs) ⇒ internalize ⇒ ack; `settleReceipts` later ⇒ `markSettled`. Typed verdicts never fall back offline. Ack on credit or a definitive refusal (malformed, contradicting script, final verdict, `ERR_EVIDENCE`, `ERR_NOT_ADMITTED`); keep `ERR_NOT_COVERED` (offline, evidence does not reach σ yet) and `ERR_BODY_UNREADABLE` (retry budget `UNREADABLE_BUDGET`, then `exhausted` until `dismissHandover`).
+- v1-v3 bodies ⇒ refused and acknowledged. "ACK" for sender post-ACK settlement = MessageBox `sendMessage` success, or the localpay `settlementAck` frame.
 
-### 7.3 localpay frame (P-WAL): `FRAME_VERSION = 6`
+### 7.3 localpay frame (P-WAL): `FRAME_VERSION = 7`
 
-`PaymentFrame` keeps `version, kind, senderIdentityKey (A or A′), outputIndex, derivationPrefix, derivationSuffix, note?, transaction (AtomicBEEF)`.
-`TokenPayment` v6 = `{ assetId: string /* underscore form <64hex>_0 */, certificates: Uint8Array[] /* unchanged opaque */, profileData: string /* UTF-8 JSON of the receipt's profileData object */ }`. **Removed:** `overlayUrl`, `overlayIdentityKey`, `linkage`, `admissions`. The payee uses its own configured overlay (0175:129). The payee builds §7.1 from the frame fields. A frame with version < 6 ⇒ CodecError. Session codec: `SESSION_VERSION = 2`; the token amount `a` is a canonical decimal string and the session asset drops overlay url/key (`u`/`k`); a v1 session ⇒ CodecError.
-
----
+The token payment carries exactly the §7.2 members (minus `v`/`kind`, which the frame version replaces): `assetId`, `amount` (decimal string), `derivationPrefix`, `derivationSuffix`, `senderIdentityKey`, `senderMode`, `transaction` (AtomicBEEF), `outputIndex`, `admission?`, `admissions`, `linkage`, `note?`, plus the unchanged opaque `certificates`. The payee host runs the §7.2 recipient path with its own configured overlay. A frame with version < 7 ⇒ CodecError (no back-compat). `SESSION_VERSION` unchanged.
 
 ## 8. `@bsv/mandala` 0.5.0 public API (P-LIB provides; P-APP, P-DESK, P-WAL consume)
 
@@ -481,7 +351,6 @@ Package: ESM. `peerDependencies`: `@bsv/sdk ^4.0.0`, `@bsv/templates ^2.2.0`, `@
 // constants / naming
 export const TOPIC = 'tm_mandala', LOOKUP = 'ls_mandala', REGISTRY_TOPIC = 'tm_mandala_kyc', REGISTRY_LOOKUP = 'ls_mandala_kyc'
 export const MESSAGEBOX = 'mandala-color'
-export const ATTESTED_PROFILE_ID = 'https://brc.dev/207/attested'
 export const MANDALA_PROFILE_ID = 'https://github.com/bsv-blockchain/mandala/blob/master/docs/profiles/issuer-v1.md'
 export const TREASURY_BASKET = 'mandala treasury'           // console issuer/admin outputs (non-P basket, D18)
 export const ADMIN_PROTOCOL: [2, 'mandala admin']           // Mandala-key outputs (treasury, authority, deploy, registry, payout change); FT_PROTOCOL stays removed
@@ -547,7 +416,7 @@ export function settleHandover (p: { wallet: WalletInterface, handover: Pick<Han
 export function receiveHandovers (p: { wallet: WalletInterface, messageBoxClient: MessageBoxLike, assetId?: string, processed?: Set<string> }):
   Promise<{ accepted: Array<{ messageId: string, txid: string, assetId: string, amount: bigint, outputIndex: number, offline: boolean }>, failed: Array<{ messageId: string, error: unknown, code?: string }> }>
 export function parseHandoverBody (body: unknown): { assetId: string, outputIndex: number, tx: number[], receipt: ReceiptInstruction, note?: string }   // throws InvalidTransferError
-export type ReceiptInstruction = { version: 1, assetId: string, derivationPrefix: string, derivationSuffix: string, senderIdentityKey: string, profileData: Record<string, unknown> }
+export type ReceiptInstruction = { version: 1, assetId: string, derivationPrefix: string, derivationSuffix: string, senderIdentityKey: string } // Revision 3: plain custody
 // issuer / admin / registry (console; Mandala keys, overlay-first noSend→submit→sendWith, TREASURY_BASKET)
 export function registerAsset (p: { wallet, identityKey: string, label: string, ticker: string, decimals: number, icon?: { mediaType: string, bytes: number[] }, feeRatePerKb?: number /* console omits it, B6 */ }): Promise<RegisterResult>  // deploy carries mandalaReq(OVERLAY_IDENTITY_KEY)
 export function issueTokens (p: { wallet, identityKey: string, asset: AdminAsset, amount: bigint, depositHash?: string }): Promise<IssuerOpResult>  // mint into treasury (Mandala keys, TREASURY_BASKET), as today
@@ -575,16 +444,46 @@ export interface MandalaStorage { getItem (k: string): Promise<string | null>; s
 
 **Removed exports** (compile errors are intended): `FT_PROTOCOL`, `BASKET`, `MAX_SAFE_AMOUNT`, `tokenTopic`, `tokenLookup`, `tokenTopicOrEmpty`, `isSigmaTopic`, `deployTopics` (→ `[TOPIC, colorTopic(id)]` inline), `decodeValue`, `lockToken`, `transferTokens`, `TransferParams/Result`, `receiveTokens`, `defaultSettle`, `SettleFn/SettleArgs`, `IncomingTransfer`, `cover`, `AdmissionBundle`, `canonicalBundleId`, `collectHandoverEvidence`, `journalEvidenceSource`, `EvidenceSource`, `HandoverBody` (v2), `WireAdmission`, `WireLinkage`, `admissionDigestV3` for token topics, the `ftSelect`/`ftChange`/`ftCandidates`/`unlock` subpaths, `MandalaLinkagePayload` (→ `MandalaEnvelope`), `encodeLinkagePayload` (→ `encodeEnvelope`).
 
+**Revision 3 (B7) changes to §8.1** (authoritative where they differ from the block above):
+```ts
+// host ledger (in-process, host-only; never over BRC-100)
+export interface LedgerRecord { v: 1, txid: string, assetId: string, state: 'settled' | 'pending' | 'refused', own?: true, outputs: number[],
+  attestation?: Attestation, submits?: Array<{ txid: string, beefHex: string, offChainHex: string }>, beefHex?: string, evidence?: Attestation[], marked?: boolean, attempts?: number, code?: string, at: number }
+export interface HostLedger { get(txid): Promise<LedgerRecord | undefined>, put(r): Promise<LedgerRecord> /* merge: never downgrades */, list(): Promise<LedgerRecord[]> }
+export function createHostLedger (storage: MandalaStorage): HostLedger
+// sender (host runtime)
+export interface HandoverResult { txid, tx: number[], reference, outputIndex, receipt: ReceiptInstruction, body: HandoverBodyV4, offChainValues: number[] }
+export function sendHandover (p: { wallet, hostWallet: WalletInterface /* underlying */, ledger: HostLedger, identityKey, assetId, amount: bigint, recipientKey,
+  blind?, note?, derivationPrefix?, derivationSuffix?, journal?, evidence?: EvidenceSource }): Promise<HandoverResult>  // records the hand-over pending (own)
+export function deliverHandover (p: { messageBoxClient, recipientKey, handover: Pick<HandoverResult, 'txid' | 'body'> }): Promise<void>
+export function settleHandover (p: { wallet, handover, assetId, overlayIdentityKey, ledger?, markSettled? }): Promise<SettleResult> // σ ⇒ ledger settled ⇒ markSettled; final ⇒ ledger refused
+export function buildHandoverEnvelope (p: { hostWallet, identityKey, overlayIdentityKey, assetId, tx: Transaction, recipient? }): Promise<number[]>
+export function collectHandoverEvidence (tip, assetId, source: EvidenceSource): Promise<{ admissions: Map<string, Attestation>, linkage: Map<string, number[]> }>
+export function handoverBody (…): HandoverBodyV4; export function receiptOfBody (b): ReceiptInstruction
+// recipient (host runtime; an app without a ledger gets the online path only)
+export function receiveHandovers (p: { wallet, messageBoxClient, assetId?, processed?, ledger?, markSettled? }): Promise<ReceiveResult>
+export function acceptHandover (h: ParsedHandover, o: { wallet, ledger?, markSettled?, overlayIdentityKey? }): Promise<AcceptedHandover>
+export function cover (e: { assetId, tip: Transaction, admissions: Map, linkage: Map }, o: { expectedSignerKey }): CoverResult  // + S1 checkHop on every unanchored hop
+export function settleReceipts (p: { ledger, markSettled?, overlayIdentityKey?, txids? }): Promise<ReceiptSettleResult[]>  // submits pending receipts; own hand-overs are never submitted, only marked once settled
+// ReconcileOptions add { ledger?, markSettled? }: a delivered hand-over reconcile admits records σ and runs markSettled
+export function dismissHandover (p: { messageBoxClient, messageId }): Promise<void>
+export const ERR_BODY_UNREADABLE, ERR_NOT_COVERED, UNREADABLE_BUDGET
+// createMandalaClient options add { ledger?, hostWallet?, markSettled? }
+```
+Removed in Revision 3: `ATTESTED_PROFILE_ID`, `issuerAttestedLeaf`, `checkOfflineHops`. Issuer payouts/reissues deliver the v4 body with `admission` = the tip σ and `linkage` = [tip envelope]; `IssuerReceiptIntent` carries `amount` and `senderMode` (no `declarationTxHex`). Journal hand-over entries carry `body` (the v4 JSON) instead of `receipt`.
+
 ### 8.2 `@bsv/mandala/profile` (imports `@bsv/color-permission-module`)
 ```ts
 export interface MandalaProfileOptions {
   overlays: Array<{ identityKey: string, url: string }>   // wallet configuration; K absent ⇒ assets fail closed (S5)
+  ledger: HostLedger                                       // Revision 3: the host ledger (required)
   fetch?: typeof fetch
   timeoutMs?: number                                       // default 15000
 }
 export function createMandalaProfile (o: MandalaProfileOptions): RequiredProfileHandler
-  // id MANDALA_PROFILE_ID, versions [1], sendPolicy 'plain-nosend', operations ['transfer'], maxReceiptBytes 16 MiB,
-  // checkDescriptor (§4), provider (routes by K), deployProviders (all configured), checkPlanData / submissionData (§5), admitReceipt (§7.1)
+  // id MANDALA_PROFILE_ID, versions [1], sendPolicy 'plain-nosend', operations ['transfer'] (Revision 3: no maxReceiptBytes),
+  // checkDescriptor (§4: req exactly {issuer-v1}), provider (routes by K; spendability backed by the host ledger),
+  // deployProviders (all configured), checkPlanData / submissionData (§5), admitReceipt (§2.2 Revision 3)
 export function createMandalaOverlayProvider (o: { url: string, identityKey: string, fetch?: typeof fetch, timeoutMs?: number }): ColorOverlayProvider & { readonly url: string, readonly identityKey: string }
 export { MANDALA_PROFILE_ID }
 ```
@@ -593,11 +492,11 @@ Host registration (P-DESK, P-WAL; identical shape):
 const color = createColorModule({
   wallet: underlyingWallet, provider: defaultProvider /* SDK LookupResolver/SHIP-based for baseline assets */,
   requestTokenAccess, store,
-  profiles: { [ATTESTED_PROFILE_ID]: createAttestedProfile(), [MANDALA_PROFILE_ID]: createMandalaProfile({ overlays: [{ identityKey, url }] }) }
+  profiles: { [MANDALA_PROFILE_ID]: createMandalaProfile({ overlays: [{ identityKey, url }], ledger }) }   // Revision 3
 })
 new WalletPermissionsManager(underlyingWallet, adminOriginator, { permissionModules: { color } })
 ```
-P-DESK calls `color.settle()` at unlock, every 5 min while unlocked and on the `online` event (single-flight, D17). P-WAL's runtime calls `settle({txids:[txid]})` after a hand-over ACK and bare `settle()` on reconnect/foreground. Hosts call `color.dispose()` at teardown.
+Revision 3: hosts call the lib's `settleReceipts({ ledger, markSettled: txid => color.markSettled(txid) })` at unlock, on reconnect/foreground and periodically, and `settleHandover({ …, ledger, markSettled })` after a hand-over ACK (reconcile resubmits delivered entries). There is no module `settle()`. Hosts call `color.dispose()` at teardown.
 
 Host rules (P-DESK, P-WAL):
 - **Default provider**: may be a host SHIP/LookupResolver wrapper with a capturing facilitator that returns the host STEAK; `offChainValues` are refused on it; a chain with no preset fails closed. A Mandala-only host MAY pass the Mandala provider as the default (profile-free assets then fail closed against the Mandala overlay).

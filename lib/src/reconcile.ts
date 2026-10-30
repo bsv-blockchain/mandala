@@ -61,7 +61,7 @@
  */
 import { Utils, WalletInterface } from '@bsv/sdk'
 import {
-  admissionReceipt, broadcastAcceptedTx, isAlreadyBroadcast, OverlayRefusedError, submitToOverlay
+  admissionReceipt, broadcastAcceptedTx, isAlreadyBroadcast, isOutcomeUnknown, OverlayRefusedError, submitToOverlay
 } from './overlay.js'
 import {
   isHandoverEntry, JournalEntry, journalGet, journalList, journalPut, journalRemove, INTENT_TTL_MS
@@ -69,6 +69,7 @@ import {
 import { tryWithLock } from './webLocks.js'
 import { OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, OVERLAY_URL, OVERLAY_URL_UNSET } from './constants.js'
 import { resubmitDelivered } from './handover.js'
+import type { HostLedger } from './hostLedger.js'
 
 /**
  * wallet-toolbox listActions spec-op: intercepts this "label" to list actions
@@ -147,6 +148,10 @@ export interface ReconcileOptions {
    * (`journalRemove`) the moment its drain really broadcasts the transaction.
    */
   broadcast?: boolean
+  /** B7 host runtime: a delivered hand-over admitted here records σ in the host ledger ... */
+  ledger?: HostLedger
+  /** ... and clears `color_offline` on its change (host-only `color.markSettled`). */
+  markSettled?: (txid: string) => Promise<void>
 }
 
 export interface ReconcileResult {
@@ -180,7 +185,10 @@ export async function reconcileWallet (
   opts: ReconcileOptions = {}
 ): Promise<ReconcileResult> {
   const { acquired, result } = await tryWithLock('mandala.reconcile', async () =>
-    await reconcilePass(wallet, opts.sweep !== false, opts.broadcast !== false)
+    await reconcilePass(wallet, opts.sweep !== false, opts.broadcast !== false, {
+      ...(opts.ledger != null ? { ledger: opts.ledger } : {}),
+      ...(opts.markSettled != null ? { markSettled: opts.markSettled } : {})
+    })
   )
   if (!acquired || result == null) {
     return { rebroadcast: [], aborted: [], resubmitted: [], stranded: [], swept: 0, handoversAwaitingDelivery: 0, skipped: true }
@@ -196,7 +204,9 @@ async function releaseReference (wallet: WalletInterface, reference?: string): P
   } catch { /* already on-chain, or the wallet is offline — the sweep owns it now */ }
 }
 
-async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast: boolean): Promise<ReconcileResult> {
+type HostPieces = { ledger?: HostLedger, markSettled?: (txid: string) => Promise<void> }
+
+async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast: boolean, host: HostPieces = {}): Promise<ReconcileResult> {
   const rebroadcast: string[] = []
   const aborted: string[] = []
   const resubmitted: string[] = []
@@ -305,7 +315,7 @@ async function reconcilePass (wallet: WalletInterface, sweep: boolean, broadcast
         }
         continue
       }
-      await settleDelivered(wallet, entry, { resubmitted, aborted, stranded }, broadcastAccepted)
+      await settleDelivered(wallet, entry, { resubmitted, aborted, stranded }, broadcastAccepted, host)
       continue
     }
     if (entry.stage === 'retryable') {
@@ -378,7 +388,8 @@ async function settleDelivered (
   wallet: WalletInterface,
   entry: JournalEntry,
   out: { resubmitted: string[], aborted: string[], stranded: string[] },
-  broadcastAccepted: (e: JournalEntry) => Promise<void>
+  broadcastAccepted: (e: JournalEntry) => Promise<void>,
+  host: HostPieces = {}
 ): Promise<void> {
   const countPass = async (code?: string): Promise<void> => {
     // resubmitDelivered already counted a retry on the stored entry; read it
@@ -409,7 +420,7 @@ async function settleDelivered (
 
   let result
   try {
-    result = await resubmitDelivered(wallet, entry, OVERLAY_IDENTITY_KEY, { broadcast: false })
+    result = await resubmitDelivered(wallet, entry, OVERLAY_IDENTITY_KEY, { broadcast: false, ...host })
   } catch (e) {
     const msg = (e as { message?: unknown })?.message
     // S5 raced a reconfiguration: not a verdict, not a pass.
@@ -605,8 +616,9 @@ async function retryRefused (
 
   if (entry.submit == null) {
     // No bytes to re-POST (an older entry, or a store that lost the field).
-    // All this pass can do is count — then release the inputs at the cap.
-    if (attempts >= RETRY_CAP) await giveUp()
+    // All this pass can do is count — then release the inputs at the cap,
+    // unless the overlay may already have applied it (item 2: never abort).
+    if (attempts >= RETRY_CAP && entry.outcome !== 'unknown') await giveUp()
     else await journalPut({ ...entry, attempts })
     return
   }
@@ -639,13 +651,23 @@ async function retryRefused (
     // A refusal the contract calls final means these bytes will never be
     // admitted — retrying is pointless, so release the inputs now.
     const final = e instanceof OverlayRefusedError && !e.retryable
-    if (final || attempts >= RETRY_CAP) {
+    // Deferred-lib item 2: an entry whose outcome is unknown (the overlay may
+    // have folded and broadcast it) is never aborted at the cap: aborting an
+    // applied tx desyncs the wallet from the chain and strands its receipt
+    // intent. It keeps retrying (idempotent) until a 200 replay or a final
+    // verdict settles it, and is surfaced once past the cap.
+    const unknown = isOutcomeUnknown(e)
+    if (final || (attempts >= RETRY_CAP && !unknown)) {
       await giveUp()
       return
+    }
+    if (attempts === RETRY_CAP && unknown) {
+      console.warn(`[mandala] ${entry.txid}: ${RETRY_CAP} re-submits left its overlay outcome unknown; it is kept (never aborted) and retried`)
     }
     await journalPut({
       ...entry,
       attempts,
+      outcome: unknown ? 'unknown' : 'refused',
       ...(e instanceof OverlayRefusedError ? { code: e.code } : {})
     })
   }

@@ -1,9 +1,9 @@
 /**
  * End to end against a live overlay-go (plan 04 Task 23, C§10 optional E2E):
- * register → issue MAX_UINT64 → payout MAX_UINT64 - 1 → the holder's
- * issuer-v1 `admitReceipt` (through `receiveHandovers` on a module-hosting
- * wallet whose `createMandalaProfile` points at the live URL) → holder
- * `sendHandover` → recipient receive → sender `settleHandover`.
+ * register → issue MAX_UINT64 → payout MAX_UINT64 - 1 → the holder host's
+ * receive (own submit, ledger, then the issuer-v1 `admitReceipt` through the
+ * real color module on a WalletPermissionsManager, profileHolder.ts) → holder `sendHandover` (host-built
+ * envelope) → recipient host receive → sender `settleHandover` + markSettled.
  *
  * Live run (skipped unless the URL is set; never wipes overlay state):
  *   MANDALA_E2E_OVERLAY_URL=http://localhost:8081 \
@@ -20,13 +20,8 @@
  * boundary is pinned end to end.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { PrivateKey, type WalletInterface } from '@bsv/sdk'
-import { WalletPermissionsManager } from '@bsv/wallet-toolbox-client'
-import {
-  createAttestedProfile, createColorModule, type ColorOverlayProvider, type RequiredProfileHandler
-} from '@bsv/color-permission-module'
-import { createMandalaProfile } from './profile.js'
-import { ATTESTED_PROFILE_ID, configureMandala } from './constants.js'
+import { PrivateKey } from '@bsv/sdk'
+import { configureMandala } from './constants.js'
 import { configureStorage, memoryStorage } from './storage.js'
 import { clearAdminAuthGates } from './adminAuthGate.js'
 import { clearDeployTxCache } from './overlayLookup.js'
@@ -34,81 +29,17 @@ import { listAdminAssets } from './assets.js'
 import { issueTokens, registerAsset } from './issuerOps.js'
 import { payoutTokens } from './payout.js'
 import { deliverHandover, sendHandover, settleHandover } from './handover.js'
-import { receiveHandovers, type MessageBoxLike } from './receive.js'
-import type { MessageBoxSender } from './receipt.js'
+import { receiveHandovers } from './receive.js'
 import { verifyAttestation, type Attestation } from './attestation.js'
 import { MAX_UINT64 } from './amount.js'
-import { decodeToken } from './brc162.js'
-import { colorBasket, colorTopic } from './naming.js'
+import { colorTopic } from './naming.js'
 import type { AdmissionReceipt } from './overlay.js'
-import { FakeWallet, memoryColorStore, withOriginator } from './__fixtures__/fakeWallet.js'
+import { FakeWallet } from './__fixtures__/fakeWallet.js'
 import { fakeMandalaOverlay } from './__fixtures__/fakeMandalaOverlay.js'
+import { heldAmount, makeProfileHolder, messageBus } from './__fixtures__/profileHolder.js'
 
-const ADMIN = 'admin.test'
 const LIVE_URL = process.env.MANDALA_E2E_OVERLAY_URL ?? ''
 const LIVE_KEY = process.env.MANDALA_E2E_OVERLAY_KEY ?? ''
-
-// ---------------------------------------------------------------------------
-// In-memory MessageBox (JSON round trip like the real client)
-// ---------------------------------------------------------------------------
-
-function messageBus (): (identityKey: string) => MessageBoxSender & MessageBoxLike {
-  const boxes = new Map<string, Array<{ messageId: string, body: unknown, sender: string }>>()
-  let n = 0
-  return identityKey => ({
-    sendMessage: async ({ recipient, messageBox, body }) => {
-      const key = `${recipient}|${messageBox}`
-      boxes.set(key, [...(boxes.get(key) ?? []), { messageId: `m${n++}`, body: JSON.parse(JSON.stringify(body)), sender: identityKey }])
-      return { status: 'success' }
-    },
-    listMessages: async ({ messageBox }) => [...(boxes.get(`${identityKey}|${messageBox}`) ?? [])],
-    acknowledgeMessage: async ({ messageIds }) => {
-      for (const [key, list] of boxes) boxes.set(key, list.filter(m => !messageIds.includes(m.messageId)))
-      return { status: 'success' }
-    }
-  })
-}
-
-// ---------------------------------------------------------------------------
-// Module-hosting holders
-// ---------------------------------------------------------------------------
-
-/** No default color overlay: Mandala assets route only through the issuer-v1 handler's provider (S5). */
-const NO_DEFAULT_PROVIDER: ColorOverlayProvider = {
-  spendability: async () => { throw new Error('no default color overlay configured') },
-  admission: async () => { throw new Error('no default color overlay configured') },
-  submit: async () => { throw new Error('no default color overlay configured') }
-}
-
-interface Holder { fake: FakeWallet, identityKey: string, wallet: WalletInterface, prompts: string[] }
-
-function makeHolder (mandala: RequiredProfileHandler): Holder {
-  const fake = new FakeWallet(PrivateKey.fromRandom())
-  const prompts: string[] = []
-  const color = createColorModule({
-    wallet: fake.asWallet(),
-    provider: NO_DEFAULT_PROVIDER,
-    requestTokenAccess: async (_app, message) => {
-      prompts.push(String(JSON.parse(message).type))
-      return true
-    },
-    profiles: { [createAttestedProfile().id]: createAttestedProfile(), [mandala.id]: mandala },
-    store: memoryColorStore()
-  })
-  const manager = new WalletPermissionsManager(fake.asWallet(), ADMIN, { permissionModules: { color } })
-  return { fake, identityKey: fake.identityKey, wallet: withOriginator(manager as unknown as WalletInterface, ADMIN), prompts }
-}
-
-/** The exact bigint value `h` holds of `assetId`: its unspent `p color` outputs, decoded (no 2^53 view). */
-function heldAmount (h: Holder, assetId: string): bigint {
-  let sum = 0n
-  for (const o of h.fake.outputs.values()) {
-    if (o.spent || o.basket !== colorBasket(assetId)) continue
-    const d = decodeToken(o.tx.outputs[o.vout].lockingScript)
-    if (d?.assetId === assetId && d.role === 'value') sum += d.amount
-  }
-  return sum
-}
 
 /** The v1 attestation a lib pipeline's admission receipt carries (C§3). */
 function receiptAttestation (txid: string, r: AdmissionReceipt): Attestation {
@@ -130,14 +61,11 @@ async function e2eFlow (env: FlowEnv): Promise<void> {
   const K = env.overlayKey
   expect(K, 'MANDALA_E2E_OVERLAY_KEY must be the overlay\'s 66-hex compressed identity key').toMatch(/^0[23][0-9a-f]{64}$/)
   configureMandala({ overlayUrl: env.url, overlayIdentityKey: K })
-  const mandala = (): RequiredProfileHandler => createMandalaProfile({
-    overlays: [{ identityKey: K, url: env.url }],
-    ...(env.fetch != null ? { fetch: env.fetch } : {})
-  })
+  const holderOf = () => makeProfileHolder({ K, url: env.url, ...(env.fetch != null ? { fetch: env.fetch } : {}) })
   const bus = messageBus()
   const issuer = new FakeWallet(PrivateKey.fromRandom())
-  const holder = makeHolder(mandala())
-  const recipient = makeHolder(mandala())
+  const holder = holderOf()
+  const recipient = holderOf()
   const wallet = issuer.asWallet()
   const identityKey = issuer.identityKey
 
@@ -161,28 +89,25 @@ async function e2eFlow (env: FlowEnv): Promise<void> {
   })
   expect(pay.notified).toBe(true)
   expect(verifyAttestation(receiptAttestation(pay.txid, pay), assetId, K)).toBe(true)
-  const payAttestations = (pay.receipt.profileData as any)[ATTESTED_PROFILE_ID][assetId].attestations as Attestation[]
-  expect(payAttestations.length).toBeGreaterThan(0)
-  for (const a of payAttestations) expect(verifyAttestation(a, assetId, K)).toBe(true)
+  expect(Object.keys(pay.receipt)).toEqual(['version', 'assetId', 'derivationPrefix', 'derivationSuffix', 'senderIdentityKey'])
 
-  // the holder's admitReceipt (online) credits the exact uint64 amount
-  const got = await receiveHandovers({ wallet: holder.wallet, messageBoxClient: bus(holder.identityKey) })
+  // the holder host submits, records settled, then the handler credits from the ledger
+  const got = await receiveHandovers({ wallet: holder.wallet, messageBoxClient: bus(holder.identityKey), ledger: holder.ledger, markSettled: holder.markSettled })
   expect(got.failed).toEqual([])
   expect(got.accepted).toEqual([expect.objectContaining({ txid: pay.txid, assetId, amount: payoutAmount, offline: false })])
   expect(heldAmount(holder, assetId)).toBe(payoutAmount)
 
   // holder → recipient hand-over (blinded by default), delivered, received online
   const handAmount = 400n
-  const h = await sendHandover({ wallet: holder.wallet, identityKey: holder.identityKey, assetId, amount: handAmount, recipientKey: recipient.identityKey })
+  const h = await sendHandover({ wallet: holder.wallet, hostWallet: holder.hostWallet, ledger: holder.ledger, identityKey: holder.identityKey, assetId, amount: handAmount, recipientKey: recipient.identityKey })
   await deliverHandover({ messageBoxClient: bus(holder.identityKey), recipientKey: recipient.identityKey, handover: h })
-  const recv = await receiveHandovers({ wallet: recipient.wallet, messageBoxClient: bus(recipient.identityKey) })
+  const recv = await receiveHandovers({ wallet: recipient.wallet, messageBoxClient: bus(recipient.identityKey), ledger: recipient.ledger, markSettled: recipient.markSettled })
   expect(recv.failed).toEqual([])
   expect(recv.accepted).toEqual([expect.objectContaining({ txid: h.txid, assetId, amount: handAmount, offline: false })])
-  expect(recipient.prompts).not.toContain('color_receive_offline')
   expect(heldAmount(recipient, assetId)).toBe(handAmount)
 
-  // the sender settles (idempotent re-submit of the exact bytes)
-  const settled = await settleHandover({ wallet: holder.wallet, handover: h, assetId, overlayIdentityKey: K })
+  // the sender settles (idempotent re-submit of the exact bytes), then markSettled clears its change
+  const settled = await settleHandover({ wallet: holder.wallet, handover: h, assetId, overlayIdentityKey: K, ledger: holder.ledger, markSettled: holder.markSettled })
   expect(settled.status).toBe('admitted')
   if (settled.status !== 'admitted') return
   expect(settled.attestation.txid).toBe(h.txid)
@@ -191,6 +116,8 @@ async function e2eFlow (env: FlowEnv): Promise<void> {
   // The holder keeps exactly the change; nothing was created or lost.
   expect(heldAmount(holder, assetId)).toBe(payoutAmount - handAmount)
   expect(heldAmount(holder, assetId) + heldAmount(recipient, assetId) + 1n).toBe(MAX_UINT64)
+  expect((await holder.coins(assetId)).every(c => !c.offline)).toBe(true)
+  expect((await holder.ledger.get(h.txid))?.state).toBe('settled')
 }
 
 beforeEach(() => {
@@ -204,7 +131,7 @@ afterEach(() => {
 })
 
 describe('e2e flow dry run (in-process fake overlay)', () => {
-  it('register → issue MAX_UINT64 → payout MAX_UINT64-1 → admitReceipt → hand-over → receive → settle', async () => {
+  it('register → issue MAX_UINT64 → payout MAX_UINT64-1 → host receive → hand-over → receive → settle', async () => {
     const priv = new PrivateKey(5555)
     const overlay = fakeMandalaOverlay({ priv })
     vi.stubGlobal('fetch', overlay.fetch)

@@ -63,54 +63,68 @@ admin action creates the holder's output through `recipientLinkage` and
 delivers the receipt on MessageBox `mandala-color`. Never re-run a payout
 whose `notified` is `false`: the value has already moved.
 
-## Holder send and receive
+## Holder send and receive (wallet host runtime, design B7)
 
-The holder's wallet must host the color module with the Mandala profile.
-`send` throws when the wallet's `signAction` result has no `colorHandoff`.
+Holder hand-overs run in the wallet HOST (the process that owns the
+underlying wallet and the color module). The host builds one ledger and
+shares it with the issuer-v1 handler and every lib call:
 
 ```ts
-const { handover, notified, settle } = await mandala.send({ assetId, counterparty, amount: 400n, note: 'rent' })
-// 1. sendHandover    sign noSend, journal 'signed' (a self-send is journaled 'delivered')
-// 2. deliverHandover MessageBox body v3 on 'mandala-color'; 'signed' → 'delivered'
-// 3. settleHandover  submit on tm_color_<assetId>, verify the attestation, sendWith
+const ledger = createHostLedger(hostStorage)                    // in-process; never exposed over BRC-100
+const mandala = createMandalaClient({ wallet: managerWallet, hostWallet: underlyingWallet, ledger,
+  markSettled: txid => color.markSettled(txid), overlayUrl, overlayIdentityKey })
 
-const { accepted, failed } = await mandala.receive()   // internalizes each receipt, then acknowledges it
+const { handover, notified, settle } = await mandala.send({ assetId, counterparty, amount: 400n, note: 'rent' })
+// 1. sendHandover    sign plain noSend through the module; the host builds the envelope from its
+//                    own custody, walks the evidence (σ / envelopes), records 'pending', journals 'signed'
+// 2. deliverHandover MessageBox body v4 on 'mandala-color'; 'signed' → 'delivered'
+// 3. settleHandover  after the ACK: submit on tm_color_<assetId>, verify σ, record settled, markSettled
+
+const { accepted, failed } = await mandala.receive()           // own submit (online) or COVER (offline), record, internalize
+await settleReceipts({ ledger, markSettled })                    // submit offline-credited chains once online
 ```
 
-`send` throws only what `sendHandover` throws: invalid arguments, the
-missing overlay key, `BusyError` while another tab is sending, or a wallet
-without the module. A delivery failure returns `notified: false`; the
-notification is journaled and `reconcileNotifications` redelivers it. An
-undelivered hand-over is never submitted by its sender. A settle failure
-returns `settle: undefined`, and `reconcile()` re-submits the delivered
-hand-over. A host with its own transport uses `sendHandover`,
-`markHandoverDelivered(txid)` and `settleHandover` directly.
+The v4 body carries the AtomicBEEF tip, the decimal amount, the receipt
+fields (`derivationPrefix`, `derivationSuffix`, `senderIdentityKey` A or A′),
+`admission` (σ of the tip), `admissions[]` (σ per admitted ancestor) and
+`linkage[]` (the envelope of each unadmitted tx, the tip included). The
+receipt the wallet internalizes is plain BRC-207 custody JSON.
 
-`receive` keeps one `processed` set for the life of the client. A typed
-retryable verdict (for example `ERR_FROZEN` or `ERR_PAUSED`) leaves the
-message unacknowledged so a later pass retries it. A declined consent is
-not re-prompted in the same session.
+Receive is online first: the recipient host submits the chain and needs a
+verified σ covering its output. Only a transport failure takes the offline
+path: COVER over `admissions[]` with the S1 hop checks (scripts verify,
+conservation or a valid authority transition, 1 sat, one asset, envelope for
+K, no duplicate spend). An offline credit is `pending` (`color_offline`)
+until `settleReceipts` admits it. A typed verdict, retryable or not, is never
+credited offline.
+
+A delivery failure returns `notified: false`; the notification is journaled
+and `reconcileNotifications` redelivers it. An undelivered hand-over is
+never submitted by its sender. An unreadable inbox body is retried up to
+`UNREADABLE_BUDGET` passes, then reported `exhausted` until
+`dismissHandover`.
 
 ## Wallet registration (`@bsv/mandala/profile`)
 
 ```ts
-import { createColorModule, createAttestedProfile, ATTESTED_PROFILE_ID } from '@bsv/color-permission-module'
+import { createColorModule } from '@bsv/color-permission-module'
 import { createMandalaProfile, MANDALA_PROFILE_ID } from '@bsv/mandala/profile'
+import { createHostLedger } from '@bsv/mandala'
 
+const ledger = createHostLedger(hostStorage)
 const color = createColorModule({
   wallet: underlyingWallet, provider: defaultProvider, requestTokenAccess, store,
-  profiles: {
-    [ATTESTED_PROFILE_ID]: createAttestedProfile(),
-    [MANDALA_PROFILE_ID]: createMandalaProfile({ overlays: [{ identityKey, url }] })
-  }
+  profiles: { [MANDALA_PROFILE_ID]: createMandalaProfile({ overlays: [{ identityKey, url }], ledger }) }
 })
 new WalletPermissionsManager(underlyingWallet, adminOriginator, { permissionModules: { color } })
 ```
 
-Hosts call `color.settle()` at unlock, on reconnect and after a hand-over
-acknowledgement. They hold the broadcast of any tx with a BRC-162 output
-until `color.isSettled(txid)`. `@bsv/color-permission-module` is an optional
-peer: only `@bsv/mandala/profile` needs it.
+The handler credits a receipt only from the host ledger (`settled` or
+`pending`), else it submits the receipt itself and requires σ. Its provider
+answers `spendability` from the ledger when the overlay is unreachable or
+has not admitted yet, so offline and chained hand-overs work.
+`@bsv/color-permission-module` is an optional peer: only
+`@bsv/mandala/profile` needs it.
 
 ## Recovery
 
@@ -150,14 +164,15 @@ dependencies with matching overrides. Once the packages are published, the
 - Tokens are BRC-162 1Color (`OneColor`). The topics are
   `tm_color_<assetId>` and `ls_color_<assetId>`, and the registry keeps
   `tm_mandala`, `ls_mandala`, `tm_mandala_kyc` and `ls_mandala_kyc`. The
-  `tm_<txid>` topics and σI v3 on token topics are gone. The overlay attests
-  admission with the BRC-207 attested statement (`verifyAttestation`).
+  `tm_<txid>` topics and σI v3 on token topics are gone. The overlay signs
+  admission with the `1color-admit:v1` statement (`verifyAttestation`). The
+  deploy `req` names only the issuer-v1 profile (B7).
 - Amounts are `bigint` everywhere: APIs, stores and wire fields. JSON reads
   accept canonical decimal strings only. `MAX_SAFE_AMOUNT` and every 2^53
   path are gone.
 - The holder-side `'p mandala'` pipeline is removed: `transferTokens`,
-  `receiveTokens`, `defaultSettle`, `cover`, `canonicalBundleId`,
-  `collectHandoverEvidence`, `journalEvidenceSource`, `lockToken`,
+  `receiveTokens`, `defaultSettle`, `canonicalBundleId`,
+  `journalEvidenceSource`, `lockToken`,
   `decodeValue`, `encodeLinkagePayload` (now `encodeEnvelope`), the
   `mandala-tokens` basket, `FT_PROTOCOL` and `BASKET`, and the `ftSelect`,
   `ftChange`, `ftCandidates` and `unlock` subpaths. Holders send with
@@ -166,8 +181,9 @@ dependencies with matching overrides. Once the packages are published, the
 - Treasury, authority, deploy, registry and payout-change outputs derive
   under `ADMIN_PROTOCOL [2, 'mandala admin']` in the `mandala treasury`
   basket.
-- MessageBox `mandala-payments` and the v1 and v2 bodies are gone. Hand-overs
-  and receipts use `mandala-color` with the v3 body.
+- MessageBox `mandala-payments` and the v1-v3 bodies are gone. Hand-overs
+  and issuer receipts use `mandala-color` with the v4 body (B7); `cover` and
+  `collectHandoverEvidence` return host-side with the S1 hop checks.
 - The journal stage `handed_over` is replaced by `signed` (not delivered:
   never submitted, aborted or swept) and `delivered` (acknowledged:
   reconcile re-submits it).

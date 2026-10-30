@@ -5,9 +5,12 @@
  * - Issuer / admin / registry flows (Mandala keys, `mandala treasury`
  *   basket) are overlay-first: noSend, overlay /submit, then sendWith, with
  *   journaled recovery (overlay.ts, reconcile.ts).
- * - Holder hand-overs go through a BRC-100 wallet that hosts
- *   `@bsv/color-permission-module` 0.2.0 with the Mandala issuer-v1 profile:
- *   send (sign noSend) → deliver (MessageBox `mandala-color`) → settle.
+ * - Holder hand-overs (B7): the wallet host runtime signs a plain-noSend
+ *   hand-over through `@bsv/color-permission-module` with the Mandala
+ *   issuer-v1 profile, sends the v4 body (receipt fields + σ / envelope
+ *   evidence) on MessageBox `mandala-color`, and submits after the ACK. The
+ *   recipient host submits (online) or runs COVER (offline) before it
+ *   internalizes the plain BRC-207 receipt.
  *
  * The core entry is React Native safe and never imports the color module;
  * the wallet-side profile handler lives in `@bsv/mandala/profile`. Retained
@@ -27,11 +30,23 @@ import { registerAsset, issueTokens, redeemTokens, IssuerOpResult, RegisterResul
 import { reconcileWallet, ReconcileOptions, ReconcileResult } from './reconcile.js'
 import { deliverHandover, HandoverResult, sendHandover, settleHandover, SettleResult } from './handover.js'
 import { receiveHandovers, ReceiveResult } from './receive.js'
+import type { HostLedger } from './hostLedger.js'
+import { normalizeKey } from './keys.js'
 import { payoutTokens, PayoutParams, PayoutResult } from './payout.js'
 
 export interface MandalaClientOptions extends MandalaEndpoints {
   /** BRC-100 wallet; defaults to a new WalletClient (browser substrate). */
   wallet?: WalletInterface
+  /**
+   * The host ledger shared with the wallet's Mandala issuer-v1 handler (B7).
+   * Only a wallet host runtime has one. Without it `send` throws (the tip's
+   * envelope is unreachable) and `receive` cannot credit offline.
+   */
+  ledger?: HostLedger
+  /** Host-only `color.markSettled(txid)` of the color module (B7). */
+  markSettled?: (txid: string) => Promise<void>
+  /** The host's underlying wallet (B7: the hand-over envelope is built from its custody). Required for `send`. */
+  hostWallet?: WalletInterface
 }
 
 export type AdminArgs = Omit<SubmitAdminActionParams, 'wallet' | 'messageBoxClient' | 'identityKey'>
@@ -134,24 +149,26 @@ export function createMandalaClient (opts: MandalaClientOptions = {}): MandalaCl
 
   const send = async (a: SendArgs): Promise<SendOutcome> => {
     const me = await identityKey()
+    const counterparty = normalizeKey(a.counterparty, 'counterparty')
     const handover = await sendHandover({
       wallet,
       identityKey: me,
       assetId: a.assetId,
       amount: a.amount,
-      recipientKey: a.counterparty,
+      recipientKey: counterparty,
       ...(a.blind != null ? { blind: a.blind } : {}),
-      ...(a.note != null ? { note: a.note } : {})
+      ...(a.note != null ? { note: a.note } : {}),
+      ledger: opts.ledger as HostLedger,
+      hostWallet: opts.hostWallet as WalletInterface
     })
-    const self = a.counterparty === me
+    const self = counterparty === me
     let notified = self
     if (!self) {
       try {
         await deliverHandover({
           messageBoxClient: await messageBox(),
-          recipientKey: a.counterparty,
-          handover,
-          ...(a.note != null ? { note: a.note } : {})
+          recipientKey: counterparty,
+          handover
         })
         notified = true
       } catch (e) {
@@ -163,7 +180,14 @@ export function createMandalaClient (opts: MandalaClientOptions = {}): MandalaCl
     if (!notified) return { handover, notified }
     try {
       // The live binding, read now: configureMandala may have run since construction.
-      const settle = await settleHandover({ wallet, handover, assetId: a.assetId, overlayIdentityKey: OVERLAY_IDENTITY_KEY })
+      const settle = await settleHandover({
+        wallet,
+        handover,
+        assetId: a.assetId,
+        overlayIdentityKey: OVERLAY_IDENTITY_KEY,
+        ...(opts.ledger != null ? { ledger: opts.ledger } : {}),
+        ...(opts.markSettled != null ? { markSettled: opts.markSettled } : {})
+      })
       return { handover, notified, settle }
     } catch (e) {
       // The entry is 'delivered': reconcile re-submits the journaled bytes.
@@ -181,6 +205,8 @@ export function createMandalaClient (opts: MandalaClientOptions = {}): MandalaCl
         wallet,
         messageBoxClient: await messageBox(),
         ...(a.assetId != null ? { assetId: a.assetId } : {}),
+        ...(opts.ledger != null ? { ledger: opts.ledger } : {}),
+        ...(opts.markSettled != null ? { markSettled: opts.markSettled } : {}),
         processed
       }),
     payout: async a =>
@@ -238,3 +264,9 @@ export * from './encoding.js'
 export * from './handover.js'
 export * from './receive.js'
 export * from './history.js'
+export * from './hostLedger.js'
+export * from './bundle.js'
+export * from './hostEnvelope.js'
+export * from './hopCheck.js'
+export * from './evidence.js'
+export * from './receiptSettle.js'

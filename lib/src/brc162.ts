@@ -9,7 +9,7 @@
 import { Hash, LockingScript, Utils, WalletInterface, WalletProtocol } from '@bsv/sdk'
 import { OneColor, decodeStrictCbor, encodeStrictCbor, readOneColorAttributes } from '@bsv/templates'
 import { MAX_UINT64 } from './amount.js'
-import { ADMIN_PROTOCOL, ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID } from './constants.js'
+import { ADMIN_PROTOCOL, MANDALA_PROFILE_ID } from './constants.js'
 
 export const MANDALA_TOPIC = 'tm_mandala'
 
@@ -221,12 +221,11 @@ function isIdentityKey (k: unknown): k is string {
 const codePoints = (s: unknown): number => typeof s === 'string' ? [...s].length : -1
 
 /**
- * The exact `req` every Mandala deploy writes (C§4): attested v1 in identity
- * mode and Mandala issuer-v1, both for K = the overlay's identity key.
+ * The exact `req` every Mandala deploy writes (design §9 B7): only the
+ * Mandala issuer-v1 profile, for K = the overlay's identity key.
  */
 export function mandalaReq (identityKey: string): Record<string, { version: 1, params: Record<string, string> }> {
   return {
-    [ATTESTED_PROFILE_ID]: { version: 1, params: { trustMode: 'identity', identityKey } },
     [MANDALA_PROFILE_ID]: { version: 1, params: { identityKey } }
   }
 }

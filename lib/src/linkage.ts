@@ -20,6 +20,7 @@
  */
 import { PrivateKey, PublicKey, WalletInterface } from '@bsv/sdk'
 import { OVERLAY_IDENTITY_KEY_UNSET } from './constants.js'
+import { normalizeKey } from './keys.js'
 import { colorProtocolID } from './naming.js'
 import { readSpecificLinkage, SpecificLinkage } from './encoding.js'
 import {
@@ -81,9 +82,10 @@ export async function recipientLinkage (
   if (a == null || typeof a !== 'object') throw new TypeError('@bsv/mandala: recipientLinkage arguments are required')
   if (a.overlayIdentityKey === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
   const A = checkKey(a.identityKey, 'identityKey')
-  const B = checkKey(a.recipientKey, 'recipientKey')
+  const recipientKey = normalizeKey(a.recipientKey, 'recipientKey')
+  const B = checkKey(recipientKey, 'recipientKey')
   checkKey(a.overlayIdentityKey, 'overlayIdentityKey')
-  if (a.recipientKey === a.identityKey) {
+  if (recipientKey === a.identityKey) {
     throw new TypeError('@bsv/mandala: recipientLinkage refuses a send to self (self uses owned outputs)')
   }
   if (typeof a.blind !== 'boolean') throw new TypeError('@bsv/mandala: blind must be a boolean')
@@ -96,7 +98,7 @@ export async function recipientLinkage (
     throw new TypeError('@bsv/mandala: identityKey is not this wallet\'s identity key')
   }
 
-  const S = await rootSharedSecret(wallet, a.recipientKey)
+  const S = await rootSharedSecret(wallet, recipientKey)
   let r: PrivateKey | undefined
   let senderIdentityKey = a.identityKey
   let secret: PublicKey = S
@@ -125,7 +127,7 @@ export async function recipientLinkage (
   const linkage = readSpecificLinkage({
     prover: a.identityKey,
     verifier: a.overlayIdentityKey,
-    counterparty: a.recipientKey,
+    counterparty: recipientKey,
     protocolID,
     keyID: COLOR_KEY_ID,
     encryptedLinkage: Array.from(encryptedLinkage),

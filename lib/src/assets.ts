@@ -2,12 +2,12 @@ import { Utils, WalletInterface } from '@bsv/sdk'
 import { OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, TREASURY_BASKET } from './constants.js'
 import { MandalaActionDetails } from './brc162.js'
 import { outpoint } from './tokens.js'
-import { AdmissionReceipt, admissionReceipt, isOutcomeUnknown } from './overlay.js'
+import { normalizeKey } from './keys.js'
+import { AdmissionReceipt, admissionReceipt, mayHaveCommitted } from './overlay.js'
 import { withAdminAuthGate, withAdminAuthGates, assertSpendablePrior } from './adminAuthGate.js'
 import { withIntent } from './txJournal.js'
 import { notifyPutIntent, notifyRemove } from './notifyJournal.js'
 import { runAuthorityTx } from './authority.js'
-import { fetchDeployTx } from './overlayLookup.js'
 import { guardPositiveAmount } from './submitGuards.js'
 import {
   checkRecipient, deliverIssuerReceipt, handoverBody, issuerReceipt, issuerRecipientOutput, MessageBoxSender,
@@ -178,19 +178,19 @@ async function spendableBeef (wallet: WalletInterface, priors: string[]): Promis
  * `details.recipient`, the amount must be a positive uint64, and the receipt
  * needs a MessageBox client.
  */
-function checkReissue (p: SubmitAdminActionParams): void {
+function checkReissue (p: SubmitAdminActionParams): string | undefined {
   const { details, ftOutput } = p
   if (ftOutput == null) {
     if (details.kind === 'reissue') throw new TypeError('@bsv/mandala: a reissue needs ftOutput { recipient, amount }')
     return
   }
   if (details.kind !== 'reissue') throw new TypeError(`@bsv/mandala: ftOutput is only valid on a reissue, not ${details.kind}`)
-  if (ftOutput.recipient !== details.recipient) {
+  if (normalizeKey(ftOutput.recipient, 'ftOutput.recipient') !== normalizeKey(details.recipient, 'details.recipient')) {
     throw new TypeError('@bsv/mandala: ftOutput.recipient must equal details.recipient (the overlay requires every reissued output to go to it)')
   }
   const gate = guardPositiveAmount(ftOutput.amount)
   if (!gate.ok) throw new Error(gate.reason)
-  checkRecipient({ identityKey: p.identityKey, recipientKey: ftOutput.recipient, messageBoxClient: p.messageBoxClient })
+  return checkRecipient({ identityKey: p.identityKey, recipientKey: ftOutput.recipient, messageBoxClient: p.messageBoxClient })
 }
 
 /**
@@ -217,13 +217,15 @@ function checkReissue (p: SubmitAdminActionParams): void {
 export async function submitAdminAction (
   p: SubmitAdminActionParams
 ): Promise<SubmitAdminActionResult> {
-  const { wallet, asset, details, ftOutput, identityKey } = p
-  checkReissue(p)
+  const { wallet, asset, identityKey } = p
+  // The recipient key is lowercased once here; everything below (the admin
+  // details, the linkage, the receipt intent, the MessageBox address) uses it.
+  const recipientKey = checkReissue(p)
+  const details = recipientKey != null ? { ...p.details, recipient: recipientKey } as typeof p.details : p.details
+  const ftOutput = recipientKey != null && p.ftOutput != null ? { ...p.ftOutput, recipient: recipientKey } : p.ftOutput
   if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
 
   return withAdminAuthGate(asset.assetId, asset.authOutpoint, async () => await withIntent(async () => {
-    // The verified deploy, before any coin is held (reissue receipts carry it).
-    const declarationTx = ftOutput != null ? (await fetchDeployTx(asset.assetId)).toBinary() : undefined
     const inputBEEF = await spendableBeef(wallet, [asset.authOutpoint])
     const foreign = ftOutput != null
       ? await issuerRecipientOutput(wallet, { identityKey, recipientKey: ftOutput.recipient, assetId: asset.assetId, amount: ftOutput.amount })
@@ -232,17 +234,18 @@ export async function submitAdminAction (
     // failure from there to admission that released the action removes it.
     // An unknown outcome (the action is held) keeps it.
     let intentTxid: string | undefined
-    const journalIntent = ftOutput != null && foreign != null && declarationTx != null
+    const journalIntent = ftOutput != null && foreign != null
       ? async (s: { txid: string, tx: number[], offChainValues: number[], topics: string[], foreignIndices: number[] }) => {
         intentTxid = s.txid
         await notifyPutIntent(s.txid, {
           assetId: asset.assetId,
           recipientKey: ftOutput.recipient,
           outputIndex: s.foreignIndices[0],
+          amount: ftOutput.amount.toString(),
           derivationPrefix: foreign.derivationPrefix,
           derivationSuffix: foreign.derivationSuffix,
           senderIdentityKey: foreign.senderIdentityKey,
-          declarationTxHex: Utils.toHex(declarationTx),
+          senderMode: 'identity',
           txHex: Utils.toHex(s.tx),
           offChainHex: Utils.toHex(s.offChainValues),
           topics: s.topics
@@ -270,27 +273,30 @@ export async function submitAdminAction (
     } catch (e) {
       // An unknown submit outcome keeps the action held (submitAndBroadcast)
       // and so keeps the intent: the reissue may have landed (see payout.ts).
-      if (intentTxid != null && !isOutcomeUnknown(e)) await notifyRemove(intentTxid)
+      if (intentTxid != null && !mayHaveCommitted(e)) await notifyRemove(intentTxid)
       throw e
     }
 
     let notified = true
-    if (ftOutput != null && foreign != null && declarationTx != null) {
+    if (ftOutput != null && foreign != null) {
       const outputIndex = res.foreignIndices[0]
-      const receipt = issuerReceipt({
-        assetId: asset.assetId,
-        derivationPrefix: foreign.derivationPrefix,
-        derivationSuffix: foreign.derivationSuffix,
-        senderIdentityKey: foreign.senderIdentityKey,
-        declarationTx,
-        attestation: requireAttestedOutput(res.admitted, outputIndex, res.txid),
-        offChainValues: res.offChainValues
-      })
+      const attestation = requireAttestedOutput(res.admitted, outputIndex, res.txid)
       notified = await deliverIssuerReceipt({
         messageBoxClient: p.messageBoxClient as MessageBoxSender,
         recipientKey: ftOutput.recipient,
         txid: res.txid,
-        body: handoverBody({ assetId: asset.assetId, outputIndex, tx: res.tx, receipt })
+        body: handoverBody({
+          assetId: asset.assetId,
+          amount: ftOutput.amount,
+          outputIndex,
+          tx: res.tx,
+          derivationPrefix: foreign.derivationPrefix,
+          derivationSuffix: foreign.derivationSuffix,
+          senderIdentityKey: foreign.senderIdentityKey,
+          senderMode: 'identity',
+          admission: attestation,
+          linkage: [{ txid: res.txid, offChainValues: res.offChainValues }]
+        })
       })
     }
     return {

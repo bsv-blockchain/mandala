@@ -32,25 +32,21 @@ describe('package manifest', () => {
     expect(pkg.peerDependenciesMeta).toEqual({ '@bsv/color-permission-module': { optional: true } })
   })
 
-  it('installs sdk and templates from vendored tarballs', () => {
-    for (const n of ['@bsv/sdk', '@bsv/templates']) {
-      expect(pkg.devDependencies[n]).toMatch(/^file:\.\.\/vendor-ts-stack\/bsv-[a-z-]+-\d+\.\d+\.\d+-[0-9a-f]{7,9}\.tgz$/)
-    }
+  it('installs the whole 1Color stack from npm', () => {
+    expect(pkg.devDependencies['@bsv/sdk']).toBe('^4.0.0')
+    expect(pkg.devDependencies['@bsv/wallet-toolbox-client']).toBe('^2.15.0')
     expect(pkg.devDependencies['@bsv/message-box-client']).toBe('^2.5.4')
+    expect(pkg.devDependencies['@bsv/templates']).toBe('^2.2.0')
+    expect(pkg.devDependencies['@bsv/color-permission-module']).toBe('^0.2.0')
+    expect(Object.values(pkg.devDependencies).filter(spec => spec.startsWith('file:'))).toEqual([])
   })
 
-  it('installs the color module and toolbox client (profile entry, tests) from vendored tarballs with overrides', () => {
-    for (const n of ['@bsv/color-permission-module', '@bsv/wallet-toolbox-client']) {
-      expect(pkg.devDependencies[n]).toMatch(/^file:\.\.\/vendor-ts-stack\/bsv-[a-z-]+-\d+\.\d+\.\d+-[0-9a-f]{7,9}\.tgz$/)
-      expect(pkg.overrides?.[n]).toBe(`$${n}`)
-    }
-    expect(pkg.devDependencies['@bsv/color-permission-module']).toContain('bsv-color-permission-module-0.2.0-')
-    expect(pkg.devDependencies['@bsv/wallet-toolbox-client']).toContain('bsv-wallet-toolbox-client-2.15.0-')
+  it('pins @bsv/sdk to the direct spec (message-box-client still declares an sdk ^2.8.6 peer)', () => {
+    expect(pkg.overrides?.['@bsv/sdk']).toBe('$@bsv/sdk')
+    expect(pkg.overrides?.['@bsv/wallet-toolbox-client']).toBeUndefined()
   })
 
-  it('overrides every vendored name to its direct spec', () => {
-    const vendored = Object.keys(pkg.devDependencies).filter(n => pkg.devDependencies[n].startsWith('file:'))
-    expect(vendored.length).toBeGreaterThan(0)
-    for (const n of vendored) expect(pkg.overrides?.[n]).toBe(`$${n}`)
+  it('overrides the shared 1Color names to their direct specs, so one copy of each installs', () => {
+    for (const n of ['@bsv/sdk', '@bsv/templates', '@bsv/color-permission-module']) expect(pkg.overrides?.[n]).toBe(`$${n}`)
   })
 })

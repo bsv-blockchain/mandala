@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import type { WalletInterface } from '@bsv/sdk'
+import { PrivateKey, type WalletInterface } from '@bsv/sdk'
 
 // The facade is wiring only: the pipelines it composes are mocked so these
 // tests pin the order, the arguments and what each failure does to `send`.
@@ -58,8 +58,8 @@ describe('index — metadata is reachable from the package root', () => {
   })
 })
 
-const ME = '02' + 'a1'.repeat(32)
-const BOB = '03' + 'b2'.repeat(32)
+const ME = PrivateKey.fromString('0a'.padStart(64, '0')).toPublicKey().toString()
+const BOB = PrivateKey.fromString('0b'.padStart(64, '0')).toPublicKey().toString()
 const OVERLAY_KEY = '02' + 'c3'.repeat(32)
 const ASSET = 'd4'.repeat(32) + '_0'
 const TXID = 'e5'.repeat(32)
@@ -69,9 +69,12 @@ const handover: HandoverResult = {
   tx: [1, 2, 3],
   reference: 'ref-1',
   outputIndex: 0,
-  receipt: { version: 1, assetId: ASSET, derivationPrefix: 'p', derivationSuffix: 's', senderIdentityKey: ME, profileData: {} },
+  receipt: { version: 1, assetId: ASSET, derivationPrefix: 'p', derivationSuffix: 's', senderIdentityKey: ME },
+  body: {} as any,
   offChainValues: [9]
 }
+const ledger = { get: vi.fn(), put: vi.fn(), list: vi.fn(), putSubmission: vi.fn(), getSubmission: vi.fn(), removeSubmission: vi.fn() } as any
+const markSettled = vi.fn(async () => {})
 const admitted = { status: 'admitted' as const, attestation: { txid: TXID, outputs: [0], signer: OVERLAY_KEY, signature: '30' } }
 
 function fakeWallet (): WalletInterface {
@@ -79,7 +82,7 @@ function fakeWallet (): WalletInterface {
 }
 
 function client (wallet = fakeWallet()) {
-  return createMandalaClient({ wallet, overlayUrl: 'https://overlay.test', overlayIdentityKey: OVERLAY_KEY, messageBoxUrl: 'https://mb.test' })
+  return createMandalaClient({ wallet, overlayUrl: 'https://overlay.test', overlayIdentityKey: OVERLAY_KEY, messageBoxUrl: 'https://mb.test', ledger, markSettled })
 }
 
 describe('createMandalaClient.send', () => {
@@ -92,9 +95,9 @@ describe('createMandalaClient.send', () => {
   it('send to another key: sendHandover → deliverHandover → settleHandover with the configured overlay key', async () => {
     const wallet = fakeWallet()
     const r = await client(wallet).send({ assetId: ASSET, counterparty: BOB, amount: 400n, note: 'rent june', blind: false })
-    expect(sendHandover).toHaveBeenCalledWith({ wallet, identityKey: ME, assetId: ASSET, amount: 400n, recipientKey: BOB, blind: false, note: 'rent june' })
-    expect(deliverHandover).toHaveBeenCalledWith({ messageBoxClient: messageBox, recipientKey: BOB, handover, note: 'rent june' })
-    expect(settleHandover).toHaveBeenCalledWith({ wallet, handover, assetId: ASSET, overlayIdentityKey: OVERLAY_KEY })
+    expect(sendHandover).toHaveBeenCalledWith({ wallet, identityKey: ME, assetId: ASSET, amount: 400n, recipientKey: BOB, blind: false, note: 'rent june', ledger })
+    expect(deliverHandover).toHaveBeenCalledWith({ messageBoxClient: messageBox, recipientKey: BOB, handover })
+    expect(settleHandover).toHaveBeenCalledWith({ wallet, handover, assetId: ASSET, overlayIdentityKey: OVERLAY_KEY, ledger, markSettled })
     const order = [sendHandover, deliverHandover, settleHandover].map(f => vi.mocked(f).mock.invocationCallOrder[0])
     expect(order).toEqual([...order].sort((a, b) => a - b))
     expect(r).toEqual({ handover, notified: true, settle: admitted })

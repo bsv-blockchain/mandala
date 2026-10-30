@@ -180,6 +180,18 @@ export function isOutcomeUnknown (e: unknown): boolean {
 }
 
 /**
+ * True when re-running the operation could pay twice: the overlay may have
+ * applied the tx (an unknown-outcome refusal) or it is known committed
+ * (ReceiptUnavailableError, or any error carrying `committed === true`).
+ * The one check callers use to decide an intent/action must be kept, never
+ * dropped or re-run. isOutcomeUnknown stays the narrower refusal-only check.
+ */
+export function mayHaveCommitted (e: unknown): boolean {
+  if (isOutcomeUnknown(e)) return true
+  return typeof e === 'object' && e !== null && (e as { committed?: unknown }).committed === true
+}
+
+/**
  * Map an HTTP status + raw body to a refusal. Only a body that actually
  * carries the contract's `{status:'error', code}` shape is trusted for its
  * code; a non-JSON body, an empty body, or an unexpected shape is
@@ -595,19 +607,26 @@ export async function submitAndBroadcast (
       //
       // Awaited: a crash between this write and the rethrow must leave the
       // entry behind, not the error.
-      await journalPut({
-        txid: signed.txid,
-        stage: 'retryable',
-        at: Date.now(),
-        code: (e as OverlayRefusedError).code,
-        attempts: 0,
-        ...(reference != null ? { reference } : {}),
-        submit: {
-          txHex: Utils.toHex(signed.tx),
-          ...(offChainValues != null ? { offChainHex: Utils.toHex(offChainValues) } : {}),
-          topics
-        }
-      })
+      // Deferred-lib item 3: a journal fault must never replace the refusal
+      // (callers branch on isOutcomeUnknown(e) to keep or drop receipt intents).
+      try {
+        await journalPut({
+          txid: signed.txid,
+          stage: 'retryable',
+          at: Date.now(),
+          code: (e as OverlayRefusedError).code,
+          outcome: unknown ? 'unknown' : 'refused',
+          attempts: 0,
+          ...(reference != null ? { reference } : {}),
+          submit: {
+            txHex: Utils.toHex(signed.tx),
+            ...(offChainValues != null ? { offChainHex: Utils.toHex(offChainValues) } : {}),
+            topics
+          }
+        })
+      } catch (je) {
+        console.warn(`[mandala] could not journal the held ${signed.txid}; the refusal stands:`, je)
+      }
     } else if (reference != null) {
       // A refusal that proves nothing was applied (or a failure before the
       // send) — release the held inputs.

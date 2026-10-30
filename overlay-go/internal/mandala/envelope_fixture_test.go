@@ -12,7 +12,7 @@ import (
 // overlay-go engine-flow test admits it. P-GO copies the file byte for byte, as with F-REQ.
 const goEnvelope, libEnvelope = "testdata/1color-envelope.json", "../../../lib/src/__fixtures__/1color-envelope.json"
 
-// TestEnvelopeFixtureMatchesLib guards the seam until the admit test lands. While P-LIB's file is absent the test
+// TestEnvelopeFixtureMatchesLib guards the byte-for-byte copy; internal/httpapi TestTSEnvelopeAdmitted admits it. While P-LIB's file is absent the test
 // logs and passes (no t.Skip, so the 0-SKIP gate holds). Once P-LIB checks the file in, this fails until the Go
 // copy exists with the same sha256; whoever copies it adds the engine-flow test that admits it (pre-merge
 // follow-up, blocked on P-LIB).

@@ -3,9 +3,11 @@
  *
  * `__fixtures__/1color-envelope.json` freezes four lib-built transactions that
  * link by txid: deploy → issue → payout (issuer FakeWallet, overlay-first,
- * attested) → a holder hand-over built by `@bsv/color-permission-module`
- * 0.2.0 with the issuer-v1 handler (blinded recipient output 0, owned change
- * output 1). Plan 03 copies the file byte for byte to
+ * attested) → a holder hand-over built through the B7 module stand-in of
+ * the time (regeneration now runs the real color module, profileHolder.ts)
+ * with the issuer-v1 handler and the host-built envelope
+ * (blinded recipient output 0, owned change output 1). Regenerated for B7
+ * (the deploy `req` names issuer-v1 only). Plan 03 copies the file byte for byte to
  * `overlay-go/internal/mandala/testdata/1color-envelope.json` and replays it
  * through its engine flow (`TestTSEnvelopeAdmitted`, hand-over
  * `outputsToAdmit [0,1]`).
@@ -14,11 +16,11 @@
  * linkage.go rule, so a TS envelope that overlay-go would read differently
  * (member shapes, protocolID tuple, the `specific linkage revelation 2 …`
  * encryption, the G9 owner counterparty) fails here first. Regenerate only
- * when the C§5 envelope format changes (see `profile.integration.test.ts`,
- * MANDALA_REGEN_ENVELOPE), and report every regeneration to P-GO.
+ * when the C§5 envelope format or the deploy `req` changes (the
+ * MANDALA_REGEN_ENVELOPE block below), and report every regeneration to P-GO.
  */
-import { describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { describe, expect, it, vi } from 'vitest'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { Beef, LockingScript, PrivateKey, ProtoWallet, PublicKey, Transaction, Utils } from '@bsv/sdk'
 import { OneColor } from '@bsv/templates'
@@ -26,7 +28,19 @@ import { decodeEnvelope, type SpecificLinkage } from './encoding.js'
 import { decodeToken, readDeploy } from './brc162.js'
 import { colorTopic } from './naming.js'
 import { outputPubKeyHash, outputPublicKey } from './blinding.js'
-import { checkOfflineHops } from './profileHopCheck.js'
+import { checkHop } from './hopCheck.js'
+import { configureMandala } from './constants.js'
+import { configureStorage, memoryStorage } from './storage.js'
+import { clearAdminAuthGates } from './adminAuthGate.js'
+import { clearDeployTxCache } from './overlayLookup.js'
+import { listAdminAssets } from './assets.js'
+import { issueTokens, registerAsset } from './issuerOps.js'
+import { payoutTokens } from './payout.js'
+import { sendHandover } from './handover.js'
+import { receiveHandovers } from './receive.js'
+import { FakeWallet } from './__fixtures__/fakeWallet.js'
+import { fakeMandalaOverlay } from './__fixtures__/fakeMandalaOverlay.js'
+import { makeProfileHolder, messageBus } from './__fixtures__/profileHolder.js'
 import { MAX_UINT64 } from './amount.js'
 
 interface FixtureTx {
@@ -171,15 +185,69 @@ describe('envelope fixture is self-consistent', () => {
     expect(BigInt(F.amounts.issue)).toBeLessThanOrEqual(MAX_UINT64)
   })
 
-  it('the hand-over hop passes the offline local hop checks with K', () => {
+  it('the hand-over hop passes the offline local hop checks with K (scripts verified)', () => {
     const t = tx('handover')
-    expect(() => checkOfflineHops({ assetId: F.assetId } as any, [{
-      txid: t.txid, atomicBEEF: Utils.toArray(t.atomicBeefHex, 'hex'), offChainValues: Utils.toArray(t.offChainValuesHex, 'hex')
-    }], F.keys.overlay)).not.toThrow()
+    expect(() => checkHop(F.assetId, parsed(t), Utils.toArray(t.offChainValuesHex, 'hex'), F.keys.overlay)).not.toThrow()
   })
 
   it('the deploy names the overlay key in its req (F-REQ)', () => {
     const d = parsed(tx('deploy'))
     expect(readDeploy(d.outputs[0].lockingScript, d.id('hex'))?.mandalaKey).toBe(F.keys.overlay)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Regeneration (run once with MANDALA_REGEN_ENVELOPE=1, commit the file, and
+// report it to P-GO, who copies it to overlay-go testdata byte for byte).
+// ---------------------------------------------------------------------------
+
+describe.skipIf(process.env.MANDALA_REGEN_ENVELOPE == null || process.env.MANDALA_REGEN_ENVELOPE === '')('envelope fixture regeneration', () => {
+  it('writes __fixtures__/1color-envelope.json', async () => {
+    configureStorage(memoryStorage())
+    clearAdminAuthGates()
+    clearDeployTxCache()
+    const priv = new PrivateKey(5555)
+    const K = priv.toPublicKey().toString()
+    const overlay = fakeMandalaOverlay({ priv })
+    vi.stubGlobal('fetch', overlay.fetch)
+    configureMandala({ overlayUrl: 'https://mandala.test', overlayIdentityKey: K })
+    const bus = messageBus()
+    const issuer = new FakeWallet(new PrivateKey(1111))
+    const holder = makeProfileHolder({ K, url: 'https://mandala.test', fetch: overlay.fetch, priv: new PrivateKey(2222) })
+    const recipient = makeProfileHolder({ K, url: 'https://mandala.test', fetch: overlay.fetch, priv: new PrivateKey(3333) })
+    const wallet = issuer.asWallet()
+    const { assetId } = await registerAsset({ wallet, identityKey: issuer.identityKey, label: 'Test Dollar', ticker: 'TUSD', decimals: 2 })
+    await issueTokens({ wallet, identityKey: issuer.identityKey, asset: (await listAdminAssets(wallet)).find(a => a.assetId === assetId)!, amount: 1500n })
+    const asset = (await listAdminAssets(wallet)).find(a => a.assetId === assetId)!
+    await payoutTokens({ wallet, identityKey: issuer.identityKey, asset, amount: 1000n, recipientKey: holder.identityKey, messageBoxClient: bus(issuer.identityKey) })
+    expect((await receiveHandovers({ wallet: holder.wallet, messageBoxClient: bus(holder.identityKey), ledger: holder.ledger })).failed).toEqual([])
+    const topic = colorTopic(assetId)
+    const h = await sendHandover({
+      wallet: holder.wallet, hostWallet: holder.hostWallet, ledger: holder.ledger, identityKey: holder.identityKey,
+      assetId, amount: 400n, recipientKey: recipient.identityKey, derivationPrefix: 'AQ==', derivationSuffix: 'Ag=='
+    })
+    const tip = Transaction.fromAtomicBEEF(h.tx)
+    const names = ['deploy', 'issue', 'payout'] as const
+    const fixture = {
+      version: 1,
+      keys: { issuer: issuer.identityKey, holder: holder.identityKey, recipient: recipient.identityKey, overlay: K },
+      privateKeys: { issuer: 1111, holder: 2222, recipient: 3333, overlay: 5555 },
+      assetId,
+      amounts: { issue: '1500', payout: '1000', handover: '400', handoverChange: '600' },
+      txs: [
+        ...overlay.submissions.slice(0, 3).map((s, i) => ({
+          name: names[i],
+          txid: s.txid,
+          topics: s.topics,
+          rawTxHex: Transaction.fromAtomicBEEF(s.beef).toHex(),
+          atomicBeefHex: Utils.toHex(s.beef),
+          offChainValuesHex: Utils.toHex(s.offChainValues),
+          outputsToAdmit: Object.fromEntries(Object.entries(s.steak).map(([t, e]) => [t, (e as { outputsToAdmit: number[] }).outputsToAdmit]))
+        })),
+        { name: 'handover', txid: h.txid, topics: [topic], rawTxHex: tip.toHex(), atomicBeefHex: Utils.toHex(h.tx), offChainValuesHex: Utils.toHex(h.offChainValues), outputsToAdmit: { [topic]: [0, 1] } }
+      ]
+    }
+    writeFileSync(FILE, JSON.stringify(fixture, null, 2) + '\n')
+    vi.unstubAllGlobals()
   })
 })
