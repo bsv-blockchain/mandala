@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"slices"
+	"strings"
 
 	"github.com/bsv-blockchain/go-overlay-services/pkg/core/engine"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -47,7 +48,9 @@ type AppliedAdmissionProof func(ctx context.Context, txid string) (map[string][]
 // and returns the compensation run only on a broadcast failure (wiring.prepareSubmitCompensation).
 type PrepareSubmitCompensation func(ctx context.Context, beef []byte, topics []string) (compensate func(context.Context) error, restore *mandala.RestoreSnapshot, err error)
 
-// submitDeps are POST /submit's collaborators. Task 23 adds the deploy hook and the maintenance gate here.
+// submitDeps are POST /submit's collaborators: the engine, broadcast-failure compensation, and the admission
+// signer, record, and applied proof. The maintenance gate and the deploy hook are /submit middleware
+// (WithSubmitGate, WithDeployHook).
 type submitDeps struct {
 	submitter Submitter
 	prepare   PrepareSubmitCompensation
@@ -485,14 +488,31 @@ func hostRuleVerdict(code mandala.Code) Verdict {
 	return Verdict{Code: string(code), HTTP: fiber.StatusServiceUnavailable, Retryable: true}
 }
 
+// submitPath reports whether Fiber would route this request to POST /submit. app.Use("/submit") prefix-matches,
+// so /submitX reaches middleware mounted there; these handlers run only for the path the route itself matches.
+// Case folding and trailing-slash trimming follow the app config, which keeps Fiber's default /Submit and /submit/
+// forms on this route.
+func submitPath(c *fiber.Ctx) bool {
+	p := c.Path()
+	cfg := c.App().Config()
+	if !cfg.CaseSensitive {
+		p = strings.ToLower(p)
+	}
+	if !cfg.StrictRouting && len(p) > 1 && p[len(p)-1] == '/' {
+		p = strings.TrimRight(p, "/")
+	}
+	return p == "/submit"
+}
+
 // submitGateMiddleware is /submit step 0: one shared slot of the maintenance gate for the whole request (host
 // rules, known-verdict path, Submit and finalize). The owner-index refold and eviction take the exclusive side, so
 // they never run beside a submit, and a waiting exclusive section holds new submits back (writer preference).
 // Lock order (Global Constraints): this shared slot is taken BEFORE the registrar mutex (Ensure, in
 // submitHostRulesMiddleware) and released after it; Ensure never waits on the gate; the gate is not re-entrant.
+// A path Fiber would not route to POST /submit (a prefix such as /submitX) takes no slot.
 func submitGateMiddleware(g SubmitGate) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		if c.Method() != fiber.MethodPost {
+		if !submitPath(c) || c.Method() != fiber.MethodPost {
 			return c.Next()
 		}
 		release, err := g.Enter(c.UserContext())
@@ -514,10 +534,11 @@ type hostRules struct {
 
 // submitHostRulesMiddleware runs /submit steps 2a and 2b for submits that name tm_mandala. It re-reads X-Topics,
 // the CompactSize framing and the BEEF itself and hands every malformed request to the core handler (c.Next), so
-// Task 20's steps 1-2 keep their answers and the wire order is 1-2 → 2a → 2b → 3-10.
+// Task 20's steps 1-2 keep their answers and the wire order is 1-2 → 2a → 2b → 3-10. A path Fiber would not
+// route to POST /submit is passed on untouched, so a prefix such as /submitX is a plain 404.
 func submitHostRulesMiddleware(h hostRules) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		if c.Method() != fiber.MethodPost {
+		if !submitPath(c) || c.Method() != fiber.MethodPost {
 			return c.Next()
 		}
 		topics, ok := hostRuleTopics(c.Get("X-Topics"))
@@ -580,36 +601,19 @@ func submitHostRulesMiddleware(h hostRules) fiber.Handler {
 	}
 }
 
-// hostRuleTopics parses X-Topics as the core does (a JSON array of strings); ok is false when the core would refuse it.
+// hostRuleTopics parses X-Topics through parseTopicsHeader (step 1). ok is false when that helper would refuse
+// the header, so steps 2a and 2b never see a topic list step 1 would reject.
 func hostRuleTopics(header string) ([]string, bool) {
-	if header == "" {
-		return nil, false
-	}
-	var topics []string
-	if err := json.Unmarshal([]byte(header), &topics); err != nil {
-		return nil, false
-	}
-	return topics, true
+	topics, problem := parseTopicsHeader(header)
+	return topics, problem == ""
 }
 
-// hostRuleSplitBody splits the body exactly as the core's step 2 (canonical CompactSize BEEF length, then the
-// off-chain values); ok is false when the core would refuse the framing.
+// hostRuleSplitBody splits the body through splitSubmitBody (step 2). ok is false when that helper would refuse
+// the framing, so steps 2a and 2b never see a body step 2 would reject.
 func hostRuleSplitBody(c *fiber.Ctx) (beef, offChain []byte, ok bool) {
-	body := c.Body()
-	if c.Get("x-includes-off-chain-values") != "true" {
-		return body, nil, true
-	}
-	r := bytes.NewReader(body)
-	n, err := readVarInt(r)
-	if err != nil {
-		return nil, nil, false
-	}
-	consumed := len(body) - r.Len()
-	if n > uint64(len(body)-consumed) {
-		return nil, nil, false
-	}
-	end := consumed + int(n)
-	return body[consumed:end], body[end:], true
+	var problem string
+	beef, offChain, problem = splitSubmitBody(c.Body(), c.Get("x-includes-off-chain-values") == "true")
+	return beef, offChain, problem == ""
 }
 
 // hostRuleParseBeef is the core's txid derivation (transaction.ParseBeef: the atomic subject, else the parsed tx).
