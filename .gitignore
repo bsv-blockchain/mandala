@@ -12,3 +12,4 @@ overlay-go/.q3-launch.local.sh
 # LICENSE / NOTICE copied into nested npm packages by their prepack script
 /lib/LICENSE
 /lib/NOTICE
+/lib/PATENTS

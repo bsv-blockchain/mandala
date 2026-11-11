@@ -21,12 +21,13 @@
   },
   "files": [
     "LICENSE",
+    "PATENTS",
     "NOTICE",
     "dist"
   ],
   "sideEffects": false,
   "scripts": {
-    "prepack": "node -e \"const fs=require('fs');for(const f of ['LICENSE','NOTICE'])fs.copyFileSync('../'+f,f)\"",
+    "prepack": "node -e \"const fs=require('fs');for(const f of ['LICENSE','NOTICE','PATENTS'])fs.copyFileSync('../'+f,f)\"",
     "build": "tsc -p tsconfig.build.json",
     "prepare": "npm run build",
     "test": "vitest run",
