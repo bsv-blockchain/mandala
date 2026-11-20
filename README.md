@@ -255,11 +255,17 @@ Both suites must pass. Typecheck the app with `npx tsc --noEmit`.
 See `overlay-go/.env.example` for every option. Required:
 
 ```env
-NODE_NAME=mandala
+# Fresh name. The database is <NODE_NAME>_lookup_services. Never reuse
+# mandala (old-format state), mandala162, or mandala_q3.
+NODE_NAME=mandala_1color
 SERVER_PRIVATE_KEY=<openssl rand -hex 32>
 HOSTING_URL=http://localhost:8081
+# Any path in MONGO_URL is ignored; the database name comes from NODE_NAME.
 MONGO_URL=mongodb://mongodb:27017/mandala
 NETWORK=test                # or main
+# Required. JSON array of compressed issuer identity public keys. Boot fails
+# if it is missing or invalid. Keep the single quotes if a shell sources this.
+MANDALA_ISSUER_KEYS='["<issuer identity public key>"]'
 # Optional — makes the overlay a full network participant (broadcast + SPV):
 # ARCADE_URL=<arcade host>
 # ARCADE_API_KEY=<key>

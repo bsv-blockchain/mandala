@@ -507,8 +507,10 @@ type BalanceRebuild struct {
 // mandalaTokens: storing a value row credits its owner once, and every debit (TakeBackRepair, and
 // takeRow on a spend, an eviction or RetireOutputs) follows a TakeToken that deleted the row. Rows
 // are deleted, never flagged, so an identity's balance is the sum of amount over every
-// mandalaTokens row it owns, across tokens. A reissued outpoint (asset state evictedOutpoints) keeps
-// its row and no path debits it, so it counts here, although CirculatingSupply leaves it out.
+// mandalaTokens row it owns, across tokens. A reissue does not delete the target row, so a
+// reissued outpoint (asset state evictedOutpoints) still counts here while that row is present,
+// although CirculatingSupply leaves it out. SweepOwnerIndex takes the row back only once the
+// output is no longer an unspent admitted coin.
 //
 // An identity with a balance document but no rows is set to 0 and keeps its document; one with
 // rows but no document gets one; a document whose stored Decimal128 balance already equals the sum

@@ -1,12 +1,14 @@
 package httpapi
 
 // A13 — bearer auth + narrowed CORS for the identity-bearing admin routes:
-// GET /admin/registry, GET /admin/activity, and A12's
-// GET /admin/admission/:txid (not yet ported to this backend — see
-// adminGatedPath). Every other /admin/* route (asset-state*, admin-history*,
-// admin-summary*, asset-auth*, registry/beef/*) is the public audit surface
-// R29 wants and keeps the wildcard CORS in server.go's corsMiddleware with
-// no auth — recovery must keep working without a console token.
+// GET /admin/registry, GET /admin/activity, and GET /admin/admission/:txid
+// (registerAdmissionRoute in admin.go). GET /admin/registry returns the KYC
+// identity list and /admin/activity returns linkage-derived counterparties.
+// Every other /admin/* route (asset-state*, admin-history*, admin-summary*,
+// authorities*, registry/beef/*, /admin/tokens) is the public audit surface
+// and keeps the wildcard CORS in server.go's corsMiddleware with no auth —
+// recovery must keep working without a console token. The v2 /admin/asset-auth*
+// routes are not registered.
 //
 // Wire shapes (401 body, header names) mirror overlay/src/adminAuth.ts
 // exactly, so both backends behave identically to the console.
@@ -64,9 +66,7 @@ func AdminAuthMiddleware(token string) fiber.Handler {
 
 // adminGatedPath reports whether path is one of the identity-bearing admin
 // routes narrowed-CORS applies to. /admin/admission/ is matched by prefix
-// even though this backend does not register that route yet (A12), so
-// narrowing takes effect automatically the day it lands — matching it now is
-// harmless since no route currently answers under that prefix.
+// (GET /admin/admission/:txid, registered by registerAdmissionRoute).
 func adminGatedPath(path string) bool {
 	return path == "/admin/registry" || path == "/admin/activity" || strings.HasPrefix(path, "/admin/admission/")
 }

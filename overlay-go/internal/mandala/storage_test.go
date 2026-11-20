@@ -637,8 +637,8 @@ func TestRebuildBalancesHealsTheBalanceIndex(t *testing.T) {
 	}
 	// B: a balance document with no rows left (the last row's debit was lost).
 	credit(stKeyB, 30)
-	// C: a row with no balance document, on an outpoint a reissue evicted. No path debits a
-	// reissued row, so it still counts (CirculatingSupply excludes it; balances do not).
+	// C: a row with no balance document, on an outpoint a reissue evicted. The reissue does not
+	// delete the row, so RebuildBalances counts it (CirculatingSupply excludes it).
 	mustRow(stToken(stHex(3), 0, tok, amt(7), keyC))
 	st := DefaultAssetState(tok, nil)
 	st.EvictedOutpoints = []string{stHex(3) + ".0"}

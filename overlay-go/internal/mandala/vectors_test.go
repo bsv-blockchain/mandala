@@ -327,8 +327,12 @@ func TestRejectVectorsHaveTheShapeGoReads(t *testing.T) {
 	if v.ID != "mandala.rejects" || v.Version != 2 {
 		t.Fatalf("id/version = %s/%d, want mandala.rejects/2", v.ID, v.Version)
 	}
-	if v.VerifierPrivateKey != mandalatest.Overlay.PrivHex() || !slices.Equal(v.TrustedIssuers, []string{mandalatest.Issuer.Identity}) {
-		t.Fatalf("cast differs from internal/mandalatest: verifier %s, trusted %v", v.VerifierPrivateKey, v.TrustedIssuers)
+	verifier, err := NewVerifier(v.VerifierPrivateKey)
+	if err != nil {
+		t.Fatalf("verifier: %v", err)
+	}
+	if verifier.IdentityKey() != mandalatest.Overlay.Identity || !slices.Equal(v.TrustedIssuers, []string{mandalatest.Issuer.Identity}) {
+		t.Fatalf("cast differs from internal/mandalatest: verifier identity %s, trusted %v", verifier.IdentityKey(), v.TrustedIssuers)
 	}
 	if len(v.Cases) < 40 {
 		t.Fatalf("%d cases, want at least 40", len(v.Cases))
