@@ -14,18 +14,18 @@ import { payoutTokens, type PayoutResult } from './payout.js'
 import { submitAdminAction, type AdminAsset } from './assets.js'
 import { submitAndBroadcast, submitToOverlay } from './overlay.js'
 import { fetchDeployTx } from './overlayLookup.js'
-import { configureMandala, ADMIN_PROTOCOL, ATTESTED_PROFILE_ID, MESSAGEBOX, TREASURY_BASKET } from './constants.js'
+import { configureMandala, ADMIN_PROTOCOL, MESSAGEBOX, TREASURY_BASKET } from './constants.js'
 import { decodeToken } from './brc162.js'
 import { decodeEnvelope } from './encoding.js'
 import { colorProtocolID, colorTopic } from './naming.js'
 import { MAX_UINT64 } from './amount.js'
 import { notifyClear, notifyList, reconcileNotifications } from './notifyJournal.js'
 import { blindingClear, blindingGet, blindingListReserved } from './blindingJournal.js'
-import { hasFreshIntent, INTENT_TTL_MS, journalClear, journalGet, journalList, journalPut } from './txJournal.js'
+import { hasFreshIntent, INTENT_TTL_MS, journalClear, journalGet, journalList, journalPut, journalRemove } from './txJournal.js'
 import { configureStorage, getStorage, memoryStorage } from './storage.js'
 import { adminAuthInFlightPrior, clearAdminAuthGates, StaleAdminAuthError } from './adminAuthGate.js'
 import { attestationFromSteak, verifyAttestation, type Attestation } from './attestation.js'
-import { handoverBody, issuerAttestedLeaf, issuerReceipt, newRemittance, ReceiptUnavailableError } from './receipt.js'
+import { handoverBody, issuerReceipt, newRemittance, ReceiptUnavailableError } from './receipt.js'
 import { OVERLAY_KEY, signedSteak } from './__fixtures__/overlaySigner.js'
 
 vi.mock('./overlay.js', async (importOriginal) => ({
@@ -130,6 +130,24 @@ const P = (over: Record<string, unknown> = {}) => ({
   ...over
 }) as Parameters<typeof payoutTokens>[0]
 
+/** The v4 body a payout of 120 sends (B7): receipt fields, the tip σ and the tip envelope. */
+const v4Body = (r: PayoutResult, env: number[], note?: string): Record<string, unknown> => ({
+  v: 4,
+  kind: 'handover',
+  assetId: ID,
+  amount: '120',
+  derivationPrefix: r.receipt.derivationPrefix,
+  derivationSuffix: r.receipt.derivationSuffix,
+  senderIdentityKey: r.receipt.senderIdentityKey,
+  senderMode: r.receipt.senderIdentityKey === ISSUER ? 'identity' : 'blinded',
+  transaction: Utils.toHex(ATOMIC),
+  outputIndex: 0,
+  admission: ATT,
+  admissions: [],
+  linkage: [{ txid: TXID, offChainValues: Utils.toHex(env) }],
+  ...(note != null ? { note } : {})
+})
+
 beforeEach(async () => {
   clearAdminAuthGates()
   await journalClear()
@@ -190,16 +208,16 @@ describe('receipt helpers', () => {
     expect(newRemittance()).not.toBe(a)
   })
 
-  it('issuerAttestedLeaf has exactly the C§7.1 members with lowercase hex', () => {
-    const leaf = issuerAttestedLeaf({ declarationTx: DEPLOY.toBinary(), attestation: ATT, offChainValues: [0xab, 0x01] })
-    expect(leaf).toEqual({ declarationTx: DEPLOY_HEX, transactions: [], attestations: [ATT], submissions: [{ txid: TXID, offChainValues: 'ab01' }] })
-    expect(Object.keys(leaf)).toEqual(['declarationTx', 'transactions', 'attestations', 'submissions'])
+  it('issuerReceipt is plain BRC-207 custody JSON (B7)', () => {
+    const r = issuerReceipt({ assetId: ID, derivationPrefix: 'p', derivationSuffix: 's', senderIdentityKey: ISSUER })
+    expect(r).toEqual({ version: 1, assetId: ID, derivationPrefix: 'p', derivationSuffix: 's', senderIdentityKey: ISSUER })
   })
 
-  it('handoverBody is the v3 body with no amount, and note only when given', () => {
-    const receipt = { version: 1 as const, assetId: ID, derivationPrefix: 'p', derivationSuffix: 's', senderIdentityKey: ISSUER, profileData: {} }
-    expect(Object.keys(handoverBody({ assetId: ID, outputIndex: 0, tx: [0xab], receipt }))).toEqual(['v', 'kind', 'assetId', 'outputIndex', 'tx', 'receipt'])
-    expect(handoverBody({ assetId: ID, outputIndex: 0, tx: [0xab], receipt, note: 'hi' })).toEqual({ v: 3, kind: 'handover', assetId: ID, outputIndex: 0, tx: 'ab', receipt, note: 'hi' })
+  it('handoverBody is the v4 body: decimal amount, receipt fields, σ and envelopes, note only when given', () => {
+    const b = handoverBody({ assetId: ID, amount: 120n, outputIndex: 0, tx: [0xab], derivationPrefix: 'p', derivationSuffix: 's', senderIdentityKey: ISSUER, senderMode: 'identity', admission: ATT, linkage: [{ txid: TXID, offChainValues: [0xab, 0x01] }] })
+    expect(Object.keys(b)).toEqual(['v', 'kind', 'assetId', 'amount', 'derivationPrefix', 'derivationSuffix', 'senderIdentityKey', 'senderMode', 'transaction', 'outputIndex', 'admission', 'admissions', 'linkage'])
+    expect(b).toMatchObject({ v: 4, amount: '120', transaction: 'ab', admission: ATT, admissions: [], linkage: [{ txid: TXID, offChainValues: 'ab01' }] })
+    expect((handoverBody({ assetId: ID, amount: 1n, outputIndex: 0, tx: [0xab], derivationPrefix: 'p', derivationSuffix: 's', senderIdentityKey: ISSUER, senderMode: 'identity', note: 'hi' }) as any).note).toBe('hi')
   })
 })
 
@@ -224,7 +242,15 @@ describe('payoutTokens (B4)', () => {
     expect(fetchDeployTx).not.toHaveBeenCalled()
   })
 
-  it('builds the recipient p color output, treasury change, envelope, attested receipt and v3 body', async () => {
+  it('an uppercase-hex recipient key pays out exactly like the lowercase key (lowercase linkage, address and intent)', async () => {
+    await payoutTokens(P({ recipientKey: RECIPIENT.toUpperCase() }))
+    const env = decodeEnvelope(vi.mocked(submitAndBroadcast).mock.calls[0][2]!)
+    expect(env.outputs![0].linkage.counterparty).toBe(RECIPIENT)
+    expect(mb.sendMessage.mock.calls[0][0].recipient).toBe(RECIPIENT)
+    await expect(payoutTokens(P({ recipientKey: '02' + '00'.repeat(32) }))).rejects.toThrow(TypeError)
+  })
+
+  it('builds the recipient p color output, treasury change, envelope, plain receipt and v4 body', async () => {
     const seenAtSend: string[] = []
     mb.sendMessage.mockImplementation(async () => { seenAtSend.push(...(await notifyList()).map(n => n.txid)); return {} })
     const r: PayoutResult = await payoutTokens(P())
@@ -267,24 +293,16 @@ describe('payoutTokens (B4)', () => {
     expect(env.admin).toBeUndefined()
 
     expect(r).toMatchObject({ txid: TXID, outputIndex: 0, notified: true, topic: colorTopic(ID), outputsToAdmit: [0, 1] })
-    expect(Object.keys(r.receipt)).toEqual(['version', 'assetId', 'derivationPrefix', 'derivationSuffix', 'senderIdentityKey', 'profileData'])
+    expect(Object.keys(r.receipt)).toEqual(['version', 'assetId', 'derivationPrefix', 'derivationSuffix', 'senderIdentityKey'])
     expect(r.receipt.version).toBe(1)
     expect(r.receipt.assetId).toBe(ID)
-    expect(Object.keys(r.receipt.profileData)).toEqual([ATTESTED_PROFILE_ID])
-    expect((r.receipt.profileData as any)[ATTESTED_PROFILE_ID][ID]).toEqual({
-      declarationTx: DEPLOY_HEX,
-      transactions: [],
-      attestations: [ATT],
-      submissions: [{ txid: TXID, offChainValues: Utils.toHex(call[2]!) }]
-    })
     expect(verifyAttestation(ATT, ID, OVERLAY_KEY)).toBe(true)
 
     const sent = mb.sendMessage.mock.calls[0][0]
     expect(sent.recipient).toBe(RECIPIENT)
     expect(sent.messageBox).toBe('mandala-color')
     expect(sent.messageBox).toBe(MESSAGEBOX)
-    expect(Object.keys(sent.body)).toEqual(['v', 'kind', 'assetId', 'outputIndex', 'tx', 'receipt'])
-    expect(sent.body).toEqual({ v: 3, kind: 'handover', assetId: ID, outputIndex: 0, tx: Utils.toHex(ATOMIC), receipt: r.receipt })
+    expect(sent.body).toEqual(v4Body(r, call[2]!))
     // The notification is journaled before sendMessage, and cleared on delivery.
     expect(seenAtSend).toContain(TXID)
     expect(await notifyList()).toEqual([])
@@ -337,14 +355,6 @@ describe('payoutTokens (B4)', () => {
     expect(out0.toHex()).toBe(new OneColor().lock(ID, 120n, Hash.hash160(Utils.toArray(publicKey, 'hex'))).toHex())
   })
 
-  it('stale or poisoned deploy answer: payoutTokens rejects before any coin is held', async () => {
-    vi.mocked(fetchDeployTx).mockRejectedValue(Object.assign(new Error('[LookupError] (ERR_INVALID_ANSWER)'), { name: 'LookupError' }))
-    await expect(payoutTokens(P())).rejects.toThrow(/ERR_INVALID_ANSWER/)
-    expect(wallet.listOutputs).not.toHaveBeenCalled()
-    expect(wallet.createAction).not.toHaveBeenCalled()
-    expect(await hasFreshIntent()).toBe(false)
-  })
-
   it('a second concurrent payout (another tab) gets BusyError', async () => {
     let release!: () => void
     const gate = new Promise<void>(resolve => { release = resolve })
@@ -369,7 +379,7 @@ describe('payoutTokens (B4)', () => {
     expect(pending[0]).toMatchObject({ recipient: RECIPIENT, messageBox: MESSAGEBOX })
     const retry = mkMb()
     expect(await reconcileNotifications(retry)).toEqual([TXID])
-    expect(retry.sendMessage.mock.calls[0][0].body).toEqual({ v: 3, kind: 'handover', assetId: ID, outputIndex: 0, tx: Utils.toHex(ATOMIC), receipt: r.receipt })
+    expect(retry.sendMessage.mock.calls[0][0].body).toEqual(v4Body(r, vi.mocked(submitAndBroadcast).mock.calls[0][2]!))
     expect(await notifyList()).toEqual([])
   })
 
@@ -457,7 +467,17 @@ describe('reissue through the payout path (submitAdminAction ftOutput)', () => {
     wallet.listOutputs.mockImplementation(async () => ({ outputs: [{ outpoint: asset.authOutpoint }], BEEF: [1] }) as any)
   })
 
-  it('outputs[0] is the recipient p color output, the authority follows, and a v3 body is sent', async () => {
+  it('an uppercase-hex recipient is lowercased for the linkage, the admin details and the address', async () => {
+    await reissue({
+      details: { kind: 'reissue', outpoint: FROZEN, recipient: RECIPIENT.toUpperCase() },
+      ftOutput: { recipient: RECIPIENT.toUpperCase(), amount: 5n }
+    })
+    const call = vi.mocked(submitAndBroadcast).mock.calls[0]
+    expect(decodeEnvelope(call[2]!).outputs![0].linkage.counterparty).toBe(RECIPIENT)
+    expect(mb.sendMessage.mock.calls[0][0]).toMatchObject({ recipient: RECIPIENT })
+  })
+
+  it('outputs[0] is the recipient p color output, the authority follows, and a v4 body is sent', async () => {
     const res = await reissue()
     const args = wallet.createAction.mock.calls[0][0]
     expect(decodeToken(args.outputs[0].lockingScript)).toEqual({ role: 'value', assetId: ID, amount: 5n })
@@ -479,13 +499,12 @@ describe('reissue through the payout path (submitAdminAction ftOutput)', () => {
     expect(res).toMatchObject({ txid: TXID, nextAuthOutpoint: `${TXID}.1`, notified: true })
     const sent = mb.sendMessage.mock.calls[0][0] as any
     expect(sent).toMatchObject({ recipient: RECIPIENT, messageBox: MESSAGEBOX })
-    expect(sent.body).toMatchObject({ v: 3, kind: 'handover', assetId: ID, outputIndex: 0, tx: Utils.toHex(ATOMIC) })
-    expect(sent.body.receipt.senderIdentityKey).toBe(ISSUER)
-    expect(sent.body.receipt.profileData[ATTESTED_PROFILE_ID][ID]).toEqual({
-      declarationTx: DEPLOY_HEX, transactions: [], attestations: [ATT], submissions: [{ txid: TXID, offChainValues: Utils.toHex(call[2]!) }]
+    expect(sent.body).toMatchObject({
+      v: 4, kind: 'handover', assetId: ID, amount: '5', outputIndex: 0, transaction: Utils.toHex(ATOMIC), senderIdentityKey: ISSUER,
+      senderMode: 'identity', admission: ATT, admissions: [], linkage: [{ txid: TXID, offChainValues: Utils.toHex(call[2]!) }]
     })
     const { publicKey } = await new ProtoWallet(RECIPIENT_PRIV).getPublicKey({
-      protocolID: colorProtocolID(ID, sent.body.receipt.derivationPrefix, sent.body.receipt.derivationSuffix),
+      protocolID: colorProtocolID(ID, sent.body.derivationPrefix, sent.body.derivationSuffix),
       keyID: 'color',
       counterparty: ISSUER,
       forSelf: true
@@ -560,12 +579,6 @@ describe('reissue through the payout path (submitAdminAction ftOutput)', () => {
     await expect(reissue({ ftOutput: { recipient: RECIPIENT, amount: 0n } })).rejects.toThrow(/greater than zero/)
     expect(wallet.createAction).not.toHaveBeenCalled()
     expect(wallet.listOutputs).not.toHaveBeenCalled()
-  })
-
-  it('a reissue fetches the deploy before any coin is held', async () => {
-    vi.mocked(fetchDeployTx).mockRejectedValue(new Error('lookup down'))
-    await expect(reissue()).rejects.toThrow(/lookup down/)
-    expect(wallet.createAction).not.toHaveBeenCalled()
   })
 })
 
@@ -643,8 +656,9 @@ describe('R6: issuer receipt intents', () => {
         derivationPrefix: r.receipt.derivationPrefix,
         derivationSuffix: r.receipt.derivationSuffix,
         senderIdentityKey: r.receipt.senderIdentityKey,
+        senderMode: 'identity',
+        amount: '120',
         note: 'october',
-        declarationTxHex: DEPLOY_HEX,
         txHex: Utils.toHex(ATOMIC),
         offChainHex: Utils.toHex(env),
         topics: [colorTopic(ID)]
@@ -703,7 +717,7 @@ describe('R6: issuer receipt intents', () => {
     expect(atSubmit).toMatchObject([{
       txid: TXID,
       pending: true,
-      intent: { assetId: ID, recipientKey: RECIPIENT, outputIndex: 0, senderIdentityKey: ISSUER, declarationTxHex: DEPLOY_HEX, topics: [colorTopic(ID)] }
+      intent: { assetId: ID, recipientKey: RECIPIENT, outputIndex: 0, amount: '5', senderIdentityKey: ISSUER, senderMode: 'identity', topics: [colorTopic(ID)] }
     }])
     expect(await notifyList()).toEqual([])
 
@@ -750,20 +764,23 @@ describe('R6: issuer receipt intents', () => {
     expect(await reconcileNotifications(later)).toEqual([TXID])
     expect(fetchSpy).not.toHaveBeenCalled() // σ came from the journal, no lookup
     expect(submitToOverlay).not.toHaveBeenCalled()
-    const receipt = issuerReceipt({
-      assetId: ID,
-      derivationPrefix: intent.derivationPrefix,
-      derivationSuffix: intent.derivationSuffix,
-      senderIdentityKey: intent.senderIdentityKey,
-      declarationTx: DEPLOY.toBinary(),
-      attestation: ATT,
-      offChainValues: Utils.toArray(intent.offChainHex, 'hex')
-    })
     expect(later.sendMessage).toHaveBeenCalledTimes(1)
     expect(later.sendMessage.mock.calls[0][0]).toEqual({
       recipient: RECIPIENT,
       messageBox: MESSAGEBOX,
-      body: handoverBody({ assetId: ID, outputIndex: 0, tx: ATOMIC, receipt, note: 'october' })
+      body: handoverBody({
+        assetId: ID,
+        amount: 120n,
+        outputIndex: 0,
+        tx: ATOMIC,
+        derivationPrefix: intent.derivationPrefix,
+        derivationSuffix: intent.derivationSuffix,
+        senderIdentityKey: intent.senderIdentityKey,
+        senderMode: 'identity',
+        admission: ATT,
+        linkage: [{ txid: TXID, offChainValues: Utils.toArray(intent.offChainHex, 'hex') }],
+        note: 'october'
+      })
     })
     expect(await notifyList()).toEqual([])
     // The broadcast owns the 'accepted' entry; completion never touches it.
@@ -777,7 +794,7 @@ describe('R6: issuer receipt intents', () => {
     expect(await reconcileNotifications(down)).toEqual([])
     const kept = await notifyList()
     expect(kept).toHaveLength(1)
-    expect(kept[0]).toMatchObject({ txid: TXID, attempts: 1, body: { v: 3, kind: 'handover' } })
+    expect(kept[0]).toMatchObject({ txid: TXID, attempts: 1, body: { v: 4, kind: 'handover' } })
     expect((kept[0] as any).pending).toBeUndefined()
   })
 
@@ -834,6 +851,38 @@ describe('R6: issuer receipt intents', () => {
     expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true }])
   })
 
+  it('deferred item 1: a retryable entry re-POSTed by reconcile during the lookup is never dropped', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
+    await restoreAged(raw, INTENT_TTL_MS + 1000)
+    await journalPut({
+      txid: TXID, stage: 'retryable', at: Date.now(), reference: 'ref-1', code: 'ERR_UNAVAILABLE', attempts: 0,
+      submit: { txHex: Utils.toHex(ATOMIC), topics: [colorTopic(ID)] }
+    })
+    // While the lookup runs, reconcile admits and broadcasts it: the entry is gone at the re-read.
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      await journalRemove(TXID)
+      const body = { type: 'output-list', outputs: [] }
+      return { ok: true, status: 200, text: async () => JSON.stringify(body), json: async () => body }
+    }))
+    expect(await reconcileNotifications(mkMb())).toEqual([])
+    expect(await notifyList()).toMatchObject([{ txid: TXID, pending: true }])
+  })
+
+  it('deferred item 1: an entry that became accepted (σ) during the lookup completes the receipt at once', async () => {
+    const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
+    await restoreAged(raw, INTENT_TTL_MS + 1000)
+    await journalPut({ txid: TXID, stage: 'retryable', at: Date.now(), reference: 'ref-1', attempts: 0, submit: { txHex: Utils.toHex(ATOMIC), topics: [colorTopic(ID)] } })
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      await journalPut({ txid: TXID, stage: 'accepted', at: Date.now(), outputsToAdmit: ATT.outputs, admissionSignature: ATT.signature, admissionIdentityKey: ATT.signer })
+      const body = { type: 'output-list', outputs: [] }
+      return { ok: true, status: 200, text: async () => JSON.stringify(body), json: async () => body }
+    }))
+    const later = mkMb()
+    expect(await reconcileNotifications(later)).toEqual([TXID])
+    expect((later.sendMessage.mock.calls[0][0].body as any).admission).toEqual(ATT)
+  })
+
   it('no accepted entry, past INTENT_TTL_MS, lookup unavailable: kept, no submit', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {})
     const raw = await crashAfterAdmission(async () => await payoutTokens(P()), false)
@@ -857,8 +906,8 @@ describe('R6: issuer receipt intents', () => {
     expect(offChain).toEqual(Utils.toArray(intent.offChainHex, 'hex'))
     expect(topics).toEqual([colorTopic(ID)])
     const body = later.sendMessage.mock.calls[0][0].body as any
-    expect(body.receipt.profileData[ATTESTED_PROFILE_ID][ID].attestations).toEqual([ATT])
-    expect(body.receipt.derivationPrefix).toBe(intent.derivationPrefix)
+    expect(body.admission).toEqual(ATT)
+    expect(body.derivationPrefix).toBe(intent.derivationPrefix)
     expect(await notifyList()).toEqual([])
   })
 

@@ -351,7 +351,7 @@ describe('submitAdminAction on 1Color', () => {
 
   it('a reissue without a MessageBox client or without an ftOutput is refused before any wallet call (payout.test.ts covers the reissue itself)', async () => {
     const wallet = mkAdminWallet()
-    const recipient = '03' + 'cd'.repeat(32)
+    const recipient = PrivateKey.fromString('05'.padStart(64, '0')).toPublicKey().toString()
     await expect(submitAdminAction({
       wallet: wallet as any,
       asset,

@@ -15,8 +15,6 @@ export const REGISTRY_PROTOCOL: WalletProtocol = [2, 'mandala registry']
 /** MessageBox box for BRC-207 hand-over and payout receipts (D11). */
 export const MESSAGEBOX = 'mandala-color'
 
-/** BRC-207 built-in attested profile id (C§4). */
-export const ATTESTED_PROFILE_ID = 'https://brc.dev/207/attested'
 /** Mandala issuer-v1 required-profile id (C§4); exactly 80 UTF-8 bytes. */
 export const MANDALA_PROFILE_ID = 'https://github.com/bsv-blockchain/mandala/blob/master/docs/profiles/issuer-v1.md'
 

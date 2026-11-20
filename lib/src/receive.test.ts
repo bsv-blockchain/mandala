@@ -1,408 +1,403 @@
 /**
- * MessageBox receive into BRC-207 receipts (plan 04 Task 14, C§7.1-7.2, G13,
- * G17, D22): strict v3 body parse, script-checked output, internalize with the
- * receipt verbatim, acknowledge only on credit or a definitive refusal.
+ * MessageBox receive of v4 hand-overs (design §9 B7): strict body parse,
+ * script-checked output, the host's own submit (online) or COVER with the S1
+ * hop checks (offline), the host-ledger record BEFORE internalize, a plain
+ * BRC-207 receipt, and acknowledge only on credit or a definitive refusal.
+ *
+ * The overlay submit is mocked with real σ (C.0 key); refusals are real
+ * `OverlayRefusedError`s. Chains are really signed (signedChain.ts).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { LockingScript, P2PKH, PrivateKey, Transaction, UnlockingScript, Utils } from '@bsv/sdk'
+import { P2PKH, Transaction, Utils } from '@bsv/sdk'
 import { OneColor } from '@bsv/templates'
-import { InvalidTransferError, parseHandoverBody, receiveHandovers } from './receive.js'
-import { ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID, MESSAGEBOX } from './constants.js'
-import { assetTag } from './naming.js'
+import {
+  classifyReceiveError, dismissHandover, ERR_BODY_UNREADABLE, InvalidTransferError, parseHandoverBody,
+  receiveHandovers, UNREADABLE_BUDGET
+} from './receive.js'
+import { configureMandala, MESSAGEBOX } from './constants.js'
+import { assetTag, colorTopic } from './naming.js'
+import { OverlayRefusedError, submitToOverlay } from './overlay.js'
+import { handoverBody } from './notifyJournal.js'
+import { createHostLedger, type HostLedger } from './hostLedger.js'
+import { configureStorage, memoryStorage } from './storage.js'
+import { attestationFromSteak } from './attestation.js'
+import { OVERLAY_KEY, signedSteak } from './__fixtures__/overlaySigner.js'
+import { A, B, chain, env, ID, sats, sigma, signed, tok } from './__fixtures__/signedChain.js'
 
-const ID = `${'c7'.repeat(32)}_0`
+vi.mock('./overlay.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./overlay.js')>()),
+  submitToOverlay: vi.fn()
+}))
+
+const A_KEY = A.toPublicKey().toString()
 const OTHER = `${'d8'.repeat(32)}_0`
-const SENDER = new PrivateKey(77).toPublicKey().toString()
-const pkh = new PrivateKey(11).toPublicKey().toHash() as number[]
+const PREFIX = 'cHJlZml4cHJlZml4cHJlZg=='
+const SUFFIX = 'c3VmZml4c3VmZml4c3VmZg=='
+const offline = (): OverlayRefusedError => new OverlayRefusedError({ code: 'ERR_UNAVAILABLE', description: 'fetch failed', retryable: true, httpStatus: 0 })
 
-function buildTip (script: LockingScript, satoshis = 1): { tx: number[], txid: string } {
-  const src = new Transaction()
-  src.addOutput({ satoshis: 10, lockingScript: new P2PKH().lock(pkh) })
-  const tx = new Transaction()
-  tx.addInput({ sourceTransaction: src, sourceOutputIndex: 0, unlockingScript: new UnlockingScript([]), sequence: 0xffffffff })
-  tx.addOutput({ satoshis, lockingScript: script })
-  return { tx: tx.toAtomicBEEF(), txid: tx.id('hex') }
+let C: Awaited<ReturnType<typeof chain>>
+let ledger: HostLedger
+
+/** The overlay admits each tx with these outputs (default: every 1-sat token output). */
+function overlayAdmits (admitted: Record<string, number[]> = {}): void {
+  vi.mocked(submitToOverlay).mockImplementation(async (beef: number[]) => {
+    const tx = Transaction.fromAtomicBEEF(beef)
+    const txid = tx.id('hex')
+    const outs = admitted[txid] ?? tx.outputs.flatMap((o, i) => {
+      try { OneColor.decode(o.lockingScript); return o.satoshis === 1 ? [i] : [] } catch { return [] }
+    })
+    const attestation = attestationFromSteak(txid, ID, await signedSteak(txid, { [colorTopic(ID)]: outs }))!
+    return { topic: colorTopic(ID), outputsToAdmit: outs, admissionSignature: attestation.signature, admissionIdentityKey: OVERLAY_KEY, attestation }
+  })
 }
 
-const TIP = buildTip(new OneColor().lock(ID, 5n, pkh))
-const TXID = TIP.txid
-
-const RECEIPT = {
-  version: 1,
-  assetId: ID,
-  derivationPrefix: 'cHJlZml4cHJlZml4cHJlZg==',
-  derivationSuffix: 'c3VmZml4c3VmZml4c3VmZg==',
-  senderIdentityKey: SENDER,
-  profileData: {
-    [ATTESTED_PROFILE_ID]: {
-      [ID]: { declarationTx: '00', transactions: [], attestations: [], submissions: [{ txid: TXID, offChainValues: '00' }] }
-    }
+function body (over: Record<string, unknown> = {}, tip?: Transaction): Record<string, unknown> {
+  const t = tip ?? C.T
+  return {
+    ...handoverBody({
+      assetId: ID,
+      amount: 6n,
+      outputIndex: 0,
+      tx: t.toAtomicBEEF(),
+      derivationPrefix: PREFIX,
+      derivationSuffix: SUFFIX,
+      senderIdentityKey: A_KEY,
+      senderMode: 'identity',
+      admissions: [C.gSigma],
+      linkage: [{ txid: C.P.id('hex'), offChainValues: env([0]) }, { txid: t.id('hex'), offChainValues: env([0, 1]) }]
+    }),
+    ...over
   }
-}
-
-function body (over: Record<string, unknown> = {}, tip = TIP): Record<string, unknown> {
-  return { v: 3, kind: 'handover', assetId: ID, outputIndex: 0, tx: Utils.toHex(tip.tx), receipt: RECEIPT, ...over }
 }
 
 function mkMb (messages: Array<{ messageId: string, body: unknown }>) {
   return {
-    listMessages: vi.fn(async () => messages.map(m => ({ ...m, sender: SENDER }))),
+    listMessages: vi.fn(async () => messages.map(m => ({ ...m, sender: A_KEY }))),
     acknowledgeMessage: vi.fn(async () => ({}))
   }
 }
 
-function mkWallet (outputs: Array<{ outpoint: string, tags?: string[] }> = []) {
-  return {
-    internalizeAction: vi.fn(async () => ({ accepted: true })),
-    listOutputs: vi.fn(async () => ({ totalOutputs: outputs.length, outputs }))
-  } as any
-}
+const mkWallet = () => ({ internalizeAction: vi.fn(async () => ({ accepted: true })) }) as any
 
-describe('parseHandoverBody (C§7.2 strict)', () => {
-  it('returns the receipt verbatim (same object) and the decoded tx', () => {
+beforeEach(async () => {
+  vi.mocked(submitToOverlay).mockReset()
+  configureStorage(memoryStorage())
+  configureMandala({ overlayUrl: 'http://o', overlayIdentityKey: OVERLAY_KEY })
+  C = await chain()
+  ledger = createHostLedger(memoryStorage())
+})
+
+describe('parseHandoverBody (v4 strict)', () => {
+  it('derives the plain receipt and decodes the evidence', () => {
     const p = parseHandoverBody(body({ note: 'lunch money' }))
     expect(p.assetId).toBe(ID)
-    expect(p.outputIndex).toBe(0)
-    expect(p.tx).toEqual(TIP.tx)
-    expect(p.receipt).toBe(RECEIPT)
+    expect(p.amount).toBe(6n)
+    expect(p.receipt).toEqual({ version: 1, assetId: ID, derivationPrefix: PREFIX, derivationSuffix: SUFFIX, senderIdentityKey: A_KEY })
+    expect(p.admissions).toEqual([C.gSigma])
+    expect([...p.linkage.keys()]).toEqual([C.P.id('hex'), C.T.id('hex')])
     expect(p.note).toBe('lunch money')
   })
 
   it('accepts a JSON string body', () => {
-    expect(parseHandoverBody(JSON.stringify(body())).receipt).toEqual(RECEIPT)
+    expect(parseHandoverBody(JSON.stringify(body())).amount).toBe(6n)
   })
 
-  const bad: Array<[string, unknown]> = [
-    ['null', null],
-    ['an array', [body()]],
-    ['a non-JSON string', '{not json'],
-    ['a v2 body', body({ v: 2 })],
-    ['a wrong kind', body({ kind: 'payment' })],
-    ['an extra amount member', body({ amount: '5' })],
-    ['a missing tx', (() => { const b = body(); delete b.tx; return b })()],
-    ['a non-Mandala asset id (_1)', body({ assetId: `${'c7'.repeat(32)}_1` })],
-    ['an uppercase asset id', body({ assetId: ID.toUpperCase() })],
-    ['a negative outputIndex', body({ outputIndex: -1 })],
-    ['a fractional outputIndex', body({ outputIndex: 0.5 })],
-    ['an outputIndex above uint32', body({ outputIndex: 2 ** 32 })],
-    ['a string outputIndex', body({ outputIndex: '0' })],
-    ['odd-length hex tx', body({ tx: 'abc' })],
-    ['uppercase hex tx', body({ tx: Utils.toHex(TIP.tx).toUpperCase() })],
-    ['an empty tx', body({ tx: '' })],
-    ['a non-string note', body({ note: 5 })],
-    ['a receipt with 5 members', body({ receipt: (() => { const { profileData, ...r } = RECEIPT; return r })() })],
-    ['a receipt with 7 members', body({ receipt: { ...RECEIPT, lifecycles: {} } })],
-    ['receipt version 2', body({ receipt: { ...RECEIPT, version: 2 } })],
-    ['a receipt for another asset', body({ receipt: { ...RECEIPT, assetId: OTHER } })],
-    ['a prefix of 49 bytes', body({ receipt: { ...RECEIPT, derivationPrefix: 'a'.repeat(49) } })],
-    ['a suffix with whitespace', body({ receipt: { ...RECEIPT, derivationSuffix: 'a b' } })],
-    ['a bad sender key', body({ receipt: { ...RECEIPT, senderIdentityKey: '02' + 'zz'.repeat(32) } })],
-    ['an off-curve sender key', body({ receipt: { ...RECEIPT, senderIdentityKey: '02' + 'ff'.repeat(32) } })],
-    ['a receipt carrying a MANDALA_PROFILE_ID leaf', body({ receipt: { ...RECEIPT, profileData: { ...RECEIPT.profileData, [MANDALA_PROFILE_ID]: { [ID]: {} } } } })],
-    ['a missing attested leaf', body({ receipt: { ...RECEIPT, profileData: {} } })],
-    ['an attested leaf for another asset only', body({ receipt: { ...RECEIPT, profileData: { [ATTESTED_PROFILE_ID]: { [OTHER]: {} } } } })],
-    ['a non-object attested leaf', body({ receipt: { ...RECEIPT, profileData: { [ATTESTED_PROFILE_ID]: { [ID]: 'x' } } } })]
+  const bad: Array<[string, () => unknown]> = [
+    ['null', () => null],
+    ['a v3 body', () => body({ v: 3 })],
+    ['a wrong kind', () => body({ kind: 'payment' })],
+    ['an extra member', () => body({ receipt: {} })],
+    ['a missing linkage', () => { const b = body(); delete b.linkage; return b }],
+    ['a JSON number amount', () => body({ amount: 6 })],
+    ['a non-canonical amount', () => body({ amount: '06' })],
+    ['a zero amount', () => body({ amount: '0' })],
+    ['an amount above uint64', () => body({ amount: (1n << 64n).toString() })],
+    ['a non-Mandala asset id (_1)', () => body({ assetId: `${'c7'.repeat(32)}_1` })],
+    ['a bad sender key', () => body({ senderIdentityKey: '02' + 'zz'.repeat(32) })],
+    ['an off-curve sender key', () => body({ senderIdentityKey: '02' + 'ff'.repeat(32) })],
+    ['a bad senderMode', () => body({ senderMode: 'secret' })],
+    ['a prefix of 49 bytes', () => body({ derivationPrefix: 'a'.repeat(49) })],
+    ['odd-length transaction hex', () => body({ transaction: 'abc' })],
+    ['an outputIndex above uint32', () => body({ outputIndex: 2 ** 32 })],
+    ['an admission with an extra member', () => body({ admissions: [{ ...C.gSigma, topic: 'x' }] })],
+    ['an admission with no outputs', () => body({ admissions: [{ ...C.gSigma, outputs: [] }] })],
+    ['a linkage row with uppercase hex', () => body({ linkage: [{ txid: C.T.id('hex'), offChainValues: 'AB' }] })],
+    ['a duplicate linkage txid', () => body({ linkage: [{ txid: C.T.id('hex'), offChainValues: 'ab' }, { txid: C.T.id('hex'), offChainValues: 'cd' }] })],
+    ['a non-string note', () => body({ note: 5 })]
   ]
   it.each(bad)('rejects %s with InvalidTransferError', (_n, b) => {
     let err: unknown
-    try { parseHandoverBody(b) } catch (e) { err = e }
-    expect((err as Error)?.name).toBe('InvalidTransferError')
+    try { parseHandoverBody(b()) } catch (e) { err = e }
     expect(err).toBeInstanceOf(InvalidTransferError)
   })
 })
 
-describe('receiveHandovers', () => {
-  beforeEach(() => { vi.restoreAllMocks() })
-
-  it('internalizes the receipt verbatim into p color <assetTag>, then acknowledges', async () => {
+describe('receiveHandovers: online (the recipient host submits first)', () => {
+  it('submits the unadmitted chain parents first, records settled, then internalizes the plain receipt and acks', async () => {
+    overlayAdmits()
     const wallet = mkWallet()
     const mb = mkMb([{ messageId: 'm1', body: body() }])
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb })
+    let recordedFirst = false
+    wallet.internalizeAction.mockImplementation(async () => {
+      recordedFirst = (await ledger.get(C.T.id('hex')))?.state === 'settled'
+      return { accepted: true }
+    })
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger })
+    expect(recordedFirst).toBe(true)
     expect(mb.listMessages).toHaveBeenCalledWith({ messageBox: MESSAGEBOX, acceptPayments: false })
+    const calls = vi.mocked(submitToOverlay).mock.calls
+    expect(calls.map(c => Transaction.fromAtomicBEEF(c[0]).id('hex'))).toEqual([C.P.id('hex'), C.T.id('hex')])
+    expect(calls[0][1]).toEqual(env([0]))
+    expect(calls[1][1]).toEqual(env([0, 1]))
+    expect(calls[1][3]).toEqual([colorTopic(ID)])
+    expect(calls[1][4]).toBe(OVERLAY_KEY)
     const ia = wallet.internalizeAction.mock.calls[0][0]
     expect(ia.outputs[0]).toEqual({
       outputIndex: 0,
       protocol: 'basket insertion',
-      insertionRemittance: { basket: `p color ${assetTag(ID)}`, customInstructions: JSON.stringify(RECEIPT) }
+      insertionRemittance: {
+        basket: `p color ${assetTag(ID)}`,
+        customInstructions: JSON.stringify({ version: 1, assetId: ID, derivationPrefix: PREFIX, derivationSuffix: SUFFIX, senderIdentityKey: A_KEY })
+      }
     })
-    expect(ia.tx).toEqual(TIP.tx)
     expect(ia.labels).toEqual(['mandala', 'receive'])
-    expect(ia.description).toBe('Receive Mandala tokens')
-    expect(r.accepted[0]).toEqual({ messageId: 'm1', txid: TXID, assetId: ID, amount: 5n, outputIndex: 0, offline: false })
-    expect(r.failed).toEqual([])
+    expect(r.accepted[0]).toEqual({ messageId: 'm1', txid: C.T.id('hex'), assetId: ID, amount: 6n, outputIndex: 0, offline: false })
     expect(mb.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m1'] })
-    // acknowledge only after the internalize resolved
-    expect(mb.acknowledgeMessage.mock.invocationCallOrder[0]).toBeGreaterThan(wallet.internalizeAction.mock.invocationCallOrder[0])
   })
 
-  it('uses a 5..50-byte note as the description, else the default', async () => {
+  it('works without a host ledger (an app over BRC-100): submit, verify, internalize', async () => {
+    overlayAdmits()
     const wallet = mkWallet()
-    await receiveHandovers({ wallet, messageBoxClient: mkMb([{ messageId: 'm1', body: body({ note: 'lunch money' }) }]) })
-    expect(wallet.internalizeAction.mock.calls[0][0].description).toBe('lunch money')
-    const w2 = mkWallet()
-    await receiveHandovers({ wallet: w2, messageBoxClient: mkMb([{ messageId: 'm1', body: body({ note: 'hi' }) }]) })
-    expect(w2.internalizeAction.mock.calls[0][0].description).toBe('Receive Mandala tokens')
-  })
-
-  it('parses a JSON string body', async () => {
-    const wallet = mkWallet()
-    const r = await receiveHandovers({ wallet, messageBoxClient: mkMb([{ messageId: 'm1', body: JSON.stringify(body()) }]) })
+    const r = await receiveHandovers({ wallet, messageBoxClient: mkMb([{ messageId: 'm1', body: body() }]) })
     expect(r.accepted).toHaveLength(1)
   })
 
-  it('a v2 body is refused and acknowledged; internalizeAction not called', async () => {
+  it('an admission that does not cover the received output is refused and acknowledged', async () => {
+    overlayAdmits({ [C.T.id('hex')]: [1] })
     const wallet = mkWallet()
-    const mb = mkMb([{ messageId: 'm1', body: { v: 2, kind: 'handover', assetId: ID, amount: '5' } }])
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb })
-    expect((r.failed[0].error as Error).name).toBe('InvalidTransferError')
-    expect(mb.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m1'] })
-    expect(wallet.internalizeAction).not.toHaveBeenCalled()
-  })
-
-  const badOutputs: Array<[string, Record<string, unknown>]> = [
-    ['an output index out of range', body({ outputIndex: 1 })],
-    ['a tx that is not AtomicBEEF', body({ tx: 'deadbeef' })],
-    ['a 2-sat token output', body({}, buildTip(new OneColor().lock(ID, 5n, pkh), 2))],
-    ['an output of another asset', body({}, buildTip(new OneColor().lock(OTHER, 5n, pkh)))],
-    ['a non-token output', body({}, buildTip(new P2PKH().lock(pkh)))]
-  ]
-  it.each(badOutputs)('%s ⇒ InvalidTransferError, acked, not internalized', async (_n, b) => {
-    const wallet = mkWallet()
-    const mb = mkMb([{ messageId: 'm1', body: b }])
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb })
-    expect((r.failed[0].error as Error).name).toBe('InvalidTransferError')
-    expect(mb.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m1'] })
-    expect(wallet.internalizeAction).not.toHaveBeenCalled()
-  })
-
-  it('an authority output is not a value receipt', async () => {
-    const auth = new OneColor().lock(ID, 0n, pkh)
-    expect(OneColor.decode(auth).role).toBe('authority')
-    const wallet = mkWallet()
-    const mb = mkMb([{ messageId: 'm1', body: body({}, buildTip(auth)) }])
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb })
-    expect((r.failed[0].error as Error).name).toBe('InvalidTransferError')
-    expect(wallet.internalizeAction).not.toHaveBeenCalled()
-  })
-
-  it('retryable verdict leaves the message unacknowledged', async () => {
-    const wallet = mkWallet()
-    wallet.internalizeAction.mockRejectedValueOnce(new Error('mandala overlay refused (ERR_FROZEN, retryable): frozen'))
     const mb = mkMb([{ messageId: 'm1', body: body() }])
-    const processed = new Set<string>()
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb, processed })
-    expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
-    expect(r.failed[0].code).toBe('ERR_FROZEN')
-    expect(r.accepted).toEqual([])
-    expect(processed.has('m1')).toBe(false)
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger })
+    expect(r.failed[0].code).toBe('ERR_NOT_ADMITTED')
+    expect(wallet.internalizeAction).not.toHaveBeenCalled()
+    expect(mb.acknowledgeMessage).toHaveBeenCalled()
   })
 
-  it('a final verdict (ERR_CONSERVATION) is acknowledged with its code', async () => {
+  it('a final verdict is acknowledged with its code; nothing recorded, nothing credited', async () => {
+    vi.mocked(submitToOverlay).mockRejectedValue(new OverlayRefusedError({ code: 'ERR_CONSERVATION', httpStatus: 400 }))
     const wallet = mkWallet()
-    wallet.internalizeAction.mockRejectedValueOnce(new Error('mandala overlay refused (ERR_CONSERVATION): burn'))
     const mb = mkMb([{ messageId: 'm1', body: body() }])
-    const processed = new Set<string>()
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb, processed })
-    expect(mb.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m1'] })
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger })
     expect(r.failed[0].code).toBe('ERR_CONSERVATION')
-    expect(processed.has('m1')).toBe(true)
-  })
-
-  it.each(['ERR_LINKAGE', 'ERR_SHAPE', 'ERR_SATOSHIS', 'ERR_INPUT_SPENT', 'ERR_EVICTED', 'ERR_AUTHORITY'])('final %s is acknowledged', async (code) => {
-    const wallet = mkWallet()
-    wallet.internalizeAction.mockRejectedValueOnce(new Error(`refused (${code}): x`))
-    const mb = mkMb([{ messageId: 'm1', body: body() }])
-    await receiveHandovers({ wallet, messageBoxClient: mb })
-    expect(mb.acknowledgeMessage).toHaveBeenCalledTimes(1)
-  })
-
-  it('a final-listed code marked retryable, and an unlisted final code, stay unacknowledged', async () => {
-    for (const msg of ['refused (ERR_LINKAGE, retryable): x', 'refused (ERR_UNKNOWN_ASSET): x']) {
-      const wallet = mkWallet()
-      wallet.internalizeAction.mockRejectedValueOnce(new Error(msg))
-      const mb = mkMb([{ messageId: 'm1', body: body() }])
-      await receiveHandovers({ wallet, messageBoxClient: mb })
-      expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
-    }
-  })
-
-  it.each([
-    ['named AttestationEvidenceError', Object.assign(new Error('frontier'), { name: 'AttestationEvidenceError' })],
-    ['prefixed [AttestationEvidenceError]', new Error('[AttestationEvidenceError] bad signature')],
-    ['named ProfileDataError', Object.assign(new Error('hop'), { name: 'ProfileDataError' })],
-    ['prefixed [ProfileDataError]', new Error('[ProfileDataError] burn hop')]
-  ])('an error %s is acknowledged', async (_n, err) => {
-    const wallet = mkWallet()
-    wallet.internalizeAction.mockRejectedValueOnce(err)
-    const mb = mkMb([{ messageId: 'm1', body: body() }])
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb })
     expect(mb.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m1'] })
-    expect(r.failed).toHaveLength(1)
+    expect(wallet.internalizeAction).not.toHaveBeenCalled()
+    expect(await ledger.list()).toEqual([])
   })
 
-  it.each([
-    ['a transport failure', new Error('fetch failed')],
-    ['UnsupportedProfileError', Object.assign(new Error('unsupported'), { name: 'UnsupportedProfileError' })],
-    ['ProfileParamsError', new Error('[ProfileParamsError] bad params')]
-  ])('%s leaves the message unacknowledged and retryable', async (_n, err) => {
+  it('a retryable typed verdict never falls back offline: unacknowledged, nothing credited', async () => {
+    vi.mocked(submitToOverlay).mockRejectedValue(new OverlayRefusedError({ code: 'ERR_FROZEN', httpStatus: 409, retryable: true }))
     const wallet = mkWallet()
-    wallet.internalizeAction.mockRejectedValueOnce(err)
     const mb = mkMb([{ messageId: 'm1', body: body() }])
     const processed = new Set<string>()
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb, processed })
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger, processed })
+    expect(r.failed[0].code).toBe('ERR_FROZEN')
     expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
     expect(processed.has('m1')).toBe(false)
-    expect(r.failed[0].messageId).toBe('m1')
+    expect(wallet.internalizeAction).not.toHaveBeenCalled()
   })
 
-  it('offline: the p color assets view tag color_offline marks the credit offline', async () => {
-    const wallet = mkWallet([{ outpoint: `${TXID}.0`, tags: ['color_offline'] }])
-    const r = await receiveHandovers({ wallet, messageBoxClient: mkMb([{ messageId: 'm1', body: body() }]) })
-    expect(r.accepted[0].offline).toBe(true)
-    expect(wallet.listOutputs).toHaveBeenCalledTimes(1)
-    expect(wallet.listOutputs.mock.calls[0][0]).toMatchObject({ basket: 'p color assets', includeTags: true, include: 'locking scripts', limit: 1000 })
-    for (const c of wallet.listOutputs.mock.calls) expect(c[0].basket).not.toBe(`p color ${assetTag(ID)}`)
-  })
-
-  it('offline: the same outpoint without the tag is not offline', async () => {
-    const wallet = mkWallet([{ outpoint: `${TXID}.0`, tags: [] }])
-    const r = await receiveHandovers({ wallet, messageBoxClient: mkMb([{ messageId: 'm1', body: body() }]) })
-    expect(r.accepted[0].offline).toBe(false)
-  })
-
-  it('a listOutputs failure after crediting keeps the credit (offline false)', async () => {
+  it('the body amount must equal the script amount', async () => {
+    overlayAdmits()
     const wallet = mkWallet()
-    wallet.listOutputs.mockRejectedValueOnce(new Error('db busy'))
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const r = await receiveHandovers({ wallet, messageBoxClient: mkMb([{ messageId: 'm1', body: body() }]) })
+    const mb = mkMb([{ messageId: 'm1', body: body({ amount: '7' }) }])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger })
+    expect((r.failed[0].error as Error).message).toMatch(/amount mismatch/)
+    expect(mb.acknowledgeMessage).toHaveBeenCalled()
+    expect(submitToOverlay).not.toHaveBeenCalled()
+  })
+
+  it('a 2-sat output, another asset and a non-token output are refused before any submit', async () => {
+    for (const out of [tok(6n, B, ID, 2), tok(6n, B, OTHER), { lockingScript: new P2PKH().lock(B.toPublicKey().toHash() as number[]), satoshis: 1 }]) {
+      const t = await signed([[C.P, 0, A], [C.P, 1, A]], [out, sats(A, 800)])
+      const wallet = mkWallet()
+      const mb = mkMb([{ messageId: 'm1', body: body({}, t) }])
+      const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger })
+      expect(r.failed[0].error).toBeInstanceOf(InvalidTransferError)
+      expect(mb.acknowledgeMessage).toHaveBeenCalled()
+    }
+    expect(submitToOverlay).not.toHaveBeenCalled()
+  })
+})
+
+describe('receiveHandovers: offline (transport failure only)', () => {
+  it('COVER accepts: pending record with the exact submit chain, then internalize; offline true', async () => {
+    vi.mocked(submitToOverlay).mockRejectedValue(offline())
+    const wallet = mkWallet()
+    const mb = mkMb([{ messageId: 'm1', body: body() }])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger })
+    expect(r.accepted[0]).toMatchObject({ txid: C.T.id('hex'), offline: true })
+    const rec = await ledger.get(C.T.id('hex'))
+    expect(rec).toMatchObject({ state: 'pending', outputs: [0] })
+    expect(rec?.submits?.map(s => s.txid)).toEqual([C.P.id('hex'), C.T.id('hex')])
+    expect(rec?.submits?.[1].offChainHex).toBe(Utils.toHex(env([0, 1])))
+    expect(mb.acknowledgeMessage).toHaveBeenCalled()
+  })
+
+  it('a verified σ of the tip itself credits settled even offline', async () => {
+    vi.mocked(submitToOverlay).mockRejectedValue(offline())
+    const wallet = mkWallet()
+    const tipSigma = await sigma(C.T, [0, 1])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mkMb([{ messageId: 'm1', body: body({ admission: tipSigma }) }]), ledger })
+    expect(r.accepted[0].offline).toBe(false)
+    expect(await ledger.get(C.T.id('hex'))).toMatchObject({ state: 'settled', attestation: tipSigma })
+  })
+
+  it('without a host ledger nothing is credited offline (retry later)', async () => {
+    vi.mocked(submitToOverlay).mockRejectedValue(offline())
+    const wallet = mkWallet()
+    const mb = mkMb([{ messageId: 'm1', body: body() }])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb })
+    expect(r.failed).toHaveLength(1)
+    expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
+    expect(wallet.internalizeAction).not.toHaveBeenCalled()
+  })
+
+  it('evidence that does not reach σ stays for an online pass (ERR_NOT_COVERED, not acked)', async () => {
+    vi.mocked(submitToOverlay).mockRejectedValue(offline())
+    const wallet = mkWallet()
+    const mb = mkMb([{ messageId: 'm1', body: body({ admissions: [] }) }])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger })
+    expect(r.failed[0].code).toBe('ERR_NOT_COVERED')
+    expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
+    expect(wallet.internalizeAction).not.toHaveBeenCalled()
+  })
+
+  it('S1: value minted from nothing is refused for good (acknowledged), never credited', async () => {
+    vi.mocked(submitToOverlay).mockRejectedValue(offline())
+    const minted = await signed([[C.P, 0, A], [C.P, 1, A]], [tok(60n, B), sats(A, 800)])
+    const wallet = mkWallet()
+    const mb = mkMb([{ messageId: 'm1', body: body({ amount: '60' }, minted) }])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger })
+    expect(r.failed[0].code).toBe('ERR_EVIDENCE')
+    expect(mb.acknowledgeMessage).toHaveBeenCalled()
+    expect(wallet.internalizeAction).not.toHaveBeenCalled()
+    expect(await ledger.list()).toEqual([])
+  })
+
+  it('a pending receipt received again online is upgraded to settled and markSettled runs after the internalize', async () => {
+    vi.mocked(submitToOverlay).mockRejectedValue(offline())
+    const wallet = mkWallet()
+    await receiveHandovers({ wallet, messageBoxClient: mkMb([{ messageId: 'm1', body: body() }]), ledger })
+    overlayAdmits()
+    const marked: string[] = []
+    const r = await receiveHandovers({
+      wallet,
+      messageBoxClient: mkMb([{ messageId: 'm1', body: body() }]),
+      ledger,
+      markSettled: async t => { marked.push(t) }
+    })
+    expect(r.accepted[0].offline).toBe(false)
+    expect(marked).toEqual([C.T.id('hex')])
+    expect(await ledger.get(C.T.id('hex'))).toMatchObject({ state: 'settled', marked: true })
+  })
+
+  it('a ledger write failure credits nothing', async () => {
+    vi.mocked(submitToOverlay).mockRejectedValue(offline())
+    const store = memoryStorage()
+    const broken = createHostLedger({ ...store, setItem: async () => { throw new Error('disk full') } })
+    const wallet = mkWallet()
+    const mb = mkMb([{ messageId: 'm1', body: body() }])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger: broken })
+    expect(r.failed).toHaveLength(1)
+    expect(wallet.internalizeAction).not.toHaveBeenCalled()
+    expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
+  })
+})
+
+describe('receiveHandovers: inbox robustness', () => {
+  it('internalize "already" counts as credited (crash between internalize and ack)', async () => {
+    overlayAdmits()
+    const wallet = mkWallet()
+    wallet.internalizeAction.mockRejectedValueOnce(new Error('output already exists'))
+    const r = await receiveHandovers({ wallet, messageBoxClient: mkMb([{ messageId: 'm1', body: body() }]), ledger })
     expect(r.accepted).toHaveLength(1)
-    expect(r.accepted[0].offline).toBe(false)
-    expect(warn).toHaveBeenCalled()
   })
 
-  it('no listOutputs read when nothing was accepted', async () => {
-    const wallet = mkWallet()
-    await receiveHandovers({ wallet, messageBoxClient: mkMb([{ messageId: 'm1', body: { v: 2 } }]) })
-    expect(wallet.listOutputs).not.toHaveBeenCalled()
-  })
-
-  it('declined consent stays processed and is not acknowledged (G17)', async () => {
-    for (const err of [
-      Object.assign(new Error('declined'), { name: 'ColorConsentDeclinedError' }),
-      new Error('[ColorConsentDeclinedError] declined')
-    ]) {
+  it('a wallet refusal named ProfileDataError is acknowledged; a transport fault is retried', async () => {
+    overlayAdmits()
+    for (const [err, acked] of [[new Error('[ProfileDataError] no'), true], [new Error('fetch failed'), false]] as const) {
       const wallet = mkWallet()
       wallet.internalizeAction.mockRejectedValueOnce(err)
       const mb = mkMb([{ messageId: 'm1', body: body() }])
-      const processed = new Set<string>()
-      const r = await receiveHandovers({ wallet, messageBoxClient: mb, processed })
-      expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
-      expect(processed.has('m1')).toBe(true)
-      expect(r.failed).toHaveLength(1)
-      await receiveHandovers({ wallet, messageBoxClient: mb, processed })
-      expect(wallet.internalizeAction).toHaveBeenCalledTimes(1)
+      await receiveHandovers({ wallet, messageBoxClient: mb, ledger })
+      expect(mb.acknowledgeMessage.mock.calls.length > 0).toBe(acked)
     }
   })
 
-  it('processed dedup: two parallel calls sharing one Set internalize once', async () => {
+  it('processed dedup: two parallel calls internalize once', async () => {
+    overlayAdmits()
     const wallet = mkWallet()
     const mb = mkMb([{ messageId: 'm1', body: body() }])
     const processed = new Set<string>()
-    const [a, b] = await Promise.all([
-      receiveHandovers({ wallet, messageBoxClient: mb, processed }),
-      receiveHandovers({ wallet, messageBoxClient: mb, processed })
+    await Promise.all([
+      receiveHandovers({ wallet, messageBoxClient: mb, processed, ledger }),
+      receiveHandovers({ wallet, messageBoxClient: mb, processed, ledger })
     ])
     expect(wallet.internalizeAction).toHaveBeenCalledTimes(1)
-    expect(a.accepted.length + b.accepted.length).toBe(1)
   })
 
-  it('an acknowledge failure after crediting keeps the credit and frees the id for a re-ack', async () => {
-    const wallet = mkWallet()
-    const mb = mkMb([{ messageId: 'm1', body: body() }])
-    mb.acknowledgeMessage.mockRejectedValueOnce(new Error('network'))
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const processed = new Set<string>()
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb, processed })
-    expect(r.accepted).toHaveLength(1)
-    expect(processed.has('m1')).toBe(false)
-    expect(warn).toHaveBeenCalled()
-  })
-
-  it('an acknowledge failure on a definitive refusal frees the id so a later run drops it', async () => {
-    const wallet = mkWallet()
-    const mb = mkMb([{ messageId: 'm1', body: { v: 2 } }])
-    mb.acknowledgeMessage.mockRejectedValueOnce(new Error('network'))
-    const processed = new Set<string>()
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb, processed })
-    expect(r.failed).toHaveLength(1)
-    expect(processed.has('m1')).toBe(false)
-  })
-
-  it('assetId filter skips other assets without touching them', async () => {
-    const wallet = mkWallet()
-    const mb = mkMb([{ messageId: 'm1', body: body() }, { messageId: 'm2', body: { ...body(), assetId: OTHER } }])
-    const processed = new Set<string>()
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb, assetId: ID, processed })
-    expect(r.accepted.map(x => x.messageId)).toEqual(['m1'])
-    expect(r.failed).toEqual([])
-    expect(processed.has('m2')).toBe(false)
-    expect(mb.acknowledgeMessage).toHaveBeenCalledTimes(1)
-  })
-
-  it.each([
-    ['the MessageBox decrypt-failure sentinel', '[Error: Failed to decrypt or parse message]'],
-    ['the live unstringifiable sentinel', '[Error: Unstringifiable message]'],
-    ['a non-JSON string', '{not json']
-  ])('%s body is retried: never acknowledged, never internalized, id freed', async (_n, b) => {
-    const wallet = mkWallet()
-    const mb = mkMb([{ messageId: 'm1', body: b }])
-    const processed = new Set<string>()
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb, processed })
-    expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
-    expect(wallet.internalizeAction).not.toHaveBeenCalled()
-    expect(processed.has('m1')).toBe(false)
-    expect(r.accepted).toEqual([])
-    expect(r.failed).toHaveLength(1)
-    expect(r.failed[0].messageId).toBe('m1')
-    expect(r.failed[0].code).toBe('ERR_BODY_UNREADABLE')
-    // A later pass (wallet unlocked) still sees the message.
-    await receiveHandovers({ wallet, messageBoxClient: mb, processed })
-    expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
-    expect(r.failed[0].error).toBeInstanceOf(InvalidTransferError)
-  })
-
-  it('an unreadable body next to a good one: the good one is credited, the unreadable one stays', async () => {
-    const wallet = mkWallet()
-    const mb = mkMb([{ messageId: 'm1', body: '[Error: Failed to decrypt or parse message]' }, { messageId: 'm2', body: body() }])
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb })
-    expect(r.accepted.map(a => a.messageId)).toEqual(['m2'])
-    expect(r.failed.map(f => f.messageId)).toEqual(['m1'])
-    expect(mb.acknowledgeMessage).toHaveBeenCalledTimes(1)
-    expect(mb.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m2'] })
-  })
-
-  it('under an assetId filter the sentinel body is skipped and not acknowledged', async () => {
+  it('an unreadable body is retried within its budget, then skipped as exhausted until dismissed (deferred item 4)', async () => {
     const wallet = mkWallet()
     const mb = mkMb([{ messageId: 'm1', body: '[Error: Failed to decrypt or parse message]' }])
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb, assetId: ID })
-    expect(r.failed).toEqual([])
-    expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
-  })
-
-  it('a JSON body that parses but is definitively invalid is still acknowledged', async () => {
-    const wallet = mkWallet()
-    const mb = mkMb([{ messageId: 'm1', body: JSON.stringify(body({ amount: '5' })) }])
+    for (let i = 0; i < UNREADABLE_BUDGET; i++) {
+      const r = await receiveHandovers({ wallet, messageBoxClient: mb })
+      expect(r.failed[0]).toMatchObject({ code: ERR_BODY_UNREADABLE })
+      expect(r.failed[0].exhausted).toBeUndefined()
+    }
     const r = await receiveHandovers({ wallet, messageBoxClient: mb })
-    expect(r.failed[0].code).toBeUndefined()
+    expect(r.failed[0]).toMatchObject({ code: ERR_BODY_UNREADABLE, exhausted: true })
+    expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
+    await dismissHandover({ messageBoxClient: mb, messageId: 'm1' })
     expect(mb.acknowledgeMessage).toHaveBeenCalledWith({ messageIds: ['m1'] })
   })
 
-  it('one bad message does not block the rest', async () => {
+  it('an unreadable body next to a good one: the good one is credited', async () => {
+    overlayAdmits()
     const wallet = mkWallet()
-    wallet.internalizeAction.mockRejectedValueOnce(new Error('fetch failed'))
-    const mb = mkMb([{ messageId: 'm1', body: body() }, { messageId: 'm2', body: body() }])
-    const r = await receiveHandovers({ wallet, messageBoxClient: mb })
-    expect(r.failed.map(f => f.messageId)).toEqual(['m1'])
+    const mb = mkMb([{ messageId: 'm1', body: '{not json' }, { messageId: 'm2', body: body() }])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger })
     expect(r.accepted.map(a => a.messageId)).toEqual(['m2'])
+    expect(mb.acknowledgeMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it('assetId filter skips other assets without touching them', async () => {
+    overlayAdmits()
+    const wallet = mkWallet()
+    const mb = mkMb([{ messageId: 'm1', body: body() }, { messageId: 'm2', body: { ...body(), assetId: OTHER } }])
+    const r = await receiveHandovers({ wallet, messageBoxClient: mb, assetId: ID, ledger })
+    expect(r.accepted.map(x => x.messageId)).toEqual(['m1'])
+    expect(r.failed).toEqual([])
+  })
+
+  it('classifies by name, [ClassName] prefix and (ERR_X[, retryable]) code', () => {
+    expect(classifyReceiveError(new InvalidTransferError('x', 'ERR_NOT_COVERED')).disposition).toBe('retry')
+    expect(classifyReceiveError(new InvalidTransferError('x')).disposition).toBe('ack')
+    expect(classifyReceiveError(new Error('[ColorConsentDeclinedError] no')).disposition).toBe('declined')
+    expect(classifyReceiveError(new Error('refused (ERR_LINKAGE): x')).disposition).toBe('ack')
+    expect(classifyReceiveError(new Error('refused (ERR_LINKAGE, retryable): x')).disposition).toBe('retry')
+    expect(classifyReceiveError(new OverlayRefusedError({ code: 'ERR_SHAPE', httpStatus: 400 }))).toEqual({ disposition: 'ack', code: 'ERR_SHAPE' })
+  })
+
+  it('fails closed without an overlay identity key (S5): retried, nothing submitted', async () => {
+    configureMandala({ overlayIdentityKey: '' })
+    try {
+      const wallet = mkWallet()
+      const mb = mkMb([{ messageId: 'm1', body: body() }])
+      const r = await receiveHandovers({ wallet, messageBoxClient: mb, ledger })
+      expect(r.failed).toHaveLength(1)
+      expect(submitToOverlay).not.toHaveBeenCalled()
+      expect(mb.acknowledgeMessage).not.toHaveBeenCalled()
+    } finally {
+      configureMandala({ overlayIdentityKey: OVERLAY_KEY })
+    }
   })
 })

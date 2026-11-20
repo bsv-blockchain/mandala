@@ -1,8 +1,11 @@
 /**
  * Issuer payouts (B4): treasury value coins (Mandala keys, `mandala
  * treasury`) → one holder `p color` output plus treasury change, overlay-first
- * (noSend → /submit → sendWith), then the BRC-207 receipt (attested leaf:
- * attestations = [tip], submissions = [tip]) delivered on MESSAGEBOX (C§7).
+ * (noSend → /submit → sendWith), then the hand-over delivered on MESSAGEBOX
+ * (C§7). B7: the receipt is plain BRC-207 custody JSON (the five
+ * `customInstructions` members, no evidence inside it); the overlay's σ
+ * admission of the tip travels in the v4 hand-over body beside it, with the
+ * tx and its linkage envelope.
  *
  * Stability:
  * - S5: refuses before any wallet call while the overlay key is unset.
@@ -41,8 +44,7 @@ import { ADMIN_PROTOCOL, OVERLAY_IDENTITY_KEY, OVERLAY_IDENTITY_KEY_UNSET, TREAS
 import { lockIssuerToken } from './brc162.js'
 import { colorTopic } from './naming.js'
 import { encodeEnvelope } from './encoding.js'
-import { AdmissionReceipt, admissionReceipt, isOutcomeUnknown, submitAndBroadcast } from './overlay.js'
-import { fetchDeployTx } from './overlayLookup.js'
+import { AdmissionReceipt, admissionReceipt, mayHaveCommitted, submitAndBroadcast } from './overlay.js'
 import { loadTreasuryCandidates } from './treasury/candidates.js'
 import { selectTreasuryInputs } from './treasury/select.js'
 import { revealIssuerLinkage } from './treasury/linkage.js'
@@ -88,11 +90,11 @@ export async function payoutTokens (p: PayoutParams): Promise<PayoutResult> {
   if (OVERLAY_IDENTITY_KEY === '') throw new Error(OVERLAY_IDENTITY_KEY_UNSET)
   const gate = guardPositiveAmount(p.amount)
   if (!gate.ok) throw new Error(gate.reason)
-  checkRecipient(p)
+  const recipientKey = checkRecipient(p)
   if (p.blind != null && typeof p.blind !== 'boolean') throw new TypeError('@bsv/mandala: blind must be a boolean')
 
   const { acquired, result } = await tryWithLock('mandala.payout', async () =>
-    await withIntent(async () => await payoutPipeline(p))
+    await withIntent(async () => await payoutPipeline({ ...p, recipientKey }))
   )
   if (!acquired || result == null) throw new BusyError('Payout already in progress in another tab')
   return result
@@ -103,9 +105,6 @@ async function payoutPipeline (p: PayoutParams): Promise<PayoutResult> {
   const assetId = asset.assetId
   const overlayIdentityKey = OVERLAY_IDENTITY_KEY
   const blind = p.blind === true
-
-  // (2) The verified deploy, before any coin is held.
-  const declarationTx = (await fetchDeployTx(assetId)).toBinary()
 
   // (3) Treasury coins.
   const { candidates, beef } = await loadTreasuryCandidates(wallet, assetId)
@@ -184,11 +183,12 @@ async function payoutPipeline (p: PayoutParams): Promise<PayoutResult> {
       assetId,
       recipientKey,
       outputIndex: 0,
+      amount: amount.toString(),
       derivationPrefix,
       derivationSuffix,
       senderIdentityKey: recipient.senderIdentityKey,
+      senderMode: blind ? 'blinded' : 'identity',
       ...(p.note != null ? { note: p.note } : {}),
-      declarationTxHex: Utils.toHex(declarationTx),
       txHex: Utils.toHex(signed.tx),
       offChainHex: Utils.toHex(env),
       topics
@@ -215,16 +215,13 @@ async function payoutPipeline (p: PayoutParams): Promise<PayoutResult> {
   try {
     admitted = await submitAndBroadcast(wallet, signed, env, reference, undefined, topics, { holdRetryable: false })
   } catch (e) {
-    if (!isOutcomeUnknown(e)) await notifyRemove(signed.txid)
+    if (!mayHaveCommitted(e)) await notifyRemove(signed.txid)
     throw e
   }
 
-  // (11) The receipt (attested leaf: the tip's attestation and submission).
+  // (11) The receipt (plain custody JSON) and the tip's σ for the v4 body.
   const attestation = requireAttestedOutput(admitted, 0, signed.txid)
-  const receipt = issuerReceipt({
-    assetId, derivationPrefix, derivationSuffix, senderIdentityKey: recipient.senderIdentityKey,
-    declarationTx, attestation, offChainValues: env
-  })
+  const receipt = issuerReceipt({ assetId, derivationPrefix, derivationSuffix, senderIdentityKey: recipient.senderIdentityKey })
 
   // (12) Journal (replacing the intent), send, clear. A ReceiptUnavailableError
   //      above keeps the intent (the tx is committed): after INTENT_TTL_MS a
@@ -234,7 +231,19 @@ async function payoutPipeline (p: PayoutParams): Promise<PayoutResult> {
     messageBoxClient: p.messageBoxClient,
     recipientKey,
     txid: signed.txid,
-    body: handoverBody({ assetId, outputIndex: 0, tx: signed.tx, receipt, ...(p.note != null ? { note: p.note } : {}) })
+    body: handoverBody({
+      assetId,
+      amount,
+      outputIndex: 0,
+      tx: signed.tx,
+      derivationPrefix,
+      derivationSuffix,
+      senderIdentityKey: recipient.senderIdentityKey,
+      senderMode: blind ? 'blinded' : 'identity',
+      admission: attestation,
+      linkage: [{ txid: signed.txid, offChainValues: env }],
+      ...(p.note != null ? { note: p.note } : {})
+    })
   })
   return { txid: signed.txid, receipt, outputIndex: 0, notified, ...admissionReceipt(admitted) }
 }

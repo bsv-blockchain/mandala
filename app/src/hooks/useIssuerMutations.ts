@@ -6,10 +6,9 @@ import { registerFlight, BusyError } from '@bsv/mandala/singleFlight'
 import { guardIssueSubmit, guardRedeemSubmit, guardRegisterSubmit } from '@bsv/mandala/submitGuards'
 import { useWallet } from '../context/WalletContext'
 import { displayAmount } from '../lib/mandala/amountDisplay'
-import { decimalsOf } from '../lib/mandala/loadHolderData'
+import { decimalsOf } from '../lib/mandala/decimals'
 import { validateRegisterForm } from '../lib/mandala/registerForm'
 import { adminAssetsKey, useAdvanceAdminAuth } from './useAdminAssets'
-import { holderDataKey } from './useHolderData'
 import { treasuryKey, type TreasuryData } from './useTreasuryBalances'
 
 export interface RegisterVars { label: string, ticker: string, decimals: number }
@@ -54,7 +53,6 @@ export function useIssuerMutations() {
   const refresh = (): void => {
     void qc.invalidateQueries({ queryKey: tKey })
     void qc.invalidateQueries({ queryKey: adminAssetsKey(identityKey) })
-    void qc.invalidateQueries({ queryKey: holderDataKey(identityKey) })
   }
 
   const settle = (): void => {
