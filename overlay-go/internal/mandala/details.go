@@ -435,8 +435,8 @@ func deployIcon(v any) (*DeployIcon, bool) {
 
 // RequireMandalaReq is the Mandala deploy req policy (contract §4 step 2): req is present and its
 // strict re-encoding is byte-identical to colorprofile.MandalaReqBytes(overlayIdentityKey), i.e.
-// exactly attested v1 {identityKey: K, trustMode: "identity"} and issuer-v1 v1 {identityKey: K}
-// with K this overlay's key. The input is never normalized: a non-canonical req already failed the
+// exactly {issuer-v1: {version: 1, params: {identityKey: K}}} with K this overlay's key (B7: no
+// attested companion; any second entry, including the attested profile, is refused). The input is never normalized: a non-canonical req already failed the
 // strict decode.
 func RequireMandalaReq(md DeployMetadata, overlayIdentityKey string) error {
 	if !md.hasReq {

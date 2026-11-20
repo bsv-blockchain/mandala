@@ -38,10 +38,10 @@ the bare overlay key. `tm_mandala_kyc` entries are unsigned. A replayed submit r
 Mandala policy (unchanged issuer policy, read through the final codec). Token outputs carry 1 satoshi; a holder
 transfer's token inputs equal its outputs; token ids are 32-byte (`<txid>_0`) only, and a 36-byte OneColor id is
 refused (`ERR_SHAPE`); deploys need a trusted issuer and a valid deploySig, plus membership, sanctions,
-freeze/pause/access and the admin chain as before. A deploy's `req` must be exactly the two-member map
-{attested profile `https://brc.dev/207/attested` with `identityKey` K and `trustMode` `identity`, Mandala issuer-v1
-profile with `identityKey` K}, where K is this overlay's identity key; another key, a reordered or extra member, or
-any `ext` is a final `ERR_SHAPE` refusal, persisted and replayed by payload hash. A non-deploy output carrying `req`
+freeze/pause/access and the admin chain as before. A deploy's `req` must be exactly the one-member map
+{Mandala issuer-v1 profile with `identityKey` K} (design §9 B7: no attested companion), where K is this overlay's
+identity key; another key, an extra member (the attested profile included), or any `ext` is a final `ERR_SHAPE`
+refusal, persisted and replayed by payload hash. A non-deploy output carrying `req`
 or `ext` is refused. A deploy payload is at most 65536 bytes and an admin details or authority payload at most 4096
 bytes, each nested at most 64 deep (the codec itself is strict DAG-CBOR with templates-parity depth 1024).
 
@@ -398,7 +398,7 @@ overlay-go/
   cmd/overlay/main.go        — entrypoint: env config, wiring.Build, App.Start, graceful shutdown
   internal/brc162/           — generic BRC-162 (1Color): TS-parity chunker, OneColor codec, strict DAG-CBOR, token ledger
   internal/amount/           — exact token amounts: Decimal128 in Mongo, decimal string in JSON, big.Int inside
-  internal/colorprofile/     — the attested + issuer-v1 profile ids and the Mandala deploy req
+  internal/colorprofile/     — the issuer-v1 profile id and the Mandala deploy req (B7: issuer-v1 only)
   internal/mandala/          — Mandala policy: topics, envelope, layers B–D, managers, lookups (incl. color-*),
                                 §6.6 store, attested v1 / σI v3 admission record, fold/refold, reconciler, KYC registry
   internal/mandalatest/      — importable test kit: parties, BEEF/envelope builders, deploy/issue/transfer flows

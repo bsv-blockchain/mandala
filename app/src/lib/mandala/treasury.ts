@@ -5,7 +5,7 @@
  */
 import type { WalletInterface } from '@bsv/sdk'
 import { TREASURY_BASKET, decodeToken } from '@bsv/mandala'
-import { decodeRecord, listAllOutputs, uniqueRecords, type InventoryRecord } from './holderBalances'
+import { decodeRecord, listAllOutputs, uniqueRecords, type InventoryRecord } from './walletOutputs'
 
 /** assetId → treasury units. Never put in a query key or JSON as-is (bigint). */
 export type TreasuryData = Record<string, bigint>

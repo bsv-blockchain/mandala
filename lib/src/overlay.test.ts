@@ -808,6 +808,23 @@ describe('submitAndBroadcast — holdRetryable: false (receipt-bearing txs)', ()
     expect(await journalList()).toMatchObject([{ txid: TXID, stage: 'abort', reference: 'ref-1' }])
   })
 
+  it('deferred item 3: a journal fault on the hold path never replaces the unknown-outcome refusal', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const mem = memoryStorage()
+    configureStorage({ ...mem, setItem: async () => { throw new Error('disk full') } })
+    try {
+      const wallet = { createAction: vi.fn(), abortAction: vi.fn() }
+      const facilitator = { send: vi.fn().mockRejectedValue(new OverlayRefusedError({ code: 'ERR_UNAVAILABLE', httpStatus: 503 })) }
+      const err = await submitAndBroadcast(wallet as any, signed, [7], 'ref-1', facilitator as any, [colorTopicOf()], { holdRetryable: false })
+        .then(() => undefined, (e: unknown) => e)
+      expect(err).toBeInstanceOf(OverlayRefusedError)
+      expect(err).toMatchObject({ code: 'ERR_UNAVAILABLE', outcome: 'unknown' })
+      expect(wallet.abortAction).not.toHaveBeenCalled()
+    } finally {
+      configureStorage(null)
+    }
+  })
+
   it('a typed 4xx verdict proves nothing was applied (outcome refused)', async () => {
     const wallet = { createAction: vi.fn(), abortAction: vi.fn().mockResolvedValue({ aborted: true }) }
     await expect(submitAndBroadcast(wallet as any, signed, undefined, 'ref-1', refusing('ERR_PAUSED'), [colorTopicOf()], { holdRetryable: false }))

@@ -146,7 +146,7 @@ describe('recipientLinkage refusals (before any wallet call)', () => {
 
   it.each([
     ['identityKey', '02' + 'zz'.repeat(32)],
-    ['recipientKey', b.toUpperCase()],
+    ['recipientKey', '02' + '00'.repeat(32)],
     ['recipientKey', '04' + b.slice(2)],
     ['overlayIdentityKey', k.slice(0, 64)],
     ['overlayIdentityKey', '02' + '00'.repeat(32)] // x = 0 is not on the curve

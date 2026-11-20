@@ -568,17 +568,17 @@ func swapFirstTwoKeys(t *testing.T, payload []byte) []byte {
 	return out
 }
 
-// Review Focus 4: the deploy req is exactly attested(identity K) + issuer-v1(K) for this overlay's
-// K; ext is absent; icon is [text, bytes]. Every refusal is the final ERR_SHAPE deploy-payload one.
+// Review Focus 4 (B7): the deploy req is exactly issuer-v1(K) for this overlay's K (a req that still
+// names the attested profile is refused); ext is absent; icon is [text, bytes]. Every refusal is the final ERR_SHAPE deploy-payload one.
 func TestDeployReqPolicy(t *testing.T) {
 	K := mandalatest.Overlay.Identity
 	good := colorprofile.MandalaReq(K)
 	extra := colorprofile.MandalaReq(K)
 	extra["https://example.com/p"] = brc162.CborMap{"version": uint64(1), "params": nil}
-	anyMode := colorprofile.MandalaReq(K)
-	anyMode[colorprofile.AttestedProfileID].(brc162.CborMap)["params"].(brc162.CborMap)["trustMode"] = "any"
-	noAttested := colorprofile.MandalaReq(K)
-	delete(noAttested, colorprofile.AttestedProfileID)
+	withAttested := colorprofile.MandalaReq(K)
+	withAttested["https://brc.dev/207/attested"] = brc162.CborMap{"version": uint64(1), "params": brc162.CborMap{"identityKey": K, "trustMode": "identity"}}
+	extraParam := colorprofile.MandalaReq(K)
+	extraParam[colorprofile.MandalaProfileID].(brc162.CborMap)["params"].(brc162.CborMap)["trustMode"] = "identity"
 	v2 := colorprofile.MandalaReq(K)
 	v2[colorprofile.MandalaProfileID].(brc162.CborMap)["version"] = uint64(2)
 	upperK := colorprofile.MandalaReq(strings.ToUpper(K))
@@ -598,9 +598,9 @@ func TestDeployReqPolicy(t *testing.T) {
 		{"other key", base(brc162.CborMap{"req": colorprofile.MandalaReq(mandalatest.Rogue.Identity)}), "req does not match this overlay's Mandala profiles"},
 		{"uppercase key", base(brc162.CborMap{"req": upperK}), "req does not match this overlay's Mandala profiles"},
 		{"extra profile", base(brc162.CborMap{"req": extra}), "req does not match this overlay's Mandala profiles"},
-		{"missing attested", base(brc162.CborMap{"req": noAttested}), "req does not match this overlay's Mandala profiles"},
+		{"attested companion (pre-B7)", base(brc162.CborMap{"req": withAttested}), "req does not match this overlay's Mandala profiles"},
 		{"issuer version 2", base(brc162.CborMap{"req": v2}), "req does not match this overlay's Mandala profiles"},
-		{"trustMode any", base(brc162.CborMap{"req": anyMode}), "req does not match this overlay's Mandala profiles"},
+		{"issuer params extra member", base(brc162.CborMap{"req": extraParam}), "req does not match this overlay's Mandala profiles"},
 		{"empty req", base(brc162.CborMap{"req": brc162.CborMap{}}), "req does not match this overlay's Mandala profiles"},
 		{"req text", base(brc162.CborMap{"req": "x"}), "req must be a map"},
 		{"req null", base(brc162.CborMap{"req": nil}), "req must be a map"},

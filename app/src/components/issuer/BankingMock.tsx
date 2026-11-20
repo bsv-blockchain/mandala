@@ -11,7 +11,7 @@ import { useWallet } from '../../context/WalletContext'
 import { reconcile, makeTransfer, TransferDirection } from '@bsv/mandala/banking'
 import { useMockTransfers, addMockTransfer, removeMockTransfer, clearMockTransfers } from '../../lib/mandala/mockBankStore'
 import { displayAmount, safeParseAmount } from '../../lib/mandala/amountDisplay'
-import { decimalsOf } from '../../lib/mandala/loadHolderData'
+import { decimalsOf } from '../../lib/mandala/decimals'
 
 interface BankingMockProps {
   /** Controlled mode: when set, use this assetId and hide the header asset selector. */

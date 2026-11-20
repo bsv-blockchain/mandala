@@ -13,6 +13,8 @@ export interface PayoutGuardInput {
   /** Treasury units for the asset; undefined while not (yet) loaded. */
   treasury: bigint | undefined
   recipientKey: string
+  /** The issuer's own identity key: a payout to it is refused (the lib requires another recipient). */
+  issuerKey?: string | null
   isPaused: boolean
   /** Dev mode: let a paused payout reach the overlay to prove it enforces the pause. */
   pauseBypass: boolean
@@ -32,19 +34,12 @@ export function guardPayout (i: PayoutGuardInput): PayoutGuardResult {
   if (!COMPRESSED_KEY.test(i.recipientKey.trim())) {
     return { ok: false, reason: 'Recipient must be a compressed identity key' }
   }
+  if (i.issuerKey != null && i.recipientKey.trim().toLowerCase() === i.issuerKey.toLowerCase()) {
+    return { ok: false, reason: 'Recipient is the issuer — pay out to a holder' }
+  }
   if (i.isPaused && !i.pauseBypass) {
     return { ok: false, reason: 'Transfers are temporarily disabled by the issuer' }
   }
   return { ok: true }
 }
 
-/**
- * True when a payout failed with an overlay outcome that is UNKNOWN (transport
- * fault, 5xx, unverifiable 200): the overlay may have committed it, the lib
- * holds the action for reconcile, and re-running the payout could pay twice.
- * Structural (`outcome === 'unknown'`, as the lib's OverlayRefusedError
- * carries it) so a second module instance cannot hide it from `instanceof`.
- */
-export function payoutOutcomeUnknown (e: unknown): boolean {
-  return typeof e === 'object' && e !== null && (e as { outcome?: unknown }).outcome === 'unknown'
-}

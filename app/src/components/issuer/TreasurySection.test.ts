@@ -14,7 +14,7 @@ vi.mock('../../context/WalletContext', () => ({
   })
 }))
 
-// SendTokens pulls in @bsv/identity-react which carries JSX that breaks Node
+// PayoutForm pulls in @bsv/identity-react which carries JSX that breaks Node
 vi.mock('@bsv/identity-react', () => ({
   useIdentitySearch: () => ({
     inputValue: '',
@@ -26,7 +26,7 @@ vi.mock('@bsv/identity-react', () => ({
   })
 }))
 
-// Block network hits from resolveAssetState (used inside SendTokens)
+// Block network hits from resolveAssetState (useAssetState in PayoutForm)
 vi.mock('@bsv/mandala/adminState', () => ({
   resolveAssetState: vi.fn().mockResolvedValue(null)
 }))
@@ -50,5 +50,12 @@ describe('TreasurySection smoke', () => {
     const mod = await import('./TreasurySection')
     // Destructured → 1 props arg
     expect(mod.default.length).toBeLessThanOrEqual(1)
+  })
+})
+
+describe('PayoutForm smoke', () => {
+  it('is a component the Treasury page renders', async () => {
+    const mod = await import('./PayoutForm')
+    expect(typeof mod.default).toBe('function')
   })
 })

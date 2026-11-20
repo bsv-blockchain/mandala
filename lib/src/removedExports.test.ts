@@ -1,7 +1,8 @@
 /**
- * Contract removal list (C§8.1): the holder-side 'p mandala' pipeline and
- * cover() are gone from the package root. Holder value moves only through
- * BRC-207 receipts; the lib credits nothing itself. The presence list pins
+ * Contract removal list (C§8.1, Revision 3 / B7): the holder-side 'p mandala'
+ * pipeline is gone from the package root. B7 restores the 0.4.1 hand-over
+ * evidence (cover, collectHandoverEvidence) on the host side; the attested
+ * companion profile is gone. The presence list pins
  * the 0.5.0 surface the consumer plans (05, 06, 07) import by name: a name
  * two modules both export would make `export *` drop it silently.
  */
@@ -16,8 +17,8 @@ const here = dirname(fileURLToPath(import.meta.url))
 describe('removed exports', () => {
   it.each([
     'FT_PROTOCOL', 'BASKET', 'MAX_SAFE_AMOUNT', 'tokenTopic', 'tokenLookup', 'tokenTopicOrEmpty', 'isSigmaTopic',
-    'deployTopics', 'decodeValue', 'lockToken', 'transferTokens', 'receiveTokens', 'defaultSettle', 'cover',
-    'canonicalBundleId', 'collectHandoverEvidence', 'journalEvidenceSource', 'encodeLinkagePayload', 'selectFtInputs',
+    'deployTopics', 'decodeValue', 'lockToken', 'transferTokens', 'receiveTokens', 'defaultSettle',
+    'canonicalBundleId', 'journalEvidenceSource', 'ATTESTED_PROFILE_ID', 'issuerAttestedLeaf', 'checkOfflineHops', 'encodeLinkagePayload', 'selectFtInputs',
     'loadFtCandidates', 'walletMandalaUnlock', 'formatAmountPlain', 'createMandalaProfile',
     // gone with the v2 hand-over evidence
     'derHex'
@@ -27,7 +28,7 @@ describe('removed exports', () => {
 
   // `./*` maps a subpath onto dist/<name>.js, so a removed subpath must have
   // no source file left to compile into one.
-  it.each(['ftSelect', 'ftChange', 'ftCandidates', 'unlock', 'transfer', 'bundle'])('src/%s.ts is gone (no subpath)', n => {
+  it.each(['ftSelect', 'ftChange', 'ftCandidates', 'unlock', 'transfer', 'profileHopCheck'])('src/%s.ts is gone (no subpath)', n => {
     expect(() => readFileSync(resolve(here, `${n}.ts`))).toThrow()
   })
 
@@ -41,7 +42,7 @@ describe('removed exports', () => {
 
 describe('present exports (C§8.1)', () => {
   it.each([
-    'TOPIC', 'LOOKUP', 'REGISTRY_TOPIC', 'REGISTRY_LOOKUP', 'MESSAGEBOX', 'ATTESTED_PROFILE_ID', 'MANDALA_PROFILE_ID',
+    'TOPIC', 'LOOKUP', 'REGISTRY_TOPIC', 'REGISTRY_LOOKUP', 'MESSAGEBOX', 'MANDALA_PROFILE_ID',
     'TREASURY_BASKET', 'ADMIN_PROTOCOL', 'actionDescription', 'signAttestation', 'postLookup', 'LookupError',
     'fetchDeployTx', 'loadHistory', 'markHandoverDelivered', 'journalListHandovers', 'resubmitDelivered',
     'submitToOverlay', 'colorTopic', 'colorLookup', 'assetTag', 'colorProtocolID', 'colorBasket', 'configureMandala',
@@ -52,7 +53,10 @@ describe('present exports (C§8.1)', () => {
     'issueTokens', 'payoutTokens', 'redeemTokens', 'submitAdminAction', 'listAdminAssets', 'createMandalaClient',
     // also named by C§8.1 and the consumer plans
     'parseDecimalAmount', 'formatAmountGrouped', 'formatCurrency', 'InvalidTransferError', 'reconcileWallet',
-    'reconcileNotifications'
+    'reconcileNotifications',
+    // B7 host-side evidence and settlement
+    'cover', 'checkHop', 'collectHandoverEvidence', 'createHostLedger', 'buildHandoverEnvelope', 'settleReceipts',
+    'acceptHandover', 'dismissHandover', 'handoverBody', 'receiptOfBody'
   ])('%s present', n => {
     expect(mod[n]).toBeDefined()
   })
@@ -63,7 +67,6 @@ describe('present exports (C§8.1)', () => {
     expect(mod.REGISTRY_TOPIC).toBe('tm_mandala_kyc')
     expect(mod.REGISTRY_LOOKUP).toBe('ls_mandala_kyc')
     expect(mod.MESSAGEBOX).toBe('mandala-color')
-    expect(mod.ATTESTED_PROFILE_ID).toBe('https://brc.dev/207/attested')
     expect(mod.MANDALA_PROFILE_ID).toBe('https://github.com/bsv-blockchain/mandala/blob/master/docs/profiles/issuer-v1.md')
     expect(mod.TREASURY_BASKET).toBe('mandala treasury')
     expect(mod.ADMIN_PROTOCOL).toEqual([2, 'mandala admin'])

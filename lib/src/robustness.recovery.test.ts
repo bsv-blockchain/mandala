@@ -160,9 +160,13 @@ describe('reconcileNotifications — hand-over redelivery', () => {
     assetId: ASSET,
     derivationPrefix: 'cHJlZml4',
     derivationSuffix: 'c3VmZml4',
-    senderIdentityKey: '02' + '11'.repeat(32),
-    profileData: { 'https://brc.dev/207/attested': { [ASSET]: { submissions: [] } } }
+    senderIdentityKey: '02' + '11'.repeat(32)
   }
+  const BODY = (note?: string) => handoverBody({
+    assetId: ASSET, amount: 5n, outputIndex: 0, tx: TX, derivationPrefix: RECEIPT.derivationPrefix,
+    derivationSuffix: RECEIPT.derivationSuffix, senderIdentityKey: RECEIPT.senderIdentityKey, senderMode: 'blinded',
+    linkage: [{ txid: TXID, offChainValues: [7, 8] }], ...(note != null ? { note } : {})
+  })
   const signedEntry = (over: Record<string, unknown> = {}): any => ({
     txid: TXID,
     stage: 'signed',
@@ -172,7 +176,7 @@ describe('reconcileNotifications — hand-over redelivery', () => {
     recipientKey: RECIPIENT,
     outputIndex: 0,
     note: 'for lunch',
-    receipt: JSON.stringify(RECEIPT),
+    body: JSON.stringify(BODY('for lunch')),
     submit: { txHex: Utils.toHex(TX), offChainHex: '0708', topics: [colorTopic(ASSET)] },
     ...over
   })
@@ -186,8 +190,8 @@ describe('reconcileNotifications — hand-over redelivery', () => {
     const sent = mbc.sendMessage.mock.calls[0][0]
     expect(sent.recipient).toBe(RECIPIENT)
     expect(sent.messageBox).toBe(MESSAGEBOX)
-    expect(sent.body.v).toBe(3)
-    expect(sent.body).toEqual(handoverBody({ assetId: ASSET, outputIndex: 0, tx: TX, receipt: RECEIPT, note: 'for lunch' }))
+    expect(sent.body.v).toBe(4)
+    expect(sent.body).toEqual(BODY('for lunch'))
     expect(delivered).toEqual([TXID])
     expect(await stageOf(TXID)).toBe('delivered')
     expect(await notifyList()).toEqual([])
@@ -203,7 +207,7 @@ describe('reconcileNotifications — hand-over redelivery', () => {
 
   it('a pending mandala-color notification for a signed entry is resent once (not rebuilt too) and promotes the entry', async () => {
     await journalPut(signedEntry())
-    const body = handoverBody({ assetId: ASSET, outputIndex: 0, tx: TX, receipt: RECEIPT })
+    const body = BODY()
     await notifyPut({ txid: TXID, recipient: RECIPIENT, messageBox: MESSAGEBOX, body, at: 1 })
     const mbc = { sendMessage: vi.fn().mockResolvedValue({}) }
     expect(await reconcileNotifications(mbc)).toEqual([TXID])

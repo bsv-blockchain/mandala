@@ -7,7 +7,8 @@ import { Hash, PrivateKey, ProtoWallet, PublicKey, Utils, WalletInterface } from
 import { OneColor, encodeStrictCbor, readOneColorAttributes } from '@bsv/templates'
 import fRaw from './__fixtures__/1color-deploy.json?raw'
 import { MAX_UINT64 } from './amount.js'
-import { ADMIN_PROTOCOL, ATTESTED_PROFILE_ID, MANDALA_PROFILE_ID } from './constants.js'
+import { ADMIN_PROTOCOL, MANDALA_PROFILE_ID } from './constants.js'
+const ATTESTED_PROFILE_ID = 'https://brc.dev/207/attested'
 import {
   authorityKeyIdOf, commitmentPayload, decodeToken, deployPayload, lockIssuerToken, mandalaReq,
   parseDeployPayload, readDeploy
@@ -24,22 +25,21 @@ const K2 = PrivateKey.fromRandom().toPublicKey().toString()
 const deployScript = (payload: number[]): string => new OneColor().lock(null, 0n, K_PKH, payload).toHex()
 
 describe('F-REQ fixture (C§4)', () => {
-  it('mandalaReq(K) encodes to the pinned 328-byte req value', () => {
+  it('mandalaReq(K) encodes to the pinned 181-byte req value (B7: issuer-v1 only)', () => {
     const req = encodeStrictCbor(mandalaReq(F.identityKey))
-    expect(req.length).toBe(328)
+    expect(req.length).toBe(181)
     expect(Utils.toHex(req)).toBe(F.reqHex)
   })
 
-  it('mandalaReq is exactly the attested + issuer-v1 profiles', () => {
+  it('mandalaReq is exactly the issuer-v1 profile (B7: no attested companion)', () => {
     expect(mandalaReq(F.identityKey)).toEqual({
-      [ATTESTED_PROFILE_ID]: { version: 1, params: { trustMode: 'identity', identityKey: F.identityKey } },
       [MANDALA_PROFILE_ID]: { version: 1, params: { identityKey: F.identityKey } }
     })
   })
 
-  it('deployPayload reproduces the pinned 365-byte payload', () => {
+  it('deployPayload reproduces the pinned 218-byte payload', () => {
     const p = deployPayload(OK)
-    expect(p.length).toBe(365)
+    expect(p.length).toBe(218)
     expect(Utils.toHex(p)).toBe(F.payloadHex)
   })
 
@@ -53,11 +53,15 @@ describe('F-REQ fixture (C§4)', () => {
 })
 
 describe('readDeploy', () => {
-  it('a req for another issuer key K2 than the attested key is not Mandala', () => {
-    const req = mandalaReq(F.identityKey) as Record<string, any>
-    req[MANDALA_PROFILE_ID] = { version: 1, params: { identityKey: K2 } }
+  it('a req that still names the attested profile is not Mandala (B7)', () => {
+    const req = { ...mandalaReq(F.identityKey), [ATTESTED_PROFILE_ID]: { version: 1, params: { trustMode: 'identity', identityKey: F.identityKey } } }
     const payload = encodeStrictCbor({ dec: 2n, req, sym: 'TUSD', label: 'Test Dollar' })
     expect(readDeploy(deployScript(payload), TXID)).toEqual({ assetId: `${TXID}_0`, sym: 'TUSD', dec: 2, label: 'Test Dollar' })
+  })
+
+  it('a req for another key K2 names K2', () => {
+    const payload = encodeStrictCbor({ dec: 2n, req: mandalaReq(K2), sym: 'TUSD', label: 'Test Dollar' })
+    expect(readDeploy(deployScript(payload), TXID)?.mandalaKey).toBe(K2)
   })
 
   it('an extra third profile is not Mandala', () => {

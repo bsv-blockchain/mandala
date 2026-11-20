@@ -7,7 +7,7 @@ import { AdminAsset } from '@bsv/mandala/assets'
 import { describeAction, exportAdminHistoryCsv, resolveAdminHistory, AdminHistoryRow } from '@bsv/mandala/adminHistory'
 import { useAdminHistoryPages } from '../../hooks/useAdminHistory'
 import { displayAmount } from '../../lib/mandala/amountDisplay'
-import { decimalsOf } from '../../lib/mandala/loadHolderData'
+import { decimalsOf } from '../../lib/mandala/decimals'
 
 interface Props {
   assets?: AdminAsset[]

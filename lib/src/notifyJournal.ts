@@ -42,6 +42,7 @@ import { journalListHandovers, journalPromoteSigned, type HandoverJournalEntry }
 import { tryWithLock } from './webLocks.js'
 import { isIssuerReceiptIntent, resolveIssuerIntent, type IssuerReceiptIntent } from './issuerIntent.js'
 import type { ReceiptInstruction } from './receipt.js'
+import type { Attestation } from './attestation.js'
 
 /** A notification ready to send. */
 export interface PendingNotification {
@@ -136,23 +137,84 @@ interface Sender {
   sendMessage: (args: { recipient: string, messageBox: string, body: object }) => Promise<unknown>
 }
 
-/** The MessageBox hand-over body (C§7.2). No amount: the recipient reads it from the script. */
+/** One σ row on the hand-over wire: the BRC-207 JSON attestation shape (txid, outputs, signer, signature). */
+export type WireAdmission = Attestation
+
+/** One envelope row on the hand-over wire: the off-chain values a txid is submitted with, lowercase hex. */
+export interface WireLinkage { txid: string, offChainValues: string }
+
+/**
+ * The MessageBox hand-over body v4 (design §9 B7): the 0.4.1 body adapted to
+ * 1Color. The recipient's receipt customInstructions are derived from it
+ * (`receiptOfBody`); the evidence (`admission`, `admissions`, `linkage`) is
+ * checked by the recipient host's lib and never travels in customInstructions.
+ */
+export interface HandoverBodyV4 {
+  v: 4
+  kind: 'handover'
+  assetId: string
+  /** Canonical decimal string; the recipient checks it against the script. */
+  amount: string
+  derivationPrefix: string
+  derivationSuffix: string
+  /** A, or A′ when blinded: the BRC-42 counterparty the recipient derives with. */
+  senderIdentityKey: string
+  senderMode: 'blinded' | 'identity'
+  /** AtomicBEEF of the tip (every unconfirmed ancestor inside), lowercase hex. */
+  transaction: string
+  outputIndex: number
+  /** σ of the tip itself, when the sender already holds it (issuer payouts and reissues). */
+  admission?: WireAdmission
+  /** σ per admitted ancestor; terminates the recipient's COVER walk. */
+  admissions: WireAdmission[]
+  /** Envelope per unadmitted transaction in the chain, the tip included. */
+  linkage: WireLinkage[]
+  note?: string
+}
+
+/** Build a v4 hand-over body. */
 export function handoverBody (p: {
   assetId: string
+  amount: bigint
   outputIndex: number
   /** AtomicBEEF of the tip. */
   tx: number[]
-  receipt: ReceiptInstruction
+  derivationPrefix: string
+  derivationSuffix: string
+  senderIdentityKey: string
+  senderMode: 'blinded' | 'identity'
+  admission?: Attestation
+  admissions?: Attestation[]
+  linkage?: Array<{ txid: string, offChainValues: number[] }>
   note?: string
-}): object {
+}): HandoverBodyV4 {
+  const att = (a: Attestation): WireAdmission => ({ txid: a.txid, outputs: [...a.outputs], signer: a.signer, signature: a.signature })
   return {
-    v: 3,
+    v: 4,
     kind: 'handover',
     assetId: p.assetId,
+    amount: p.amount.toString(),
+    derivationPrefix: p.derivationPrefix,
+    derivationSuffix: p.derivationSuffix,
+    senderIdentityKey: p.senderIdentityKey,
+    senderMode: p.senderMode,
+    transaction: Utils.toHex(p.tx),
     outputIndex: p.outputIndex,
-    tx: Utils.toHex(p.tx),
-    receipt: p.receipt,
+    ...(p.admission != null ? { admission: att(p.admission) } : {}),
+    admissions: (p.admissions ?? []).map(att),
+    linkage: (p.linkage ?? []).map(l => ({ txid: l.txid, offChainValues: Utils.toHex(l.offChainValues) })),
     ...(p.note != null ? { note: p.note } : {})
+  }
+}
+
+/** The plain BRC-207 custody receipt a v4 body implies (0207:1431-1440; < 1000 bytes). */
+export function receiptOfBody (b: Pick<HandoverBodyV4, 'assetId' | 'derivationPrefix' | 'derivationSuffix' | 'senderIdentityKey'>): ReceiptInstruction {
+  return {
+    version: 1,
+    assetId: b.assetId,
+    derivationPrefix: b.derivationPrefix,
+    derivationSuffix: b.derivationSuffix,
+    senderIdentityKey: b.senderIdentityKey
   }
 }
 
@@ -172,16 +234,10 @@ export const REDELIVER_AFTER_MS = 60_000
  */
 function rebuildNotification (entry: HandoverJournalEntry, now: number): PendingNotification | undefined {
   try {
-    const tx = Utils.toArray(entry.submit.txHex, 'hex')
+    const body = JSON.parse(entry.body) as HandoverBodyV4
+    if (body?.v !== 4 || body.kind !== 'handover' || typeof body.transaction !== 'string') throw new Error('the journaled body is not a v4 hand-over')
+    const tx = Utils.toArray(body.transaction, 'hex')
     if (Transaction.fromAtomicBEEF(tx).id('hex') !== entry.txid) throw new Error('the journaled bytes do not hash to the txid')
-    const receipt = JSON.parse(entry.receipt) as ReceiptInstruction
-    const body = handoverBody({
-      assetId: entry.assetId,
-      outputIndex: entry.outputIndex,
-      tx,
-      receipt,
-      ...(entry.note != null ? { note: entry.note } : {})
-    })
     return { txid: entry.txid, recipient: entry.recipientKey, messageBox: MESSAGEBOX, body, at: now }
   } catch (e) {
     console.warn(`[mandala] cannot redeliver hand-over ${entry.txid} from its journal entry; left 'signed':`, e)
@@ -189,10 +245,10 @@ function rebuildNotification (entry: HandoverJournalEntry, now: number): Pending
   }
 }
 
-/** A hand-over to the sender's own key (unblinded, so the receipt shows the recipient as sender). */
+/** A hand-over to the sender's own key (unblinded, so the body shows the recipient as sender). */
 function isSelfSend (entry: HandoverJournalEntry): boolean {
   try {
-    return (JSON.parse(entry.receipt) as ReceiptInstruction)?.senderIdentityKey === entry.recipientKey
+    return (JSON.parse(entry.body) as HandoverBodyV4)?.senderIdentityKey === entry.recipientKey
   } catch {
     return false
   }
@@ -248,9 +304,15 @@ async function completeIntent (entry: PendingReceiptIntent, now: number, s5: { w
   const { intent } = entry
   const body = handoverBody({
     assetId: intent.assetId,
+    amount: BigInt(intent.amount),
     outputIndex: intent.outputIndex,
     tx: Utils.toArray(intent.txHex, 'hex'),
-    receipt: outcome.receipt,
+    derivationPrefix: intent.derivationPrefix,
+    derivationSuffix: intent.derivationSuffix,
+    senderIdentityKey: intent.senderIdentityKey,
+    senderMode: intent.senderMode,
+    admission: outcome.attestation,
+    linkage: [{ txid: entry.txid, offChainValues: Utils.toArray(intent.offChainHex, 'hex') }],
     ...(intent.note != null ? { note: intent.note } : {})
   })
   const done: PendingNotification = { txid: entry.txid, recipient: intent.recipientKey, messageBox: MESSAGEBOX, body, at: now }
