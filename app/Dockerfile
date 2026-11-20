@@ -28,7 +28,7 @@ ENV VITE_OVERLAY_URL=$VITE_OVERLAY_URL \
     VITE_ADMIN_API_TOKEN=$VITE_ADMIN_API_TOKEN
 RUN cd app && npm run build
 
-FROM nginx:1.28-alpine
+FROM nginx:1.30.7-alpine
 COPY app/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /src/app/dist /usr/share/nginx/html
 EXPOSE 8080
